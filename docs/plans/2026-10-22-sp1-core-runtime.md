@@ -380,7 +380,7 @@ web/
   - `thread::create(pool, &Tenant, SpaceId, TeamId, title: &str) -> Result<ThreadId, KatError>` and `thread::get(pool, &Tenant, ThreadId) -> Result<Thread, KatError>`; another workspace's thread is `NotFound`
   - `Author::{User(UserId), Dot(DotId), System}` (`Eq`, `Hash`)
   - `Message { id: MessageId, thread_id: ThreadId, author: Author, body: String, synthetic: bool, question: Option<Question>, job_id: Option<JobId>, created_at: DateTime<Utc> }`
-  - `NewMessage { id: Option<MessageId>, author: Author, body: String, client_msg_id: Option<String>, idempotency_key: Option<String>, synthetic: bool, question: Option<Question> }`; `id: None` generates a new id
+  - `NewMessage { id: Option<MessageId>, author: Author, body: String, client_msg_id: Option<String>, idempotency_key: Option<String>, synthetic: bool, question: Option<Question>, job_id: Option<JobId> }`; `id: None` generates a new id, and `job_id` links the message to its job when it is inserted
   - `message::append(conn: &mut PgConnection, &Tenant, ThreadId, NewMessage) -> Result<Appended, KatError>` and `Appended { message_id: MessageId, job_id: Option<JobId>, created: bool }`. It runs `INSERT … ON CONFLICT DO NOTHING RETURNING`, and when no row comes back it selects the committed row: a repeat of the same `(thread, author, client_msg_id)` or of the same `idempotency_key` returns the original row with `created: false`, and a concurrent duplicate waits on the unique index, then returns the first row. It takes a connection so that intake (Task 12) and `job::conclude` (Task 10) can write inside their transactions.
   - `message::set_job(conn: &mut PgConnection, &Tenant, MessageId, JobId) -> Result<(), KatError>`
   - `message::list(pool, &Tenant, ThreadId, before: Option<MessageId>, limit: u16) -> Result<Vec<Message>, KatError>`
@@ -693,7 +693,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `job::conclude(tx: &mut Transaction<'_, Postgres>, tenant: &Tenant, job_id: JobId, thread_id: ThreadId, dot_id: Option<DotId>, idem_key: &str, facts: &RunFacts) -> Result<EventSeq, KatError>`: the single place that writes a job's outcome. The caller must already hold, in the global lock order, the job row, the task row when there is one, and the thread row (`lease::complete`, `lease::claim`, intake and cancel do); `conclude` takes no other lock. In the caller's transaction it:
     1. runs `policy::decide_job(facts, &Thresholds::SP1)`
     2. appends `katwork.decision`
-    3. when `dot_id` is set and there is `final_text` or a `pending_question`, appends the Dot's message, followed by its `katwork.message_stored` event, with `id = facts.reply_message_id`, `idempotency_key = "reply:{idem_key}"` and `synthetic = facts.synthetic`. For a question, the body is the question text and `question` holds the question with its options.
+    3. when `dot_id` is set and there is `final_text` or a `pending_question`, appends the Dot's message, followed by its `katwork.message_stored` event, with `id = facts.reply_message_id`, `idempotency_key = "reply:{idem_key}"` and `synthetic = facts.synthetic`. For a question, the body is the question text and `question` holds the question with its options. Every message `conclude` writes has `job_id` set to the job.
     4. for a `stopped` verdict, appends a `System` message whose body is the reason code, with `idempotency_key = "notice:{idem_key}"`, followed by its `katwork.message_stored` event
     5. calls `job::finish_by_policy`
     6. when `facts.run_id` is set, appends `katwork.dot_state` (`needs_approval` for an approval stop, `waiting` for a question, `paused` for a workspace pause, `idle` otherwise), then `RUN_FINISHED` unless `facts.stop` is `Cancelled` or `WorkspacePaused` (those runs already ended with `RUN_ERROR`)
@@ -705,7 +705,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 
 - [ ] **Step 1: Write the failing tests:**
   - in `crates/katwork/tests/policy.rs`: `policy_same_facts_same_verdict`, `answered_only_without_artifacts_else_ready`, `executor_unavailable_is_stopped_provider_unavailable`, `needs_approval_is_needs_input_approval_pending`, `every_stop_reason_maps_to_its_reason_code` (table-driven over the table above), `policy_never_returns_cancelled_or_error`
-  - in `crates/katwork/tests/jobs.rs`: `finish_by_policy_records_reason_and_decided_by`, `finish_by_harness_sets_cancelled_and_error`, `cannot_finish_twice`, `decision_event_precedes_job_status`, `conclude_twice_writes_one_reply`, `follow_up_job_links_parent_needs_input_job`, `enqueue_is_idempotent_on_key`
+  - in `crates/katwork/tests/jobs.rs`: `finish_by_policy_records_reason_and_decided_by`, `finish_by_harness_sets_cancelled_and_error`, `cannot_finish_twice`, `decision_event_precedes_job_status`, `conclude_twice_writes_one_reply`, `conclusion_messages_link_to_their_job`, `follow_up_job_links_parent_needs_input_job`, `enqueue_is_idempotent_on_key`
 - [ ] **Step 2: Run** `cargo test -p katwork --test policy --test jobs`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run.** Expected: PASS.
@@ -782,8 +782,8 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `pipeline::intake(tx: &mut Transaction<'_, Postgres>, core: &Core, tenant: &Tenant, thread_id: ThreadId, post: UserPost) -> Result<Submitted, KatError>`: the whole intake inside the caller's transaction. It takes its locks before any write, in the global order: the thread row first (`SELECT … FROM threads WHERE id = $1 FOR UPDATE`, which also serializes posts to the thread), then, once routing has chosen a Dot, that Dot's row inside `quota::check`. Steps:
     1. lock the thread row; then look up the user message for `(thread, author, client_msg_id)`. If it exists, return its stored `{message_id, job_id}`; because a message, its job and its task commit together, a stored message always has its `job_id`.
     2. reads only: `job::latest_in_thread`, then routing (below); if a Dot was chosen, `quota::check` locks its row and checks the quotas
-    3. writes: `message::append` for the user message; `job::create_follow_up` when the latest job is `needs_input`, otherwise `job::create` (ADR-0002); the unique `jobs.request_message_id` rejects any second job for the message
-    4. `task::enqueue` and `message::set_job`, or `job::conclude` for a job that ends at intake, plus the notices
+    3. writes: `message::append` for the user message; `job::create_follow_up` when the latest job is `needs_input`, otherwise `job::create` (ADR-0002), where the unique `jobs.request_message_id` rejects any second job for the message; then at once `message::set_job` for the request message, whatever routing decided
+    4. `task::enqueue`, or `job::conclude` for a job that ends at intake, plus the notices, each written with `job_id` set to the job
   - `pipeline::submit(core: &Core, tenant: &Tenant, thread_id: ThreadId, post: UserPost) -> Result<Submitted, KatError>`: begins a transaction, runs `intake`, commits, then notifies the hub. A crash at any point before the commit leaves no message, job or task, so the client's retry with the same `client_msg_id` starts clean; a concurrent retry waits on the thread lock, then finds the first post's message and returns its ids. The route answers 201 when `created`, otherwise 200.
   - Intake rules inside `intake`:
     - SP1 routing (spec §6.2 Stage 0 subset; Laya arrives in SP4). The eligible set is the thread team's Dots that are `active` and granted to the thread's Space. Mentions from `mentions::parse` are matched, in text order, against the team's Dot names (case-insensitive, NFC; names are unique within a team, Task 5):
@@ -794,7 +794,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
     - quotas before enqueue: `quota::check`; when exceeded, the job ends with `job::conclude` on `RunFacts::not_run(StopReason::QuotaExceeded)`, which posts a localized notice. Nothing is dropped silently.
     - in a paused workspace the task is still enqueued and waits (Task 11), and the pipeline posts a `System` notice `workspace_paused`
     - every `job::conclude` call here uses the job id as `idem_key`, and each notice uses the idempotency key `"notice:{job_id}:{code}"`, so a retried post never doubles them
-    - builds `TaskInput` with `build_history`, calls `task::enqueue` with the routed Dot's `policy_version`, read after `quota::check` has locked the Dot row, and key `"job:{job_id}:dot:{dot_id}"`, then `message::set_job`
+    - builds `TaskInput` with `build_history`, and calls `task::enqueue` with the routed Dot's `policy_version`, read after `quota::check` has locked the Dot row, and key `"job:{job_id}:dot:{dot_id}"`
   - `quota::check(conn: &mut PgConnection, dot: &Dot, sender: UserId) -> Result<Option<StopReason>, KatError>`, run inside intake's transaction:
     - it first locks the Dot row (`FOR UPDATE`): the last lock intake takes, after the thread row and before any write
     - the daily budget is `dot.daily_token_budget` (`None` means no cap), compared with the sum of `model_calls.charged_tokens` for that Dot over the last 24 hours, so missing usage counts at its conservative charge, never as zero
@@ -824,7 +824,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `retry_with_same_client_msg_id_creates_one_job`
   - `concurrent_retries_with_same_client_msg_id_create_one_job`: two posts with the same `client_msg_id` race; one message, one job and one task exist, and both responses carry the same ids
   - `intake_rolled_back_leaves_no_message_job_or_task`: runs `pipeline::intake` to its last step and drops the transaction without committing (a crash between any two steps rolls back the same way); no message, job or task remains, and a retry then creates exactly one of each
-  - `retry_after_intake_stop_returns_same_job`: a post whose job ends at intake (quota) is retried; the same job comes back and no second job or notice appears
+  - `retry_after_intake_stop_returns_same_job`: a post whose job ends at intake (quota) is retried; the same job comes back, no second job or notice appears, and in the database the request message and the notice both carry that `job_id`
   - `reply_to_needs_input_job_starts_linked_follow_up`
   - `history_budget_keeps_latest_user_message_whole`
   - `other_dots_messages_are_user_role_with_name`
