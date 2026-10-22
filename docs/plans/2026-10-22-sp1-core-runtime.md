@@ -887,8 +887,8 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 ### Task 14: Compose smoke, backup before migrate, HTTPS profile
 
 **Files:**
-- Create: `scripts/smoke.sh`, `scripts/compose-backup.sh`, `Caddyfile`, `crates/katwork-server/tests/e2e_compose.rs` (`#[ignore]`, run in a CI job)
-- Modify: `docker-compose.yml`, `.env.example` (`KATWORK_HTTPS_HOST`), `.github/workflows/ci.yml` (`e2e` and `upgrade_from_previous_release` jobs), `README.md` (a "Try it" section, HTTPS, backups and upgrades)
+- Create: `scripts/smoke.sh`, `scripts/compose-backup.sh`, `Caddyfile`, `docker-compose.smoke.yml`, `crates/katwork-server/tests/e2e_compose.rs` (`#[ignore]`, run in a CI job)
+- Modify: `docker-compose.yml`, `Dockerfile` (build argument `CARGO_FEATURES`), `crates/katwork/{Cargo.toml,src/models/fake.rs,src/models/registry.rs}` (the `smoke-fixtures` feature), `.env.example` (`KATWORK_HTTPS_HOST`), `.github/workflows/ci.yml` (`e2e` and `upgrade_from_previous_release` jobs), `README.md` (a "Try it" section, HTTPS, backups and upgrades)
 
 **Interfaces:**
 - Consumes: everything above.
@@ -896,16 +896,23 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   1. `backup`: the `postgres:17` image on the `backend` network, run once. `scripts/compose-backup.sh` runs `pg_dump --format=custom` into the `./backups` bind mount as `/backups/katwork-<UTC timestamp>.dump`, but only when the database already has KatWork's schema (`_sqlx_migrations` exists); on a fresh database it does nothing.
   2. `migrate`: the KatWork image with `command: ["migrate"]`, after `backup` completes successfully.
   3. `katwork`: `serve`, after `migrate` completes successfully.
+- A deterministic in-flight run for the restart scenario:
+  - the `katwork` crate gets a Cargo feature `smoke-fixtures`, off by default and never enabled in release images. With it, `FakeProvider::demo_held(hold: Duration) -> FakeProvider` behaves like `demo()`, except that each run's first attempt waits `hold` before its first chunk; `Registry::from_config` selects it when `KATWORK_SMOKE_HOLD_SECS` is set. Without the feature the variable is ignored.
+  - the `Dockerfile` takes a build argument `CARGO_FEATURES` (empty by default) and passes it to `cargo build --features`
+  - `docker-compose.smoke.yml` builds with `CARGO_FEATURES=katwork/smoke-fixtures`, sets `KATWORK_SMOKE_HOLD_SECS=20` (under the 30 s first-chunk timeout) and `KATWORK_DEMO=1`, and sets `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` to empty strings, so demo mode selects the fake even when the host has provider keys
 - An optional `https` profile adds a `caddy:2` service that publishes ports 80 and 443 and proxies `KATWORK_HTTPS_HOST` to `katwork:3000`. With it, `KATWORK_PUBLIC_URL=https://<host>`, so the session cookie is `Secure`.
 
 - [ ] **Step 1: Write `scripts/smoke.sh`.** It must:
-  1. Run `docker compose up -d --build` with `KATWORK_DEMO=1` and `KATWORK_DEMO_PASSWORD` set.
+  1. Run `docker compose -f docker-compose.yml -f docker-compose.smoke.yml up -d --build` with `KATWORK_DEMO_PASSWORD` set.
   2. Wait for `/healthz`.
   3. Run `seed-demo`.
   4. Log in as demo and post `"สวัสดี ช่วยแนะนำทีมหน่อย"` with `Origin: $KATWORK_PUBLIC_URL` and a `client_msg_id`.
   5. Read SSE until `katwork.job_status`.
   6. Assert status `answered`, and that the Dot reply from the messages API has `synthetic: true`.
-  7. In a second scenario, run `docker compose restart katwork` mid-run. After recovery, assert exactly one job status **and** exactly one Dot reply message, or `stopped/interrupted_review_required`; the task never ran twice at once.
+  7. In a second scenario, post again, then poll Postgres (`docker compose exec -T postgres psql …`) until the task is `leased` and its `runs` row is `running`. Only then run `docker compose kill katwork` and `docker compose up -d katwork`. After recovery, assert that:
+     - a second `runs` row with `kind = 'recovery'` exists for the task, so a recovery attempt really happened
+     - the job has exactly one Dot reply message
+     - the job has exactly one `katwork.decision` event and one terminal `katwork.job_status`, and its status is `answered`
   8. In a third scenario, run `docker compose up -d` again on the existing volume and assert that a new dump appeared in `./backups`.
   9. Print `SMOKE OK`.
 - [ ] **Step 2: Run** `scripts/smoke.sh`. Expected: FAIL before wiring, PASS after.
