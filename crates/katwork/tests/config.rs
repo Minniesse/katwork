@@ -215,6 +215,11 @@ fn config_debug_redacts_secrets() {
 fn redaction_handles_encoded_query_and_malformed_database_passwords() {
     for (url, message, expected) in [
         (
+            "postgres://user:db%22pass%5Cword@localhost/db",
+            r#"failed db\"pass\\word"#,
+            "failed [redacted]",
+        ),
+        (
             "postgres://user:p%40ss%3Aword@localhost/db",
             "failed p%40ss%3Aword or p@ss:word",
             "failed [redacted] or [redacted]",

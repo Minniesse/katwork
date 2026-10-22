@@ -68,6 +68,15 @@ impl Config {
                 }
             }
         }
+        // SQLx quotes invalid options using Debug, escaping quotes and backslashes.
+        let escaped: Vec<_> = secrets
+            .iter()
+            .map(|secret| {
+                let quoted = format!("{secret:?}");
+                quoted[1..quoted.len() - 1].to_owned()
+            })
+            .collect();
+        secrets.extend(escaped);
         secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
         let mut redacted = message.to_owned();
         for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
