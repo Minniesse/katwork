@@ -1,14 +1,13 @@
 use std::sync::Arc;
 
 use axum::{Router, routing::get};
-use sqlx::PgPool;
+use katwork::runtime::Core;
 
-use crate::{config::Config, routes::health};
+use crate::routes::health;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub pool: PgPool,
-    pub config: Arc<Config>,
+    pub core: Arc<Core>,
 }
 
 pub fn build_router(state: AppState) -> Router {

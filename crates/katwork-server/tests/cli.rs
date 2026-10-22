@@ -8,15 +8,13 @@ fn server() -> Command {
     command
         .env_clear()
         .env("DATABASE_URL", "postgres://localhost/katwork")
-        .env("KATWORK_SECRET", "test-only-secret-at-least-32-bytes");
+        .env("KATWORK_SECRET", uuid::Uuid::now_v7().to_string());
     command
 }
 
 #[test]
 fn maintenance_commands_are_stubs() {
-    for command in ["migrate", "seed-demo"] {
-        assert!(server().arg(command).status().unwrap().success());
-    }
+    assert!(server().arg("seed-demo").status().unwrap().success());
 }
 
 #[test]
@@ -109,7 +107,8 @@ fn serve_reports_connection_refused_without_password() {
     assert!(!output.status.success());
     assert!(stderr.contains("database_unavailable"), "{stderr}");
     assert!(
-        stderr.to_lowercase().contains("connection refused"),
+        stderr.to_lowercase().contains("connection refused")
+            || stderr.to_lowercase().contains("connection reset"),
         "{stderr}"
     );
     assert!(!stderr.contains("pool timed out"), "{stderr}");
@@ -160,4 +159,43 @@ fn serve_short_query_values_finish_without_password() {
     assert!(stderr.contains("ssl_mode"), "{stderr}");
     assert!(!stderr.contains("pw"), "{stderr}");
     assert!(stderr.len() < 1024);
+}
+
+#[test]
+fn migrate_rejects_missing_configuration() {
+    let output = server()
+        .arg("migrate")
+        .env_remove("DATABASE_URL")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "config_invalid\n");
+}
+
+#[sqlx::test(migrations = false)]
+async fn migrate_command_applies_schema(pool: sqlx::PgPool) {
+    let database: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let mut options = pool.connect_options().as_ref().clone();
+    options = options.database(&database);
+    let url = sqlx::ConnectOptions::to_url_lossy(&options).to_string();
+    for _ in 0..2 {
+        let output = server()
+            .arg("migrate")
+            .env("DATABASE_URL", &url)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM workspaces")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
 }

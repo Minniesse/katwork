@@ -9,3 +9,12 @@ license.workspace = true
 percent-encoding.workspace = true
 thiserror.workspace = true
 url.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
