@@ -13,7 +13,7 @@
 - The loop returns facts. One pure policy function turns facts into a job status (spec §5.1).
 
 **Tech Stack:**
-- Rust (edition 2024): tokio 1, tokio-util (`CancellationToken`), axum 0.8, sqlx (exact release pinned at Task 2 start after a crates.io check; postgres, runtime-tokio, tls-rustls, uuid, chrono, json, migrate), serde/serde_json, uuid 1 (v7), chrono, argon2 0.5, lettre 0.11, rig-core (exact release checked and pinned at Task 7 start; used directly, with explicit reqwest and rustls features), reqwest (pinned at Task 7 start to the release rig-core uses), async-trait, futures (`BoxStream`), unicode-segmentation, tracing, tracing-subscriber, thiserror 2.
+- Rust (edition 2024): tokio 1 (with `test-util` as a dev-dependency feature, for paused-clock tests), tokio-util (`CancellationToken`), axum 0.8, sqlx (exact release pinned at Task 2 start after a crates.io check; default features off, with postgres, runtime-tokio, tls-rustls, macros, uuid, chrono, json, migrate), serde/serde_json, uuid 1 (v7), chrono, argon2 0.5, lettre 0.11, rig-core (exact release checked and pinned at Task 7 start; used directly, with explicit reqwest and rustls features), reqwest (the version requirement Rig's reqwest transport declares, checked at Task 7 start, so the lock file holds one reqwest), async-trait, futures (`BoxStream`), unicode-segmentation, tracing, tracing-subscriber, thiserror 2.
 - Web: React 19, Vite, TypeScript, Vitest, Node 22 LTS.
 - Infrastructure: PostgreSQL 17, Qdrant (container only in SP1), Docker Compose with an optional Caddy HTTPS profile, GitHub Actions.
 
@@ -196,7 +196,7 @@ web/
   - `model_calls(id, workspace_id, space_id, job_id, task_id, run_id, dot_id, provider_id, model, residency, attempt INT, input_tokens BIGINT NULL, cache_read_tokens BIGINT NULL, cache_write_tokens BIGINT NULL, output_tokens BIGINT NULL, usage_complete BOOLEAN NOT NULL, cost_micros BIGINT NULL, latency_ms INT, outcome TEXT, created_at)`: one row per model attempt, retries included; a missing count is NULL, never 0
   - `events(thread_id, seq BIGINT, workspace_id, run_id NULL, kind, payload JSONB, created_at, PRIMARY KEY (thread_id, seq))`
 
-- [ ] **Step 1: Pin versions and check the MSRV.** Check crates.io for the latest released sqlx and pin it exactly (`=x.y.z`) in `[workspace.dependencies]` with the features above; add `uuid` (v7, serde), `chrono` (serde) and `serde`. Add the CI job `msrv`: `cargo +<rust-version> check --workspace --locked`. If the locked graph needs a newer compiler than 1.85 (let-chains under edition 2024 need 1.88), raise `rust-version` in `Cargo.toml` to the lowest version that passes and use the same value in the job.
+- [ ] **Step 1: Pin versions and check the MSRV.** Check crates.io for the latest released sqlx and pin it exactly (`=x.y.z`) in `[workspace.dependencies]` with the features above; `macros` must be listed, because default features are off and `migrate` does not enable `#[sqlx::test]` or the `sqlx::Type` derive. Add `uuid` (v7, serde), `chrono` (serde), `serde`, and tokio's `test-util` feature under `[dev-dependencies]`. Add the CI job `msrv`: `cargo +<rust-version> check --workspace --locked`. If the locked graph needs a newer compiler than 1.85 (let-chains under edition 2024 need 1.88), raise `rust-version` in `Cargo.toml` to the lowest version that passes and use the same value in the job.
 - [ ] **Step 2: Write the failing tests** with `#[sqlx::test]` in `crates/katwork/tests/schema.rs`:
   - `migrations_apply_cleanly`
   - `job_status_rejects_unknown_value`: an insert with status `'done'` errors
@@ -236,7 +236,13 @@ web/
   - `katwork::auth::AuthUser { user_id: UserId }`
   - `session::create(pool, UserId) -> Result<SessionToken, KatError>`, `session::authenticate(pool, token: &str) -> Result<AuthUser, KatError>` and `session::revoke(pool, token: &str) -> Result<(), KatError>`, where `SessionToken(String)` is the raw token returned once and only its SHA-256 is stored
   - `reset::request(pool, mailer: &dyn Mailer, email: &str, link_base: &str) -> Result<(), KatError>` and `reset::confirm(pool, token: &str, new_password: &str) -> Result<(), KatError>`
-  - `#[async_trait] trait Mailer: Send + Sync { async fn send(&self, to: &str, subject: &str, body: &str) -> Result<(), KatError>; }`, with `ConsoleMailer` (logs) and `SmtpMailer` (lettre, from `Config::smtp`)
+  - `MailKind::{PasswordReset}`, `Mail { kind: MailKind, to: String, subject: String, body: String }` and `#[async_trait] trait Mailer: Send + Sync { async fn send(&self, mail: &Mail) -> Result<(), KatError>; }`
+  - `mailer::from_config(config: &Config) -> Arc<dyn Mailer>` picks one backend:
+    - `SmtpMailer` (lettre, from `Config::smtp`) when SMTP is configured. It logs only the mail kind and the delivery outcome, never the recipient, subject or body.
+    - `DisabledMailer` when SMTP is unset and demo mode is off. It sends nothing and logs `mail_not_sent` with the kind and `smtp_unconfigured`; a reset request still returns the same 202.
+    - `ConsoleMailer` only when SMTP is unset and `KATWORK_DEMO=1`: it prints the whole mail, reset link included, under a "demo only" banner, for local demos.
+  - `CapturingMailer` for tests: keeps sent mail in memory, with `sent(&self) -> Vec<Mail>`
+  - Neither `reset::request` nor any backend except `ConsoleMailer` writes a reset token or link to a log.
   - `impl FromRequestParts<AppState> for AuthUser` in `crates/katwork-server/src/extract.rs` (allowed by the orphan rule because `AppState` is local); no valid session is 401 `unauthenticated`
 - Routes: `POST /api/auth/login`, `POST /api/auth/logout`, `POST /api/auth/reset/request`, `POST /api/auth/reset/confirm`, `GET /api/auth/me`.
 - Session cookie `kw_session` is `HttpOnly; SameSite=Lax; Path=/`, expiring after 14 days, and `Secure` only when `cookie_secure()`. On an `http://` public URL, `serve` logs a startup warning that the cookie is not `Secure`.
@@ -256,6 +262,8 @@ web/
   - `reset_token_single_use`: the second confirm returns 400 `reset_token_invalid`
   - `reset_token_expires_after_30_minutes`: the test moves `expires_at` into the past in SQL
   - `reset_revokes_existing_sessions`
+  - `reset_token_never_appears_in_logs`: with a `CapturingMailer` and all tracing output captured, the token from the captured mail appears nowhere in the logs
+  - `reset_without_smtp_returns_202_and_sends_nothing`: SMTP unset and demo off selects `DisabledMailer`
   - `cookie_secure_when_public_url_is_https`
   - `cookie_not_secure_on_http_public_url`
   - `seed_demo_creates_demo_user_and_workspace`: idempotent; with `KATWORK_DEMO_PASSWORD` set, login works with that password
@@ -421,7 +429,7 @@ web/
   - Anthropic's opening and closing usage snapshots are merged, never summed
   - a provider tool call with no id gets `kw_call_{index}`; a duplicate id within one turn is `Protocol`
 
-- [ ] **Step 1: Pin dependencies.** Check crates.io for the latest rig-core release; pin it exactly (`=x.y.z`) with `default-features = false` and explicit reqwest and rustls features. Pin `reqwest` to the release that rig-core uses. Add `async-trait`, `futures` and `tracing-subscriber`. In `katwork-server`, initialize tracing from `RUST_LOG`, defaulting to `info,rig=info`, because Rig's `rig::completions` TRACE level logs full prompts.
+- [ ] **Step 1: Pin dependencies.** Check crates.io for the latest rig-core release; pin it exactly (`=x.y.z`) with `default-features = false` and explicit reqwest and rustls features. If the release moves its reqwest transport into a separate crate, pin that crate to the same exact version. Add `reqwest` with the same version requirement that transport declares (for example `0.13`), never a different line, so `Cargo.lock` resolves one reqwest. Then re-run the `msrv` check on the new locked graph; if it fails, raise `rust-version` in `Cargo.toml` and the CI job's toolchain together to the lowest version that passes. Add `async-trait`, `futures` and `tracing-subscriber`. In `katwork-server`, initialize tracing from `RUST_LOG`, defaulting to `info,rig=info`, because Rig's `rig::completions` TRACE level logs full prompts.
 - [ ] **Step 2: Write the failing tests** in `crates/katwork/tests/models.rs`:
   - `registry_refuses_external_provider_for_local_only_space`: returns `ModelError::ResidencyDenied`
   - `demo_mode_uses_synthetic_provider_without_keys`: no API keys plus `KATWORK_DEMO=1` gives `FakeProvider::demo`
