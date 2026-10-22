@@ -1,0 +1,12 @@
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_test","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"","annotations":[]}]}}
+
+data: {"type":"response.content_part.added","output_index":0,"content_index":0,"item_id":"msg_test","part":{"type":"output_text","text":"","annotations":[]}}
+
+data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"item_id":"msg_test","delta":"draft"}
+
+data: {"type":"response.output_text.done","output_index":0,"content_index":0,"item_id":"msg_test","text":"draft"}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_test","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"draft","annotations":[]}]}}
+
+data: {"type":"response.completed","response":{"id":"resp_test","object":"response","created_at":1,"model":"gpt-4.1","status":"completed","output":[{"id":"msg_test","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"final answer","annotations":[]}]}],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}
+

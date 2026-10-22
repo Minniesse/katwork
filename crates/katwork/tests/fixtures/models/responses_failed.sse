@@ -1,0 +1,10 @@
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_test","type":"function_call","call_id":"call_test","name":"first","arguments":"","status":"in_progress"}}
+
+data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_test","delta":"{}"}
+
+data: {"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_test","arguments":"{}"}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_test","type":"function_call","call_id":"call_test","name":"first","arguments":"{}","status":"completed"}}
+
+data: {"type":"response.failed","response":{"id":"resp_test","object":"response","created_at":1,"model":"gpt-4.1","status":"failed","output":[{"id":"fc_test","type":"function_call","call_id":"call_test","name":"first","arguments":"{}","status":"completed"}],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7},"error":{"code":"server_error","message":"private failure"}}}
+

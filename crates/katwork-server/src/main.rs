@@ -8,6 +8,17 @@ use katwork_server::{
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,rig=info".into()),
+        )
+        .with(tracing_subscriber::filter::filter_fn(
+            dependency_log_allowed,
+        ))
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .init();
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -40,6 +51,19 @@ fn error_report(error: &KatError, config: Option<&Config>, database_url: Option<
     lines.join("\n")
 }
 
+fn dependency_log_allowed(metadata: &tracing::Metadata<'_>) -> bool {
+    // SQLx's config parser logs unrecognized option values, including secrets, at WARN.
+    if metadata.target().starts_with("sqlx") {
+        return false;
+    }
+    // More specific RUST_LOG directives must not enable Rig's prompt traces.
+    !(metadata.target().starts_with("rig")
+        && matches!(
+            *metadata.level(),
+            tracing::Level::DEBUG | tracing::Level::TRACE
+        ))
+}
+
 async fn run() -> Result<(), KatError> {
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "serve".into());
@@ -69,6 +93,47 @@ async fn run() -> Result<(), KatError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn rig_trace_prompts_are_blocked_even_with_explicit_trace_directives() {
+        use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new(
+                "trace,rig::completions=trace",
+            ))
+            .with(tracing_subscriber::filter::filter_fn(
+                dependency_log_allowed,
+            ))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .without_time()
+                    .with_ansi(false)
+                    .with_writer({
+                        let output = output.clone();
+                        move || Capture(output.clone())
+                    }),
+            );
+        let _guard = subscriber.set_default();
+        tracing::trace!(target: "rig::completions", "private prompt");
+        tracing::debug!(target: "rig_core::completions", "private response");
+        tracing::warn!(target: "sqlx_postgres::options::parse", "private database option");
+        tracing::info!(target: "rig::completions", "safe status");
+        let logged = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("safe status"));
+        assert!(!logged.contains("private"));
+    }
 
     #[test]
     fn error_report_without_config_never_prints_url_credentials() {

@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+tracing-subscriber.workspace = true
+tracing.workspace = true
 axum.workspace = true
 katwork = { path = "../katwork" }
 serde_json.workspace = true

@@ -303,12 +303,15 @@ fn config_and_provider_debug_show_only_url_origins() {
         ("https://host/path@secret", "[redacted]"),
         ("not-a-url", "[redacted]"),
     ] {
-        let config = Config::from_lookup(|name| match name {
-            "KATWORK_PUBLIC_URL" | "OPENAI_BASE_URL" | "ANTHROPIC_BASE_URL" => Some(url.into()),
-            "OPENAI_API_KEY" | "ANTHROPIC_API_KEY" => Some("test-api-key".into()),
+        let mut config = Config::from_lookup(|name| match name {
+            "KATWORK_PUBLIC_URL" => Some(url.into()),
+            "OPENAI_API_KEY" | "ANTHROPIC_API_KEY" => Some(uuid::Uuid::now_v7().to_string()),
             _ => lookup(name),
         })
         .unwrap();
+        // Debug must redact even malformed URLs supplied through direct construction.
+        config.openai.as_mut().unwrap().base_url = Some(url.into());
+        config.anthropic.as_mut().unwrap().base_url = Some(url.into());
         let debug = format!("{config:?}");
         assert!(
             debug.contains(&format!("public_url: Some({expected:?})")),

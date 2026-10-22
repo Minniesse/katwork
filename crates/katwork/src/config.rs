@@ -237,6 +237,14 @@ impl Config {
             return Err(KatError::ConfigInvalid);
         }
         let optional = |name: &str| lookup(name).filter(|value| !value.is_empty());
+        for key in ["OPENAI_BASE_URL", "ANTHROPIC_BASE_URL"] {
+            if let Some(value) = optional(key) {
+                let url = Url::parse(&value).map_err(|_| KatError::ConfigInvalid)?;
+                if !matches!(url.scheme(), "http" | "https") || !url.has_host() {
+                    return Err(KatError::ConfigInvalid);
+                }
+            }
+        }
         let smtp = if let Some(host) = optional("SMTP_HOST") {
             let port = optional("SMTP_PORT")
                 .map(|value| value.parse::<u16>().map_err(|_| KatError::ConfigInvalid))
