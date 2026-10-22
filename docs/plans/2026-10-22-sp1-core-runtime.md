@@ -35,7 +35,7 @@
 - The job status set is exactly `accepted | ready | answered | stopped | needs_input | cancelled | error` (spec §4). Only the policy function sets the first five; the harness sets `cancelled` and `error`. In SP1 a job can end as `answered`, `stopped`, `needs_input`, `cancelled` or `error` (`ready` needs an artifact, which arrives in SP2). `needs_input` is final in SP1: the person's answer starts a follow-up job linked by `parent_job_id` (ADR-0002).
 - Agent loop limits, initial defaults:
   - at most 24 steps per run, where a step is one model attempt, retries included
-  - run wall-clock 90 s; token budget per run 200,000 input+output tokens summed over attempts; task deadline 5 minutes; job deadline 10 minutes. Every model or tool call's timeout is `min(its own, the run's remaining time)`
+  - run wall-clock 90 s; token budget per run 200,000 input+output tokens charged over attempts (a missing count is charged conservatively, Task 8); task deadline 5 minutes; job deadline 10 minutes. Every model or tool call's timeout is `min(its own, the run's remaining time)`
   - tool timeout 60 s; a model stream gets 30 s to its first chunk and at most 30 s between chunks; at most 1 retry per model call, only before the first chunk
   - loop detection: the same tool with the same canonical arguments 3 times in a row, **or** 5 times within the last 10 calls, stops the run before that call runs
   - tool results capped at 8,000 Unicode scalar values, the truncation marker included
@@ -166,7 +166,7 @@ web/
   - `types::Locale::{En, Th}`
   - `types::DotStatus::{Active, Paused}`
   - `types::SideEffect::{Read, Navigate, WorkspaceRead, Draft, WorkspaceWrite, Exec, CredentialUse, Destructive, Outward(OutwardKind)}` and `types::OutwardKind::{Send, Publish, Pay, Share, ExternalApi}`, with `SideEffect::wire(&self) -> &'static str` giving `read, navigate, workspace_read, draft, workspace_write, exec, credential_use, destructive, outward_send, outward_publish, outward_pay, outward_share, outward_external_api`
-  - `types::ReasonCode` with `wire(&self) -> &'static str` and `ReasonCode::ALL`: `provider_unavailable, provider_rate_limited, provider_quota, provider_auth_failed, model_protocol_error, time_limit, quota_exceeded, workspace_paused, step_limit, token_budget, output_truncated, loop_detected, policy_changed, approval_pending, question_pending, interrupted_review_required, dot_paused, retries_exhausted, cancelled, outcome_unknown, lease_lost`. Each value is a job `reason`, a notice body or a `RUN_ERROR` code, and has a message in both locales (Task 13).
+  - `types::ReasonCode` with `wire(&self) -> &'static str` and `ReasonCode::ALL`: `provider_unavailable, provider_rate_limited, provider_quota, provider_auth_failed, model_protocol_error, time_limit, quota_exceeded, workspace_paused, step_limit, token_budget, output_truncated, residency_denied, loop_detected, policy_changed, approval_pending, question_pending, interrupted_review_required, dot_paused, retries_exhausted, cancelled, outcome_unknown, lease_lost`. Each value is a job `reason`, a notice body or a `RUN_ERROR` code, and has a message in both locales (Task 13).
   - `db::connect(url: &str) -> Result<PgPool, KatError>` and `db::migrate(pool: &PgPool) -> Result<(), KatError>`
   - `fence::Fence { task_id: TaskId, epoch: LeaseEpoch }` and `fence::check(conn: &mut PgConnection, f: &Fence) -> Result<(), KatError>`. Run inside the caller's write transaction, it selects the task joined to its lease where `tasks.state = 'leased'`, `tasks.lease_epoch` and `task_leases.lease_epoch` both equal `f.epoch`, and `expires_at > now()`, taking `FOR SHARE OF tasks`; no row is `lease_lost`. The share lock lasts until the write commits. Claim, cancel and every terminal transition take `FOR UPDATE` on the task row, so they wait for an in-flight fenced write, and any write after them fails the check.
   - `runtime::Core { pool: PgPool, config: Arc<Config> }` and `Core::new(pool: PgPool, config: Arc<Config>) -> Core`. Task 7 adds `registry: Arc<Registry>` and Task 9 adds `events: EventHub`; both are filled inside `Core::new`, so its signature never changes.
@@ -193,7 +193,7 @@ web/
   - `task_leases(task_id PRIMARY KEY, worker_id, lease_epoch BIGINT NOT NULL, expires_at)`; `expires_at` is always computed with Postgres `now()`, never the worker clock
   - `runs(id, workspace_id, job_id, task_id, dot_id, kind, lease_epoch BIGINT NOT NULL, dot_config_hash TEXT NOT NULL, model TEXT NULL, state, stop_reason TEXT NULL, started_at, ended_at NULL)` with `kind IN ('initial','repair','recovery')` and `state IN ('running','finished','interrupted','cancelled','error')`. Repairs (at most 2, set by the policy from SP3) and recoveries (owned by the scheduler) are counted separately through `kind`.
   - `tool_calls(id, workspace_id, run_id, step INT, tool_call_id TEXT, tool_name TEXT, side_effect TEXT, args_sha256 TEXT, state TEXT, result TEXT NULL, started_at, ended_at NULL, UNIQUE (run_id, step, tool_call_id))`, with `side_effect` checked against the 13 `SideEffect::wire` values and `state IN ('started','succeeded','failed','timed_out','outcome_unknown','refused')`. `result` holds the exact text passed to the next model call.
-  - `model_calls(id, workspace_id, space_id, job_id, task_id, run_id, dot_id, provider_id, model, residency, attempt INT, input_tokens BIGINT NULL, cache_read_tokens BIGINT NULL, cache_write_tokens BIGINT NULL, output_tokens BIGINT NULL, usage_complete BOOLEAN NOT NULL, cost_micros BIGINT NULL, latency_ms INT, outcome TEXT, created_at)`: one row per model attempt, retries included; a missing count is NULL, never 0
+  - `model_calls(id, workspace_id, space_id, job_id, task_id, run_id, dot_id, provider_id, model, residency, attempt INT, input_tokens BIGINT NULL, cache_read_tokens BIGINT NULL, cache_write_tokens BIGINT NULL, output_tokens BIGINT NULL, usage_complete BOOLEAN NOT NULL, charged_tokens BIGINT NOT NULL, cost_micros BIGINT NULL, latency_ms INT, outcome TEXT, created_at)`: one row per model attempt, retries included; a missing count is NULL, never 0; `charged_tokens` is the attempt's budget charge (Task 8) and is never NULL
   - `events(thread_id, seq BIGINT, workspace_id, run_id NULL, kind, payload JSONB, created_at, PRIMARY KEY (thread_id, seq))`
 
 - [ ] **Step 1: Pin versions and check the MSRV.** Check crates.io for the latest released sqlx and pin it exactly (`=x.y.z`) in `[workspace.dependencies]` with the features above; `macros` must be listed, because default features are off and `migrate` does not enable `#[sqlx::test]` or the `sqlx::Type` derive. Add `uuid` (v7, serde), `chrono` (serde), `serde`, and tokio's `test-util` feature under `[dev-dependencies]`. Add the CI job `msrv`: `cargo +<rust-version> check --workspace --locked`. If the locked graph needs a newer compiler than 1.85 (let-chains under edition 2024 need 1.88), raise `rust-version` in `Cargo.toml` to the lowest version that passes and use the same value in the job.
@@ -387,7 +387,7 @@ web/
 
 **Files:**
 - Create: `crates/katwork/src/models/{mod,provider,registry,guard,fake,rig_adapter}.rs`, `crates/katwork/tests/{models.rs,rig_fixtures.rs}`, `crates/katwork/tests/fixtures/models/` (recorded provider bytes)
-- Modify: `Cargo.toml`, `Cargo.lock`, `crates/katwork/src/runtime.rs`, `crates/katwork-server/src/main.rs`
+- Modify: `Cargo.toml`, `Cargo.lock`, `crates/katwork/src/{runtime.rs,config.rs}`, `crates/katwork-server/src/main.rs`
 
 **Interfaces:**
 - Consumes: `Config`, `ProviderEnv` (Task 1); `types::{ModelTier, SpacePolicy}` and `Core` (Task 2). Nothing from Tasks 3–6.
@@ -407,24 +407,27 @@ web/
   - `guard::guard_stream(inner: BoxStream<'static, Result<ChatChunk, ModelError>>, t: StreamTimeouts) -> BoxStream<'static, Result<ChatChunk, ModelError>>`. It times the actual stream polling, not only the opener: a stall yields `Timeout { phase }`. A stream that ends without `Done` yields `Protocol`, and so does `Done { stop: ToolUse }` with no tool call.
   - `Capabilities { tools: bool, residency: Residency, synthetic: bool }` and `Residency::{Local, External}`
   - `TokenPrice { input_micros_per_mtok: u64, output_micros_per_mtok: u64 }`
-  - `ModelEntry { provider_id: String, model: String, tier: ModelTier, capabilities: Capabilities, price: Option<TokenPrice> }`. Capabilities and residency come from the entry, never from the provider name or base URL. SP1 configures no prices, so `model_calls.cost_micros` stays NULL; cost is only ever computed from usage the provider reported.
+  - `ModelEntry { provider_id: String, model: String, tier: ModelTier, capabilities: Capabilities, max_output_tokens: u32, temperature: Option<f32>, price: Option<TokenPrice> }`. Capabilities and residency come from the entry, never from the provider name or base URL. SP1 configures no prices, so `model_calls.cost_micros` stays NULL; cost is only ever computed from usage the provider reported.
   - `Selected { provider: Arc<dyn ModelProvider>, entry: ModelEntry }`
   - `Registry::from_config(&Config) -> Registry` and `Registry::from_entries(Vec<(ModelEntry, Arc<dyn ModelProvider>)>) -> Registry`
   - `Registry::for_tier(&self, tier: ModelTier, space_policy: &SpacePolicy) -> Result<Selected, ModelError>`
   - `FakeTurn::{Chunks(Vec<ChatChunk>), Error(ModelError), Hang, ChunksThenHang(Vec<ChatChunk>)}`
   - `FakeProvider::scripted(Vec<FakeTurn>) -> FakeProvider` (`Clone`; each `stream` call takes the next turn) and `FakeProvider::received(&self) -> Vec<ChatRequest>`, the requests it got
   - `FakeProvider::demo() -> FakeProvider`: canned English and Thai replies, `Local`, with `capabilities().synthetic == true`
+  - `HttpLimits { connect: Duration, read: Duration, max_response_bytes: usize, max_error_body_bytes: usize, max_sse_frame_bytes: usize }`, with `HttpLimits::default()` = 10 s, 30 s, 16 MiB, 64 KiB and 1 MiB (initial defaults), and `BoundedHttp::new(limits: HttpLimits) -> Result<BoundedHttp, ModelError>`
   - `OpenAiApi::{Chat, Responses}`, `RigProvider::openai(env: &ProviderEnv, model: &str, api: OpenAiApi) -> Result<RigProvider, ModelError>` and `RigProvider::anthropic(env: &ProviderEnv, model: &str) -> Result<RigProvider, ModelError>`
   - `Core` gains `registry: Arc<Registry>`, built in `Core::new` with `Registry::from_config`, and `Core::with_registry(self, registry: Registry) -> Core` for tests
 - Registry rules:
-  - `from_config` registers each configured provider as `External`: OpenAI through `OpenAiApi::Chat` (chosen explicitly, never detected) and Anthropic, with one model id per tier from a constant table in `registry.rs` (initial defaults, checked at Task 7 start).
+  - `from_config` registers each configured provider as `External`: OpenAI through `OpenAiApi::Chat` (chosen explicitly, never detected) and Anthropic, with one model id per tier from a constant table in `registry.rs` (initial defaults, checked at Task 7 start). The same table sets `max_output_tokens` to 2,048 (Fast), 4,096 (Standard) and 8,192 (Strong), and `temperature: None`, meaning the provider's default (initial defaults).
+  - `from_config` never fails. A provider whose constructor returns an error is left out and logged once as `provider_init_failed` with the provider id only (no key, no URL); its tiers then resolve to `ProviderUnavailable`, never to the demo provider.
+  - Task 7 also tightens `Config::from_lookup`: `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL`, when set, must parse as `http` or `https` URLs, otherwise `config_invalid` at startup.
   - With no provider keys and `demo`, every tier maps to `FakeProvider::demo()`. With no keys and no demo, `for_tier` returns `ProviderUnavailable`.
   - An `External` entry for a Space with `allow_external = false` is `ResidencyDenied`.
 - Rig adapter rules (ADR-0001), all inside `rig_adapter.rs`; no Rig type leaves that file:
   - only Rig's completion and streaming clients; no `AgentRunner`, `ToolServer`, hooks or typed-output retries
   - tools advertised as `ToolDefinition` only
   - hosted tools, server-side fallbacks, raw `additional_params` and hidden continuation stay off
-  - a reqwest client with a 10 s connect deadline, a 30 s read deadline, caps of 16 MiB per response, 64 KiB per error body and 1 MiB per SSE frame, and no redirects (initial defaults)
+  - all HTTP goes through KatWork's `BoundedHttp`, injected through Rig's HTTP client interface (the trait Rig's own reqwest transport implements). reqwest supplies the connect and read timeouts and the no-redirect policy. `BoundedHttp` reads every body chunk by chunk and applies the byte caps before buffering or decoding: an over-cap response is `Protocol("response_too_large")`; an error body is cut at its cap before Rig reads it; an SSE frame that passes its cap without a terminating blank line is `Protocol("sse_frame_too_large")`. If the pinned Rig release has no injectable HTTP client interface, stop and revise this task; never fall back to an unbounded client.
   - provider bytes are decoded with an incremental UTF-8 decoder, never `String::from_utf8` per network chunk
   - Anthropic's opening and closing usage snapshots are merged, never summed
   - a provider tool call with no id gets `kw_call_{index}`; a duplicate id within one turn is `Protocol`
@@ -432,6 +435,8 @@ web/
 - [ ] **Step 1: Pin dependencies.** Check crates.io for the latest rig-core release; pin it exactly (`=x.y.z`) with `default-features = false` and explicit reqwest and rustls features. If the release moves its reqwest transport into a separate crate, pin that crate to the same exact version. Add `reqwest` with the same version requirement that transport declares (for example `0.13`), never a different line, so `Cargo.lock` resolves one reqwest. Then re-run the `msrv` check on the new locked graph; if it fails, raise `rust-version` in `Cargo.toml` and the CI job's toolchain together to the lowest version that passes. Add `async-trait`, `futures` and `tracing-subscriber`. In `katwork-server`, initialize tracing from `RUST_LOG`, defaulting to `info,rig=info`, because Rig's `rig::completions` TRACE level logs full prompts.
 - [ ] **Step 2: Write the failing tests** in `crates/katwork/tests/models.rs`:
   - `registry_refuses_external_provider_for_local_only_space`: returns `ModelError::ResidencyDenied`
+  - `invalid_provider_base_url_is_config_invalid`
+  - `provider_init_failure_resolves_to_provider_unavailable`
   - `demo_mode_uses_synthetic_provider_without_keys`: no API keys plus `KATWORK_DEMO=1` gives `FakeProvider::demo`
   - `no_keys_and_no_demo_is_provider_unavailable`
   - `stream_stall_returns_model_timeout`: `FakeTurn::Hang` gives `Timeout { phase: FirstChunk }` and `ChunksThenHang` gives `Timeout { phase: Idle }`, with the timeouts injected small
@@ -452,6 +457,9 @@ web/
   - `cancel_during_network_wait_returns_promptly`
   - `unknown_events_are_ignored`
   - `replay_round_trips_to_the_same_provider`
+  - `oversized_response_is_rejected_before_decoding`
+  - `oversized_error_body_is_capped_before_rig_reads_it`
+  - `unterminated_sse_frame_over_cap_is_rejected`
   - `live_openai_chat_smoke` (`#[ignore]`): runs only when `OPENAI_API_KEY` is set, never in CI
 - [ ] **Step 4: Run** `cargo test -p katwork --test models --test rig_fixtures`. Expected: FAIL.
 - [ ] **Step 5: Implement.**
@@ -533,7 +541,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `RunFacts::not_run(stop: StopReason) -> RunFacts`: no run id, a fresh `reply_message_id`, everything else empty; used when the harness decides without a run (Tasks 11 and 12)
   - `ToolCallRecord { id: ToolCallRecordId, step: u32, tool_call_id: String, name: String, side_effect: SideEffect, state: ToolCallState }` and `ToolCallState::{Started, Succeeded, Failed, TimedOut, OutcomeUnknown, Refused}`
   - `PendingCall { tool_call_id: String, name: String, args_sha256: String }` and `PendingQuestion { question: String, options: Vec<String> }`
-  - `StopReason::{ProviderUnavailable, ProviderRateLimited, ProviderQuota, ProviderAuthFailed, ModelProtocol, StepLimit, LoopDetected, NeedsApproval, TokenBudget, OutputTruncated, TimeLimit, PolicyChanged, QuotaExceeded, WorkspacePaused, DotPaused, Interrupted, OutcomeUnknown, Cancelled}`
+  - `StopReason::{ProviderUnavailable, ProviderRateLimited, ProviderQuota, ProviderAuthFailed, ModelProtocol, StepLimit, LoopDetected, NeedsApproval, TokenBudget, OutputTruncated, TimeLimit, PolicyChanged, ResidencyDenied, QuotaExceeded, WorkspacePaused, DotPaused, Interrupted, OutcomeUnknown, Cancelled}`
   - `Limits { max_steps: u32, tool_timeout: Duration, result_max_chars: usize, repeat_limit: u32, repeat_window: (u32, u32), max_total_tokens: u64, run_wall_clock: Duration, task_deadline: Duration, job_deadline: Duration, model_retries: u32, stream: StreamTimeouts }`. `Limits::default()` holds the initial defaults: 24, 60 s, 8,000, 3, (5, 10), 200,000, 90 s, 5 min, 10 min, 1, and 30 s / 30 s. The run deadline is separate from the lease TTL.
   - `guards::authorize(conn: &mut PgConnection, fence: &Fence, dot_id: DotId, space_id: SpaceId, policy_version: i64) -> Result<Option<StopReason>, KatError>`: runs `fence::check`, then reads the Dot and its workspace. A paused workspace gives `WorkspacePaused`, a paused Dot `DotPaused`, and a missing grant to `space_id` or a `policy_version` other than `input.policy_version` gives `PolicyChanged`. Status, grant and allowlist changes all increment `policy_version` (Task 5), so a change made while the task was queued is caught on the first check.
   - `guards::canonical_args(args: &serde_json::Value) -> String`: object keys sorted and whitespace normalized; array order and values kept
@@ -545,9 +553,20 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - Fencing: every run-scoped write (the `runs` row, each ledger function, each event through the fenced `PgEventSink`, each tool write) runs `fence::check` in the same transaction as the write, and `lease_lost` aborts it. Before each model attempt the loop also runs `guards::authorize`, which includes `fence::check`, so a reclaimed or cancelled worker makes no further model calls. On `lease_lost` the loop stops at once and writes nothing further.
 - Loop rules:
   - **Steps.** A step is one model attempt, retries included. An answer on attempt 24 is accepted; a tool batch that would need attempt 25 is not executed (`StepLimit`).
-  - **Model attempts.** Each attempt calls `models.for_tier(dot.model_tier, &input.space_policy)`, so a provider change re-checks residency, and wraps the stream in `guard_stream`, raced against `input.deadline` (`TimeLimit`). It retries only before the first chunk, at most `model_retries` times. Every attempt gets one `model_calls` row and one `katwork.usage` event.
-  - **Provider errors.** `ProviderUnavailable` or a `Timeout` still failing after retries stops `ProviderUnavailable` and sets `executor_unavailable`. `RateLimited` stops `ProviderRateLimited`; `QuotaExceeded` stops `ProviderQuota`; `AuthFailed` stops `ProviderAuthFailed`; `Protocol` stops `ModelProtocol`.
-  - **Token budget.** Input plus output tokens are summed over attempts; once the sum passes `max_total_tokens`, the run stops `TokenBudget` before the next attempt.
+  - **Model attempts.** Each attempt calls `models.for_tier(dot.model_tier, &input.space_policy)`, so a provider change re-checks residency, and wraps the stream in `guard_stream`, raced against `input.deadline` (`TimeLimit`). It retries only before the first chunk, at most `model_retries` times. Every attempt gets one `model_calls` row and one `katwork.usage` event. Each request uses `max_output_tokens = min(entry.max_output_tokens, the run's remaining token budget)` and `temperature = entry.temperature`; with less than 256 tokens of budget left, the run stops `TokenBudget` before the attempt.
+  - **Provider errors.** Every `ModelError` has exactly one outcome. Provider text stays in private, redacted logs, never in events, messages or the job reason.
+
+    | `ModelError` | retried before the first chunk | outcome when it persists |
+    |---|---|---|
+    | `ProviderUnavailable`, `Other(_)`, `Timeout { phase: FirstChunk }` | yes, up to `model_retries` | stop `ProviderUnavailable`, `executor_unavailable = true` |
+    | `Timeout { phase: Idle }` | no, a chunk already arrived | stop `ProviderUnavailable`, `executor_unavailable = true` |
+    | `RateLimited { retry_after_secs }` | once, only if the wait fits in the run's remaining time | stop `ProviderRateLimited` |
+    | `QuotaExceeded { .. }` | no | stop `ProviderQuota` |
+    | `AuthFailed` | no | stop `ProviderAuthFailed` |
+    | `Protocol(_)` | no | stop `ModelProtocol` |
+    | `ResidencyDenied` | no | stop `ResidencyDenied` |
+
+  - **Token budget.** Each attempt is charged the reported input plus output when both counts are present. A missing output count is charged as that request's `max_output_tokens`; a missing input count as the character count of the request's system text and messages, an upper bound for any practical tokenizer. The charge goes to `model_calls.charged_tokens`, while the reported counts stay NULL when missing. Once the run's charged total reaches `max_total_tokens`, the run stops `TokenBudget` before the next attempt.
   - **Turn validation before dispatch.** Only an `EndTurn` or `ToolUse` turn can dispatch tools. Errored, aborted, filtered or unknown turn endings, malformed arguments and unfinished calls never execute. A `MaxTokens` turn keeps its partial text as `final_text`, stops `OutputTruncated`, and runs none of its tool calls.
   - **Allowlist at call time.** Each call resolves the tool from `dot.tool_allowlist ∩ ToolRegistry`; anything else gets a `ToolError::NotAllowed` error result.
   - **Authority before every model attempt and every tool dispatch.** The loop runs `guards::authorize`; a returned stop reason ends the run before that model call or tool runs.
@@ -589,6 +608,9 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `tool_output_never_enters_system_role`
   - `capability_preamble_lists_effective_tools`
   - `usage_recorded_once_per_attempt`
+  - `every_model_error_maps_to_a_stable_stop_reason`: table-driven over the table above; no provider text reaches an event or message
+  - `max_output_tokens_capped_by_remaining_budget`
+  - `missing_usage_is_charged_conservatively_and_stored_null`
   - `duplicate_call_ids_stay_distinguishable`: the same provider id in two steps gives two ledger rows and two `toolCallId`s
   - `successful_sibling_audited_when_another_fails`
   - `provider_change_rechecks_residency`
@@ -620,7 +642,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
     |---|---|---|---|
     | `ProviderUnavailable` / `ProviderRateLimited` / `ModelProtocol` / `TimeLimit` | `stopped` | `provider_unavailable` / `provider_rate_limited` / `model_protocol_error` / `time_limit` | `Retry` |
     | `ProviderQuota` / `QuotaExceeded` / `WorkspacePaused` | `stopped` | `provider_quota` / `quota_exceeded` / `workspace_paused` | `Retry` (after the reset or unpause) |
-    | `ProviderAuthFailed` / `DotPaused` | `stopped` | `provider_auth_failed` / `dot_paused` | `AskUser` (an admin) |
+    | `ProviderAuthFailed` / `DotPaused` / `ResidencyDenied` | `stopped` | `provider_auth_failed` / `dot_paused` / `residency_denied` | `AskUser` (an admin) |
     | `StepLimit` / `TokenBudget` / `OutputTruncated` | `stopped` | `step_limit` / `token_budget` / `output_truncated` | `SaveDraftWithReport` |
     | `LoopDetected` | `stopped` | `loop_detected` | `HandToLead` |
     | `PolicyChanged` | `stopped` | `policy_changed` | `RestartJob` |
@@ -752,6 +774,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `paused_dot_leaves_routing_set`
   - `provider_unavailable_ends_job_stopped_with_reason`: Review Focus 5; the notice code is `provider_unavailable` and the job finishes within the test timeout
   - `provider_quota_and_rate_limit_end_stopped_with_named_reason`
+  - `local_only_space_with_only_hosted_keys_stops_residency_denied`: through the full pipeline; the notice code is `residency_denied` and no request leaves the install
   - `demo_mode_reply_is_flagged_synthetic`: the reply from the messages API has `synthetic: true`
   - `full_event_sequence`: the order above
   - `stream_message_id_equals_stored_reply_id`
