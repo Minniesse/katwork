@@ -184,7 +184,8 @@ web/
     - `reason` holds a `ReasonCode` wire value; `decision_seq` is the per-thread seq of the job's `katwork.decision` event; `contract_sha256` is reserved and always NULL in SP1
     - one job per request message: the unique `request_message_id` means a retried or concurrent intake can never create a second job
   - `tasks(id, workspace_id, job_id, dot_id, input JSONB, state, attempts INT NOT NULL DEFAULT 0, max_attempts INT NOT NULL DEFAULT 3, idempotency_key TEXT UNIQUE, effects_started_at TIMESTAMPTZ NULL, hold_reason TEXT NULL, lease_epoch BIGINT NOT NULL DEFAULT 0, pending_tool_call JSONB NULL, created_at)`
-    - `CHECK (state IN ('queued','leased','done','failed','interrupted'))` and `CHECK (hold_reason IN ('dot_busy','provider_quota','workspace_paused'))`
+    - `CHECK (state IN ('queued','leased','done','failed','interrupted','cancelled'))` and `CHECK (hold_reason IN ('dot_busy','provider_quota','workspace_paused'))`
+    - terminal states: `done` (concluded by the policy after a run), `failed` (the harness gave up: deadline or retries exhausted), `interrupted` (stopped after a side effect, or by a workspace pause), `cancelled` (its job was cancelled). Every move to a terminal state deletes the task's `task_leases` row in the same transaction.
     - `pending_tool_call` is `{tool_call_id, name, args_sha256}`, kept when a run stops on `NeedsApproval`
   - `task_leases(task_id PRIMARY KEY, worker_id, lease_epoch BIGINT NOT NULL, expires_at)`; `expires_at` is always computed with Postgres `now()`, never the worker clock
   - `runs(id, workspace_id, job_id, task_id, dot_id, kind, lease_epoch BIGINT NOT NULL, dot_config_hash TEXT NOT NULL, model TEXT NULL, state, stop_reason TEXT NULL, started_at, ended_at NULL)` with `kind IN ('initial','repair','recovery')` and `state IN ('running','finished','interrupted','cancelled','error')`. Repairs (at most 2, set by the policy from SP3) and recoveries (owned by the scheduler) are counted separately through `kind`.
@@ -611,7 +612,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `job::create_follow_up(conn: &mut PgConnection, &Tenant, parent: JobId, MessageId) -> Result<JobId, KatError>`: `parent` must be `needs_input` in the same thread, otherwise `job_not_awaiting_input`; sets `parent_job_id` (ADR-0002)
   - `JobSummary { id: JobId, status: Option<JobStatus> }` and `job::latest_in_thread(conn: &mut PgConnection, &Tenant, ThreadId) -> Result<Option<JobSummary>, KatError>`
   - `job::finish_by_policy(tx: &mut Transaction<'_, Postgres>, job_id: JobId, v: &Verdict, decision_seq: EventSeq) -> Result<EventSeq, KatError>`: sets `status`, `reason`, `decided_by = 'policy'` and `decision_seq`, then appends `katwork.job_status` and returns its seq. The caller has already appended `katwork.decision`.
-  - `HarnessEnd::{Cancelled, Error { code: ReasonCode }}` and `job::finish_by_harness(pool, hub: &EventHub, job_id: JobId, end: HarnessEnd) -> Result<(), KatError>`: sets `decided_by = 'harness'`, appends `katwork.job_status`, commits, then notifies the hub
+  - `HarnessEnd::{Cancelled, Error { code: ReasonCode }}` and `job::finish_by_harness(tx: &mut Transaction<'_, Postgres>, job_id: JobId, end: HarnessEnd) -> Result<EventSeq, KatError>`: sets `status`, `reason` and `decided_by = 'harness'`, then appends `katwork.job_status` and returns its seq, inside the caller's transaction (claim and cancel use it); the caller commits and notifies the hub
   - Finishing a finished job is `job_already_finished`.
   - `job::conclude(tx: &mut Transaction<'_, Postgres>, tenant: &Tenant, job_id: JobId, thread_id: ThreadId, dot_id: Option<DotId>, idem_key: &str, facts: &RunFacts) -> Result<EventSeq, KatError>`: the single place that writes a job's outcome. In the caller's transaction it:
     1. runs `policy::decide_job(facts, &Thresholds::SP1)`
@@ -642,19 +643,20 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 **Interfaces:**
 - Consumes: `task::enqueue`, `TaskInput`, `job::{conclude, finish_by_harness}` (Task 10); `run::execute`, `RunEnv`, `RunInput`, `RunFacts`, `RunFacts::not_run`, `RunKind`, `Limits`, `StopReason`, `ToolRegistry::builtin` (Task 8); `PgEventSink`, `log::append` (Task 9); `dot::get` (Task 5); `thread::get` (Task 6); `space::get`, `tenancy::resolve` (Task 4); `Core`.
 - Produces:
-  - `lease::claim(core: &Core, worker_id: &str, ttl: Duration, limits: &Limits) -> Result<Option<ClaimedTask>, KatError>`: one transaction with `SELECT … FOR UPDATE SKIP LOCKED` over queued tasks and tasks whose lease has expired, every time from `now()`. It:
+  - `lease::claim(core: &Core, worker_id: &str, ttl: Duration, limits: &Limits) -> Result<Option<ClaimedTask>, KatError>`. Candidates are tasks with `state = 'queued'`, or `state = 'leased'` with an expired lease, **whose job is still running** (`jobs.status IS NULL`), selected with `FOR UPDATE OF tasks, jobs SKIP LOCKED`; every time comes from `now()`. Each candidate is handled in its own transaction. A branch that ends without a run commits and claim moves on to the next candidate (at most 16 per call); the first candidate that gets a lease is returned. For each candidate, in order:
+    - on an expired lease, first emits `TOOL_CALL_RESULT` and `katwork.tool_status{ok: false}` for each of the previous run's open calls (started in `tool_calls` with no end), marks those calls `outcome_unknown` and the run `interrupted`, and emits `RUN_ERROR{code: "lease_lost"}`, before any later `RUN_STARTED`
+    - **deadline:** a task past `created_at + task_deadline`, or whose job is past `created_at + job_deadline`, becomes `failed`, its lease row is deleted, and the job ends with `job::conclude` on `RunFacts::not_run(StopReason::TimeLimit)`
+    - **retries exhausted:** at `attempts >= max_attempts` (3), the task becomes `failed`, its lease row is deleted, and the job ends with `finish_by_harness(tx, Error { code: RetriesExhausted })`
+    - **effects started:** an expired lease with `effects_started_at` set makes the task `interrupted`, deletes its lease row, and ends the job with `job::conclude` on `RunFacts::not_run(StopReason::Interrupted)`
     - skips a task of a paused workspace and sets `hold_reason = 'workspace_paused'`
-    - skips a task whose Dot already runs `max_concurrency` leased tasks and sets `hold_reason = 'dot_busy'`
+    - skips a task whose Dot already runs `max_concurrency` tasks and sets `hold_reason = 'dot_busy'`
     - emits `katwork.job_status {status: null, holdReason}` when it first sets a hold reason
-    - on any expired lease, first emits `TOOL_CALL_RESULT` and `katwork.tool_status{ok: false}` for each of the previous run's open calls (started in `tool_calls` with no end) and `RUN_ERROR{code: "lease_lost"}`, before any later `RUN_STARTED`
-    - then, if `effects_started_at IS NULL`, claims the task again as a `Recovery` (attempts + 1)
-    - otherwise sets the task `interrupted` and ends the job with `job::conclude` on `RunFacts::not_run(StopReason::Interrupted)`
-    - ends the job with `job::conclude` on `RunFacts::not_run(StopReason::TimeLimit)` when the task is past `created_at + task_deadline` or its job is past `created_at + job_deadline`
-    - at `attempts > max_attempts` (3), ends the job with `finish_by_harness(Error { code: RetriesExhausted })`
-    - increments `tasks.lease_epoch`, writes it to `task_leases`, and clears `hold_reason`
+    - otherwise claims it: attempts + 1 (a `Recovery` run when the lease had expired), increments `tasks.lease_epoch`, writes the lease with the same epoch, and clears `hold_reason`
+
+    Because each no-run branch moves the task to a terminal state and finishes its job in the same transaction, a repeated poll never finishes the same job twice.
   - `ClaimedTask { task_id: TaskId, job_id: JobId, dot_id: DotId, workspace_id: WorkspaceId, thread_id: ThreadId, requested_by: UserId, input: TaskInput, attempts: i32, lease_epoch: LeaseEpoch, kind: RunKind, deadline_at: DateTime<Utc> }`, where `deadline_at = min(task created_at + task_deadline, job created_at + job_deadline)`, computed in SQL
-  - `HeartbeatStatus::{Continue, Stop(StopReason)}` and `lease::heartbeat(pool, task_id: TaskId, worker_id: &str, epoch: LeaseEpoch, ttl: Duration) -> Result<HeartbeatStatus, KatError>`: `Stop(Cancelled)` once the job is cancelled, `Stop(WorkspacePaused)` once the workspace is paused; a stale epoch is `lease_lost`
-  - `lease::complete(core: &Core, task_id: TaskId, worker_id: &str, epoch: LeaseEpoch, facts: RunFacts) -> Result<(), KatError>`: a stale epoch is `lease_lost`. If the job is already `cancelled`, it sets the task `interrupted`, releases the lease and emits `dot_state idle`. Otherwise, in one transaction: `job::conclude` (with `idem_key` = the task id); the task state (`done`, or `interrupted` for `WorkspacePaused`) and `pending_tool_call`; the lease release. Then it commits and notifies the hub.
+  - `HeartbeatStatus::{Continue, Stop(StopReason)}` and `lease::heartbeat(pool, task_id: TaskId, worker_id: &str, epoch: LeaseEpoch, ttl: Duration) -> Result<HeartbeatStatus, KatError>`: `Stop(WorkspacePaused)` once the workspace is paused. A task that is no longer leased under this epoch (reclaimed, cancelled or finished by the harness) is `lease_lost`.
+  - `lease::complete(core: &Core, task_id: TaskId, worker_id: &str, epoch: LeaseEpoch, facts: RunFacts) -> Result<(), KatError>`: a task that is no longer leased under this epoch is `lease_lost`, and the worker drops its facts, because whoever ended the lease (reclaim or cancel) already closed the run. Otherwise, in one transaction: `job::conclude` (with `idem_key` = the task id); the task state (`done`, or `interrupted` for `WorkspacePaused`) and `pending_tool_call`; the lease release. Then it commits and notifies the hub.
   - `worker::spawn_pool(core: Arc<Core>, n: usize, ttl: Duration) -> JoinSet<()>`. Each worker:
     - polls `claim` (every 1 s when idle)
     - builds the `Tenant` with `tenancy::resolve(&core.pool, requested_by, workspace_id)`, loads the Dot and the thread's Space policy, and creates a `PgEventSink` for a new `RunId`
@@ -670,6 +672,9 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `reclaim_does_not_duplicate_reply`
   - `reclaimed_run_closes_open_calls_before_new_run_started`
   - `retries_exhausted_finishes_job_error`
+  - `cancelled_job_task_is_never_claimed`: a job cancelled while its task is queued is never claimed, and no model call happens
+  - `deadline_branch_finishes_once_across_repeated_polls`: the task ends `failed` with no lease row, and one job status is written however often workers poll
+  - `retries_exhausted_branch_finishes_once_across_repeated_polls`
   - `one_dot_runs_one_task_at_a_time`
   - `paused_workspace_claims_nothing`
   - `pausing_workspace_interrupts_running_task`: the task ends `interrupted` and the job `stopped/workspace_paused`
@@ -707,8 +712,8 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
     - the newest messages up to `budget_chars` (24,000); the latest user message is always kept whole, and the number of cut messages is recorded
     - the Dot's own messages map to `Assistant`; other Dots and people map to `User` with their server-side `name`
     - system notes become plain `User` notes, never the system role
-  - `job::cancel(pool, hub: &EventHub, tenant: &Tenant, job_id: JobId) -> Result<(), KatError>`: another workspace's job is `NotFound`; a running job ends with `finish_by_harness(Cancelled)`, and its worker stops at the next heartbeat
-  - Route `POST /api/workspaces/{workspace_id}/jobs/{job_id}/cancel` returns 202, and 404 across tenants.
+  - `job::cancel(pool, hub: &EventHub, tenant: &Tenant, job_id: JobId) -> Result<(), KatError>`: another workspace's job is `NotFound`; a finished job is `job_already_finished`. In one transaction it locks the job row, then its task rows (the same job → task order as `claim`). Each queued or leased task becomes `cancelled` and its lease row is deleted. For a running run it closes the open calls (`TOOL_CALL_RESULT`, `katwork.tool_status{ok: false}`, ledger state `outcome_unknown`), marks the run `cancelled`, and emits `RUN_ERROR{code: "cancelled"}` and `katwork.dot_state idle`. It then calls `finish_by_harness(tx, Cancelled)`, commits and notifies the hub. The old worker's next heartbeat or write finds the task no longer leased and gets `lease_lost`.
+  - Route `POST /api/workspaces/{workspace_id}/jobs/{job_id}/cancel` returns 202, 404 across tenants, and 409 `job_already_finished`.
   - `serve` builds `Core` and runs `worker::spawn_pool(core, 4, Duration::from_secs(60))`.
   - Event order for an answered job: `RUN_STARTED`, `katwork.dot_state working`, `TEXT_MESSAGE_*`, `katwork.decision`, `katwork.job_status answered`, `katwork.dot_state idle`, `RUN_FINISHED`. `katwork.job_status` is the only success signal; cancelled, needs-input and interrupted outcomes are explicit job statuses, never an omitted one.
 
@@ -731,6 +736,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `other_dots_messages_are_user_role_with_name`
   - `seventh_message_in_a_minute_is_stopped_quota_exceeded`
   - `cancel_ends_job_cancelled`
+  - `cancel_queued_job_terminalizes_its_task`: the task becomes `cancelled` with no lease row, and no worker ever claims it
   - `cancel_other_workspace_job_is_404`
 - [ ] **Step 2: Run** `cargo test -p katwork-server --test pipeline`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
