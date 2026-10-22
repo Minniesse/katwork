@@ -327,7 +327,7 @@ web/
   - `DotRole::{Lead, Researcher, Writer, Analyst, Scheduler, Reviewer, Custom(String)}` and `Autonomy::{AskFirst, Standard}`
   - `Appearance { avatar: String, accent: String }`, stored in `dots.appearance`
   - `NewDot { name, role, persona, instructions, tool_allowlist, model_tier, autonomy, appearance }`
-  - `DotPatch { name, persona, instructions, tool_allowlist, model_tier, autonomy, status, appearance, max_concurrency, daily_token_budget }`, every field an `Option` (`daily_token_budget: Option<Option<i64>>`, where `Some(None)` removes the cap)
+  - `DotPatch { name, persona, instructions, tool_allowlist, model_tier, autonomy, status, appearance, max_concurrency, daily_token_budget }`, every field an `Option`. `daily_token_budget: Option<Option<i64>>` carries `#[serde(default, deserialize_with = "double_option")]`, where `double_option` is a small local deserializer: an omitted field stays `None` (no change), JSON `null` becomes `Some(None)` (remove the cap), and a number becomes `Some(Some(n))`. So `{"daily_token_budget": null}` clears the cap.
   - `HireDot { name: String, role: DotRole, persona: String }`, the hire request
   - `roles::template(role: &DotRole, locale: Locale) -> NewDot`: the defaults a hire starts from: the role's instructions, `tool_allowlist = ["read_thread", "ask_user"]`, `model_tier = Standard`, `autonomy = AskFirst`, and the role's avatar (a neutral avatar for `Custom`); the request's name and persona replace the template's
   - Who may change what: any member may hire a Dot, edit its `name`, `persona` and `appearance`, create teams and change team membership. Only an owner or admin may change execution-affecting settings (`instructions`, `tool_allowlist`, `model_tier`, `autonomy`, `status`, `max_concurrency`, `daily_token_budget`) and grants; a member gets 403 `forbidden`.
@@ -358,6 +358,7 @@ web/
   - `team_rejects_second_lead`: `PUT …/members/{dot_id}` with `is_lead: true` on a team that has a lead gives 422 `team_lead_conflict`
   - `hire_uses_role_template_defaults`
   - `member_cannot_change_execution_settings_admin_can`
+  - `patch_daily_budget_omitted_null_and_number`: through the route, an omitted field keeps the cap, `null` clears it, and a number sets it
   - `duplicate_dot_name_in_team_is_rejected`: `"Writer"` and `"writer"` in one team give 422 `dot_name_conflict`
   - `hire_custom_dot_with_thai_name`
   - `team_persisted_server_side_and_returned_in_order`: the lead comes first
