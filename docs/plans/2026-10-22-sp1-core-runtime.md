@@ -649,7 +649,8 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
     - **retries exhausted:** at `attempts >= max_attempts` (3), the task becomes `failed`, its lease row is deleted, and the job ends with `finish_by_harness(tx, Error { code: RetriesExhausted })`
     - **effects started:** an expired lease with `effects_started_at` set makes the task `interrupted`, deletes its lease row, and ends the job with `job::conclude` on `RunFacts::not_run(StopReason::Interrupted)`
     - skips a task of a paused workspace and sets `hold_reason = 'workspace_paused'`
-    - skips a task whose Dot already runs `max_concurrency` tasks and sets `hold_reason = 'dot_busy'`
+    - locks the candidate's Dot row (`SELECT … FROM dots WHERE id = $1 FOR UPDATE`), then counts the Dot's **other** tasks with a live lease (`state = 'leased'`, lease `expires_at > now()`, a different task id); expired leases never count. At `max_concurrency` or more it skips the candidate and sets `hold_reason = 'dot_busy'`. The Dot row stays locked until the claim commits, so a second claimer for the same Dot waits on it and then sees the first lease.
+    - lock order, here and everywhere else that takes more than one of these locks: job row → task row → Dot row
     - emits `katwork.job_status {status: null, holdReason}` when it first sets a hold reason
     - otherwise claims it: attempts + 1 (a `Recovery` run when the lease had expired), increments `tasks.lease_epoch`, writes the lease with the same epoch, and clears `hold_reason`
 
@@ -676,6 +677,8 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `deadline_branch_finishes_once_across_repeated_polls`: the task ends `failed` with no lease row, and one job status is written however often workers poll
   - `retries_exhausted_branch_finishes_once_across_repeated_polls`
   - `one_dot_runs_one_task_at_a_time`
+  - `simultaneous_claims_for_one_dot_dispatch_once`: two workers claim two different tasks of one Dot (`max_concurrency = 1`) at the same moment behind a barrier; exactly one lease is granted and the other task gets `dot_busy`
+  - `expired_lease_does_not_block_reclaim_at_max_concurrency_one`: the Dot's only task has an expired lease; it is reclaimed rather than held as `dot_busy`
   - `paused_workspace_claims_nothing`
   - `pausing_workspace_interrupts_running_task`: the task ends `interrupted` and the job `stopped/workspace_paused`
   - `task_past_deadline_finishes_time_limit`
