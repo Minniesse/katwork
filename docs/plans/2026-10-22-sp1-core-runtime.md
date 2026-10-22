@@ -168,7 +168,7 @@ web/
   - `types::JobStatus::{Accepted, Ready, Answered, Stopped, NeedsInput, Cancelled, Error}` and `types::HoldReason::{DotBusy, ProviderQuota, WorkspacePaused}`, each with `wire(&self) -> &'static str` matching the schema values; they live here because the event payloads (Task 9) carry them
   - `types::Question { question: String, options: Vec<String> }` (`Serialize`, `Deserialize`): a Dot's question to a person; the first option, when present, is the recommended one
   - `types::SideEffect::{Read, Navigate, WorkspaceRead, Draft, WorkspaceWrite, Exec, CredentialUse, Destructive, Outward(OutwardKind)}` and `types::OutwardKind::{Send, Publish, Pay, Share, ExternalApi}`, with `SideEffect::wire(&self) -> &'static str` giving `read, navigate, workspace_read, draft, workspace_write, exec, credential_use, destructive, outward_send, outward_publish, outward_pay, outward_share, outward_external_api`
-  - `types::ReasonCode` with `wire(&self) -> &'static str` and `ReasonCode::ALL`: `provider_unavailable, provider_rate_limited, provider_quota, provider_auth_failed, model_protocol_error, time_limit, quota_exceeded, workspace_paused, step_limit, token_budget, output_truncated, residency_denied, loop_detected, policy_changed, approval_pending, question_pending, interrupted_review_required, dot_paused, retries_exhausted, cancelled, outcome_unknown, lease_lost`. Each value is a job `reason`, a notice body or a `RUN_ERROR` code, and has a message in both locales (Task 13).
+  - `types::ReasonCode` with `wire(&self) -> &'static str` and `ReasonCode::ALL`: `provider_unavailable, provider_rate_limited, provider_quota, provider_auth_failed, model_protocol_error, time_limit, quota_exceeded, workspace_paused, step_limit, token_budget, output_truncated, residency_denied, loop_detected, policy_changed, approval_pending, question_pending, interrupted_review_required, dot_paused, retries_exhausted, cancelled, outcome_unknown, no_eligible_dot, dot_not_in_space, lease_lost`. Each value is a job `reason`, a notice body or a `RUN_ERROR` code, and has a message in both locales (Task 13).
   - `db::connect(url: &str) -> Result<PgPool, KatError>` and `db::migrate(pool: &PgPool) -> Result<(), KatError>`
   - `fence::Fence { task_id: TaskId, epoch: LeaseEpoch }` and `fence::check(conn: &mut PgConnection, f: &Fence) -> Result<(), KatError>`. Run inside the caller's write transaction, it selects the task joined to its lease where `tasks.state = 'leased'`, `tasks.lease_epoch` and `task_leases.lease_epoch` both equal `f.epoch`, and `expires_at > now()`, taking `FOR SHARE OF tasks`; no row is `lease_lost`. The share lock lasts until the write commits. Claim, cancel and every terminal transition take `FOR UPDATE` on the task row, so they wait for an in-flight fenced write, and any write after them fails the check.
   - `runtime::Core { pool: PgPool, config: Arc<Config> }` and `Core::new(pool: PgPool, config: Arc<Config>) -> Core`. Task 7 adds `registry: Arc<Registry>` and Task 9 adds `events: EventHub`; both are filled inside `Core::new`, so its signature never changes.
@@ -321,29 +321,43 @@ web/
 **Interfaces:**
 - Consumes: `Tenant`, `SpaceId`, `types::{ModelTier, Locale, DotStatus}`.
 - Produces:
-  - `Dot { id: DotId, default_space_id: SpaceId, spaces: Vec<SpaceId>, name: String, role: DotRole, persona: String, instructions: String, tool_allowlist: Vec<String>, model_tier: ModelTier, autonomy: Autonomy, status: DotStatus, appearance: Appearance, max_concurrency: u16, policy_version: i64 }`
+  - `Dot { id: DotId, default_space_id: SpaceId, spaces: Vec<SpaceId>, name: String, role: DotRole, persona: String, instructions: String, tool_allowlist: Vec<String>, model_tier: ModelTier, autonomy: Autonomy, status: DotStatus, appearance: Appearance, max_concurrency: u16, daily_token_budget: Option<i64>, policy_version: i64 }`
   - `Dot::config_hash(&self) -> String`: hex SHA-256 of the canonical JSON of `persona`, `instructions`, `tool_allowlist`, `model_tier`, `autonomy` and `policy_version`
   - `DotRole::{Lead, Researcher, Writer, Analyst, Scheduler, Reviewer, Custom(String)}` and `Autonomy::{AskFirst, Standard}`
   - `Appearance { avatar: String, accent: String }`, stored in `dots.appearance`
   - `NewDot { name, role, persona, instructions, tool_allowlist, model_tier, autonomy, appearance }`
-  - `DotPatch { name, persona, instructions, tool_allowlist, model_tier, autonomy, status, appearance }`, every field an `Option`
+  - `DotPatch { name, persona, instructions, tool_allowlist, model_tier, autonomy, status, appearance, max_concurrency, daily_token_budget }`, every field an `Option` (`daily_token_budget: Option<Option<i64>>`, where `Some(None)` removes the cap)
+  - `HireDot { name: String, role: DotRole, persona: String }`, the hire request
+  - `roles::template(role: &DotRole, locale: Locale) -> NewDot`: the defaults a hire starts from: the role's instructions, `tool_allowlist = ["read_thread", "ask_user"]`, `model_tier = Standard`, `autonomy = AskFirst`, and the role's avatar (a neutral avatar for `Custom`); the request's name and persona replace the template's
+  - Who may change what: any member may hire a Dot, edit its `name`, `persona` and `appearance`, create teams and change team membership. Only an owner or admin may change execution-affecting settings (`instructions`, `tool_allowlist`, `model_tier`, `autonomy`, `status`, `max_concurrency`, `daily_token_budget`) and grants; a member gets 403 `forbidden`.
+  - Dot names are unique within a team, compared case-insensitively after Unicode NFC normalization; `team::create`, `team::add_member` and a rename through `dot::update` return 422 `dot_name_conflict` otherwise.
   - `Team { id: TeamId, space_id: SpaceId, name: String }` and `TeamView { team: Team, members: Vec<Dot> }`, with the lead first
   - `roles::default_roster(locale: Locale) -> Vec<NewDot>`: 6 Dots with English and Thai display names, for example Lead/หัวหน้าทีม, Researcher/นักวิจัย, Writer/นักเขียน, Analyst/นักวิเคราะห์, Scheduler/เลขา, Reviewer/ผู้ตรวจ. Each role gets a distinct avatar, and every Dot gets `tool_allowlist = ["read_thread", "ask_user"]`.
   - `dot::hire(pool, &Tenant, SpaceId, NewDot) -> Result<DotId, KatError>`: the Space becomes the Dot's default and its first grant
+  - `dot::list(pool, &Tenant, SpaceId) -> Result<Vec<Dot>, KatError>`: the Dots granted to that Space
   - `dot::get(pool, &Tenant, DotId) -> Result<Dot, KatError>`
   - `dot::update(pool, &Tenant, DotId, DotPatch) -> Result<Dot, KatError>`
   - `dot::grant_space(pool, &Tenant, DotId, SpaceId) -> Result<(), KatError>` and `dot::revoke_space(pool, &Tenant, DotId, SpaceId) -> Result<(), KatError>`; revoking the default Space is 422 `default_space_required`
   - Any change to `tool_allowlist`, `status` or grants increments `policy_version` in the same statement.
   - `team::create_default(pool, &Tenant, SpaceId, Locale) -> Result<TeamId, KatError>` and `team::get(pool, &Tenant, TeamId) -> Result<TeamView, KatError>`
+  - `NewTeam { name: String, lead: DotId, members: Vec<DotId> }`, `team::create(pool, &Tenant, SpaceId, NewTeam) -> Result<TeamId, KatError>` and `team::list(pool, &Tenant, SpaceId) -> Result<Vec<Team>, KatError>`
+  - `team::add_member(pool, &Tenant, TeamId, DotId, is_lead: bool) -> Result<(), KatError>`: a second lead is 422 `team_lead_conflict`; a Dot not granted to the team's Space is 422 `dot_not_in_space`
+  - `team::remove_member(pool, &Tenant, TeamId, DotId) -> Result<(), KatError>`: removing the lead is 422 `team_lead_required`
 - Routes:
-  - `GET/POST /api/workspaces/{workspace_id}/spaces/{space_id}/dots`. "Hire" is the `POST`, with role, name and persona.
-  - `GET/PATCH /api/workspaces/{workspace_id}/dots/{dot_id}`
-  - `PUT/DELETE /api/workspaces/{workspace_id}/dots/{dot_id}/spaces/{space_id}` (admin): grant and revoke
-  - `GET/POST /api/workspaces/{workspace_id}/spaces/{space_id}/teams` and `GET /api/workspaces/{workspace_id}/teams/{team_id}`
+  - Bodies are the serde JSON of the named structs, with snake_case fields.
+  - `GET /api/workspaces/{workspace_id}/spaces/{space_id}/dots` → 200 `[Dot]`; `POST` ("hire") with `HireDot` → 201 `Dot`
+  - `GET /api/workspaces/{workspace_id}/dots/{dot_id}` → 200 `Dot`; `PATCH` with `DotPatch` → 200 `Dot`
+  - `PUT/DELETE /api/workspaces/{workspace_id}/dots/{dot_id}/spaces/{space_id}` (admin): grant and revoke → 204
+  - `GET /api/workspaces/{workspace_id}/spaces/{space_id}/teams` → 200 `[Team]`; `POST` with `NewTeam` → 201 `TeamView`
+  - `GET /api/workspaces/{workspace_id}/teams/{team_id}` → 200 `TeamView`
+  - `PUT /api/workspaces/{workspace_id}/teams/{team_id}/members/{dot_id}` with `{"is_lead": bool}` → 204; `DELETE` → 204
 
 - [ ] **Step 1: Write the failing tests** in `crates/katwork-server/tests/team.rs`:
   - `default_team_has_one_lead_and_five_specialists`
-  - `team_rejects_second_lead`: 422 `team_lead_conflict`
+  - `team_rejects_second_lead`: `PUT …/members/{dot_id}` with `is_lead: true` on a team that has a lead gives 422 `team_lead_conflict`
+  - `hire_uses_role_template_defaults`
+  - `member_cannot_change_execution_settings_admin_can`
+  - `duplicate_dot_name_in_team_is_rejected`: `"Writer"` and `"writer"` in one team give 422 `dot_name_conflict`
   - `hire_custom_dot_with_thai_name`
   - `team_persisted_server_side_and_returned_in_order`: the lead comes first
   - `default_roster_avatars_are_distinct`
@@ -550,7 +564,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `RunFacts::not_run(stop: StopReason) -> RunFacts`: no run id, a fresh `reply_message_id`, everything else empty; used when the harness decides without a run (Tasks 11 and 12)
   - `ToolCallRecord { id: ToolCallRecordId, step: u32, tool_call_id: String, name: String, side_effect: Option<SideEffect>, state: ToolCallState }` and `ToolCallState::{Started, Succeeded, Failed, TimedOut, OutcomeUnknown, Refused}`
   - `PendingCall { record_id: ToolCallRecordId, tool_call_id: String, name: String, args_canonical: String, args_sha256: String }`, stored as `tasks.pending_tool_call`
-  - `StopReason::{ProviderUnavailable, ProviderRateLimited, ProviderQuota, ProviderAuthFailed, ModelProtocol, StepLimit, LoopDetected, NeedsApproval, TokenBudget, OutputTruncated, TimeLimit, PolicyChanged, ResidencyDenied, QuotaExceeded, WorkspacePaused, DotPaused, Interrupted, OutcomeUnknown, Cancelled}`
+  - `StopReason::{ProviderUnavailable, ProviderRateLimited, ProviderQuota, ProviderAuthFailed, ModelProtocol, StepLimit, LoopDetected, NeedsApproval, TokenBudget, OutputTruncated, TimeLimit, PolicyChanged, ResidencyDenied, QuotaExceeded, WorkspacePaused, DotPaused, NoEligibleDot, Interrupted, OutcomeUnknown, Cancelled}`
   - `Limits { max_steps: u32, tool_timeout: Duration, result_max_chars: usize, repeat_limit: u32, repeat_window: (u32, u32), max_total_tokens: u64, run_wall_clock: Duration, task_deadline: Duration, job_deadline: Duration, model_retries: u32, stream: StreamTimeouts }`. `Limits::default()` holds the initial defaults: 24, 60 s, 8,000, 3, (5, 10), 200,000, 90 s, 5 min, 10 min, 1, and 30 s / 30 s. The run deadline is separate from the lease TTL.
   - `guards::authorize(conn: &mut PgConnection, fence: &Fence, dot_id: DotId, space_id: SpaceId, policy_version: i64) -> Result<Option<StopReason>, KatError>`: runs `fence::check`, then reads the Dot and its workspace. A paused workspace gives `WorkspacePaused`, a paused Dot `DotPaused`, and a missing grant to `space_id` or a `policy_version` other than `input.policy_version` gives `PolicyChanged`. Status, grant and allowlist changes all increment `policy_version` (Task 5), so a change made while the task was queued is caught on the first check.
   - `guards::canonical_args(args: &serde_json::Value) -> String`: object keys sorted and whitespace normalized; array order and values kept
@@ -660,7 +674,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
     |---|---|---|---|
     | `ProviderUnavailable` / `ProviderRateLimited` / `ModelProtocol` / `TimeLimit` | `stopped` | `provider_unavailable` / `provider_rate_limited` / `model_protocol_error` / `time_limit` | `Retry` |
     | `ProviderQuota` / `QuotaExceeded` / `WorkspacePaused` | `stopped` | `provider_quota` / `quota_exceeded` / `workspace_paused` | `Retry` (after the reset or unpause) |
-    | `ProviderAuthFailed` / `DotPaused` / `ResidencyDenied` | `stopped` | `provider_auth_failed` / `dot_paused` / `residency_denied` | `AskUser` (an admin) |
+    | `ProviderAuthFailed` / `DotPaused` / `ResidencyDenied` / `NoEligibleDot` | `stopped` | `provider_auth_failed` / `dot_paused` / `residency_denied` / `no_eligible_dot` | `AskUser` (an admin) |
     | `StepLimit` / `TokenBudget` / `OutputTruncated` | `stopped` | `step_limit` / `token_budget` / `output_truncated` | `SaveDraftWithReport` |
     | `LoopDetected` | `stopped` | `loop_detected` | `HandToLead` |
     | `PolicyChanged` | `stopped` | `policy_changed` | `RestartJob` |
@@ -772,13 +786,20 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
     4. `task::enqueue` and `message::set_job`, or `job::conclude` for a job that ends at intake
   - `pipeline::submit(core: &Core, tenant: &Tenant, thread_id: ThreadId, post: UserPost) -> Result<Submitted, KatError>`: begins a transaction, runs `intake`, commits, then notifies the hub. A crash at any point before the commit leaves no message, job or task, so the client's retry with the same `client_msg_id` starts clean; a concurrent retry waits on the message's unique index and returns the first post's ids. The route answers 201 when `created`, otherwise 200.
   - Intake rules inside `intake`:
-    - SP1 routing (spec §6.2 Stage 0 subset; Laya arrives in SP4): the closed set is the thread team's Dots that are `active` and granted to the thread's Space. An `@mention` of a Dot in the set goes to that Dot; otherwise to the team's Lead.
-    - a mentioned Dot that is paused leaves the set: the pipeline posts a `System` notice `dot_paused` and routes to the Lead. If no eligible Dot remains, the job ends with `job::conclude` on `RunFacts::not_run(StopReason::DotPaused)`.
+    - SP1 routing (spec §6.2 Stage 0 subset; Laya arrives in SP4). The eligible set is the thread team's Dots that are `active` and granted to the thread's Space. Mentions from `mentions::parse` are matched, in text order, against the team's Dot names (case-insensitive, NFC; names are unique within a team, Task 5):
+      1. the first mention that names an eligible Dot gets the task; later mentions are ignored in SP1 (team jobs arrive in SP4)
+      2. a mention of a team Dot that is not eligible posts a `System` notice, `dot_paused` or `dot_not_in_space`, and matching moves on to the next mention
+      3. with no eligible mention, the Lead gets the task if it is eligible, otherwise the first eligible Dot in team order (`team_members.position`)
+      4. with no eligible Dot at all, the job ends with `job::conclude` on `RunFacts::not_run(StopReason::NoEligibleDot)`
     - quotas before enqueue: `quota::check`; when exceeded, the job ends with `job::conclude` on `RunFacts::not_run(StopReason::QuotaExceeded)`, which posts a localized notice. Nothing is dropped silently.
     - in a paused workspace the task is still enqueued and waits (Task 11), and the pipeline posts a `System` notice `workspace_paused`
     - every `job::conclude` call here uses the job id as `idem_key`, and each notice uses the idempotency key `"notice:{job_id}:{code}"`, so a retried post never doubles them
     - builds `TaskInput` with `build_history`, calls `task::enqueue` with the routed Dot's `policy_version` and key `"job:{job_id}:dot:{dot_id}"`, then `message::set_job`
-  - `quota::check(conn: &mut PgConnection, dot: &Dot, sender: UserId) -> Result<Option<StopReason>, KatError>`: the Dot's rolling 24-hour token total from `model_calls` against `daily_token_budget` (NULL means no cap), and at most 6 jobs per minute per (Dot, sender), both counted in Postgres
+  - `quota::check(conn: &mut PgConnection, dot: &Dot, sender: UserId) -> Result<Option<StopReason>, KatError>`, run inside intake's transaction:
+    - it first locks the Dot row (`FOR UPDATE`), the last lock intake takes, in line with the job → task → Dot order
+    - the daily budget is `dot.daily_token_budget` (`None` means no cap), compared with the sum of `model_calls.charged_tokens` for that Dot over the last 24 hours, so missing usage counts at its conservative charge, never as zero
+    - the rate limit is at most 6 jobs per minute per (Dot, sender), counted from tasks routed to that Dot whose job that sender requested in the last 60 s
+    - intake's `task::enqueue` records the routing in the same transaction, so a concurrent submission for the same Dot waits on the Dot row and then counts it
   - `History { messages: Vec<ChatMsg>, cut: u32 }` and `pipeline::build_history(messages: &[Message], dot_id: DotId, names: &HashMap<Author, String>, budget_chars: usize) -> History`:
     - the newest messages up to `budget_chars` (24,000); the latest user message is always kept whole, and the number of cut messages is recorded
     - the Dot's own messages map to `Assistant`; other Dots and people map to `User` with their server-side `name`
@@ -808,6 +829,11 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `history_budget_keeps_latest_user_message_whole`
   - `other_dots_messages_are_user_role_with_name`
   - `seventh_message_in_a_minute_is_stopped_quota_exceeded`
+  - `two_simultaneous_submissions_with_five_recent_jobs_admit_one`: one is enqueued and the other ends `stopped/quota_exceeded`
+  - `daily_budget_counts_charged_tokens_when_usage_is_missing`
+  - `first_eligible_mention_wins_among_several`
+  - `paused_lead_routes_to_first_active_specialist`
+  - `no_eligible_dot_ends_job_stopped`
   - `cancel_ends_job_cancelled`
   - `cancel_queued_job_terminalizes_its_task`: the task becomes `cancelled` with no lease row, and no worker ever claims it
   - `cancel_other_workspace_job_is_404`
