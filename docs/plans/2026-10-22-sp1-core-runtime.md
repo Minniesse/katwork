@@ -286,6 +286,8 @@ web/
 - [ ] **Step 4: Run.** Expected: PASS. Then run `cargo test -p katwork rig_adapter -- --ignored`, a live smoke test that runs only when `OPENAI_API_KEY` is set and is skipped in CI.
 - [ ] **Step 5: Commit** with `feat: model gateway with residency policy, fake and rig providers`.
 
+**Gateway review follow-up contract:** `ChatChunk::Progress` records non-text provider activity (tool arguments, reasoning, usage, part boundaries, and unknown Rig items); streaming HTTP bytes also count when Rig suppresses a provider event. `guard_stream` consumes it, switches to the idle phase, and resets the deadline without exposing it as content. Consumers must use the guard for liveness; this marker is never a tool call or billable usage. Tool-bearing requests include an initial 1,024-token implicit tool-prompt allowance for both supported providers in `input_charge_bound()`. OpenAI Responses uses the typed `store(false)` option; Chat tool errors carry an `Error: ` content prefix. Demo providers retain no request history.
+
 ### Task 8: Tool registry and agent loop
 
 **Files:**

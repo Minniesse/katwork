@@ -155,12 +155,30 @@ fn no_keys_and_no_demo_is_provider_unavailable() {
         Err(ModelError::ProviderUnavailable)
     ));
 }
+#[tokio::test]
+async fn demo_mode_retains_no_requests_after_many_calls() {
+    let provider = FakeProvider::demo();
+    for _ in 0..100 {
+        let chunks = provider
+            .stream(request())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(chunks.last(), Some(Ok(ChatChunk::Done { .. }))));
+    }
+    assert!(provider.received().is_empty());
+}
 #[tokio::test(start_paused = true)]
 async fn stream_stall_returns_model_timeout() {
     for (turn, phase) in [
         (FakeTurn::Hang, TimeoutPhase::FirstChunk),
         (
             FakeTurn::ChunksThenHang(vec![ChatChunk::TextDelta("a".into())]),
+            TimeoutPhase::Idle,
+        ),
+        (
+            FakeTurn::ChunksThenHang(vec![ChatChunk::Progress]),
             TimeoutPhase::Idle,
         ),
     ] {
@@ -209,6 +227,18 @@ fn input_charge_bound_includes_tool_schemas() {
         parameters: json!({"description":"x".repeat(20_000)}),
     });
     assert!(req.input_charge_bound() >= before + 20_000);
+}
+#[test]
+fn input_charge_bound_covers_provider_tool_prompt_overhead() {
+    let mut req = request();
+    req.system = "Hi".into();
+    req.tools.push(ToolSpec {
+        name: "t".into(),
+        description: String::new(),
+        parameters: json!({"type":"object"}),
+    });
+    let request_bytes = serde_json::to_vec(&req).unwrap().len() as u64;
+    assert!(req.input_charge_bound() >= request_bytes + 1024);
 }
 #[tokio::test]
 async fn tool_use_stop_without_call_is_protocol_error() {

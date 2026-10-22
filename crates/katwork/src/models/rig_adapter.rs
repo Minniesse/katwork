@@ -18,6 +18,42 @@ use rig_core::{
     streaming::{Item, StreamEvent},
 };
 use std::{collections::HashSet, sync::Arc, time::Duration};
+use tokio::sync::Notify;
+
+/// Rig may consume provider frames without emitting an item (for example, ping).
+#[derive(Clone)]
+struct ProgressHttp<H> {
+    inner: H,
+    activity: Arc<Notify>,
+}
+impl<H: HttpClientExt> HttpClientExt for ProgressHttp<H> {
+    fn send<T: Into<Bytes> + Send, U: From<Bytes> + Send + 'static>(
+        &self,
+        req: Request<T>,
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static {
+        self.inner.send(req)
+    }
+    fn send_multipart<U: From<Bytes> + Send + 'static>(
+        &self,
+        req: Request<MultipartForm>,
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static {
+        self.inner.send_multipart(req)
+    }
+    async fn send_streaming<T: Into<Bytes> + Send>(
+        &self,
+        req: Request<T>,
+    ) -> http_client::Result<StreamingResponse> {
+        let response = self.inner.send_streaming(req).await?;
+        let activity = self.activity.clone();
+        Ok(response.map(|body| {
+            Box::pin(body.inspect(move |chunk| {
+                if chunk.as_ref().is_ok_and(|bytes| !bytes.is_empty()) {
+                    activity.notify_one();
+                }
+            })) as http_client::BoxedStream
+        }))
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct HttpLimits {
@@ -119,8 +155,12 @@ impl BoundedHttp {
                                 "sse_frame_too_large".into(),
                             )))?;
                         }
-                        if byte == b'\n' {
-                            if line_bytes == 0 || (line_bytes == 1 && last_cr) {
+                        if byte == b'\n' && last_cr {
+                            last_cr = false;
+                            continue;
+                        }
+                        if matches!(byte, b'\r' | b'\n') {
+                            if line_bytes == 0 {
                                 frame_bytes = 0;
                             }
                             line_bytes = 0;
@@ -277,28 +317,22 @@ impl RigProvider {
         self.http = http;
         self
     }
-}
-#[async_trait]
-impl ModelProvider for RigProvider {
-    fn id(&self) -> &str {
-        match self.backend {
-            Backend::OpenAi(_, OpenAiApi::Chat) => "openai:chat",
-            Backend::OpenAi(_, OpenAiApi::Responses) => "openai:responses",
-            Backend::Anthropic(_) => "anthropic",
-        }
-    }
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            tools: true,
-            residency: Residency::External,
-            synthetic: false,
-        }
-    }
-    async fn stream(
+    fn stream_with_http<H: HttpClientExt + Clone + 'static>(
         &self,
         req: ChatRequest,
+        http: H,
     ) -> Result<BoxStream<'static, Result<ChatChunk, ModelError>>, ModelError> {
-        let request = to_rig(req, self.id())?;
+        let activity = Arc::new(Notify::new());
+        let http = ProgressHttp {
+            inner: http,
+            activity: activity.clone(),
+        };
+        let mut request = to_rig(req, self.id())?;
+        if matches!(self.backend, Backend::OpenAi(_, OpenAiApi::Responses)) {
+            request = request.provider_option(
+                rig_core::providers::openai::extension::OpenAiOptions::new().store(false),
+            );
+        }
         let final_wire = match &self.backend {
             Backend::OpenAi(config, OpenAiApi::Responses) => Some(
                 rig_core::providers::openai::responses_api::wire::Responses::new(
@@ -311,7 +345,7 @@ impl ModelProvider for RigProvider {
         let sent = request.clone();
         let model = match &self.backend {
             Backend::OpenAi(config, api) => {
-                let client = config.as_ref().clone().connect(self.http.clone());
+                let client = config.as_ref().clone().connect(http.clone());
                 match api {
                     OpenAiApi::Chat => client.chat(&self.model).erase(),
                     OpenAiApi::Responses => client.responses(&self.model).erase(),
@@ -319,7 +353,7 @@ impl ModelProvider for RigProvider {
             }
             Backend::Anthropic(config) => config
                 .clone()
-                .connect(self.http.clone())
+                .connect(http.clone())
                 .completion(&self.model)
                 .erase(),
         };
@@ -329,13 +363,26 @@ impl ModelProvider for RigProvider {
         let provider_id = self.id().to_owned();
         Ok(Box::pin(async_stream::try_stream! {
             let mut phase = TimeoutPhase::FirstChunk;
-            while let Some(item) = stream.next().await {
+            loop {
+                let item = tokio::select! {
+                    item = stream.next() => match item {
+                        Some(item) => item,
+                        None => break,
+                    },
+                    _ = activity.notified() => {
+                        phase = TimeoutPhase::Idle;
+                        yield ChatChunk::Progress;
+                        continue;
+                    }
+                };
                 if let Item::Event(StreamEvent::Text { text, .. }) =
                     item.map_err(|error| model_error(error, phase))?
                 {
                     yield ChatChunk::TextDelta(text);
-                    phase = TimeoutPhase::Idle;
+                } else {
+                    yield ChatChunk::Progress;
                 }
+                phase = TimeoutPhase::Idle;
             }
             let mut response = stream
                 .finish()
@@ -370,6 +417,29 @@ impl ModelProvider for RigProvider {
         }))
     }
 }
+#[async_trait]
+impl ModelProvider for RigProvider {
+    fn id(&self) -> &str {
+        match self.backend {
+            Backend::OpenAi(_, OpenAiApi::Chat) => "openai:chat",
+            Backend::OpenAi(_, OpenAiApi::Responses) => "openai:responses",
+            Backend::Anthropic(_) => "anthropic",
+        }
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            tools: true,
+            residency: Residency::External,
+            synthetic: false,
+        }
+    }
+    async fn stream(
+        &self,
+        req: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<ChatChunk, ModelError>>, ModelError> {
+        self.stream_with_http(req, self.http.clone())
+    }
+}
 fn tool_name(name: &str) -> Result<ToolName, ModelError> {
     ToolName::new(name).map_err(|_| ModelError::Protocol("empty_tool_name".into()))
 }
@@ -390,6 +460,11 @@ fn to_rig(req: ChatRequest, provider_id: &str) -> Result<CompletionRequest, Mode
                 if tool_call_id.is_empty() {
                     return Err(ModelError::Protocol("empty_tool_call_id".into()));
                 }
+                let content = if is_error && provider_id == "openai:chat" {
+                    format!("Error: {content}")
+                } else {
+                    content
+                };
                 Message::tool_results(vec![ToolResult {
                     call: CallId::from_wire(tool_call_id),
                     name: tool_name(&name)?,
@@ -623,10 +698,192 @@ fn model_error(error: ProviderError, phase: TimeoutPhase) -> ModelError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+
+    #[derive(Clone)]
+    struct TimedHttp {
+        body: &'static str,
+        attempts: Arc<AtomicUsize>,
+    }
+    impl HttpClientExt for TimedHttp {
+        fn send<T: Into<Bytes> + Send, U: From<Bytes> + Send + 'static>(
+            &self,
+            _: Request<T>,
+        ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
+        {
+            std::future::ready(Err(http_client::Error::instance(std::io::Error::other(
+                "fixture is streaming only",
+            ))))
+        }
+        fn send_multipart<U: From<Bytes> + Send + 'static>(
+            &self,
+            _: Request<MultipartForm>,
+        ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static
+        {
+            std::future::ready(Err(http_client::Error::instance(std::io::Error::other(
+                "fixture is streaming only",
+            ))))
+        }
+        async fn send_streaming<T: Into<Bytes> + Send>(
+            &self,
+            _: Request<T>,
+        ) -> http_client::Result<StreamingResponse> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            let body = self.body;
+            let frames: http_client::BoxedStream = Box::pin(async_stream::stream! {
+                for frame in body.split_inclusive("\n\n") {
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+                    yield Ok(Bytes::from_static(frame.as_bytes()));
+                }
+            });
+            Ok(Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(frames)
+                .unwrap())
+        }
+    }
+
+    async fn timed_fixture(
+        body: &'static str,
+        api: Option<OpenAiApi>,
+    ) -> Vec<Result<ChatChunk, ModelError>> {
+        let env = ProviderEnv {
+            api_key: uuid::Uuid::now_v7().to_string(),
+            base_url: None,
+        };
+        let provider = match api {
+            Some(api) => RigProvider::openai(&env, "gpt-4.1", api),
+            None => RigProvider::anthropic(&env, "claude-sonnet-4-6"),
+        }
+        .unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let request = ChatRequest {
+            system: "test".into(),
+            messages: vec![ChatMsg::User {
+                content: "hi".into(),
+                name: None,
+            }],
+            tools: vec![],
+            max_output_tokens: 128,
+            temperature: None,
+        };
+        let stream = provider
+            .stream_with_http(
+                request,
+                TimedHttp {
+                    body,
+                    attempts: attempts.clone(),
+                },
+            )
+            .unwrap();
+        let start = tokio::time::Instant::now();
+        let chunks = guard_stream(stream, StreamTimeouts::default())
+            .collect::<Vec<_>>()
+            .await;
+        assert!(
+            matches!(chunks.last(), Some(Ok(ChatChunk::Done { .. }))),
+            "{api:?} first frame {:?}: {chunks:?}",
+            body.lines().next()
+        );
+        assert!(start.elapsed() > Duration::from_secs(30));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| matches!(chunk, Ok(ChatChunk::Usage(_))))
+                .count(),
+            1
+        );
+        assert!(
+            !chunks
+                .iter()
+                .any(|chunk| matches!(chunk, Ok(ChatChunk::Progress)))
+        );
+        chunks
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn argument_only_stream_keeps_first_and_idle_timers_alive() {
+        let chunks = timed_fixture(
+            include_str!("../../tests/fixtures/models/chat_arguments.sse"),
+            Some(OpenAiApi::Chat),
+        )
+        .await;
+        let Some(Ok(ChatChunk::Done { stop, turn })) = chunks.last() else {
+            unreachable!()
+        };
+        assert_eq!(*stop, StopKind::ToolUse);
+        assert!(turn.content.is_empty());
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].args_json, r#"{"x":123}"#);
+        assert!(chunks.contains(&Ok(ChatChunk::Usage(Usage {
+            input: Some(5),
+            output: Some(7),
+            complete: true,
+            ..Usage::default()
+        }))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reasoning_usage_and_unknown_events_keep_streams_alive() {
+        for (api, body) in [
+            (
+                None,
+                include_str!("../../tests/fixtures/models/anthropic_replay.sse"),
+            ),
+            (
+                None,
+                include_str!("../../tests/fixtures/models/anthropic_usage.sse"),
+            ),
+            (
+                Some(OpenAiApi::Responses),
+                include_str!("../../tests/fixtures/models/responses_final.sse"),
+            ),
+            (
+                Some(OpenAiApi::Chat),
+                include_str!("../../tests/fixtures/models/chat_unknown.sse"),
+            ),
+        ] {
+            timed_fixture(body, api).await;
+        }
+    }
+
+    #[test]
+    fn utf8_decoder_retains_split_codepoints() {
+        for (text, split) in [("ส", 1), ("ส", 2), ("👋", 1)] {
+            let mut decoder = Utf8Decoder::default();
+            let bytes = text.as_bytes();
+            assert!(decoder.push(&bytes[..split]).unwrap().is_empty());
+            assert_eq!(decoder.push(&bytes[split..]).unwrap(), bytes);
+            assert!(decoder.pending.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_frame_cap_resets_on_bare_cr_lines() {
+        let body = b"data: a\r\r".repeat(20);
+        let (url, server) = response(200, body.clone()).await;
+        let http = BoundedHttp::new(HttpLimits {
+            max_sse_frame_bytes: 16,
+            ..HttpLimits::default()
+        })
+        .unwrap();
+        let response = http
+            .send_streaming(Request::get(url).body(Bytes::new()).unwrap())
+            .await
+            .unwrap();
+        let chunks = response.into_body().collect::<Vec<_>>().await;
+        let decoded = chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(decoded, body);
+        server.await.unwrap();
+    }
 
     async fn response(status: u16, body: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

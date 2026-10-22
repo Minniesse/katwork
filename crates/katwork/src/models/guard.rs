@@ -43,6 +43,7 @@ pub fn guard_stream(
             };
             first = false;
             match chunk {
+                Ok(ChatChunk::Progress) => continue,
                 Ok(ChatChunk::Done {
                     stop: StopKind::ToolUse,
                     ref turn,

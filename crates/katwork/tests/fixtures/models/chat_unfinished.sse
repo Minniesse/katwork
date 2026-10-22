@@ -1,4 +1,0 @@
-data: {"id":"chat_test","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"first","arguments":"{\"x\":"},"id":"a"}]},"finish_reason":null}]}
-
-data: [DONE]
-

@@ -25,8 +25,13 @@ pub struct ChatRequest {
 }
 impl ChatRequest {
     /// Conservative input charge for the registry's UTF-8 byte tokenizers.
+    /// Includes an initial 1,024-token tool-use allowance for each supported
+    /// provider, covering Anthropic's implicit tool system prompt as well as OpenAI.
     pub fn input_charge_bound(&self) -> u64 {
-        serde_json::to_vec(self).map_or(u64::MAX, |json| json.len() as u64)
+        let tool_overhead = if self.tools.is_empty() { 0 } else { 1024 };
+        serde_json::to_vec(self)
+            .map_or(u64::MAX, |json| json.len() as u64)
+            .saturating_add(tool_overhead)
     }
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -69,10 +74,15 @@ pub struct ToolSpec {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatChunk {
+    /// Provider activity without user-visible content; consumed by `guard_stream`.
+    Progress,
     TextDelta(String),
     ToolCall(ToolCall),
     Usage(Usage),
-    Done { stop: StopKind, turn: AssistantTurn },
+    Done {
+        stop: StopKind,
+        turn: AssistantTurn,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssistantTurn {

@@ -91,12 +91,12 @@ impl ModelProvider for FakeProvider {
                 },
             ])
         } else {
+            state.received.push(req);
             state
                 .turns
                 .pop_front()
                 .unwrap_or(FakeTurn::Error(ModelError::ProviderUnavailable))
         };
-        state.received.push(req);
         match turn {
             FakeTurn::Error(error) => Err(error),
             FakeTurn::Chunks(chunks) => Ok(stream::iter(chunks.into_iter().map(Ok)).boxed()),

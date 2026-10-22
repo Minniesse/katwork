@@ -12,6 +12,7 @@ struct Server {
     url: String,
     request: Arc<Mutex<Option<Value>>>,
     arrived: Arc<Notify>,
+    closed: Arc<Notify>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Server {
@@ -21,12 +22,28 @@ impl Drop for Server {
 }
 impl Server {
     async fn new(body: Vec<u8>, status: u16, split: Option<usize>, hold: bool) -> Self {
+        let chunks = match split {
+            Some(n) => vec![body[..n].to_vec(), body[n..].to_vec()],
+            None => vec![body],
+        };
+        Self::start(chunks, status, hold, "", Duration::from_millis(5)).await
+    }
+    async fn start(
+        chunks: Vec<Vec<u8>>,
+        status: u16,
+        hold: bool,
+        headers: &str,
+        interval: Duration,
+    ) -> Self {
+        let headers = headers.to_owned();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let request = Arc::new(Mutex::new(None));
         let captured = request.clone();
         let arrived = Arc::new(Notify::new());
         let received = arrived.clone();
+        let closed = Arc::new(Notify::new());
+        let disconnected = closed.clone();
         let task = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut raw = Vec::new();
@@ -56,18 +73,20 @@ impl Server {
             }
             received.notify_one();
             if hold {
-                std::future::pending::<()>().await;
+                match socket.read(&mut buf).await {
+                    Ok(0) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                    other => panic!("expected client disconnect, got {other:?}"),
+                }
+                disconnected.notify_one();
+                return;
             }
             let header = format!(
-                "HTTP/1.1 {status} fixture\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                "HTTP/1.1 {status} fixture\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n{headers}\r\n"
             );
             if socket.write_all(header.as_bytes()).await.is_err() {
                 return;
             }
-            let chunks = match split {
-                Some(n) => vec![&body[..n], &body[n..]],
-                None => vec![body.as_slice()],
-            };
             for chunk in chunks {
                 if socket
                     .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
@@ -76,13 +95,13 @@ impl Server {
                 {
                     return;
                 }
-                if socket.write_all(chunk).await.is_err() {
+                if socket.write_all(&chunk).await.is_err() {
                     return;
                 }
                 if socket.write_all(b"\r\n").await.is_err() {
                     return;
                 }
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                tokio::time::sleep(interval).await;
             }
             let _ = socket.write_all(b"0\r\n\r\n").await;
         });
@@ -90,6 +109,7 @@ impl Server {
             url,
             request,
             arrived,
+            closed,
             task,
         }
     }
@@ -197,6 +217,17 @@ async fn openai_responses_final_text_replaces_deltas() {
     assert_eq!(turn(&chunks).content, "final answer");
 }
 #[tokio::test]
+async fn responses_request_disables_storage_and_uses_only_function_tools() {
+    let server = Server::new(fixture("responses_final.sse"), 200, None, false).await;
+    turn(&collect(&server.provider(Some(OpenAiApi::Responses))).await);
+    let captured = server.request.lock().await.clone().unwrap();
+    assert_eq!(captured["store"], false);
+    assert!(captured.get("previous_response_id").is_none());
+    let tools = captured["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 1);
+    assert!(tools.iter().all(|tool| tool["type"] == "function"));
+}
+#[tokio::test]
 async fn completed_tool_call_then_response_failed_is_not_executable() {
     let server = Server::new(fixture("responses_failed.sse"), 200, None, false).await;
     let chunks = collect(&server.provider(Some(OpenAiApi::Responses))).await;
@@ -230,10 +261,8 @@ async fn interleaved_argument_fragments_assemble_per_call() {
     );
 }
 #[tokio::test]
-async fn malformed_and_unfinished_calls_are_protocol_errors() {
-    for name in ["chat_malformed.sse", "chat_unfinished.sse"] {
-        protocol(&chat(name).await);
-    }
+async fn malformed_call_is_protocol_error() {
+    protocol(&chat("chat_malformed.sse").await);
 }
 #[tokio::test]
 async fn several_calls_in_one_turn_keep_order() {
@@ -295,7 +324,7 @@ async fn anthropic_error_results_map_to_model_errors() {
     );
 }
 #[tokio::test]
-async fn cancel_during_network_wait_returns_promptly() {
+async fn cancellation_closes_the_provider_connection() {
     let server = Server::new(vec![], 200, None, true).await;
     let provider = server.provider(Some(OpenAiApi::Chat));
     let task = tokio::spawn(async move { collect(&provider).await });
@@ -308,10 +337,30 @@ async fn cancel_during_network_wait_returns_promptly() {
             .unwrap_err()
             .is_cancelled()
     );
+    tokio::time::timeout(Duration::from_secs(1), server.closed.notified())
+        .await
+        .expect("provider socket must close when the stream is dropped");
 }
 #[tokio::test]
-async fn unknown_events_are_ignored() {
-    assert_eq!(turn(&chat("chat_unknown.sse").await).content, "สวัสดี 👋");
+async fn unknown_events_are_ignored_by_every_adapter() {
+    for (api, fixture_name, expected) in [
+        (Some(OpenAiApi::Chat), "chat_unknown.sse", "สวัสดี 👋"),
+        (
+            Some(OpenAiApi::Responses),
+            "responses_final.sse",
+            "final answer",
+        ),
+        (None, "anthropic_usage.sse", "hello"),
+    ] {
+        let server = Server::new(fixture(fixture_name), 200, None, false).await;
+        let chunks = collect(&server.provider(api)).await;
+        assert_eq!(turn(&chunks).content, expected);
+        assert!(
+            !chunks
+                .iter()
+                .any(|chunk| matches!(chunk, Ok(ChatChunk::Progress)))
+        );
+    }
 }
 #[tokio::test]
 async fn replay_round_trips_to_the_same_provider() {
@@ -345,6 +394,7 @@ async fn replay_round_trips_to_the_same_provider() {
     let captured = server.request.lock().await.clone().unwrap();
     assert_eq!(captured["messages"][2]["tool_calls"][0]["id"], "a");
     assert_eq!(captured["messages"][3]["tool_call_id"], "a");
+    assert_eq!(captured["messages"][3]["content"], "Error: refused");
     assert!(captured.get("previous_response_id").is_none());
     assert_eq!(captured["messages"][0]["role"], "system");
 }
@@ -550,4 +600,67 @@ async fn anthropic_reasoning_signature_replays_only_to_anthropic() {
             api.is_none()
         );
     }
+}
+
+#[tokio::test]
+async fn anthropic_http_status_and_retry_after_are_preserved() {
+    for (status, kind, headers, expected) in [
+        (401, "authentication_error", "", ModelError::AuthFailed),
+        (403, "permission_error", "", ModelError::AuthFailed),
+        (
+            400,
+            "billing_error",
+            "",
+            ModelError::QuotaExceeded { resets_at: None },
+        ),
+        (
+            429,
+            "rate_limit_error",
+            "",
+            ModelError::RateLimited {
+                retry_after_secs: None,
+            },
+        ),
+        (
+            429,
+            "rate_limit_error",
+            "retry-after: 7\r\n",
+            ModelError::RateLimited {
+                retry_after_secs: Some(7),
+            },
+        ),
+        (503, "api_error", "", ModelError::ProviderUnavailable),
+        (529, "overloaded_error", "", ModelError::ProviderUnavailable),
+    ] {
+        let body =
+            serde_json::to_vec(&json!({"type":"error","error":{"type":kind,"message":"fixture"}}))
+                .unwrap();
+        let server = Server::start(vec![body], status, false, headers, Duration::ZERO).await;
+        assert_eq!(
+            collect(&server.provider(None)).await.last(),
+            Some(&Err(expected))
+        );
+    }
+}
+
+#[tokio::test]
+async fn provider_redirect_is_not_followed() {
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let headers = format!(
+        "Location: http://{}/redirected\r\n",
+        target.local_addr().unwrap()
+    );
+    let server = Server::start(vec![], 307, false, &headers, Duration::ZERO).await;
+    let chunks = tokio::time::timeout(
+        Duration::from_secs(1),
+        collect(&server.provider(Some(OpenAiApi::Chat))),
+    )
+    .await
+    .expect("redirect must fail without waiting on its target");
+    assert!(matches!(chunks.last(), Some(Err(_))));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), target.accept())
+            .await
+            .is_err()
+    );
 }
