@@ -222,15 +222,15 @@ async fn claim_live_lease_and_quota_queries_have_indexes(pool: PgPool) {
         .unwrap();
     for (query, index) in [
         (
-            "SELECT id FROM tasks WHERE state = 'queued' ORDER BY created_at LIMIT 1",
+            "EXPLAIN (FORMAT JSON) SELECT id FROM tasks WHERE state = 'queued' ORDER BY created_at LIMIT 1",
             "tasks_claim_state_created_at",
         ),
         (
-            "SELECT count(*) FROM tasks JOIN task_leases ON task_leases.task_id = tasks.id WHERE tasks.dot_id = $1 AND tasks.state = 'leased' AND task_leases.expires_at > clock_timestamp()",
+            "EXPLAIN (FORMAT JSON) SELECT count(*) FROM tasks JOIN task_leases ON task_leases.task_id = tasks.id WHERE tasks.dot_id = $1 AND tasks.state = 'leased' AND task_leases.expires_at > clock_timestamp()",
             "tasks_live_leases_by_dot",
         ),
         (
-            "SELECT sum(charged_tokens) FROM model_calls WHERE dot_id = $1 AND created_at > clock_timestamp() - interval '24 hours'",
+            "EXPLAIN (FORMAT JSON) SELECT sum(charged_tokens) FROM model_calls WHERE dot_id = $1 AND created_at > clock_timestamp() - interval '24 hours'",
             "model_calls_dot_daily_tokens",
         ),
     ] {
