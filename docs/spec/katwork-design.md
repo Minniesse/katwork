@@ -29,12 +29,12 @@ KatWork lets anyone in an organization hire a team of named AI coworkers ("Dots"
 7. Four views: 3D office, live agent graph, chat, and a tasks-and-files board.
 8. Six showcase templates (§8): four chosen, plus two from the use-case research.
 9. Two KatWork installs linked by federation (§12). This is the first item cut if the schedule slips (§18).
-10. Login with password reset and demo accounts, so a demo never fails the way the April 2026 one did.
+10. Login with password reset and demo accounts, so a live demo never depends on an external login.
 
 ### 1.2 Non-goals for the alpha
 
 - KatWork's own agentOS; the alpha uses rivet agentOS (§14 lists what the in-house agentOS must provide).
-- A VM per Dot. glidex hosts the install; per-Dot microVMs come with the in-house agentOS.
+- A VM per Dot. Per-Dot microVMs come with the in-house agentOS.
 - Voice and video calls.
 - High availability or multi-host scheduling.
 - A hosted cloud offering. The paid cloud comes after the alpha (§16).
@@ -64,7 +64,7 @@ KatWork lets anyone in an organization hire a team of named AI coworkers ("Dots"
 | Revenue | Free core, paid Enterprise edition, and later a paid hosted cloud. |
 | Name | KatWork, "the self-hosted AI team office". Repo `Minniesse/katwork`. |
 | Team | A solo maintainer builds the app with AI coding agents orchestrated by Orca. An infrastructure partner owns the future in-house agentOS. |
-| Development loop | Approved spec, then small GitHub Issues labelled `ready-for-agent`, then Orca workers in worktrees with TDD. Work is split between **Claude and Codex** (§19.1); Gemini is paused for now. The model that didn't write a PR reviews it, the founder approves every PR, CI must be green, and there is a weekly demo. |
+| Development loop | Approved spec, then small GitHub Issues labelled `ready-for-agent`, then Orca workers in worktrees with TDD. The model that didn't write a PR reviews it (§19.1), the founder approves every PR, CI must be green, and there is a weekly demo. |
 | Tracking | GitHub Issues for engineering; the Notion KatWork board for phases. |
 
 ## 3. Users and their jobs
@@ -135,7 +135,7 @@ KatWork follows the JEVIS layering: **the decision model advises, the harness ex
 │ browser-supervisor (Rust, chromiumoxide) ── chromium containers (one profile per Dot)       │
 │ craft-apps (web builds / MCP servers that pass the gates, §9)                               │
 │ postgres (jobs, tasks, proposals, events, memory metadata) · qdrant (vectors)               │
-│ artifact volume (local or hyperstor) · optional: mistral.rs local LLM                  │
+│ artifact volume (local or S3-compatible) · optional: mistral.rs local LLM                   │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -198,7 +198,7 @@ sequenceDiagram
 - Code builds the **closed set of eligible Dots** from Space ACLs, so the model can never pick a Dot the person may not use.
 - Thai script detection picks the language calibration table.
 
-### 6.3 Stage 1: Laya, intake only (about 9–31 ms)
+### 6.3 Stage 1: Laya, intake only
 
 One forward pass asks:
 - `target_dot`: a choice over the closed set, plus `none_suitable`.
@@ -211,8 +211,8 @@ Rules:
 - Low confidence means "no opinion" and goes to the lead Dot. A missing answer is never agreement.
 - **Uncertainty narrows permissions.** If the request's mode (produce or change files / read-only / answer) is uncertain, the job runs read-only or asks the user.
 
-Evidence from an internal GPU spike:
-- Routing was 0.83 accurate in both English and Thai, at about 9 ms p50.
+What early evaluation suggests (to be confirmed by the calibration work in §15):
+- Routing accuracy was similar in English and Thai.
 - English confidence was badly calibrated.
 - Approval and numeric-proof questions failed, so they are not Laya's job.
 
@@ -287,14 +287,14 @@ Templates are data. New ones need no code changes.
 | Meeting minutes | DOCX formal minutes plus an action-item list | Writer, Scheduler (owners and dates), Reviewer | Every action item has an owner and date or is flagged; decisions quoted from the source |
 | Research brief | DOCX or PPTX brief with cited sources | Researcher, Analyst, Writer, Reviewer | Every factual claim links to a saved web or file span; no uncited figures |
 
-| Monthly management / board commentary pack (from R5, UC-02) | DOCX bilingual commentary plus an XLSX variance and lineage table. PPTX deck comes after the alpha | Lead, Analyst (variance bridge, cross-file reconciliation), Researcher (explains the drivers), Writer, Reviewer | Every figure is identical across all outputs because they draw on the same verified fact ids; cross-file conflicts become an approval card; actual vs budget, month-over-month and year-over-year recomputed in code |
-| Hospital HA Standard v6 self-assessment (from R5, UC-01): a **rubric pack on the SAR engine, no code** | DOCX in the HA official form (`FM-ACD-088-01`) | SAR team | As SAR, plus a **patient-identifier (HN) and personal-data redaction check** in the Reviewer before any approval |
+| Monthly management / board commentary pack (added after early evaluation) | DOCX bilingual commentary plus an XLSX variance and lineage table. PPTX deck comes after the alpha | Lead, Analyst (variance bridge, cross-file reconciliation), Researcher (explains the drivers), Writer, Reviewer | Every figure is identical across all outputs because they draw on the same verified fact ids; cross-file conflicts become an approval card; actual vs budget, month-over-month and year-over-year recomputed in code |
+| Hospital HA Standard v6 self-assessment (added after early evaluation): a **rubric pack on the SAR engine, no code** | DOCX in the HA official form (`FM-ACD-088-01`) | SAR team | As SAR, plus a **patient-identifier (HN) and personal-data redaction check** in the Reviewer before any approval |
 
-R5 scored 30 use cases. These two were added because:
+An early evaluation scored candidate office use cases. These two were added because:
 - The monthly pack runs **every month** in every company, while SAR and One Report are yearly.
 - HA self-assessment has the same structure as a university SAR. Together they reuse the alpha engine for about 3–5 extra days of work.
 
-The roadmap after the alpha (R5 §4.3):
+The roadmap after the alpha, from the same early evaluation:
 
 | Phase | Timing | Use cases | New capability |
 |---|---|---|---|
@@ -364,7 +364,7 @@ The alpha computer for each Dot has these parts:
 - Review the MPL-2.0 dependencies (CADCraft, the audio and media apps) before adopting them.
 - Ship no restricted model weights: no SAM or RawNIND, and no PdfCraft OCR weights by default.
 
-**Gates per operation** (R6 "Gates"):
+**Gates per operation** (from early evaluation):
 - Thai fidelity, on a shared corpus checked by two Thai reviewers.
 - Export parity, checked in the office's reference Word, Excel and PDF tools.
 - Crash and data safety: malformed files, worker kill, out-of-memory, interrupted saves.
@@ -438,17 +438,17 @@ All four views read **one event model** from the core over AG-UI SSE: job and ta
 
 ## 14. agentOS requirements (for the in-house sandbox)
 
-The alpha uses rivet agentOS behind a stable `Computer` contract. The in-house agentOS, built on glidex and hyperstor, should provide the following so KatWork can switch to it without product changes:
+The alpha uses rivet agentOS behind a stable `Computer` contract. The in-house agentOS is planned as a VM-based sandbox; candidates are under evaluation. Whichever is chosen must provide the following so KatWork can switch to it without product changes:
 
-1. **Exec and stream.** Run a command in a Dot's computer and stream stdout and stderr with exit codes. Today glidex offers only the serial console or SSH.
-2. **Files.** Put and get files and list directories, with content hashes. glidex has no file API today.
-3. **Snapshot, restore and fork** a Dot's computer (memory and disk). This supports "try two approaches" and rollback after a bad edit. Cloud Hypervisor supports it; glidex doesn't wire it yet; hyperstor plans clone and rollback.
-4. **Warm pool and fast start.** A ready computer in under 1 s, where a cold boot takes tens of seconds today.
-5. **Per-Dot identity and delegated authority.** An agent acts for a person, recording both identities (glidex workload identity WI3, in draft).
+1. **Exec and stream.** Run a command in a Dot's computer and stream stdout and stderr with exit codes.
+2. **Files.** Put and get files and list directories, with content hashes.
+3. **Snapshot, restore and fork** a Dot's computer (memory and disk). This supports "try two approaches" and rollback after a bad edit.
+4. **Warm pool and fast start.** A ready computer in under 1 s.
+5. **Per-Dot identity and delegated authority.** An agent acts for a person, recording both identities.
 6. **Egress policy** per computer (allowlists).
 7. **Idle pause and resume** with persistent state.
 8. **A browser and GUI tier** for the Craft apps and the human-takeover browser, beside the light code sandbox (§9).
-9. **Quotas and metering** per workspace and per Dot. glidex already has projects, quotas and metering.
+9. **Quotas and metering** per workspace and per Dot.
 
 ## 15. Testing and evaluation
 
@@ -459,7 +459,7 @@ The alpha uses rivet agentOS behind a stable `Computer` contract. The in-house a
   - A 200-case labelled Thai and English intake set from real requests.
   - Per-language temperature and abstention fitting.
   - 10× resampling.
-  - The R3 50-case routing and delegation benchmark as the release gate.
+  - A 50-case routing and delegation benchmark as the release gate.
 - **Document fidelity gates.** Real Thai and English DOCX and XLSX samples: read, change and save, then compare text, values, formulas, structure and the rendered output. A scanned Thai PDF goes through OCR, checking names and numbers. Templates are filled with every placeholder and section checked.
 - **Approval gate tests.**
   - Approve one action and reject another.
@@ -506,7 +506,7 @@ The alpha uses rivet agentOS behind a stable `Computer` contract. The in-house a
 | Laya calibration fails in English or Thai | Route through the lead Dot (higher LLM cost); Laya becomes optional. |
 | Craft apps immature | They are gated (§9); the docx-rs, umya and Typst base keeps working. |
 | Free bundled AI at universities, and OpenAI Dots | Lead with finished, cited documents, approvals and self-hosting. Measure the rewrite rate with design partners. |
-| Demo reliability (April 2026 lesson) | Password reset and demo accounts in week 1; demo mode needs no keys. |
+| Demo reliability: a live demo must never depend on an external login | Password reset and demo accounts in week 1; demo mode needs no keys. |
 
 ## 19. Implementation breakdown
 
@@ -534,35 +534,9 @@ This spec covers the whole alpha. Implementation planning splits it into sub-pro
 7. **Craft integration.** PdfCraft, PhotoCraft and WordCraft behind their gates.
 8. **Federation.**
 
-### 19.1 Build delegation: Claude vs Codex (Gemini paused)
+### 19.1 Review rule
 
-Workers run through Orca (`--agent claude` / `--agent codex`), one worktree per issue. Gemini (Antigravity) is **paused** for now. Its usual work (web research, Thai copy) moves to Claude.
-
-The split follows what each model did well during the research phase:
-- **Codex** was most rigorous on code-reading and evidence. It produced the storytold evaluation with 131 verified references, the Rust vendor map with 90 candidates, the Craft-apps report with 168 citation checks, and the fact-check.
-- **Claude** was strongest at adversarial review, cross-document reasoning, design and Thai-language work. Examples: the T6 review, the voice-of-customer and social research, and orchestration.
-
-| Sub-project (§19) / task type | Implements | Reviews | Why |
-|---|---|---|---|
-| 1 Core runtime (Axum, SQLx, scheduler, leases, Rig loop, gateway) | **Codex** | Claude | Large, well-specified Rust systems code; parallel issues |
-| 2 Computers and documents (agentOS client, browser supervisor, docx/xlsx/pdf/OCR/Typst tools, evidence store) | **Codex** | Claude (Thai fidelity cases) | Library integration and byte-level correctness |
-| 3 Gates and policy (approval host, evidence verifier, policy function, statuses, replay and kill-switch) | **Claude** | Codex | The trust core: small, subtle, correctness-critical logic; Claude writes the tests first, Codex tries to break them |
-| 4 Routing (Laya in Rust via ONNX, Stage 0–2, lead-Dot planner, calibration scripts) | **Codex** | Claude (prompts, question phrasing, Thai) | Inference plumbing; question wording is the subtle part |
-| 5 Channels (7 adapters) | **Codex**, one worker per adapter | Claude | Mechanical SDK glue that parallelizes well |
-| 6 Views and shells (React UI, R3F 3D office, live graph, Computer panel, Tauri, Capacitor, EN/TH copy) | **Claude** | Codex | UX, accessibility and Thai UI text |
-| 7 Craft integration (web-build hosting, sandboxed origins, bridge, control lease, gates) | **Codex** | Claude (security and UX) | Build pipeline plus isolation details |
-| 8 Federation (reason-network fork, identity, relay) | **Codex** | Claude (security review) | Rust networking code; trust model checked separately |
-| Plans, issue breakdown, specs, ADRs | **Claude** (main session) | Founder | Owns the design context |
-| Security review of every gate, sandbox, channel and federation PR | **Claude** | Founder | Adversarial reading |
-| Docs, README, landing copy (EN/TH) | **Claude** | Founder | Language |
-| Research spikes, when needed | **Claude** subagents (code-reading spikes go to Codex) | Founder | Gemini paused |
-
-**Rules:**
-- **Cross-review.** Every PR is reviewed by the model that didn't write it, then approved by the founder.
-- **Concurrency.** At most **3 Codex + 2 Claude workers** at once, so founder review keeps pace.
-- **Usage.** Usage is checked weekly; when a model's limit runs high, its review-only tasks move to the other model first.
-- **Workers never** merge, push to `main`, publish, or change approval or security code without that cross-review.
-- **Startup hygiene.** Keep Codex updated, since its update and hooks prompts block TUI workers. Name every worker tab `<task> · <model> · <title>`.
+The model that didn't write a PR reviews it, then the maintainer approves.
 
 ## 20. References
 

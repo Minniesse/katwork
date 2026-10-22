@@ -26,7 +26,7 @@
 - **Model output is never executed as shell. Tool ids are matched against a registry** (spec §5.1, §13).
 - Every model call goes through `ModelProvider`; provider and Space data-residency rules are enforced in the gateway (spec §11).
 - The job status set is exactly `accepted | ready | answered | stopped | needs_input | cancelled | error` (spec §4). In SP1 a job can end as `answered`, `stopped`, `needs_input`, `cancelled` or `error`.
-- Agent loop limits, from the v3 lessons:
+- Agent loop limits, initial defaults:
   - tool timeout 60 s
   - tool results truncated to 8,000 characters
   - at most 24 steps per run
