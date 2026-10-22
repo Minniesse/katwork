@@ -20,4 +20,4 @@ Resuming the same job needs a parked task, a rule for who may answer, and a chan
 
 - Sub-project 1 needs no parked-task state and no answer-authorization rule.
 - Sub-project 3 carries one migration: resumable `needs_input`, and the copy of plan and evidence that team jobs will need by then.
-- Until then, the spec's job-status table and Stage 0 describe the follow-up job, not a resumed lease.
+- The spec's job-status table and Stage 0 state both phases: a follow-up job in sub-project 1, and resume from sub-project 3, before the alpha ships.

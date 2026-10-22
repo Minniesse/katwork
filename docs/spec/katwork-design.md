@@ -105,7 +105,7 @@ KatWork lets anyone in an organization hire a team of named AI coworkers ("Dots"
 | `accepted` | The template's preset acceptance contract passed against the current artifact version. |
 | `ready` | A result exists, but there was no independent acceptance, for example because the checks were produced by the same Dot. |
 | `answered` | A read-only answer. |
-| `needs_input` | Waiting on a person. Final in the alpha: the person's answer starts a follow-up job linked by `parent_job_id`. Resuming the same job, together with approval resume, comes with the gates sub-project (§19; `docs/adr/0002-needs-input-is-final-in-sp1.md`). |
+| `needs_input` | Waiting on a person. In sub-project 1 it is final: the person's answer starts a follow-up job linked by `parent_job_id`. From sub-project 3 (gates and policy), which lands before the alpha, the answer resumes the same job, as an approval does (§19; `docs/adr/0002-needs-input-is-final-in-sp1.md`). |
 | `stopped` | A rule fired; the job carries a named reason and a way to carry on. |
 
 `cancelled` and `error` are set by the harness, outside the policy.
@@ -196,7 +196,7 @@ sequenceDiagram
 ### 6.2 Stage 0: code (under 1 ms)
 
 - Approval callbacks go to the approval host.
-- A message in a thread whose last job ended `needs_input` starts a follow-up job linked by `parent_job_id`. Resuming the waiting task comes with the gates sub-project (§19).
+- A message in a thread whose last job ended `needs_input`: in sub-project 1 it starts a follow-up job linked by `parent_job_id`; from sub-project 3 it resumes that job's waiting task (§19).
 - `@mentions`, in English or Thai (`@นักวิจัย`, "researcher"), go straight to that Dot if the person may use it.
 - Code builds the **closed set of eligible Dots** from Space ACLs, so the model can never pick a Dot the person may not use.
 - Thai script detection picks the language calibration table.
