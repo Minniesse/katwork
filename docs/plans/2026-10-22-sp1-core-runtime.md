@@ -411,7 +411,9 @@ web/
 - Consumes: `Config`, `ProviderEnv` (Task 1); `types::{ModelTier, SpacePolicy}` and `Core` (Task 2). Nothing from Tasks 3–6.
 - Produces:
   - `#[async_trait] trait ModelProvider: Send + Sync { fn id(&self) -> &str; fn capabilities(&self) -> Capabilities; async fn stream(&self, req: ChatRequest) -> Result<BoxStream<'static, Result<ChatChunk, ModelError>>, ModelError>; }`
-  - `ChatRequest { system: String, messages: Vec<ChatMsg>, tools: Vec<ToolSpec>, max_output_tokens: u32, temperature: Option<f32> }`. System text lives only in `system`; there is no system role.
+  - `ChatRequest { system: String, messages: Vec<ChatMsg>, tools: Vec<ToolSpec>, max_output_tokens: u32, temperature: Option<f32> }` (`Serialize`).
+  - `ChatRequest::input_charge_bound(&self) -> u64`: the byte length of the whole request serialized as JSON: system text, every message and every tool schema, with their JSON framing. Tokenizers that work on UTF-8 bytes (byte-level BPE, and byte-fallback tokenizers) emit at most one token per byte, so this is an upper bound on input tokens even for emoji and Thai, where one character can be several tokens; the JSON framing of each message is longer in bytes than the few framing tokens a provider adds. The model table in `registry.rs` lists only models whose tokenizer has this property.
+  - System text lives only in `ChatRequest.system`; there is no system role.
   - `enum ChatMsg { User { content: String, name: Option<String> }, Assistant { content: String, tool_calls: Vec<ToolCall>, replay: Option<ProviderReplay> }, Tool { tool_call_id: String, name: String, content: String, is_error: bool } }` (`Serialize`, `Deserialize`)
   - `ToolCall { id: String, name: String, args_json: String }`
   - `ProviderReplay { provider_id: String, version: u32, data: serde_json::Value }`: opaque, versioned provider state, passed back only to the same provider in the same workspace and thread
@@ -459,6 +461,8 @@ web/
   - `no_keys_and_no_demo_is_provider_unavailable`
   - `stream_stall_returns_model_timeout`: `FakeTurn::Hang` gives `Timeout { phase: FirstChunk }` and `ChunksThenHang` gives `Timeout { phase: Idle }`, with the timeouts injected small
   - `stream_without_done_is_protocol_error`
+  - `input_charge_bound_covers_multibyte_text`: for `"👋"` and `"ฯ"` repeated, the bound is at least the UTF-8 byte count, which exceeds their published token counts
+  - `input_charge_bound_includes_tool_schemas`: adding a 20 KB tool schema raises the bound by at least 20 KB
   - `tool_use_stop_without_call_is_protocol_error`
 - [ ] **Step 3: Write the failing adapter fixture tests** in `crates/katwork/tests/rig_fixtures.rs`. Each serves recorded provider bytes from `tests/fixtures/models/` through a local HTTP server, offline, with the adapter's base URL pointed at it:
   - `thai_split_mid_codepoint_across_http_chunks_decodes`
@@ -593,7 +597,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
     | `Protocol(_)` | no | stop `ModelProtocol` |
     | `ResidencyDenied` | no | stop `ResidencyDenied` |
 
-  - **Token budget.** Each attempt is charged the reported input plus output when both counts are present. A missing output count is charged as that request's `max_output_tokens`; a missing input count as the character count of the request's system text and messages, an upper bound for any practical tokenizer. The charge goes to `model_calls.charged_tokens`, while the reported counts stay NULL when missing. Once the run's charged total reaches `max_total_tokens`, the run stops `TokenBudget` before the next attempt.
+  - **Token budget.** Each attempt is charged the reported input plus output when both counts are present. A missing output count is charged as that request's `max_output_tokens`; a missing input count as `ChatRequest::input_charge_bound()` of that request (Task 7). The charge goes to `model_calls.charged_tokens`, while the reported counts stay NULL when missing. Once the run's charged total reaches `max_total_tokens`, the run stops `TokenBudget` before the next attempt.
   - **Turn validation before dispatch.** Only an `EndTurn` or `ToolUse` turn can dispatch tools. Errored, aborted, filtered or unknown turn endings, malformed arguments and unfinished calls never execute. A `MaxTokens` turn keeps its partial text as `final_text`, stops `OutputTruncated`, and runs none of its tool calls.
   - **Allowlist at call time.** Each call resolves the tool from `dot.tool_allowlist ∩ ToolRegistry`; anything else gets a `ToolError::NotAllowed` error result.
   - **Authority before every model attempt and every tool dispatch.** The loop runs `guards::authorize`; a returned stop reason ends the run before that model call or tool runs.
