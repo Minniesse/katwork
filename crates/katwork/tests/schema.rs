@@ -851,3 +851,11 @@ async fn events_reject_cross_workspace_parents(pool: PgPool) {
             .bind(thread).bind(f.workspace).bind(run).execute(&pool).await.unwrap_err(), constraint);
     }
 }
+
+#[sqlx::test]
+async fn emails_are_unique_ignoring_case(pool: PgPool) {
+    sqlx::query("INSERT INTO users (id, email, password_hash, display_name, locale) VALUES ($1, 'A@x', 'hash', 'A', 'en')")
+        .bind(Uuid::now_v7()).execute(&pool).await.unwrap();
+    sqlstate(sqlx::query("INSERT INTO users (id, email, password_hash, display_name, locale) VALUES ($1, 'a@x', 'hash', 'a', 'en')")
+        .bind(Uuid::now_v7()).execute(&pool).await.unwrap_err(), "23505");
+}

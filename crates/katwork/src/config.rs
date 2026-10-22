@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, env, fmt};
+use std::{collections::BTreeSet, env, fmt, net::IpAddr};
 
 use percent_encoding::percent_decode_str;
 use url::Url;
@@ -9,6 +9,7 @@ pub struct Config {
     pub database_url: String,
     pub secret: String,
     pub demo: bool,
+    pub trusted_proxies: Vec<(IpAddr, u8)>,
     pub public_url: Option<String>,
     pub demo_password: Option<String>,
     pub smtp: Option<SmtpConfig>,
@@ -210,6 +211,22 @@ impl Config {
             .unwrap_or("http://localhost:3000")
     }
 
+    pub fn trusts_proxy(&self, ip: IpAddr) -> bool {
+        self.trusted_proxies
+            .iter()
+            .any(|(network, prefix)| match (network, ip) {
+                (IpAddr::V4(network), IpAddr::V4(ip)) => {
+                    let shift = 32 - u32::from(*prefix);
+                    u32::from(*network).checked_shr(shift) == u32::from(ip).checked_shr(shift)
+                }
+                (IpAddr::V6(network), IpAddr::V6(ip)) => {
+                    let shift = 128 - u32::from(*prefix);
+                    u128::from(*network).checked_shr(shift) == u128::from(ip).checked_shr(shift)
+                }
+                _ => false,
+            })
+    }
+
     pub fn cookie_secure(&self) -> bool {
         self.public_url_or_default().starts_with("https://")
     }
@@ -268,6 +285,33 @@ impl Config {
             }
             public_url = Some(url.origin().ascii_serialization());
         }
+        let demo = lookup("KATWORK_DEMO").is_some_and(|value| value == "1");
+        if demo
+            && public_url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("https://"))
+            && optional("KATWORK_ALLOW_DEMO_ON_HTTPS").is_none()
+        {
+            return Err(KatError::ConfigInvalid);
+        }
+        let trusted_proxies = optional("KATWORK_TRUSTED_PROXIES")
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|cidr| {
+                        let (ip, prefix) =
+                            cidr.trim().split_once('/').ok_or(KatError::ConfigInvalid)?;
+                        let ip: IpAddr = ip.parse().map_err(|_| KatError::ConfigInvalid)?;
+                        let prefix: u8 = prefix.parse().map_err(|_| KatError::ConfigInvalid)?;
+                        if prefix > if ip.is_ipv4() { 32 } else { 128 } {
+                            return Err(KatError::ConfigInvalid);
+                        }
+                        Ok((ip, prefix))
+                    })
+                    .collect::<Result<Vec<_>, KatError>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
         let smtp = if let Some(host) = optional("SMTP_HOST") {
             if host.contains('@') {
                 return Err(KatError::ConfigInvalid);
@@ -291,7 +335,8 @@ impl Config {
         Ok(Self {
             database_url,
             secret,
-            demo: lookup("KATWORK_DEMO").is_some_and(|value| value == "1"),
+            demo,
+            trusted_proxies,
             public_url,
             demo_password: optional("KATWORK_DEMO_PASSWORD"),
             smtp,

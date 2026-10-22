@@ -71,12 +71,7 @@ async fn run() -> Result<(), KatError> {
             let pool = db::connect(&config.database_url).await?;
             let core = Arc::new(Core::new(pool, config));
             let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
-            axum::serve(
-                listener,
-                build_router(AppState { core })
-                    .into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .await?;
+            katwork_server::transport::serve(listener, build_router(AppState { core })).await?;
             Ok(())
         }
         "migrate" => {
@@ -86,6 +81,9 @@ async fn run() -> Result<(), KatError> {
         }
         "seed-demo" => {
             let config = Config::from_env()?;
+            if !config.demo {
+                return Err(KatError::ConfigInvalid);
+            }
             let pool = db::connect(&config.database_url).await?;
             if let Some(password) = auth::seed_demo(&pool, &config, reset_password).await? {
                 println!("{password}");

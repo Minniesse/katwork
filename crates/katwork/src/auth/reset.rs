@@ -22,6 +22,11 @@ pub async fn request(
     let Some((user_id, email)) = user else {
         return Ok(());
     };
+    let outstanding: i64 = sqlx::query_scalar("SELECT count(*) FROM password_resets WHERE user_id = $1 AND used_at IS NULL AND expires_at > clock_timestamp()")
+        .bind(user_id).fetch_one(&mut *tx).await?;
+    if outstanding >= 3 {
+        return Ok(());
+    }
     let token = random_token()?;
     sqlx::query("INSERT INTO password_resets (id, user_id, token_sha256, expires_at) VALUES ($1, $2, $3, clock_timestamp() + interval '30 minutes')")
         .bind(Uuid::now_v7()).bind(user_id).bind(token_hash(&token)).execute(&mut *tx).await?;
@@ -45,9 +50,7 @@ pub async fn confirm(pool: &PgPool, token: &str, new_password: &str) -> Result<(
     let user_id: UserId = sqlx::query_scalar("SELECT user_id FROM password_resets WHERE token_sha256 = $1 AND used_at IS NULL AND expires_at > clock_timestamp()")
         .bind(&digest).fetch_optional(pool).await?.ok_or(KatError::ResetTokenInvalid)?;
     let new_password = new_password.to_owned();
-    let hash = tokio::task::spawn_blocking(move || password::hash(&new_password))
-        .await
-        .map_err(|_| KatError::AuthFailed)??;
+    let hash = password::run(move || password::hash(&new_password)).await??;
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE")
         .bind(user_id)

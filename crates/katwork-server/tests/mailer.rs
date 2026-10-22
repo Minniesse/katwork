@@ -70,6 +70,13 @@ async fn reset_token_never_appears_in_logs(pool: PgPool) {
     .with_subscriber(subscriber(&logs))
     .await;
     assert_eq!(response.status(), 202);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while capture.sent().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     let sent = capture.sent();
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].to, "person@example.test");
@@ -131,6 +138,13 @@ async fn reset_without_smtp_returns_202_and_sends_nothing(pool: PgPool) {
     .with_subscriber(subscriber(&logs))
     .await;
     assert_eq!(response.status(), 202);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !logs.text().contains("mail_not_sent") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     let text = logs.text();
     assert!(text.contains("mail_not_sent"));
     assert!(text.contains("smtp_unconfigured"));
@@ -143,7 +157,7 @@ async fn only_demo_console_backend_logs_mail_content() {
     let token = Uuid::now_v7().to_string();
     let mail = Mail {
         kind: MailKind::PasswordReset,
-        to: "person@example.test".into(),
+        to: "demo@katwork.local".into(),
         subject: "Reset password".into(),
         body: format!("https://katwork.example/reset?token={token}"),
     };
@@ -195,4 +209,101 @@ async fn smtp_errors_never_log_mail_or_credentials_and_override_demo() {
         assert!(!text.contains(&secret));
     }
     assert!(!text.contains("demo only"));
+}
+
+#[tokio::test]
+async fn demo_console_never_logs_non_demo_reset_links() {
+    let mut config = support::config(None);
+    config.demo = true;
+    let mail = Mail {
+        kind: MailKind::PasswordReset,
+        to: "person@example.test".into(),
+        subject: "Reset password".into(),
+        body: "http://localhost:3000/reset?token=private".into(),
+    };
+    let logs = Logs::default();
+    mailer::from_config(&config)
+        .send(&mail)
+        .with_subscriber(subscriber(&logs))
+        .await
+        .unwrap();
+    assert!(logs.text().contains("smtp_unconfigured"));
+    assert!(!logs.text().contains(&mail.to));
+    assert!(!logs.text().contains(&mail.body));
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn reset_link_uses_configured_origin_instead_of_host(pool: PgPool) {
+    use axum::{body::Body, extract::ConnectInfo, http::Request};
+    use tower::ServiceExt;
+    support::user(&pool).await;
+    let capture = Arc::new(CapturingMailer::default());
+    let mut core = Core::new(
+        pool,
+        Arc::new(support::config(Some("https://katwork.example"))),
+    );
+    core.mailer = capture.clone();
+    let app = build_router(AppState {
+        core: Arc::new(core),
+    });
+    let response = app
+        .oneshot(
+            Request::post("/api/auth/reset/request")
+                .header("host", "localhost:9999")
+                .header("origin", "https://katwork.example")
+                .header("content-type", "application/json")
+                .extension(ConnectInfo(
+                    "127.0.0.1:7000".parse::<std::net::SocketAddr>().unwrap(),
+                ))
+                .body(Body::from(
+                    json!({"email": "person@example.test"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while capture.sent().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        capture.sent()[0]
+            .body
+            .starts_with("https://katwork.example/reset?token=")
+    );
+}
+
+#[tokio::test]
+async fn smtp_timeout_logs_failed_without_reset_content() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = support::config(None);
+    config.smtp = Some(katwork::config::SmtpConfig {
+        host: "127.0.0.1".into(),
+        port: Some(listener.local_addr().unwrap().port()),
+        username: None,
+        password: None,
+        from: None,
+    });
+    let mailer = mailer::from_config(&config);
+    let mail = Mail {
+        kind: MailKind::PasswordReset,
+        to: "person@example.test".into(),
+        subject: "Reset".into(),
+        body: "private-reset-token".into(),
+    };
+    let logs = Logs::default();
+    let send =
+        tokio::spawn(async move { mailer.send(&mail).await }.with_subscriber(subscriber(&logs)));
+    let (_stream, _) = listener.accept().await.unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(11), send)
+        .await
+        .expect("send did not time out")
+        .unwrap();
+    assert_eq!(result.unwrap_err().code(), "mail_delivery_failed");
+    assert!(logs.text().contains("failed"));
+    assert!(!logs.text().contains("private-reset-token"));
 }

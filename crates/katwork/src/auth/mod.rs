@@ -44,28 +44,35 @@ pub async fn login(
     email: &str,
     password: &str,
 ) -> Result<(AuthUser, session::SessionToken), KatError> {
-    let mut tx = pool.begin().await?;
-    // Serialize password verification and session creation against password changes.
     let user: Option<(UserId, String)> =
-        sqlx::query_as("SELECT id, password_hash FROM users WHERE email = $1 FOR NO KEY UPDATE")
+        sqlx::query_as("SELECT id, password_hash FROM users WHERE email = $1")
             .bind(email)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(pool)
             .await?;
     let hash = user.as_ref().map(|(_, hash)| hash.clone());
     let password = password.to_owned();
-    let valid = tokio::task::spawn_blocking(move || match hash {
+    let valid = password::run(move || match hash {
         Some(hash) => password::verify(&password, &hash),
         None => {
             password::verify_unknown(&password);
             false
         }
     })
-    .await
-    .map_err(|_| KatError::AuthFailed)?;
+    .await?;
     if !valid {
         return Err(KatError::Unauthenticated);
     }
-    let user_id = user.ok_or(KatError::Unauthenticated)?.0;
+    let (user_id, verified_hash) = user.ok_or(KatError::Unauthenticated)?;
+    let mut tx = pool.begin().await?;
+    // Recheck under the user lock so a concurrent reset cannot issue a session for the old password.
+    let current_hash: Option<String> =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if current_hash.as_deref() != Some(&verified_hash) {
+        return Err(KatError::Unauthenticated);
+    }
     let token = session::create_on(&mut tx, user_id).await?;
     tx.commit().await?;
     Ok((AuthUser { user_id }, token))
@@ -76,15 +83,16 @@ pub async fn seed_demo(
     config: &Config,
     reset_password: bool,
 ) -> Result<Option<String>, KatError> {
+    if !config.demo {
+        return Err(KatError::ConfigInvalid);
+    }
     let password = config
         .demo_password
         .clone()
         .map(Ok)
         .unwrap_or_else(random_token)?;
     let candidate = password.clone();
-    let hash = tokio::task::spawn_blocking(move || password::hash(&candidate))
-        .await
-        .map_err(|_| KatError::AuthFailed)??;
+    let hash = password::run(move || password::hash(&candidate)).await??;
     let mut tx = pool.begin().await?;
     // A transaction-scoped lock makes concurrent seed commands idempotent before a user exists.
     sqlx::query("SELECT pg_advisory_xact_lock(3000003)")

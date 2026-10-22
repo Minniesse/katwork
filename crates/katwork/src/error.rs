@@ -12,6 +12,8 @@ pub enum KatError {
     RequestInvalid,
     #[error("body_too_large")]
     BodyTooLarge,
+    #[error("auth_busy")]
+    AuthBusy,
     #[error("auth_failed")]
     AuthFailed,
     #[error("mail_delivery_failed")]
@@ -60,6 +62,7 @@ impl KatError {
             Self::RateLimited => "rate_limited",
             Self::RequestInvalid => "request_invalid",
             Self::BodyTooLarge => "body_too_large",
+            Self::AuthBusy => "auth_busy",
             Self::AuthFailed => "auth_failed",
             Self::MailDeliveryFailed => "mail_delivery_failed",
 

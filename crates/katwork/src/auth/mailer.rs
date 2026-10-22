@@ -66,6 +66,9 @@ pub struct ConsoleMailer;
 #[async_trait]
 impl Mailer for ConsoleMailer {
     async fn send(&self, mail: &Mail) -> Result<(), KatError> {
+        if mail.to != "demo@katwork.local" {
+            return DisabledMailer.send(mail).await;
+        }
         tracing::warn!(kind = ?mail.kind, to = %mail.to, subject = %mail.subject, body = %mail.body, "demo only: console mail");
         Ok(())
     }
@@ -118,7 +121,9 @@ impl SmtpMailer {
 #[async_trait]
 impl Mailer for SmtpMailer {
     async fn send(&self, mail: &Mail) -> Result<(), KatError> {
-        let result = self.deliver(mail).await;
+        let result = tokio::time::timeout(Duration::from_secs(10), self.deliver(mail))
+            .await
+            .unwrap_or(Err(KatError::MailDeliveryFailed));
         tracing::info!(kind = ?mail.kind, outcome = if result.is_ok() { "sent" } else { "failed" }, "mail_delivery");
         result
     }

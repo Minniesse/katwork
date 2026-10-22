@@ -27,7 +27,9 @@ impl IntoResponse for ApiError {
             }
             KatError::HostNotAllowed | KatError::CrossSiteRequest => StatusCode::FORBIDDEN,
             KatError::JsonRequired => StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            KatError::DatabaseUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            KatError::AuthBusy | KatError::DatabaseUnavailable(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             KatError::LeaseLost => StatusCode::CONFLICT,
             KatError::ConfigInvalid
             | KatError::CommandInvalid

@@ -60,6 +60,11 @@ async fn api_errors_return_only_stable_codes() {
             "io_error",
         ),
         (KatError::LeaseLost, StatusCode::CONFLICT, "lease_lost"),
+        (
+            KatError::AuthBusy,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "auth_busy",
+        ),
     ] {
         let response = ApiError::from(error).into_response();
         assert_eq!(response.status(), status);

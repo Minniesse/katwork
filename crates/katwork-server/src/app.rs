@@ -23,6 +23,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/auth/reset/confirm", post(auth::confirm_reset))
         .route("/api/auth/me", get(auth::me))
         .layer(Extension(auth::LoginLimiter::default()))
+        .layer(Extension(auth::ResetLimiter::default()))
+        .layer(Extension(auth::ResetWork::default()))
         .with_state(state);
     crate::guards::apply(router, &config)
 }

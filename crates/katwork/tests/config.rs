@@ -692,3 +692,69 @@ fn https_scheme_is_canonicalized_before_cookie_security() {
     assert!(config.cookie_secure());
     assert_eq!(config.public_url_or_default(), "https://katwork.example");
 }
+
+#[test]
+fn demo_on_https_requires_explicit_override() {
+    for allow in [None, Some(""), Some("1")] {
+        let result = Config::from_lookup(|name| match name {
+            "KATWORK_DEMO" => Some("1".into()),
+            "KATWORK_PUBLIC_URL" => Some("HTTPS://katwork.example".into()),
+            "KATWORK_ALLOW_DEMO_ON_HTTPS" => allow.map(str::to_owned),
+            _ => lookup(name),
+        });
+        if allow == Some("1") {
+            assert!(result.is_ok());
+        } else {
+            assert_eq!(result.unwrap_err().code(), "config_invalid");
+        }
+    }
+}
+
+#[test]
+fn trusted_proxy_config_rejects_invalid_cidrs() {
+    for value in [
+        "127.0.0.1",
+        "127.0.0.1/33",
+        "::1/129",
+        "evil/8",
+        "10.0.0.0/8,,::1/128",
+    ] {
+        let result = Config::from_lookup(|name| match name {
+            "KATWORK_TRUSTED_PROXIES" => Some(value.into()),
+            _ => lookup(name),
+        });
+        assert_eq!(result.unwrap_err().code(), "config_invalid", "{value}");
+    }
+}
+
+#[test]
+fn trusted_proxy_cidrs_match_only_the_configured_networks() {
+    let empty = Config::from_lookup(lookup).unwrap();
+    assert!(!empty.trusts_proxy("127.0.0.1".parse().unwrap()));
+    for (networks, yes, no) in [
+        (
+            "192.0.2.0/24, 2001:db8::/32",
+            vec!["192.0.2.0", "192.0.2.255", "2001:db8::1"],
+            vec!["192.0.3.0", "2001:db9::1", "::ffff:192.0.2.1"],
+        ),
+        (
+            "127.0.0.1/32, ::1/128",
+            vec!["127.0.0.1", "::1"],
+            vec!["127.0.0.2", "::2"],
+        ),
+        ("0.0.0.0/0", vec!["192.0.2.1"], vec!["::1"]),
+        ("::/0", vec!["2001:db8::1"], vec!["192.0.2.1"]),
+    ] {
+        let config = Config::from_lookup(|name| match name {
+            "KATWORK_TRUSTED_PROXIES" => Some(networks.into()),
+            _ => lookup(name),
+        })
+        .unwrap();
+        for ip in yes {
+            assert!(config.trusts_proxy(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in no {
+            assert!(!config.trusts_proxy(ip.parse().unwrap()), "{ip}");
+        }
+    }
+}

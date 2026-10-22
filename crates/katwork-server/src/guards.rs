@@ -1,8 +1,11 @@
+use std::time::Duration;
+
 use axum::{
     Router,
-    body::HttpBody,
-    extract::{DefaultBodyLimit, Request, State},
-    http::{HeaderMap, HeaderValue, Method, uri::Authority},
+    body::{Body, Bytes, HttpBody},
+    error_handling::HandleErrorLayer,
+    extract::{DefaultBodyLimit, FromRequest, Request, State},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, uri::Authority},
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
@@ -26,6 +29,20 @@ pub fn apply(router: Router, config: &Config) -> Router {
         origin: url.map(|url| url.origin().ascii_serialization()),
     };
     router
+        .layer(middleware::from_fn(read_body))
+        .layer(
+            tower::ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(|error: axum::BoxError| async move {
+                    if error.is::<tower::timeout::error::Elapsed>() {
+                        StatusCode::REQUEST_TIMEOUT
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }))
+                .timeout(Duration::from_secs(30))
+                .load_shed()
+                .layer(tower::limit::GlobalConcurrencyLimitLayer::new(256)),
+        )
         .layer(DefaultBodyLimit::max(1_048_576))
         .layer(middleware::from_fn_with_state(config, guard))
 }
@@ -88,6 +105,7 @@ fn check(request: &Request, config: &GuardConfig) -> Result<(), KatError> {
 }
 
 async fn guard(State(config): State<GuardConfig>, request: Request, next: Next) -> Response {
+    let auth = request.uri().path().starts_with("/api/auth/");
     let mut response = match check(&request, &config) {
         Ok(()) => next.run(request).await,
         Err(error) => ApiError(error).into_response(),
@@ -101,4 +119,34 @@ async fn guard(State(config): State<GuardConfig>, request: Request, next: Next) 
         HeaderValue::from_static("default-src 'self'; frame-ancestors 'none'"),
     );
     response
+        .headers_mut()
+        .insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    if auth {
+        response
+            .headers_mut()
+            .insert("cache-control", HeaderValue::from_static("no-store"));
+    }
+    response
+}
+
+async fn read_body(request: Request, next: Next) -> Response {
+    let (parts, body) = request.into_parts();
+    let bytes = tokio::time::timeout(
+        Duration::from_secs(10),
+        Bytes::from_request(Request::from_parts(parts.clone(), body), &()),
+    )
+    .await;
+    match bytes {
+        Ok(Ok(bytes)) => {
+            next.run(Request::from_parts(parts, Body::from(bytes)))
+                .await
+        }
+        Ok(Err(error)) => ApiError(if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            KatError::BodyTooLarge
+        } else {
+            KatError::RequestInvalid
+        })
+        .into_response(),
+        Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
+    }
 }

@@ -1,3 +1,7 @@
+#[allow(dead_code)]
+#[path = "support/mod.rs"]
+mod support;
+
 use std::{
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -206,6 +210,7 @@ async fn seed_demo_creates_demo_user_and_workspace(pool: sqlx::PgPool) {
     for _ in 0..2 {
         let output = server()
             .arg("seed-demo")
+            .env("KATWORK_DEMO", "1")
             .env("DATABASE_URL", database_url(&pool))
             .env("KATWORK_DEMO_PASSWORD", &password)
             .output()
@@ -221,26 +226,15 @@ async fn seed_demo_creates_demo_user_and_workspace(pool: sqlx::PgPool) {
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM memberships m JOIN users u ON u.id = m.user_id JOIN workspaces w ON w.id = m.workspace_id WHERE u.email = 'demo@katwork.local' AND m.role = 'owner'")
         .fetch_one(&pool).await.unwrap();
     assert_eq!(count, 1);
-    let hash: String =
-        sqlx::query_scalar("SELECT password_hash FROM users WHERE email = 'demo@katwork.local'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    use argon2::PasswordVerifier;
-    assert!(
-        argon2::Argon2::default()
-            .verify_password(
-                password.as_bytes(),
-                &argon2::PasswordHash::new(&hash).unwrap()
-            )
-            .is_ok()
-    );
+    let app = support::app(&pool, None);
+    assert_eq!(demo_login(&app, &password).await.status(), 200);
 }
 
 #[sqlx::test(migrations = "../katwork/migrations")]
 async fn seed_demo_reset_password_allows_login(pool: sqlx::PgPool) {
     let first = server()
         .arg("seed-demo")
+        .env("KATWORK_DEMO", "1")
         .env("DATABASE_URL", database_url(&pool))
         .output()
         .unwrap();
@@ -249,40 +243,55 @@ async fn seed_demo_reset_password_allows_login(pool: sqlx::PgPool) {
     assert!(first_password.len() >= 32);
     let second = server()
         .arg("seed-demo")
+        .env("KATWORK_DEMO", "1")
         .env("DATABASE_URL", database_url(&pool))
         .output()
         .unwrap();
     assert!(second.status.success());
     assert!(second.stdout.is_empty());
+    let app = support::app(&pool, None);
+    let cookie = support::cookie(&demo_login(&app, &first_password).await);
     let password = uuid::Uuid::now_v7().to_string();
     let reset = server()
         .args(["seed-demo", "--reset-password"])
+        .env("KATWORK_DEMO", "1")
         .env("DATABASE_URL", database_url(&pool))
         .env("KATWORK_DEMO_PASSWORD", &password)
         .output()
         .unwrap();
     assert!(reset.status.success());
     assert_eq!(String::from_utf8(reset.stdout).unwrap().trim(), password);
-    let hash: String =
-        sqlx::query_scalar("SELECT password_hash FROM users WHERE email = 'demo@katwork.local'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    use argon2::PasswordVerifier;
-    assert!(
-        argon2::Argon2::default()
-            .verify_password(
-                password.as_bytes(),
-                &argon2::PasswordHash::new(&hash).unwrap()
-            )
-            .is_ok()
-    );
-    assert!(
-        argon2::Argon2::default()
-            .verify_password(
-                first_password.as_bytes(),
-                &argon2::PasswordHash::new(&hash).unwrap()
-            )
-            .is_err()
-    );
+    assert_eq!(demo_login(&app, &password).await.status(), 200);
+    support::assert_code(
+        demo_login(&app, &first_password).await,
+        401,
+        "unauthenticated",
+    )
+    .await;
+    support::assert_code(
+        support::request(&app, "GET", "/api/auth/me", None, Some(&cookie)).await,
+        401,
+        "unauthenticated",
+    )
+    .await;
+}
+
+#[test]
+fn seed_demo_requires_demo_mode_before_connecting() {
+    let output = server().arg("seed-demo").output().unwrap();
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "config_invalid\n");
+}
+
+async fn demo_login(app: &axum::Router, password: &str) -> axum::response::Response {
+    support::request(
+        app,
+        "POST",
+        "/api/auth/login",
+        Some(serde_json::json!({
+            "email": "demo@katwork.local", "password": password,
+        })),
+        None,
+    )
+    .await
 }

@@ -227,3 +227,139 @@ async fn duplicate_host_and_origin_headers_are_rejected() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn auth_responses_disable_caching_and_all_responses_disable_referrers() {
+    for (uri, host) in [
+        ("/healthz", "localhost"),
+        ("/missing", "localhost"),
+        ("/api/auth/me", "localhost"),
+        ("/api/auth/login", "evil.example"),
+        ("/api/auth/missing", "localhost"),
+    ] {
+        let response = app()
+            .oneshot(
+                Request::get(uri)
+                    .header("host", host)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers().get("referrer-policy").unwrap(),
+            "no-referrer"
+        );
+        if uri.starts_with("/api/auth/") {
+            assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn request_timeout_finishes_with_408_after_thirty_seconds() {
+    let config = Config::from_lookup(|name| match name {
+        "DATABASE_URL" => Some("postgres://localhost/katwork".into()),
+        "KATWORK_SECRET" => Some(uuid::Uuid::now_v7().to_string()),
+        _ => None,
+    })
+    .unwrap();
+    let router = katwork_server::guards::apply(
+        Router::new().route(
+            "/hang",
+            axum::routing::get(|| async {
+                std::future::pending::<()>().await;
+            }),
+        ),
+        &config,
+    );
+    let start = tokio::time::Instant::now();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(31),
+        router.oneshot(
+            Request::get("/hang")
+                .header("host", "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("request timeout missing")
+    .unwrap();
+    assert_eq!(response.status(), 408);
+    assert_eq!(start.elapsed(), std::time::Duration::from_secs(30));
+    assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+}
+
+#[tokio::test]
+async fn slow_client_body_read_times_out() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        katwork_server::transport::serve(listener, app())
+            .await
+            .unwrap()
+    });
+    let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+    client.write_all(b"POST /api/auth/login HTTP/1.1\r\nHost: localhost\r\nOrigin: https://katwork.example:8443\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{").await.unwrap();
+    let mut response = vec![0; 1024];
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(11),
+        client.read(&mut response),
+    )
+    .await;
+    server.abort();
+    let count = result.expect("slow body never timed out").unwrap();
+    assert!(String::from_utf8_lossy(&response[..count]).starts_with("HTTP/1.1 408"));
+}
+
+#[tokio::test]
+async fn concurrent_request_limit_rejects_overload() {
+    let config = Config::from_lookup(|name| match name {
+        "DATABASE_URL" => Some("postgres://localhost/katwork".into()),
+        "KATWORK_SECRET" => Some(uuid::Uuid::now_v7().to_string()),
+        _ => None,
+    })
+    .unwrap();
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let signal = started.clone();
+    let router = katwork_server::guards::apply(
+        Router::new()
+            .route(
+                "/hang",
+                axum::routing::get(move || {
+                    let signal = signal.clone();
+                    async move {
+                        signal.add_permits(1);
+                        std::future::pending::<()>().await;
+                    }
+                }),
+            )
+            .route("/ok", axum::routing::get(|| async {})),
+        &config,
+    );
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..256 {
+        let router = router.clone();
+        tasks.spawn(
+            router.oneshot(
+                Request::get("/hang")
+                    .header("host", "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+    }
+    let _started = started.acquire_many(256).await.unwrap();
+    let response = router
+        .oneshot(
+            Request::get("/ok")
+                .header("host", "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+}
