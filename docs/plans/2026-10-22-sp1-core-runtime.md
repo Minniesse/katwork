@@ -415,33 +415,33 @@ web/
 - Produces:
   - `#[async_trait] trait ModelProvider: Send + Sync { fn id(&self) -> &str; fn capabilities(&self) -> Capabilities; async fn stream(&self, req: ChatRequest) -> Result<BoxStream<'static, Result<ChatChunk, ModelError>>, ModelError>; }`
   - `ChatRequest { system: String, messages: Vec<ChatMsg>, tools: Vec<ToolSpec>, max_output_tokens: u32, temperature: Option<f32> }` (`Serialize`).
-  - `ChatRequest::input_charge_bound(&self) -> u64`: the byte length of the whole request serialized as JSON: system text, every message and every tool schema, with their JSON framing. Tokenizers that work on UTF-8 bytes (byte-level BPE, and byte-fallback tokenizers) emit at most one token per byte, so this is an upper bound on input tokens even for emoji and Thai, where one character can be several tokens; the JSON framing of each message is longer in bytes than the few framing tokens a provider adds. The model table in `registry.rs` lists only models whose tokenizer has this property.
+  - `ChatRequest::input_charge_bound(&self, tool_prompt_overhead: u64) -> u64`: the byte length of the whole request serialized as JSON, plus `tool_prompt_overhead` when the request has tools (the hidden tool instructions a provider adds; the value comes from the registry entry). The JSON covers system text, every message and every tool schema, with their JSON framing. Tokenizers that work on UTF-8 bytes (byte-level BPE, and byte-fallback tokenizers) emit at most one token per byte, so this is an upper bound on input tokens even for emoji and Thai, where one character can be several tokens; the JSON framing of each message is longer in bytes than the few framing tokens a provider adds. The model table in `registry.rs` lists only models whose tokenizer has this property.
   - System text lives only in `ChatRequest.system`; there is no system role.
   - `enum ChatMsg { User { content: String, name: Option<String> }, Assistant { content: String, tool_calls: Vec<ToolCall>, replay: Option<ProviderReplay> }, Tool { tool_call_id: String, name: String, content: String, is_error: bool } }` (`Serialize`, `Deserialize`)
   - `ToolCall { id: String, name: String, args_json: String }`
   - `ProviderReplay { provider_id: String, version: u32, data: serde_json::Value }`: opaque, versioned provider state, passed back only to the same provider in the same workspace and thread
   - `ToolSpec { name: String, description: String, parameters: serde_json::Value }`, where `parameters` is JSON Schema
-  - `ChatChunk::{TextDelta(String), ToolCall(ToolCall), Usage(Usage), Done { stop: StopKind, turn: AssistantTurn }}`. Text deltas are provisional. `ToolCall` chunks are emitted only after the whole turn is accepted. `turn` is the canonical final turn, never joined deltas.
+  - `ChatChunk::{TextDelta(String), Progress, ToolCall(ToolCall), Usage(Usage), Done { stop: StopKind, turn: AssistantTurn }}`. `Progress` is content the loop does not use: a part starting or ending, a reasoning delta, or a non-empty tool-argument delta. The adapter emits it so the stall timers see that content. Text deltas are provisional. `ToolCall` chunks are emitted only after the whole turn is accepted. `turn` is the canonical final turn, never joined deltas.
   - `AssistantTurn { content: String, tool_calls: Vec<ToolCall>, replay: Option<ProviderReplay> }`
   - `StopKind::{EndTurn, ToolUse, MaxTokens, Refusal, Other(String)}`
   - `Usage { input: Option<u64>, cache_read: Option<u64>, cache_write: Option<u64>, output: Option<u64>, complete: bool }`. Cache counters are subsets of `input`, not extra. A missing count is `None`, never 0.
   - `ModelError::{ProviderUnavailable, ResidencyDenied, Timeout { phase: TimeoutPhase }, RateLimited { retry_after_secs: Option<u64> }, QuotaExceeded { resets_at: Option<DateTime<Utc>> }, AuthFailed, Protocol(String), Other(String)}` and `TimeoutPhase::{FirstChunk, Idle}`. `Protocol` and `Other` hold private diagnostics only; the provider's raw error body never reaches a tenant.
-  - `StreamTimeouts { first_chunk: Duration, idle: Duration }`, default 30 s each
-  - `guard::guard_stream(inner: BoxStream<'static, Result<ChatChunk, ModelError>>, t: StreamTimeouts) -> BoxStream<'static, Result<ChatChunk, ModelError>>`. It times the actual stream polling, not only the opener: a stall yields `Timeout { phase }`. A stream that ends without `Done` yields `Protocol`, and so does `Done { stop: ToolUse }` with no tool call.
+  - `StreamTimeouts { first_chunk: Duration, idle: Duration }`, default 30 s each: `first_chunk` is the time to the first content chunk, and `idle` the longest gap between content chunks
+  - `guard::guard_stream(inner: BoxStream<'static, Result<ChatChunk, ModelError>>, t: StreamTimeouts) -> BoxStream<'static, Result<ChatChunk, ModelError>>`. It times the actual stream polling, not only the opener: a stall yields `Timeout { phase }`. **Only content counts as progress:** a non-empty `TextDelta`, `Progress`, `ToolCall` or `Done`. Raw HTTP bytes, SSE comments, blank lines, empty deltas, unknown events, Anthropic `ping` and `message_start`, and usage-only frames (`Usage`) never reset either timer, so a stream that keeps the connection alive without content still times out. A stream that ends without `Done` yields `Protocol`, and so does `Done { stop: ToolUse }` with no tool call.
   - `Capabilities { tools: bool, residency: Residency, synthetic: bool }` and `Residency::{Local, External}`
   - `TokenPrice { input_micros_per_mtok: u64, output_micros_per_mtok: u64 }`
-  - `ModelEntry { provider_id: String, model: String, tier: ModelTier, capabilities: Capabilities, max_output_tokens: u32, temperature: Option<f32>, price: Option<TokenPrice> }`. Capabilities and residency come from the entry, never from the provider name or base URL. SP1 configures no prices, so `model_calls.cost_micros` stays NULL; cost is only ever computed from usage the provider reported.
+  - `ModelEntry { provider_id: String, model: String, tier: ModelTier, capabilities: Capabilities, max_output_tokens: u32, temperature: Option<f32>, tool_prompt_overhead: u64, price: Option<TokenPrice> }`. Capabilities and residency come from the entry, never from the provider name or base URL. SP1 configures no prices, so `model_calls.cost_micros` stays NULL; cost is only ever computed from usage the provider reported.
   - `Selected { provider: Arc<dyn ModelProvider>, entry: ModelEntry }`
   - `Registry::from_config(&Config) -> Registry` and `Registry::from_entries(Vec<(ModelEntry, Arc<dyn ModelProvider>)>) -> Registry`
   - `Registry::for_tier(&self, tier: ModelTier, space_policy: &SpacePolicy) -> Result<Selected, ModelError>`
   - `FakeTurn::{Chunks(Vec<ChatChunk>), Error(ModelError), Hang, ChunksThenHang(Vec<ChatChunk>)}`
-  - `FakeProvider::scripted(Vec<FakeTurn>) -> FakeProvider` (`Clone`; each `stream` call takes the next turn) and `FakeProvider::received(&self) -> Vec<ChatRequest>`, the requests it got
-  - `FakeProvider::demo() -> FakeProvider`: canned English and Thai replies, `Local`, with `capabilities().synthetic == true`
+  - `FakeProvider::scripted(Vec<FakeTurn>) -> FakeProvider` (`Clone`; each `stream` call takes the next turn) and `FakeProvider::received(&self) -> Vec<ChatRequest>`, the requests it got. Only scripted mode records requests.
+  - `FakeProvider::demo() -> FakeProvider`: canned English and Thai replies, `Local`, with `capabilities().synthetic == true`. It records no requests, because it serves real keyless installs.
   - `HttpLimits { connect: Duration, read: Duration, max_response_bytes: usize, max_error_body_bytes: usize, max_sse_frame_bytes: usize }`, with `HttpLimits::default()` = 10 s, 30 s, 16 MiB, 64 KiB and 1 MiB (initial defaults), and `BoundedHttp::new(limits: HttpLimits) -> Result<BoundedHttp, ModelError>`
   - `OpenAiApi::{Chat, Responses}`, `RigProvider::openai(env: &ProviderEnv, model: &str, api: OpenAiApi) -> Result<RigProvider, ModelError>` and `RigProvider::anthropic(env: &ProviderEnv, model: &str) -> Result<RigProvider, ModelError>`
   - `Core` gains `registry: Arc<Registry>`, built in `Core::new` with `Registry::from_config`, and `Core::with_registry(self, registry: Registry) -> Core` for tests
 - Registry rules:
-  - `from_config` registers each configured provider as `External`: OpenAI through `OpenAiApi::Chat` (chosen explicitly, never detected) and Anthropic, with one model id per tier from a constant table in `registry.rs` (initial defaults, checked at Task 7 start). The same table sets `max_output_tokens` to 2,048 (Fast), 4,096 (Standard) and 8,192 (Strong), and `temperature: None`, meaning the provider's default (initial defaults).
+  - `from_config` registers each configured provider as `External`: OpenAI through `OpenAiApi::Chat` (chosen explicitly, never detected) and Anthropic, with one model id per tier from a constant table in `registry.rs` (initial defaults, checked at Task 7 start). The same table sets `max_output_tokens` to 2,048 (Fast), 4,096 (Standard) and 8,192 (Strong), `temperature: None`, meaning the provider's default, and `tool_prompt_overhead` to 1,024 tokens for each provider (initial defaults).
   - `from_config` never fails. A provider whose constructor returns an error is left out and logged once as `provider_init_failed` with the provider id only (no key, no URL); its tiers then resolve to `ProviderUnavailable`, never to the demo provider.
   - Task 7 also tightens `Config::from_lookup`: `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL`, when set, must parse as `http` or `https` URLs, otherwise `config_invalid` at startup.
   - With no provider keys and `demo`, every tier maps to `FakeProvider::demo()`. With no keys and no demo, `for_tier` returns `ProviderUnavailable`.
@@ -454,6 +454,8 @@ web/
   - provider bytes are decoded with an incremental UTF-8 decoder, never `String::from_utf8` per network chunk
   - Anthropic's opening and closing usage snapshots are merged, never summed
   - a provider tool call with no id gets `kw_call_{index}`; a duplicate id within one turn is `Protocol`
+  - the OpenAI Responses route sends `store: false`, so the provider keeps no stored copy of the conversation
+  - on both OpenAI routes, a `ChatMsg::Tool` with `is_error: true` is sent with the text prefix `Error: `, because neither the Chat nor the Responses encoder has an error field
 
 - [ ] **Step 1: Pin dependencies.** Pin `rig-core = "=0.45.0"` with `default-features = false` and explicit reqwest and rustls features. Pin it explicitly: under resolver 3, which honours `rust-version`, an unpinned add silently resolves to 0.42.0, the newest release that fits the 1.94.0 floor. rig-core 0.45.0 and its sub-crates need Rust 1.97.1, so the same commit raises `rust-version` in `Cargo.toml` and the CI `msrv` job's toolchain to 1.97.1. If the release moves its reqwest transport into a separate crate, pin that crate to the same exact version. Add `reqwest` with the same version requirement that transport declares (for example `0.13`), never a different line, so `Cargo.lock` resolves one reqwest. Then re-run the `msrv` check on the new locked graph at 1.97.1. Add `async-trait`, `futures` and `tracing-subscriber`. In `katwork-server`, initialize tracing from `RUST_LOG`, defaulting to `info,rig=info`, because Rig's `rig::completions` TRACE level logs full prompts.
 - [ ] **Step 2: Write the failing tests** in `crates/katwork/tests/models.rs`:
@@ -466,6 +468,8 @@ web/
   - `stream_without_done_is_protocol_error`
   - `input_charge_bound_covers_multibyte_text`: for `"👋"` and `"ฯ"` repeated, the bound is at least the UTF-8 byte count, which exceeds their published token counts
   - `input_charge_bound_includes_tool_schemas`: adding a 20 KB tool schema raises the bound by at least 20 KB
+  - `input_charge_bound_adds_tool_prompt_overhead_only_with_tools`
+  - `demo_provider_records_no_requests`
   - `tool_use_stop_without_call_is_protocol_error`
 - [ ] **Step 3: Write the failing adapter fixture tests** in `crates/katwork/tests/rig_fixtures.rs`. Each serves recorded provider bytes from `tests/fixtures/models/` through a local HTTP server, offline, with the adapter's base URL pointed at it:
   - `thai_split_mid_codepoint_across_http_chunks_decodes`
@@ -481,6 +485,11 @@ web/
   - `anthropic_error_results_map_to_model_errors`
   - `cancel_during_network_wait_returns_promptly`
   - `unknown_events_are_ignored`
+  - `ping_only_stream_times_out_first_chunk_at_30s`: Anthropic `ping` events and nothing else; paused tokio clock
+  - `comment_only_stream_times_out_first_chunk_at_30s`: SSE `:` comments and nothing else; paused tokio clock
+  - `pings_after_text_time_out_idle`: text, then only pings; `Timeout { phase: Idle }` 30 s after the last text
+  - `responses_route_sends_store_false`: the fixture server checks the request body
+  - `openai_tool_error_results_carry_error_prefix`: on both the Chat and the Responses route
   - `replay_round_trips_to_the_same_provider`
   - `oversized_response_is_rejected_before_decoding`
   - `oversized_error_body_is_capped_before_rig_reads_it`
@@ -603,7 +612,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
     | `Protocol(_)` | no | stop `ModelProtocol` |
     | `ResidencyDenied` | no | stop `ResidencyDenied` |
 
-  - **Token budget.** Each attempt is charged the reported input plus output when both counts are present. A missing output count is charged as that request's `max_output_tokens`; a missing input count as `ChatRequest::input_charge_bound()` of that request (Task 7). The charge goes to `model_calls.charged_tokens`, while the reported counts stay NULL when missing. Once the run's charged total reaches `max_total_tokens`, the run stops `TokenBudget` before the next attempt.
+  - **Token budget.** Each attempt is charged the reported input plus output when both counts are present. A missing output count is charged as that request's `max_output_tokens`; a missing input count as `ChatRequest::input_charge_bound(entry.tool_prompt_overhead)` of that request (Task 7). The charge goes to `model_calls.charged_tokens`, while the reported counts stay NULL when missing. Once the run's charged total reaches `max_total_tokens`, the run stops `TokenBudget` before the next attempt.
   - **Turn validation before dispatch.** Only an `EndTurn` or `ToolUse` turn can dispatch tools. Errored, aborted, filtered or unknown turn endings, malformed arguments and unfinished calls never execute. A `MaxTokens` turn keeps its partial text as `final_text`, stops `OutputTruncated`, and runs none of its tool calls.
   - **Allowlist at call time.** Each call resolves the tool from `dot.tool_allowlist ∩ ToolRegistry`; anything else gets a `ToolError::NotAllowed` error result.
   - **Authority before every model attempt and every tool dispatch.** The loop runs `guards::authorize`; a returned stop reason ends the run before that model call or tool runs.
