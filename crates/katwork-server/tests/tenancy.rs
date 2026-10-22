@@ -111,6 +111,19 @@ async fn member_cannot_create_space_admin_can(pool: PgPool) {
     let cookie = cookie(&login(&app, &password).await);
     let path = format!("/api/workspaces/{workspace_id}/spaces");
     membership(&pool, workspace_id, id, "member").await;
+    for payload in [
+        json!({"name": "Missing policy"}),
+        json!({"name": "Null policy", "allow_external": null}),
+        json!({"name": "Wrong type", "allow_external": "false"}),
+        json!({}),
+    ] {
+        assert_code(
+            request(&app, "POST", &path, Some(payload), Some(&cookie)).await,
+            403,
+            "forbidden",
+        )
+        .await;
+    }
     assert_code(
         request(
             &app,
@@ -192,7 +205,8 @@ async fn create_space_without_policy_is_422(pool: PgPool) {
 
 #[sqlx::test(migrations = "../katwork/migrations")]
 async fn seed_demo_space_allows_external(pool: PgPool) {
-    let config = config(None);
+    let mut config = config(None);
+    config.demo = true;
     auth::seed_demo(&pool, &config, false).await.unwrap();
     auth::seed_demo(&pool, &config, false).await.unwrap();
     let spaces: Vec<(String, bool)> = sqlx::query_as("SELECT s.name, s.allow_external FROM spaces s JOIN memberships m ON m.workspace_id = s.workspace_id JOIN users u ON u.id = m.user_id WHERE u.email = 'demo@katwork.local'")
@@ -474,4 +488,308 @@ async fn workspace_creation_rolls_back_without_valid_owner(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(count, 0);
+}
+
+async fn assert_invalid_name(pool: &PgPool, name: &str) {
+    let (id, password) = user(pool).await;
+    let own = workspace(pool, "Own").await;
+    membership(pool, own, id, "owner").await;
+    let app = app(pool, None);
+    let cookie = cookie(&login(&app, &password).await);
+    for path in [
+        "/api/workspaces".to_owned(),
+        format!("/api/workspaces/{own}/spaces"),
+    ] {
+        assert_code(
+            request(
+                &app,
+                "POST",
+                &path,
+                Some(json!({"name": name, "allow_external": false})),
+                Some(&cookie),
+            )
+            .await,
+            400,
+            "request_invalid",
+        )
+        .await;
+    }
+    let counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM workspaces), (SELECT count(*) FROM memberships), (SELECT count(*) FROM spaces)",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(counts, (1, 1, 0));
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn empty_names_are_rejected(pool: PgPool) {
+    assert_invalid_name(&pool, "").await;
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn whitespace_only_names_are_rejected(pool: PgPool) {
+    assert_invalid_name(&pool, "  \u{2003}  ").await;
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn names_over_120_characters_are_rejected(pool: PgPool) {
+    assert_invalid_name(&pool, &"界".repeat(121)).await;
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn nul_names_are_rejected(pool: PgPool) {
+    assert_invalid_name(&pool, "Office\0").await;
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn control_characters_in_names_are_rejected(pool: PgPool) {
+    assert_invalid_name(&pool, "\nOffice\u{0085}").await;
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn names_are_trimmed_and_allow_120_unicode_characters(pool: PgPool) {
+    let (id, password) = user(&pool).await;
+    let own = workspace(&pool, "Own").await;
+    membership(&pool, own, id, "owner").await;
+    let app = app(&pool, None);
+    let cookie = cookie(&login(&app, &password).await);
+    let name = "界".repeat(120);
+    for path in [
+        "/api/workspaces".to_owned(),
+        format!("/api/workspaces/{own}/spaces"),
+    ] {
+        let response = request(
+            &app,
+            "POST",
+            &path,
+            Some(json!({"name": format!("  {name}\u{2003} "), "allow_external": false})),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(response.status(), 201);
+        let created = body(response).await["id"].clone();
+        let response = request(&app, "GET", &path, None, Some(&cookie)).await;
+        assert_eq!(response.status(), 200);
+        let rows = body(response).await;
+        let stored = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == created)
+            .unwrap();
+        assert_eq!(stored["name"], name);
+    }
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn removed_membership_denies_every_tenant_route_on_next_request(pool: PgPool) {
+    let (id, password) = user(&pool).await;
+    let own = workspace(&pool, "Own").await;
+    membership(&pool, own, id, "admin").await;
+    let app = app(&pool, None);
+    let cookie = cookie(&login(&app, &password).await);
+    for removed in [false, true] {
+        if removed {
+            sqlx::query("DELETE FROM memberships WHERE workspace_id = $1 AND user_id = $2")
+                .bind(own)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        for (method, suffix, payload, status) in [
+            ("GET", "spaces", None, 200),
+            (
+                "POST",
+                "spaces",
+                Some(json!({"name": "Office", "allow_external": false})),
+                201,
+            ),
+            ("PUT", "paused", Some(json!({"paused": !removed})), 200),
+        ] {
+            let response = request(
+                &app,
+                method,
+                &format!("/api/workspaces/{own}/{suffix}"),
+                payload,
+                Some(&cookie),
+            )
+            .await;
+            if removed {
+                assert_code(response, 404, "not_found").await;
+            } else {
+                assert_eq!(response.status(), status);
+            }
+        }
+    }
+    let stored: (bool, i64) = sqlx::query_as("SELECT paused, (SELECT count(*) FROM spaces WHERE workspace_id = $1) FROM workspaces WHERE id = $1")
+        .bind(own).fetch_one(&pool).await.unwrap();
+    assert_eq!(stored, (true, 1));
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn downgraded_admin_cannot_write_on_next_request(pool: PgPool) {
+    let (id, password) = user(&pool).await;
+    let own = workspace(&pool, "Own").await;
+    let app = app(&pool, None);
+    let cookie = cookie(&login(&app, &password).await);
+    for role in ["admin", "member"] {
+        membership(&pool, own, id, role).await;
+        for (method, suffix, payload, status) in [
+            (
+                "POST",
+                "spaces",
+                json!({"name": "Office", "allow_external": false}),
+                201,
+            ),
+            ("PUT", "paused", json!({"paused": role == "admin"}), 200),
+        ] {
+            let response = request(
+                &app,
+                method,
+                &format!("/api/workspaces/{own}/{suffix}"),
+                Some(payload),
+                Some(&cookie),
+            )
+            .await;
+            if role == "member" {
+                assert_code(response, 403, "forbidden").await;
+            } else {
+                assert_eq!(response.status(), status);
+            }
+        }
+    }
+    let response = request(
+        &app,
+        "GET",
+        &format!("/api/workspaces/{own}/spaces"),
+        None,
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(body(response).await.as_array().unwrap().len(), 1);
+    let paused: bool = sqlx::query_scalar("SELECT paused FROM workspaces WHERE id = $1")
+        .bind(own)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(paused);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn admin_role_does_not_carry_to_another_workspace(pool: PgPool) {
+    let (id, password) = user(&pool).await;
+    let own = workspace(&pool, "Own").await;
+    let other = workspace(&pool, "Other").await;
+    membership(&pool, own, id, "admin").await;
+    membership(&pool, other, id, "member").await;
+    let app = app(&pool, None);
+    let cookie = cookie(&login(&app, &password).await);
+    for workspace_id in [own, other] {
+        for (method, suffix, payload, status) in [
+            (
+                "POST",
+                "spaces",
+                json!({"name": "Office", "allow_external": false}),
+                201,
+            ),
+            ("PUT", "paused", json!({"paused": true}), 200),
+        ] {
+            let response = request(
+                &app,
+                method,
+                &format!("/api/workspaces/{workspace_id}/{suffix}"),
+                Some(payload),
+                Some(&cookie),
+            )
+            .await;
+            if workspace_id == other {
+                assert_code(response, 403, "forbidden").await;
+            } else {
+                assert_eq!(response.status(), status);
+            }
+        }
+    }
+    let stored: (bool, i64) = sqlx::query_as("SELECT paused, (SELECT count(*) FROM spaces WHERE workspace_id = $1) FROM workspaces WHERE id = $1")
+        .bind(other).fetch_one(&pool).await.unwrap();
+    assert_eq!(stored, (false, 0));
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn tenant_extractor_rejects_missing_or_misnamed_capture(pool: PgPool) {
+    use axum::{Router, routing::get};
+    use katwork::{runtime::Core, tenancy::Tenant};
+    use katwork_server::app::AppState;
+    use std::sync::Arc;
+    let (id, password) = user(&pool).await;
+    let own = workspace(&pool, "Own").await;
+    membership(&pool, own, id, "owner").await;
+    let cookie = cookie(&login(&app(&pool, None), &password).await);
+    for (route, path) in [
+        ("/probe", "/probe".to_owned()),
+        ("/probe/{id}", format!("/probe/{own}")),
+        ("/probe/{workspaceId}", format!("/probe/{own}")),
+    ] {
+        let router = Router::new()
+            .route(route, get(|_: Tenant| async { "authorized" }))
+            .with_state(AppState {
+                core: Arc::new(Core::new(pool.clone(), Arc::new(config(None)))),
+            });
+        assert_code(
+            request(&router, "GET", &path, None, Some(&cookie)).await,
+            400,
+            "request_invalid",
+        )
+        .await;
+    }
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn workspace_id_in_body_cannot_override_path(pool: PgPool) {
+    let (id, password) = user(&pool).await;
+    let own = workspace(&pool, "Own").await;
+    let other = workspace(&pool, "Other").await;
+    membership(&pool, own, id, "owner").await;
+    let app = app(&pool, None);
+    let cookie = cookie(&login(&app, &password).await);
+    let response = request(
+        &app,
+        "POST",
+        &format!("/api/workspaces/{own}/spaces"),
+        Some(json!({"name": "Office", "allow_external": false, "workspace_id": other})),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(response.status(), 201);
+    let created: Uuid = serde_json::from_value(body(response).await["id"].clone()).unwrap();
+    let stored: Uuid = sqlx::query_scalar("SELECT workspace_id FROM spaces WHERE id = $1")
+        .bind(created)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, own);
+    let response = request(
+        &app,
+        "PUT",
+        &format!("/api/workspaces/{own}/paused"),
+        Some(json!({"paused": true, "workspace_id": other})),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let rows: Vec<(Uuid, bool)> = sqlx::query_as("SELECT id, paused FROM workspaces ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(own, true), (other, false)]);
+    let other_spaces: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM spaces WHERE workspace_id = $1")
+            .bind(other)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(other_spaces, 0);
 }

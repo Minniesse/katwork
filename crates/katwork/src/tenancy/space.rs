@@ -18,6 +18,7 @@ pub async fn create(
     policy: SpacePolicy,
 ) -> Result<SpaceId, KatError> {
     tenant.require_admin()?;
+    let name = super::validate_name(name)?;
     let id = SpaceId::new();
     sqlx::query(
         "INSERT INTO spaces (id, workspace_id, name, allow_external) VALUES ($1, $2, $3, $4)",

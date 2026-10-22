@@ -65,6 +65,7 @@ pub(crate) async fn create_space(
     tenant: Tenant,
     body: Result<Json<NewSpace>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    tenant.require_admin()?;
     let body = payload(body)?;
     let policy = SpacePolicy {
         allow_external: body.allow_external.ok_or(KatError::SpacePolicyRequired)?,

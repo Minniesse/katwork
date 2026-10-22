@@ -16,6 +16,7 @@ pub struct WorkspaceSummary {
 }
 
 pub async fn create(pool: &PgPool, name: &str, owner: UserId) -> Result<WorkspaceId, KatError> {
+    let name = super::validate_name(name)?;
     let id = WorkspaceId::new();
     let mut tx = pool.begin().await?;
     sqlx::query("INSERT INTO workspaces (id, name) VALUES ($1, $2)")
