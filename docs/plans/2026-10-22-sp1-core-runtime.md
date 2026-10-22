@@ -85,6 +85,7 @@ crates/katwork/
   src/ids.rs                    typed UUIDv7 ids, EventSeq, LeaseEpoch
   src/types.rs                  shared domain types (ModelTier, SpacePolicy, Locale, DotStatus, SideEffect, ReasonCode)
   src/runtime.rs                Core
+  src/fence.rs                  Fence: the lease check inside every run-scoped write
   src/db.rs                     pool + migrate
   src/auth/{mod,password,session,reset,mailer}.rs
   src/tenancy/{mod,workspace,space}.rs
@@ -152,7 +153,7 @@ web/
 ### Task 2: Schema, typed ids, shared types and `Core`
 
 **Files:**
-- Create: `crates/katwork/migrations/0001_init.sql`, `crates/katwork/src/{ids.rs,types.rs,db.rs,runtime.rs}`, `crates/katwork/tests/schema.rs`, `crates/katwork-server/src/error.rs`
+- Create: `crates/katwork/migrations/0001_init.sql`, `crates/katwork/src/{ids.rs,types.rs,db.rs,runtime.rs,fence.rs}`, `crates/katwork/tests/schema.rs`, `crates/katwork-server/src/error.rs`
 - Modify: `Cargo.toml`, `Cargo.lock`, `crates/katwork/{Cargo.toml,src/lib.rs,src/error.rs}`, `crates/katwork-server/src/{app.rs,main.rs}`, `crates/katwork-server/tests/{health.rs,cli.rs}`, `.github/workflows/ci.yml`
 
 **Interfaces:**
@@ -167,6 +168,7 @@ web/
   - `types::SideEffect::{Read, Navigate, WorkspaceRead, Draft, WorkspaceWrite, Exec, CredentialUse, Destructive, Outward(OutwardKind)}` and `types::OutwardKind::{Send, Publish, Pay, Share, ExternalApi}`, with `SideEffect::wire(&self) -> &'static str` giving `read, navigate, workspace_read, draft, workspace_write, exec, credential_use, destructive, outward_send, outward_publish, outward_pay, outward_share, outward_external_api`
   - `types::ReasonCode` with `wire(&self) -> &'static str` and `ReasonCode::ALL`: `provider_unavailable, provider_rate_limited, provider_quota, provider_auth_failed, model_protocol_error, time_limit, quota_exceeded, workspace_paused, step_limit, token_budget, output_truncated, loop_detected, policy_changed, approval_pending, question_pending, interrupted_review_required, dot_paused, retries_exhausted, cancelled, lease_lost`. Each value is a job `reason`, a notice body or a `RUN_ERROR` code, and has a message in both locales (Task 13).
   - `db::connect(url: &str) -> Result<PgPool, KatError>` and `db::migrate(pool: &PgPool) -> Result<(), KatError>`
+  - `fence::Fence { task_id: TaskId, epoch: LeaseEpoch }` and `fence::check(conn: &mut PgConnection, f: &Fence) -> Result<(), KatError>`. Run inside the caller's write transaction, it selects the task joined to its lease where `tasks.state = 'leased'`, `tasks.lease_epoch` and `task_leases.lease_epoch` both equal `f.epoch`, and `expires_at > now()`, taking `FOR SHARE OF tasks`; no row is `lease_lost`. The share lock lasts until the write commits. Claim, cancel and every terminal transition take `FOR UPDATE` on the task row, so they wait for an in-flight fenced write, and any write after them fails the check.
   - `runtime::Core { pool: PgPool, config: Arc<Config> }` and `Core::new(pool: PgPool, config: Arc<Config>) -> Core`. Task 7 adds `registry: Arc<Registry>` and Task 9 adds `events: EventHub`; both are filled inside `Core::new`, so its signature never changes.
   - `katwork_server::app::AppState { core: Arc<Core> }`
   - `katwork_server::error::ApiError(pub KatError)` with `From<KatError>` and `IntoResponse`: the body is `{"code": e.code()}` and the status comes from one `match` that each later task extends
@@ -204,6 +206,7 @@ web/
   - `tool_call_unique_per_run_step_call`
   - `client_msg_id_unique_per_thread_and_author`
   - `job_request_message_is_unique`: a second job for the same `request_message_id` errors
+  - `fence_check_fails_after_epoch_or_state_change`: passes for the live lease; fails after the epoch is incremented, after the task leaves `leased`, and after `expires_at` passes
   - `missing_usage_is_stored_as_null`
   - `space_allow_external_has_no_default`: an insert without `allow_external` errors
   - `side_effect_wire_values_pass_the_schema_check`: every `SideEffect::wire` value inserts into `tool_calls.side_effect`, and `'shell'` is rejected
@@ -455,7 +458,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 - Modify: `crates/katwork/src/runtime.rs`, `Cargo.toml` (`unicode-segmentation`)
 
 **Interfaces:**
-- Consumes: `Tenant`, `thread::get`, ids, `types::{SideEffect, ReasonCode}`, `Core`.
+- Consumes: `Tenant`, `thread::get`, ids, `types::{SideEffect, ReasonCode}`, `fence::{Fence, check}`, `Core`.
 - Produces:
   - `enum AgUiEvent`: KatWork's own serde types for AG-UI protocol 1.0, covering only the events KatWork emits (ADR-0003). Serialized with `#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]` and camelCase fields. Variants: `RunStarted{threadId,runId}`, `TextMessageStart{messageId,role}`, `TextMessageContent{messageId,delta}`, `TextMessageEnd{messageId}`, `ToolCallStart{toolCallId,toolCallName,parentMessageId}`, `ToolCallArgs{toolCallId,delta}`, `ToolCallEnd{toolCallId}`, `ToolCallResult{messageId,toolCallId,content}`, `RunFinished{threadId,runId}`, `RunError{message,code}`, `Custom{name,value}`.
   - Ids: `threadId` and `runId` are KatWork's. `toolCallId` is the `ToolCallRecordId`, so a provider id reused in a later step stays distinct. `TextMessageStart.messageId` equals the stored reply's `MessageId`. `TOOL_CALL_END` means the arguments are complete; `TOOL_CALL_RESULT` means execution is complete.
@@ -470,7 +473,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `log::since(pool, &Tenant, ThreadId, after: EventSeq) -> Result<Vec<(EventSeq, AgUiEvent)>, KatError>`
   - `EventHub` (`Clone`): `EventHub::new() -> EventHub`, `subscribe(&self, ThreadId) -> tokio::sync::broadcast::Receiver<EventSeq>` and `notify(&self, ThreadId, EventSeq)`. The broadcast is only a wake-up; the log is the truth.
   - `#[async_trait] trait EventSink: Send + Sync { async fn emit(&self, e: AgUiEvent) -> Result<EventSeq, KatError>; }`
-  - `PgEventSink::new(pool: PgPool, hub: EventHub, workspace_id: WorkspaceId, thread_id: ThreadId, run_id: Option<RunId>) -> PgEventSink`: each `emit` commits `log::append` in its own transaction and only then calls `hub.notify`
+  - `PgEventSink::new(pool: PgPool, hub: EventHub, workspace_id: WorkspaceId, thread_id: ThreadId, run_id: Option<RunId>, fence: Option<Fence>) -> PgEventSink`: each `emit` runs, in its own transaction, `fence::check` (when `fence` is set) and then `log::append`, commits, and only then calls `hub.notify`. A failed check returns `lease_lost` and writes nothing, so a worker whose lease was reclaimed or cancelled cannot add events after the harness closed its run.
   - `DeltaCoalescer::new() -> DeltaCoalescer`, `push(&mut self, delta: &str, now: Instant) -> Option<String>` and `finish(&mut self) -> Option<String>`: it buffers text deltas and releases them at ≥100 ms or ≥512 bytes, cut only at a grapheme-cluster boundary (`unicode-segmentation`)
   - `Core` gains `events: EventHub`, built in `Core::new`
   - Route `GET /api/workspaces/{workspace_id}/threads/{thread_id}/events`: SSE with `id:` set to the per-thread `EventSeq`. It subscribes to the hub first, then replays `since(Last-Event-ID or 0)`, then on each wake-up reads `since(last sent)` from the log. It drops any event with `seq ≤` the last one sent, re-reads from the log when the receiver lags, and sends a `:` comment keep-alive every 15 s.
@@ -479,6 +482,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `events_serialize_as_agui_json`: `TextMessageContent` → `{"type":"TEXT_MESSAGE_CONTENT","messageId":"…","delta":"…"}`
   - `agui_fixtures_match_protocol_1_0`: every emitted variant round-trips against the protocol JSON in `tests/fixtures/agui/`
   - `concurrent_appenders_never_skip_on_resume`: two tasks append to one thread at once, and a reader resuming at any seq sees every event
+  - `fenced_sink_rejects_writes_after_epoch_change`: after the task's epoch is incremented, `emit` returns `lease_lost` and the log is unchanged
   - `thai_delta_never_splits_a_grapheme_cluster`: `"ที่นี่สวัสดีครับ 👋🏽"` pushed in every split; every released chunk ends on a grapheme boundary, and the concatenation is byte-equal
 - [ ] **Step 2: Write the failing route tests** in `crates/katwork-server/tests/events.rs`, reading the response as raw bytes, never `String`s:
   - `reconnect_with_last_event_id_has_no_gap_or_duplicate`: Review Focus 3
@@ -500,13 +504,14 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 - Modify: `Cargo.toml` (`tokio-util`)
 
 **Interfaces:**
-- Consumes: `Registry`, `Selected`, `ModelProvider`, `ChatRequest`, `ChatMsg`, `ChatChunk`, `ToolSpec`, `ModelError`, `StreamTimeouts`, `guard_stream` (Task 7); `EventSink`, `AgUiEvent`, `KatworkEvent`, `DotState`, `DeltaCoalescer` (Task 9); `Dot`, `Dot::config_hash` (Task 5); `Tenant` (Task 4); ids and `types::{SideEffect, SpacePolicy}` (Task 2).
+- Consumes: `fence::{Fence, check}` (Task 2); `Registry`, `Selected`, `ModelProvider`, `ChatRequest`, `ChatMsg`, `ChatChunk`, `ToolSpec`, `ModelError`, `StreamTimeouts`, `guard_stream` (Task 7); `EventSink`, `AgUiEvent`, `KatworkEvent`, `DotState`, `DeltaCoalescer` (Task 9); `Dot`, `Dot::config_hash` (Task 5); `Tenant` (Task 4); ids and `types::{SideEffect, SpacePolicy}` (Task 2).
 - Produces:
   - `#[async_trait] trait Tool: Send + Sync { fn spec(&self) -> ToolSpec; fn side_effect(&self) -> SideEffect; async fn call(&self, ctx: &ToolCtx, args: serde_json::Value) -> Result<String, ToolError>; }`
   - `ToolCtx { tenant: Tenant, thread_id: ThreadId, dot_id: DotId, job_id: JobId, task_id: TaskId, run_id: RunId, step: u32, tool_call_id: String, idempotency_key: String, lease_epoch: LeaseEpoch, actor: UserId, initiator: Initiator, computer: Option<ComputerHandle>, pool: PgPool, cancel: CancellationToken }`
     - `idempotency_key` is `"{run_id}:{step}:{tool_call_id}"`
     - `computer` is always `None` in SP1; `ComputerHandle` is an empty placeholder struct
     - tenant authority and the pool never appear in model-visible arguments
+    - `ToolCtx::fence(&self) -> Fence` gives `{task_id, lease_epoch}`; every tool write runs `fence::check` inside its own write transaction
   - `Initiator::{Person, Routine, Handoff, System}` (`Serialize`, `Deserialize`)
   - `ToolError::{NotAllowed, NeedsApproval, InvalidArgs(String), Failed(String), Timeout, OutcomeUnknown}`
   - `ToolRegistry::new() -> ToolRegistry`, `register(&mut self, tool: Arc<dyn Tool>)`, `get(&self, id: &str) -> Option<Arc<dyn Tool>>` and `ToolRegistry::builtin() -> ToolRegistry`
@@ -524,10 +529,10 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `guards::canonical_args(args: &serde_json::Value) -> String`: object keys sorted and whitespace normalized; array order and values kept
   - `guards::RepeatKey { tool_name: String, canonical_args: String, target_revision: Option<String> }`, where `target_revision` is always `None` in SP1 (SP2 fills it so a render after each edit is not a loop), and `guards::RepeatGuard::new(limit: u32, window: (u32, u32))` with `check(&mut self, key: &RepeatKey) -> bool`, false meaning stop before this call. The provider's call id is never part of the key.
   - `guards::truncate_result(text: &str, max_scalars: usize) -> String`: at most `max_scalars` Unicode scalar values, the marker `"…[truncated]"` included. A JSON result over the cap becomes a plain-string preview prefixed `"[JSON truncated] "`, never cut inside its structure.
-  - `ledger::start_tool_call(pool, ctx: &ToolCtx, name: &str, side_effect: SideEffect, args_sha256: &str) -> Result<ToolCallRecordId, KatError>`: inserts a `started` row. The first row whose `side_effect` is not `read` also sets `tasks.effects_started_at`, in the same transaction. A stale `lease_epoch` is `lease_lost`.
-  - `ledger::end_tool_call(pool, id: ToolCallRecordId, state: ToolCallState, result: Option<&str>) -> Result<(), KatError>`
-  - `ledger::check_epoch(conn: &mut PgConnection, TaskId, LeaseEpoch) -> Result<(), KatError>`: every tool that writes runs it inside its own write transaction, so a stale epoch is rejected
-  - `ledger::record_model_call(pool, row: &ModelCallRow) -> Result<ModelCallId, KatError>`, where `ModelCallRow` mirrors the `model_calls` columns
+  - `ledger::start_tool_call(pool, ctx: &ToolCtx, name: &str, side_effect: SideEffect, args_sha256: &str) -> Result<ToolCallRecordId, KatError>`: inserts a `started` row. The first row whose `side_effect` is not `read` also sets `tasks.effects_started_at`, in the same transaction.
+  - `ledger::end_tool_call(pool, fence: &Fence, id: ToolCallRecordId, state: ToolCallState, result: Option<&str>) -> Result<(), KatError>`
+  - `ledger::record_model_call(pool, fence: &Fence, row: &ModelCallRow) -> Result<ModelCallId, KatError>`, where `ModelCallRow` mirrors the `model_calls` columns
+  - Fencing: every run-scoped write (the `runs` row, each ledger function, each event through the fenced `PgEventSink`, each tool write) runs `fence::check` in the same transaction as the write, and `lease_lost` aborts it. Before each model attempt the loop also runs `fence::check`, so a reclaimed or cancelled worker makes no further model calls. On `lease_lost` the loop stops at once and writes nothing further.
 - Loop rules:
   - **Steps.** A step is one model attempt, retries included. An answer on attempt 24 is accepted; a tool batch that would need attempt 25 is not executed (`StepLimit`).
   - **Model attempts.** Each attempt calls `models.for_tier(dot.model_tier, &input.space_policy)`, so a provider change re-checks residency, and wraps the stream in `guard_stream`, raced against `input.deadline` (`TimeLimit`). It retries only before the first chunk, at most `model_retries` times. Every attempt gets one `model_calls` row and one `katwork.usage` event.
@@ -562,6 +567,8 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `tool_result_truncated_to_8000_scalars_including_marker_thai`: includes a long single-line Thai string
   - `tool_timeout_60s_returns_error_result`: paused tokio clock
   - `timed_out_tool_cannot_write_afterwards`
+  - `old_worker_cannot_emit_text_after_reclaim`: the run's lease is reclaimed mid-stream; its next text event fails with `lease_lost`, nothing more is logged, and no further model attempt starts
+  - `old_worker_cannot_commit_tool_write_after_reclaim`: a test tool blocks, the lease is reclaimed, then the tool resumes; its write transaction fails `fence::check` and commits nothing
   - `cancellation_token_stops_with_cancelled`
   - `no_done_after_cancellation`: no `RUN_FINISHED` and no text event after the cancel
   - `ask_user_ends_run_needs_input`: `pending_question` is set and `final_text` is `None`
@@ -656,13 +663,14 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 
     Because each no-run branch moves the task to a terminal state and finishes its job in the same transaction, a repeated poll never finishes the same job twice.
   - `ClaimedTask { task_id: TaskId, job_id: JobId, dot_id: DotId, workspace_id: WorkspaceId, thread_id: ThreadId, requested_by: UserId, input: TaskInput, attempts: i32, lease_epoch: LeaseEpoch, kind: RunKind, deadline_at: DateTime<Utc> }`, where `deadline_at = min(task created_at + task_deadline, job created_at + job_deadline)`, computed in SQL
-  - `HeartbeatStatus::{Continue, Stop(StopReason)}` and `lease::heartbeat(pool, task_id: TaskId, worker_id: &str, epoch: LeaseEpoch, ttl: Duration) -> Result<HeartbeatStatus, KatError>`: `Stop(WorkspacePaused)` once the workspace is paused. A task that is no longer leased under this epoch (reclaimed, cancelled or finished by the harness) is `lease_lost`.
-  - `lease::complete(core: &Core, task_id: TaskId, worker_id: &str, epoch: LeaseEpoch, facts: RunFacts) -> Result<(), KatError>`: a task that is no longer leased under this epoch is `lease_lost`, and the worker drops its facts, because whoever ended the lease (reclaim or cancel) already closed the run. Otherwise, in one transaction: `job::conclude` (with `idem_key` = the task id); the task state (`done`, or `interrupted` for `WorkspacePaused`) and `pending_tool_call`; the lease release. Then it commits and notifies the hub.
+  - `HeartbeatStatus::{Continue, Stop(StopReason)}` and `lease::heartbeat(pool, task_id: TaskId, worker_id: &str, epoch: LeaseEpoch, ttl: Duration) -> Result<HeartbeatStatus, KatError>`: renews `expires_at = now() + ttl` only while `fence::check` passes, so an expired lease is never revived; `Stop(WorkspacePaused)` once the workspace is paused. A task that is no longer leased under this epoch (reclaimed, cancelled or finished by the harness) is `lease_lost`.
+  - `lease::complete(core: &Core, task_id: TaskId, worker_id: &str, epoch: LeaseEpoch, facts: RunFacts) -> Result<(), KatError>`: it runs `fence::check` first in its transaction; a task that is no longer leased under this epoch is `lease_lost`, and the worker drops its facts, because whoever ended the lease (reclaim or cancel) already closed the run. Otherwise, in one transaction: `job::conclude` (with `idem_key` = the task id); the task state (`done`, or `interrupted` for `WorkspacePaused`) and `pending_tool_call`; the lease release. Then it commits and notifies the hub.
   - `worker::spawn_pool(core: Arc<Core>, n: usize, ttl: Duration) -> JoinSet<()>`. Each worker:
     - polls `claim` (every 1 s when idle)
     - builds the `Tenant` with `tenancy::resolve(&core.pool, requested_by, workspace_id)`, loads the Dot and the thread's Space policy, and creates a `PgEventSink` for a new `RunId`
     - runs `run::execute` with `Limits::default()`, `ToolRegistry::builtin()`, `core.registry`, `reply_message_id = MessageId::new()` and `deadline = min(now + run_wall_clock, deadline_at)`
-    - heartbeats every `ttl / 3`; on `Stop(reason)` it cancels the run and sets `facts.stop = Some(reason)`; on `lease_lost` it cancels the run and drops its facts
+    - creates its `PgEventSink` with `fence = Some(Fence { task_id, epoch })`
+    - heartbeats every `ttl / 3`; on `Stop(reason)` it cancels the run and sets `facts.stop = Some(reason)`. It cancels the run and drops its facts on `lease_lost`, on a failed renewal, or as soon as the last successful renewal is older than `ttl`.
     - finishes with `lease::complete`
   - TTL defaults to 60 s, with a heartbeat every 20 s.
 
@@ -680,6 +688,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `simultaneous_claims_for_one_dot_dispatch_once`: two workers claim two different tasks of one Dot (`max_concurrency = 1`) at the same moment behind a barrier; exactly one lease is granted and the other task gets `dot_busy`
   - `expired_lease_does_not_block_reclaim_at_max_concurrency_one`: the Dot's only task has an expired lease; it is reclaimed rather than held as `dot_busy`
   - `paused_workspace_claims_nothing`
+  - `worker_cancels_run_when_renewal_fails`: heartbeats start failing; the run is cancelled within `ttl`, before the lease can be reclaimed
   - `pausing_workspace_interrupts_running_task`: the task ends `interrupted` and the job `stopped/workspace_paused`
   - `task_past_deadline_finishes_time_limit`
 - [ ] **Step 2: Run** `cargo test -p katwork --test leases`. Expected: FAIL.
