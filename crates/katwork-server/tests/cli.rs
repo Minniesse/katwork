@@ -13,11 +13,6 @@ fn server() -> Command {
 }
 
 #[test]
-fn maintenance_commands_are_stubs() {
-    assert!(server().arg("seed-demo").status().unwrap().success());
-}
-
-#[test]
 fn rejects_unknown_commands_and_extra_arguments() {
     for args in [vec!["unknown"], vec!["migrate", "unexpected"]] {
         let output = server().args(args).output().unwrap();
@@ -64,6 +59,7 @@ fn serve_reports_database_cause_without_password() {
     ] {
         let output = server()
             .arg("serve")
+            .env("RUST_LOG", "trace")
             .env("DATABASE_URL", url)
             .output()
             .unwrap();
@@ -198,4 +194,95 @@ async fn migrate_command_applies_schema(pool: sqlx::PgPool) {
         .await
         .unwrap();
     assert_eq!(count, 0);
+}
+
+fn database_url(pool: &sqlx::PgPool) -> String {
+    sqlx::ConnectOptions::to_url_lossy(pool.connect_options().as_ref()).to_string()
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn seed_demo_creates_demo_user_and_workspace(pool: sqlx::PgPool) {
+    let password = uuid::Uuid::now_v7().to_string();
+    for _ in 0..2 {
+        let output = server()
+            .arg("seed-demo")
+            .env("DATABASE_URL", database_url(&pool))
+            .env("KATWORK_DEMO_PASSWORD", &password)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(&password));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(&password));
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM memberships m JOIN users u ON u.id = m.user_id JOIN workspaces w ON w.id = m.workspace_id WHERE u.email = 'demo@katwork.local' AND m.role = 'owner'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(count, 1);
+    let hash: String =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE email = 'demo@katwork.local'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    use argon2::PasswordVerifier;
+    assert!(
+        argon2::Argon2::default()
+            .verify_password(
+                password.as_bytes(),
+                &argon2::PasswordHash::new(&hash).unwrap()
+            )
+            .is_ok()
+    );
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn seed_demo_reset_password_allows_login(pool: sqlx::PgPool) {
+    let first = server()
+        .arg("seed-demo")
+        .env("DATABASE_URL", database_url(&pool))
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let first_password = String::from_utf8(first.stdout).unwrap().trim().to_owned();
+    assert!(first_password.len() >= 32);
+    let second = server()
+        .arg("seed-demo")
+        .env("DATABASE_URL", database_url(&pool))
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    assert!(second.stdout.is_empty());
+    let password = uuid::Uuid::now_v7().to_string();
+    let reset = server()
+        .args(["seed-demo", "--reset-password"])
+        .env("DATABASE_URL", database_url(&pool))
+        .env("KATWORK_DEMO_PASSWORD", &password)
+        .output()
+        .unwrap();
+    assert!(reset.status.success());
+    assert_eq!(String::from_utf8(reset.stdout).unwrap().trim(), password);
+    let hash: String =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE email = 'demo@katwork.local'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    use argon2::PasswordVerifier;
+    assert!(
+        argon2::Argon2::default()
+            .verify_password(
+                password.as_bytes(),
+                &argon2::PasswordHash::new(&hash).unwrap()
+            )
+            .is_ok()
+    );
+    assert!(
+        argon2::Argon2::default()
+            .verify_password(
+                first_password.as_bytes(),
+                &argon2::PasswordHash::new(&hash).unwrap()
+            )
+            .is_err()
+    );
 }

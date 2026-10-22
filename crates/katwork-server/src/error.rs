@@ -16,6 +16,17 @@ impl From<KatError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.0 {
+            KatError::Unauthenticated => StatusCode::UNAUTHORIZED,
+            KatError::ResetTokenInvalid | KatError::PasswordInvalid | KatError::RequestInvalid => {
+                StatusCode::BAD_REQUEST
+            }
+            KatError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            KatError::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            KatError::AuthFailed | KatError::MailDeliveryFailed => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+            KatError::HostNotAllowed | KatError::CrossSiteRequest => StatusCode::FORBIDDEN,
+            KatError::JsonRequired => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             KatError::DatabaseUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             KatError::LeaseLost => StatusCode::CONFLICT,
             KatError::ConfigInvalid

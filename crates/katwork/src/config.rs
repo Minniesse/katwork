@@ -16,6 +16,7 @@ pub struct Config {
     pub anthropic: Option<ProviderEnv>,
 }
 
+#[derive(Clone)]
 pub struct SmtpConfig {
     pub host: String,
     pub port: Option<u16>,
@@ -203,6 +204,16 @@ pub fn redact_database_secrets(message: &str, database_url: &str) -> String {
 }
 
 impl Config {
+    pub fn public_url_or_default(&self) -> &str {
+        self.public_url
+            .as_deref()
+            .unwrap_or("http://localhost:3000")
+    }
+
+    pub fn cookie_secure(&self) -> bool {
+        self.public_url_or_default().starts_with("https://")
+    }
+
     pub fn redact_secrets(&self, message: &str) -> String {
         let Some(mut secrets) = database_secrets(&self.database_url) else {
             return "[redacted]".into();
@@ -237,7 +248,30 @@ impl Config {
             return Err(KatError::ConfigInvalid);
         }
         let optional = |name: &str| lookup(name).filter(|value| !value.is_empty());
+        for name in ["SMTP_PASSWORD", "KATWORK_DEMO_PASSWORD"] {
+            if optional(name).is_some_and(|value| value.chars().count() < 8) {
+                return Err(KatError::ConfigInvalid);
+            }
+        }
+        let mut public_url = optional("KATWORK_PUBLIC_URL");
+        if let Some(value) = &public_url {
+            let url = Url::parse(value).map_err(|_| KatError::ConfigInvalid)?;
+            if !matches!(url.scheme(), "http" | "https")
+                || !url.has_host()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.path() != "/"
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                return Err(KatError::ConfigInvalid);
+            }
+            public_url = Some(url.origin().ascii_serialization());
+        }
         let smtp = if let Some(host) = optional("SMTP_HOST") {
+            if host.contains('@') {
+                return Err(KatError::ConfigInvalid);
+            }
             let port = optional("SMTP_PORT")
                 .map(|value| value.parse::<u16>().map_err(|_| KatError::ConfigInvalid))
                 .transpose()?;
@@ -258,7 +292,7 @@ impl Config {
             database_url,
             secret,
             demo: lookup("KATWORK_DEMO").is_some_and(|value| value == "1"),
-            public_url: optional("KATWORK_PUBLIC_URL"),
+            public_url,
             demo_password: optional("KATWORK_DEMO_PASSWORD"),
             smtp,
             openai: optional("OPENAI_API_KEY").map(|api_key| ProviderEnv {
