@@ -34,7 +34,7 @@ impl Fixture {
             .execute(&mut *tx)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO users (id, email, password_hash, display_name, locale) VALUES ($1, 'test@example.invalid', $2, 'Test', 'th')").bind(f.user).bind(Uuid::now_v7().to_string()).execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO users (id, email, password_hash, display_name, locale) VALUES ($1, $2, $3, 'Test', 'th')").bind(f.user).bind(format!("{}@example.invalid", f.user)).bind(Uuid::now_v7().to_string()).execute(&mut *tx).await.unwrap();
         sqlx::query("INSERT INTO spaces (id, workspace_id, name, allow_external) VALUES ($1, $2, 'Space', false)").bind(f.space).bind(f.workspace).execute(&mut *tx).await.unwrap();
         sqlx::query("INSERT INTO dots (id, workspace_id, default_space_id, name, role, persona, instructions, tool_allowlist, model_tier, autonomy) VALUES ($1, $2, $3, 'นักวิจัย', 'researcher', '', '', '{}', 'standard', 'ask_first')").bind(f.dot).bind(f.workspace).bind(f.space).execute(&mut *tx).await.unwrap();
         sqlx::query("INSERT INTO dot_spaces (workspace_id, dot_id, space_id) VALUES ($1, $2, $3)")
