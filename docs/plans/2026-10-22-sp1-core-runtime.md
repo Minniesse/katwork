@@ -165,6 +165,7 @@ web/
   - `types::SpacePolicy { allow_external: bool }`, with no `Default`: every Space states it
   - `types::Locale::{En, Th}`
   - `types::DotStatus::{Active, Paused}`
+  - `types::JobStatus::{Accepted, Ready, Answered, Stopped, NeedsInput, Cancelled, Error}` and `types::HoldReason::{DotBusy, ProviderQuota, WorkspacePaused}`, each with `wire(&self) -> &'static str` matching the schema values; they live here because the event payloads (Task 9) carry them
   - `types::Question { question: String, options: Vec<String> }` (`Serialize`, `Deserialize`): a Dot's question to a person; the first option, when present, is the recommended one
   - `types::SideEffect::{Read, Navigate, WorkspaceRead, Draft, WorkspaceWrite, Exec, CredentialUse, Destructive, Outward(OutwardKind)}` and `types::OutwardKind::{Send, Publish, Pay, Share, ExternalApi}`, with `SideEffect::wire(&self) -> &'static str` giving `read, navigate, workspace_read, draft, workspace_write, exec, credential_use, destructive, outward_send, outward_publish, outward_pay, outward_share, outward_external_api`
   - `types::ReasonCode` with `wire(&self) -> &'static str` and `ReasonCode::ALL`: `provider_unavailable, provider_rate_limited, provider_quota, provider_auth_failed, model_protocol_error, time_limit, quota_exceeded, workspace_paused, step_limit, token_budget, output_truncated, residency_denied, loop_detected, policy_changed, approval_pending, question_pending, interrupted_review_required, dot_paused, retries_exhausted, cancelled, outcome_unknown, lease_lost`. Each value is a job `reason`, a notice body or a `RUN_ERROR` code, and has a message in both locales (Task 13).
@@ -477,16 +478,18 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 - Modify: `crates/katwork/src/runtime.rs`, `Cargo.toml` (`unicode-segmentation`)
 
 **Interfaces:**
-- Consumes: `Tenant`, `thread::get`, ids, `types::{SideEffect, ReasonCode}`, `fence::{Fence, check}`, `Core`.
+- Consumes: `Tenant`, `thread::get`, `Author` (Task 6), ids, `types::{SideEffect, ReasonCode, JobStatus, HoldReason, Question}`, `fence::{Fence, check}`, `Core`.
 - Produces:
   - `enum AgUiEvent`: KatWork's own serde types for AG-UI protocol 1.0, covering only the events KatWork emits (ADR-0003). Serialized with `#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]` and camelCase fields. Variants: `RunStarted{threadId,runId}`, `TextMessageStart{messageId,role}`, `TextMessageContent{messageId,delta}`, `TextMessageEnd{messageId}`, `ToolCallStart{toolCallId,toolCallName,parentMessageId}`, `ToolCallArgs{toolCallId,delta}`, `ToolCallEnd{toolCallId}`, `ToolCallResult{messageId,toolCallId,content}`, `RunFinished{threadId,runId}`, `RunError{message,code}`, `Custom{name,value}`.
   - Ids: `threadId` and `runId` are KatWork's. `toolCallId` is the `ToolCallRecordId`, so a provider id reused in a later step stays distinct. `TextMessageStart.messageId` equals the stored reply's `MessageId`. `TOOL_CALL_END` means the arguments are complete; `TOOL_CALL_RESULT` means execution is complete.
-  - `KatworkEvent`, serialized as `Custom{name,value}` through `From<KatworkEvent> for AgUiEvent`:
-    - `katwork.dot_state {dotId, state}` with `DotState::{Idle, Working, Researching, Waiting, NeedsApproval, Error, Paused}`
-    - `katwork.job_status {jobId, status, reason?, holdReason?}`; `status` is null while the job runs
-    - `katwork.decision {jobId, inputs, verdict, policyVersion, thresholds}`
-    - `katwork.tool_status {toolCallId, ok, code}`
-    - `katwork.usage {runId, dotId, modelCallId, input, output, complete}`
+  - `KatworkEvent`, serialized as `Custom{name,value}` through `From<KatworkEvent> for AgUiEvent`. Each payload is a serde struct with camelCase fields, typed only with Task 2 and Task 6 types:
+    - `katwork.dot_state`: `DotStateEvent { dot_id: DotId, state: DotState }`, with `DotState::{Idle, Working, Researching, Waiting, NeedsApproval, Error, Paused}`
+    - `katwork.job_status`: `JobStatusEvent { job_id: JobId, status: Option<JobStatus>, reason: Option<ReasonCode>, hold_reason: Option<HoldReason> }`; `status` is null while the job runs
+    - `katwork.decision`: `DecisionEvent { job_id: JobId, inputs: serde_json::Value, verdict: serde_json::Value, policy_version: u32, thresholds: serde_json::Value }`; Task 10's `policy::decision_event` owns the conversion and defines the shapes
+    - `katwork.tool_status`: `ToolStatusEvent { tool_call_id: ToolCallRecordId, ok: bool, code: Option<String> }`
+    - `katwork.usage`: `UsageEvent { run_id: RunId, dot_id: DotId, model_call_id: ModelCallId, input: Option<u64>, output: Option<u64>, complete: bool }`
+    - `katwork.message_stored`: `MessageStoredEvent { message_id: MessageId, author: Author, body: String, synthetic: bool, question: Option<Question> }`, emitted once a message is committed
+  - Client folding rules, which Task 13 implements: a `TEXT_MESSAGE_START` for a `messageId` starts that message's provisional text over; `TEXT_MESSAGE_CONTENT` appends to it; `katwork.message_stored` is authoritative and replaces whatever the client holds for that `messageId`, with the stored body, `synthetic` flag and question.
   - `DotState::for_tool(SideEffect) -> DotState`: `Read`, `WorkspaceRead` and `Navigate` give `Researching`; every other effect gives `Working`. Only the harness emits `dot_state`: `Working` while the model streams, `NeedsApproval` on an approval stop, `Waiting` on a question, `Error` on a run error, `Paused` for a paused Dot, `Idle` otherwise.
   - `log::append(tx: &mut Transaction<'_, Postgres>, workspace_id: WorkspaceId, thread_id: ThreadId, run_id: Option<RunId>, e: &AgUiEvent) -> Result<EventSeq, KatError>`: runs `UPDATE threads SET last_event_seq = last_event_seq + 1 WHERE id = $1 RETURNING last_event_seq` and then the insert, inside the caller's transaction, so appenders serialize per thread
   - `log::since(pool, &Tenant, ThreadId, after: EventSeq) -> Result<Vec<(EventSeq, AgUiEvent)>, KatError>`
@@ -499,7 +502,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 
 - [ ] **Step 1: Write the failing tests** in `crates/katwork/tests/events.rs`:
   - `events_serialize_as_agui_json`: `TextMessageContent` → `{"type":"TEXT_MESSAGE_CONTENT","messageId":"…","delta":"…"}`
-  - `agui_fixtures_match_protocol_1_0`: every emitted variant round-trips against the protocol JSON in `tests/fixtures/agui/`
+  - `agui_fixtures_match_protocol_1_0`: every emitted variant round-trips against the protocol JSON in `tests/fixtures/agui/`, and every `katwork.*` payload against its fixture in `tests/fixtures/agui/katwork/`
   - `concurrent_appenders_never_skip_on_resume`: two tasks append to one thread at once, and a reader resuming at any seq sees every event
   - `fenced_sink_rejects_writes_after_epoch_change`: after the task's epoch is incremented, `emit` returns `lease_lost` and the log is unchanged
   - `thai_delta_never_splits_a_grapheme_cluster`: `"ที่นี่สวัสดีครับ 👋🏽"` pushed in every split; every released chunk ends on a grapheme boundary, and the concatenation is byte-equal
@@ -584,7 +587,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - **Ledger.** Every dispatched call goes through `start_tool_call`, then `end_tool_call` with `succeeded`, `failed`, `timed_out` or `outcome_unknown`. Every call that is not dispatched goes through `record_refused`, so a refused outward call never marks effects as started. A failed ledger write aborts the run before the tool is called.
   - **Result pairing.** An unknown tool name, a validation failure, a timeout and a refusal each become exactly one `ChatMsg::Tool { is_error: true }` with the original call id and name, and the loop continues unless a stop rule above applies. The text given to the model is `truncate_result(…, result_max_chars)`, and that exact text is stored in `tool_calls.result`.
   - **Prompt hygiene.** The system text is the Dot's persona and instructions plus a capability preamble generated from the effective tool set, never hand-written into `instructions`. Tool results, history and retrieved text never use the system role. Prompts never say "never ask".
-  - **Events.** `RUN_STARTED`, `dot_state working`, then `TEXT_MESSAGE_START` with `messageId = reply_message_id`, the text through `DeltaCoalescer` as `TEXT_MESSAGE_CONTENT`, and `TEXT_MESSAGE_END`. Tool-call events follow only once the turn is accepted; `TOOL_CALL_RESULT` and `katwork.tool_status` follow execution. On cancel, the loop emits `TOOL_CALL_RESULT` (content: `cancelled`) and `katwork.tool_status{ok: false, code: "cancelled"}` for every open call, then `RUN_ERROR{code: "cancelled"}`, and returns with `stop = Cancelled`. The loop never emits `RUN_FINISHED`; `job::conclude` does (Task 10).
+  - **Events.** `RUN_STARTED`, `dot_state working`, then `TEXT_MESSAGE_START` with `messageId = reply_message_id`, the text through `DeltaCoalescer` as `TEXT_MESSAGE_CONTENT`, and `TEXT_MESSAGE_END`. Every model turn of the run streams under the same `reply_message_id` and opens with its own `TEXT_MESSAGE_START`, so text a turn wrote before calling tools is replaced, not kept; the stored reply arrives as `katwork.message_stored` (Task 10). Tool-call events follow only once the turn is accepted; `TOOL_CALL_RESULT` and `katwork.tool_status` follow execution. On cancel, the loop emits `TOOL_CALL_RESULT` (content: `cancelled`) and `katwork.tool_status{ok: false, code: "cancelled"}` for every open call, then `RUN_ERROR{code: "cancelled"}`, and returns with `stop = Cancelled`. The loop never emits `RUN_FINISHED`; `job::conclude` does (Task 10).
 
 - [ ] **Step 1: Write the failing tests** in `crates/katwork/tests/agent.rs` (FakeProvider scripted; test-only tools registered per test):
   - `plain_text_reply_sets_final_text`
@@ -641,9 +644,8 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 - Create: `crates/katwork/src/jobs/{mod,job,task}.rs`, `crates/katwork/src/policy.rs`, `crates/katwork/tests/{jobs.rs,policy.rs}`
 
 **Interfaces:**
-- Consumes: `RunFacts`, `StopReason`, `Initiator` (Task 8); `ChatMsg` (Task 7); `log::append`, `EventHub`, `AgUiEvent`, `KatworkEvent`, `DotState` (Task 9); `message::append`, `NewMessage` (Task 6); `Tenant`; `types::ReasonCode`.
+- Consumes: `RunFacts`, `StopReason`, `Initiator` (Task 8); `ChatMsg` (Task 7); `log::append`, `EventHub`, `AgUiEvent`, `KatworkEvent`, `DotState` (Task 9); `message::append`, `NewMessage` (Task 6); `Tenant`; `types::{ReasonCode, JobStatus}`.
 - Produces:
-  - `JobStatus::{Accepted, Ready, Answered, Stopped, NeedsInput, Cancelled, Error}`
   - `NextStep::{RunCheapChecks, AskUser, HandToLead, SaveDraftWithReport, Retry, RestartJob}`
   - `Thresholds { version: u32 }` and `Thresholds::SP1` (`version: 1`)
   - `Verdict { status: JobStatus, reason: Option<ReasonCode>, next: Option<NextStep> }`; `status` is never `Cancelled` or `Error`
@@ -666,7 +668,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
     | `Interrupted` (lease reclaimed after a side effect) / `OutcomeUnknown` (a non-Read call's result is unknown) | `stopped` | `interrupted_review_required` / `outcome_unknown` | `Retry` after review |
     | `Cancelled` | `stopped` | `cancelled` | `Retry`; never reached in practice, because cancelled jobs end through the harness |
 
-  - `policy::decision_event(job_id: JobId, facts: &RunFacts, v: &Verdict, t: &Thresholds) -> KatworkEvent`: `katwork.decision`, with a summary of the facts as `inputs`
+  - `policy::decision_event(job_id: JobId, facts: &RunFacts, v: &Verdict, t: &Thresholds) -> KatworkEvent`: builds `katwork.decision`. `inputs` is `{"stop": the stop reason's wire name or null, "executorUnavailable", "hasFinalText", "pendingQuestion", "artifactsCreated", "toolCalls": count, "synthetic"}`; `verdict` is `{"status", "reason", "next"}` as wire strings; `thresholds` is `Thresholds` as JSON; `policyVersion` is `Thresholds.version`.
   - `job::create(conn: &mut PgConnection, &Tenant, ThreadId, MessageId) -> Result<JobId, KatError>`: a running job (`status` NULL) with `requested_by = tenant.user_id`
   - `job::create_follow_up(conn: &mut PgConnection, &Tenant, parent: JobId, MessageId) -> Result<JobId, KatError>`: `parent` must be `needs_input` in the same thread, otherwise `job_not_awaiting_input`; sets `parent_job_id` (ADR-0002)
   - `JobSummary { id: JobId, status: Option<JobStatus> }` and `job::latest_in_thread(conn: &mut PgConnection, &Tenant, ThreadId) -> Result<Option<JobSummary>, KatError>`
@@ -676,8 +678,8 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `job::conclude(tx: &mut Transaction<'_, Postgres>, tenant: &Tenant, job_id: JobId, thread_id: ThreadId, dot_id: Option<DotId>, idem_key: &str, facts: &RunFacts) -> Result<EventSeq, KatError>`: the single place that writes a job's outcome. In the caller's transaction it:
     1. runs `policy::decide_job(facts, &Thresholds::SP1)`
     2. appends `katwork.decision`
-    3. when `dot_id` is set and there is `final_text` or a `pending_question`, appends the Dot's message with `id = facts.reply_message_id`, `idempotency_key = "reply:{idem_key}"` and `synthetic = facts.synthetic`. For a question, the body is the question text and `question` holds the question with its options.
-    4. for a `stopped` verdict, appends a `System` message whose body is the reason code, with `idempotency_key = "notice:{idem_key}"`
+    3. when `dot_id` is set and there is `final_text` or a `pending_question`, appends the Dot's message, followed by its `katwork.message_stored` event, with `id = facts.reply_message_id`, `idempotency_key = "reply:{idem_key}"` and `synthetic = facts.synthetic`. For a question, the body is the question text and `question` holds the question with its options.
+    4. for a `stopped` verdict, appends a `System` message whose body is the reason code, with `idempotency_key = "notice:{idem_key}"`, followed by its `katwork.message_stored` event
     5. calls `job::finish_by_policy`
     6. when `facts.run_id` is set, appends `katwork.dot_state` (`needs_approval` for an approval stop, `waiting` for a question, `paused` for a workspace pause, `idle` otherwise), then `RUN_FINISHED` unless `facts.stop` is `Cancelled` or `WorkspacePaused` (those runs already ended with `RUN_ERROR`)
 
@@ -784,7 +786,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `job::cancel(pool, hub: &EventHub, tenant: &Tenant, job_id: JobId) -> Result<(), KatError>`: another workspace's job is `NotFound`; a finished job is `job_already_finished`. In one transaction it locks the job row, then its task rows (the same job → task order as `claim`). Each queued or leased task becomes `cancelled` and its lease row is deleted. For a running run it closes the open calls (`TOOL_CALL_RESULT`, `katwork.tool_status{ok: false}`, ledger state `outcome_unknown`), marks the run `cancelled`, and emits `RUN_ERROR{code: "cancelled"}` and `katwork.dot_state idle`. It then calls `finish_by_harness(tx, Cancelled)`, commits and notifies the hub. The old worker's next heartbeat or write finds the task no longer leased and gets `lease_lost`.
   - Route `POST /api/workspaces/{workspace_id}/jobs/{job_id}/cancel` returns 202, 404 across tenants, and 409 `job_already_finished`.
   - `serve` builds `Core` and runs `worker::spawn_pool(core, 4, Duration::from_secs(60))`.
-  - Event order for an answered job: `RUN_STARTED`, `katwork.dot_state working`, `TEXT_MESSAGE_*`, `katwork.decision`, `katwork.job_status answered`, `katwork.dot_state idle`, `RUN_FINISHED`. `katwork.job_status` is the only success signal; cancelled, needs-input and interrupted outcomes are explicit job statuses, never an omitted one.
+  - Event order for an answered job: `RUN_STARTED`, `katwork.dot_state working`, `TEXT_MESSAGE_*`, `katwork.decision`, `katwork.message_stored`, `katwork.job_status answered`, `katwork.dot_state idle`, `RUN_FINISHED`. `katwork.job_status` is the only success signal; cancelled, needs-input and interrupted outcomes are explicit job statuses, never an omitted one.
 
 - [ ] **Step 1: Write the failing tests** in `crates/katwork-server/tests/pipeline.rs` (FakeProvider):
   - `message_without_mention_goes_to_lead_and_job_answered`
@@ -796,6 +798,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `demo_mode_reply_is_flagged_synthetic`: the reply from the messages API has `synthetic: true`
   - `full_event_sequence`: the order above
   - `stream_message_id_equals_stored_reply_id`
+  - `stored_reply_snapshot_replaces_provisional_text`: the scripted deltas say "Draft" while the final turn says "Final"; `katwork.message_stored` and the stored message both carry "Final"
   - `restart_mid_run_posts_exactly_one_reply`
   - `retry_with_same_client_msg_id_creates_one_job`
   - `concurrent_retries_with_same_client_msg_id_create_one_job`: two posts with the same `client_msg_id` race; one message, one job and one task exist, and both responses carry the same ids
@@ -822,7 +825,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 **Interfaces:**
 - Consumes: the auth, workspaces, teams, threads, events and jobs routes; `crates/katwork-server/tests/fixtures/sse/thai_emoji.sse` (Task 9); `ReasonCode::ALL` (Task 2).
 - Produces:
-  - `sse.ts`: `subscribe(url, onEvent): () => void`, using the browser `EventSource` (no Rust or SDK client) and its native `Last-Event-ID` resume. It keeps the last seq and drops duplicates after a reconnect, and folds text by `messageId` and tool arguments by `toolCallId`, never into "the last message".
+  - `sse.ts`: `subscribe(url, onEvent): () => void`, using the browser `EventSource` (no Rust or SDK client) and its native `Last-Event-ID` resume. It keeps the last seq and drops duplicates after a reconnect, and folds text by `messageId` and tool arguments by `toolCallId`, never into "the last message". It follows Task 9's folding rules: `TEXT_MESSAGE_START` resets a message's provisional text, and `katwork.message_stored` replaces it with the stored body, `synthetic` flag and any question with its options.
   - `i18n.t(key, vars?)` with locales `en` and `th`; the locale switch persists in `localStorage`, and the locale is read with try/catch
   - `i18n.formatDate(date, { calendar: 'gregory' | 'buddhist' })`: Gregorian in the UI chrome, Buddhist Era where a template asks for it
   - every `ReasonCode` has a `reason.<code>` key in both locales
@@ -838,6 +841,9 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `chat_streams_deltas_into_one_bubble`: a mocked EventSource with 3 deltas gives 1 bubble with the concatenated text
   - `chat_streams_thai_and_emoji_split_at_every_byte`: a mocked EventSource fed from the Task 9 fixture
   - `sse_folds_by_id_and_drops_duplicates_after_reconnect`
+  - `final_text_differs_from_deltas_shows_stored_text`: through the real reducer
+  - `new_turn_start_resets_provisional_text`
+  - `ask_user_question_and_options_render_from_snapshot`
   - `synthetic_reply_shows_badge`: a message with `synthetic: true` shows a visible "Demo / ตัวอย่าง" badge; the same text with `synthetic: false` shows none
   - `stop_button_cancels_running_job`
   - `replayed_run_error_cleared_by_later_success`
