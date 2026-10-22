@@ -281,15 +281,21 @@ async fn fence_locks_last_until_commit_and_allow_foreign_keys(pool: PgPool) {
         .unwrap();
     fence::check(&mut other, &fence).await.unwrap();
     sqlx::query("INSERT INTO runs (id, workspace_id, job_id, task_id, dot_id, kind, lease_epoch, dot_config_hash, state) VALUES ($1, $2, $3, $4, $5, 'recovery', 1, 'hash', 'running')").bind(Uuid::now_v7()).bind(f.workspace).bind(f.job).bind(f.task).bind(f.dot).execute(&mut *other).await.unwrap();
+    other.commit().await.unwrap();
+    let mut updater = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL lock_timeout = '100ms'")
+        .execute(&mut *updater)
+        .await
+        .unwrap();
     sqlstate(
         sqlx::query("UPDATE tasks SET state = 'done' WHERE id = $1")
             .bind(f.task)
-            .execute(&mut *other)
+            .execute(&mut *updater)
             .await
             .unwrap_err(),
         "55P03",
     );
-    other.rollback().await.unwrap();
+    updater.rollback().await.unwrap();
     writer.commit().await.unwrap();
 
     let mut terminal = pool.begin().await.unwrap();
@@ -299,6 +305,7 @@ async fn fence_locks_last_until_commit_and_allow_foreign_keys(pool: PgPool) {
         .execute(&mut *blocked)
         .await
         .unwrap();
+    sqlx::query("INSERT INTO runs (id, workspace_id, job_id, task_id, dot_id, kind, lease_epoch, dot_config_hash, state) VALUES ($1, $2, $3, $4, $5, 'recovery', 1, 'hash', 'running')").bind(Uuid::now_v7()).bind(f.workspace).bind(f.job).bind(f.task).bind(f.dot).execute(&mut *blocked).await.unwrap();
     let error = fence::check(&mut blocked, &fence).await.unwrap_err();
     let katwork::error::KatError::Database(error) = error else {
         panic!("expected database lock timeout")
