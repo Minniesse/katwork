@@ -10,7 +10,7 @@
 
 ## 1. Summary
 
-KatWork lets anyone in an organization hire a team of named AI coworkers ("Dots") that do real office work on their own isolated computers and hand back **finished files with proof**. People talk to the team from LINE, Slack, Teams, RustChat/Mattermost, Telegram, Discord, WhatsApp, the web, desktop or mobile, and they watch the work in a cute 3D office and a live graph of every agent call. Anything risky waits for a human to approve. The whole system runs **on the organization's own servers**, with any model provider, in English and Thai.
+KatWork lets anyone in an organization hire a team of named AI coworkers ("Dots") that do real office work on their own isolated computers and hand back **finished files with proof**. People talk to the team from LINE, Slack, Teams, RustChat/Mattermost, Telegram, Discord, WhatsApp, the web, desktop or mobile, and they watch the work in a cute 3D office and a live graph of every agent call. Anything risky waits for a human to approve. The whole system runs **on the organization's own servers**, with the model providers you choose (qualified hosted APIs or local models), in English and Thai.
 
 **Positioning:** KatWork is *the self-hosted AI team office*, for organizations of any size. It turns folders of everyday files into finished, source-cited documents through a persistent team of named coworkers, with human approvals. It differs from:
 - hosted coworker products such as OpenAI ChatGPT Dots, which run in the vendor's cloud;
@@ -53,17 +53,17 @@ KatWork lets anyone in an organization hire a team of named AI coworkers ("Dots"
 | Platforms | Web, desktop and mobile, plus connectors for LINE, Slack, Teams, RustChat/Mattermost, Telegram, Discord and WhatsApp (official Cloud API). |
 | Hosting | Self-hosted from day one, packaged with Docker Compose. |
 | Licence | Open-core under Apache-2.0. No GPL or AGPL code in the core. |
-| Models | Any provider; the admin chooses. Default to the strongest API model, with a local model for sensitive data. |
+| Models | The model providers the admin chooses, from qualified hosted APIs or local models (§11). Default to the strongest API model, with a local model for sensitive data. |
 | Decision layer | Laya, multilingual checkpoint only, running inside Rust (ONNX via `ort`, or `laya-rust`), with separate calibration per language. Used for intake routing only. |
 | Routing | A 4-stage routing design (§6) combined with the four JEVIS layers (§5). |
-| Sandbox | rivet agentOS now, plus a shared headless-Chromium service. KatWork's own agentOS later, built with an infrastructure partner. |
+| Sandbox | rivet agentOS now, plus a shared headless-Chromium service. Later, an in-house agentOS replaces the existing one; candidates are under evaluation (§14). |
 | Office apps | The storytold Craft apps where they pass our gates (§9). docx-rs, umya-spreadsheet, pdf-extract, lopdf, Typst and OAR-OCR are the dependable base. |
 | Memory | Built in: Postgres, Qdrant and Tantivy with nlpO3, per Dot and per team. Plus a RustShare connector. |
 | Views | 3D office (react-three-fiber with Kenney and Quaternius CC0 assets), live agent graph, chat, tasks-and-files board. |
 | Federation | In the alpha: a selective fork of reason-network with our own identity and relay (§12). |
 | Revenue | Free core, paid Enterprise edition, and later a paid hosted cloud. |
 | Name | KatWork, "the self-hosted AI team office". Repo `Minniesse/katwork`. |
-| Team | A solo maintainer builds the app with AI coding agents orchestrated by Orca. An infrastructure partner owns the future in-house agentOS. |
+| Team | A solo maintainer builds the app with AI coding agents orchestrated by Orca. |
 | Development loop | Approved spec, then small GitHub Issues labelled `ready-for-agent`, then Orca workers in worktrees with TDD. The model that didn't write a PR reviews it (§19.1), the founder approves every PR, CI must be green, and there is a weekly demo. |
 | Tracking | GitHub Issues for engineering; the Notion KatWork board for phases. |
 
@@ -286,7 +286,6 @@ Templates are data. New ones need no code changes.
 | One Report sustainability section (56-1) | DOCX in Thai and English, with an XLSX data appendix | Lead, Analyst (reconciles branch data), Writer, Reviewer | Totals reconcile with source sheets; year-over-year changes recomputed; conflicting figures flagged; bilingual sections in parity |
 | Meeting minutes | DOCX formal minutes plus an action-item list | Writer, Scheduler (owners and dates), Reviewer | Every action item has an owner and date or is flagged; decisions quoted from the source |
 | Research brief | DOCX or PPTX brief with cited sources | Researcher, Analyst, Writer, Reviewer | Every factual claim links to a saved web or file span; no uncited figures |
-
 | Monthly management / board commentary pack (added after early evaluation) | DOCX bilingual commentary plus an XLSX variance and lineage table. PPTX deck comes after the alpha | Lead, Analyst (variance bridge, cross-file reconciliation), Researcher (explains the drivers), Writer, Reviewer | Every figure is identical across all outputs because they draw on the same verified fact ids; cross-file conflicts become an approval card; actual vs budget, month-over-month and year-over-year recomputed in code |
 | Hospital HA Standard v6 self-assessment (added after early evaluation): a **rubric pack on the SAR engine, no code** | DOCX in the HA official form (`FM-ACD-088-01`) | SAR team | As SAR, plus a **patient-identifier (HN) and personal-data redaction check** in the Reviewer before any approval |
 
