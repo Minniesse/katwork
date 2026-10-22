@@ -165,6 +165,7 @@ web/
   - `types::SpacePolicy { allow_external: bool }`, with no `Default`: every Space states it
   - `types::Locale::{En, Th}`
   - `types::DotStatus::{Active, Paused}`
+  - `types::Question { question: String, options: Vec<String> }` (`Serialize`, `Deserialize`): a Dot's question to a person; the first option, when present, is the recommended one
   - `types::SideEffect::{Read, Navigate, WorkspaceRead, Draft, WorkspaceWrite, Exec, CredentialUse, Destructive, Outward(OutwardKind)}` and `types::OutwardKind::{Send, Publish, Pay, Share, ExternalApi}`, with `SideEffect::wire(&self) -> &'static str` giving `read, navigate, workspace_read, draft, workspace_write, exec, credential_use, destructive, outward_send, outward_publish, outward_pay, outward_share, outward_external_api`
   - `types::ReasonCode` with `wire(&self) -> &'static str` and `ReasonCode::ALL`: `provider_unavailable, provider_rate_limited, provider_quota, provider_auth_failed, model_protocol_error, time_limit, quota_exceeded, workspace_paused, step_limit, token_budget, output_truncated, residency_denied, loop_detected, policy_changed, approval_pending, question_pending, interrupted_review_required, dot_paused, retries_exhausted, cancelled, outcome_unknown, lease_lost`. Each value is a job `reason`, a notice body or a `RUN_ERROR` code, and has a message in both locales (Task 13).
   - `db::connect(url: &str) -> Result<PgPool, KatError>` and `db::migrate(pool: &PgPool) -> Result<(), KatError>`
@@ -180,7 +181,7 @@ web/
   - `dot_spaces(workspace_id, dot_id, space_id, PRIMARY KEY (dot_id, space_id))`, then `ALTER TABLE dots ADD FOREIGN KEY (id, default_space_id) REFERENCES dot_spaces(dot_id, space_id) DEFERRABLE INITIALLY DEFERRED`, so a Dot's default Space is always among its grants
   - `teams(id, workspace_id, space_id, name)`; `team_members(team_id, dot_id, is_lead, position)` with a partial unique index that allows one lead per team
   - `threads(id, workspace_id, space_id, team_id, title, last_event_seq BIGINT NOT NULL DEFAULT 0)`
-  - `messages(id, workspace_id, thread_id, author_kind, author_user_id NULL, author_dot_id NULL, body, client_msg_id TEXT NULL CHECK (char_length(client_msg_id) <= 64), idempotency_key TEXT NULL UNIQUE, synthetic BOOLEAN NOT NULL DEFAULT false, job_id UUID NULL, created_at, UNIQUE (thread_id, author_user_id, client_msg_id))`; the `job_id` FK is added once `jobs` exists
+  - `messages(id, workspace_id, thread_id, author_kind, author_user_id NULL, author_dot_id NULL, body, client_msg_id TEXT NULL CHECK (char_length(client_msg_id) <= 64), idempotency_key TEXT NULL UNIQUE, synthetic BOOLEAN NOT NULL DEFAULT false, question JSONB NULL, job_id UUID NULL, created_at, UNIQUE (thread_id, author_user_id, client_msg_id))`; `question` holds a `Question` when the message asks one; the `job_id` FK is added once `jobs` exists
   - `jobs(id, workspace_id, thread_id, request_message_id UUID NOT NULL UNIQUE REFERENCES messages(id), requested_by UUID NOT NULL REFERENCES users(id), parent_job_id UUID NULL REFERENCES jobs(id), status NULL, reason TEXT NULL, decided_by TEXT NULL CHECK (decided_by IN ('policy','harness')), decision_seq BIGINT NULL, contract_sha256 TEXT NULL, created_at, finished_at NULL)`
     - `status` NULL means running, with `CHECK (status IS NULL OR status IN ('accepted','ready','answered','stopped','needs_input','cancelled','error'))`
     - `reason` holds a `ReasonCode` wire value; `decision_seq` is the per-thread seq of the job's `katwork.decision` event; `contract_sha256` is reserved and always NULL in SP1
@@ -189,10 +190,10 @@ web/
     - `CHECK (state IN ('queued','leased','done','failed','interrupted','cancelled'))` and `CHECK (hold_reason IN ('dot_busy','provider_quota','workspace_paused'))`
     - terminal states: `done` (concluded by the policy after a run), `failed` (the harness gave up: deadline or retries exhausted), `interrupted` (stopped after a side effect, or by a workspace pause), `cancelled` (its job was cancelled). Every move to a terminal state deletes the task's `task_leases` row in the same transaction.
     - `dot_policy_version` is the Dot's `policy_version` when the task was routed; claim and the loop compare against it, never against whatever the Dot holds when the run starts
-    - `pending_tool_call` is `{tool_call_id, name, args_sha256}`, kept when a run stops on `NeedsApproval`
+    - `pending_tool_call` is `{tool_call_record_id, tool_call_id, name, args_canonical, args_sha256}`, kept when a run stops on `NeedsApproval`: the exact call, with its canonical arguments, bound to its ledger row, so sub-project 3 can rebuild and resume it after a restart (ADR-0002)
   - `task_leases(task_id PRIMARY KEY, worker_id, lease_epoch BIGINT NOT NULL, expires_at)`; `expires_at` is always computed with Postgres `now()`, never the worker clock
   - `runs(id, workspace_id, job_id, task_id, dot_id, kind, lease_epoch BIGINT NOT NULL, dot_config_hash TEXT NOT NULL, model TEXT NULL, state, stop_reason TEXT NULL, started_at, ended_at NULL)` with `kind IN ('initial','repair','recovery')` and `state IN ('running','finished','interrupted','cancelled','error')`. Repairs (at most 2, set by the policy from SP3) and recoveries (owned by the scheduler) are counted separately through `kind`.
-  - `tool_calls(id, workspace_id, run_id, step INT, tool_call_id TEXT, tool_name TEXT, side_effect TEXT, args_sha256 TEXT, state TEXT, result TEXT NULL, started_at, ended_at NULL, UNIQUE (run_id, step, tool_call_id))`, with `side_effect` checked against the 13 `SideEffect::wire` values and `state IN ('started','succeeded','failed','timed_out','outcome_unknown','refused')`. `result` holds the exact text passed to the next model call.
+  - `tool_calls(id, workspace_id, run_id, step INT, tool_call_id TEXT, tool_name TEXT, side_effect TEXT NULL, args_canonical TEXT NOT NULL, args_sha256 TEXT, state TEXT, attempts INT NOT NULL DEFAULT 1 CHECK (attempts IN (1, 2)), result TEXT NULL, started_at, ended_at NULL, UNIQUE (run_id, step, tool_call_id))`, with `side_effect` checked against the 13 `SideEffect::wire` values, `CHECK (side_effect IS NOT NULL OR state = 'refused')` (an unknown tool has no effect), and `state IN ('started','succeeded','failed','timed_out','outcome_unknown','refused')`. `result` holds the exact text passed to the next model call; `attempts` is 2 only after a `Read` retry, which reuses the row.
   - `model_calls(id, workspace_id, space_id, job_id, task_id, run_id, dot_id, provider_id, model, residency, attempt INT, input_tokens BIGINT NULL, cache_read_tokens BIGINT NULL, cache_write_tokens BIGINT NULL, output_tokens BIGINT NULL, usage_complete BOOLEAN NOT NULL, charged_tokens BIGINT NOT NULL, cost_micros BIGINT NULL, latency_ms INT, outcome TEXT, created_at)`: one row per model attempt, retries included; a missing count is NULL, never 0; `charged_tokens` is the attempt's budget charge (Task 8) and is never NULL
   - `events(thread_id, seq BIGINT, workspace_id, run_id NULL, kind, payload JSONB, created_at, PRIMARY KEY (thread_id, seq))`
 
@@ -211,6 +212,7 @@ web/
   - `missing_usage_is_stored_as_null`
   - `space_allow_external_has_no_default`: an insert without `allow_external` errors
   - `side_effect_wire_values_pass_the_schema_check`: every `SideEffect::wire` value inserts into `tool_calls.side_effect`, and `'shell'` is rejected
+  - `only_refused_calls_may_have_no_side_effect`
 - [ ] **Step 3: Run** `cargo test -p katwork --test schema`. Expected: FAIL.
 - [ ] **Step 4: Implement** the migration, the ids, `types.rs`, `db.rs`, `runtime.rs` and `ApiError`. Wire `katwork-server migrate` to `db::connect` + `db::migrate`, and make `serve` build `Core`. Switch `AppState` to `{ core: Arc<Core> }` and update `tests/health.rs`. In `tests/cli.rs`, `maintenance_commands_are_stubs` keeps only `seed-demo`.
 - [ ] **Step 5: Run** `cargo test --workspace --locked`. Expected: PASS.
@@ -356,13 +358,13 @@ web/
 - Create: `crates/katwork/src/chat/{mod,thread,message,mentions}.rs`, `crates/katwork-server/src/routes/threads.rs`, `crates/katwork-server/tests/chat.rs`
 
 **Interfaces:**
-- Consumes: `Tenant`, `SpaceId`, `TeamId`, `DotId`, `JobId`.
+- Consumes: `Tenant`, `SpaceId`, `TeamId`, `DotId`, `JobId`, `types::Question`.
 - Produces:
   - `Thread { id: ThreadId, space_id: SpaceId, team_id: TeamId, title: String }`
   - `thread::create(pool, &Tenant, SpaceId, TeamId, title: &str) -> Result<ThreadId, KatError>` and `thread::get(pool, &Tenant, ThreadId) -> Result<Thread, KatError>`; another workspace's thread is `NotFound`
   - `Author::{User(UserId), Dot(DotId), System}` (`Eq`, `Hash`)
-  - `Message { id: MessageId, thread_id: ThreadId, author: Author, body: String, synthetic: bool, job_id: Option<JobId>, created_at: DateTime<Utc> }`
-  - `NewMessage { id: Option<MessageId>, author: Author, body: String, client_msg_id: Option<String>, idempotency_key: Option<String>, synthetic: bool }`; `id: None` generates a new id
+  - `Message { id: MessageId, thread_id: ThreadId, author: Author, body: String, synthetic: bool, question: Option<Question>, job_id: Option<JobId>, created_at: DateTime<Utc> }`
+  - `NewMessage { id: Option<MessageId>, author: Author, body: String, client_msg_id: Option<String>, idempotency_key: Option<String>, synthetic: bool, question: Option<Question> }`; `id: None` generates a new id
   - `message::append(conn: &mut PgConnection, &Tenant, ThreadId, NewMessage) -> Result<Appended, KatError>` and `Appended { message_id: MessageId, job_id: Option<JobId>, created: bool }`. It runs `INSERT … ON CONFLICT DO NOTHING RETURNING`, and when no row comes back it selects the committed row: a repeat of the same `(thread, author, client_msg_id)` or of the same `idempotency_key` returns the original row with `created: false`, and a concurrent duplicate waits on the unique index, then returns the first row. It takes a connection so that intake (Task 12) and `job::conclude` (Task 10) can write inside their transactions.
   - `message::set_job(conn: &mut PgConnection, &Tenant, MessageId, JobId) -> Result<(), KatError>`
   - `message::list(pool, &Tenant, ThreadId, before: Option<MessageId>, limit: u16) -> Result<Vec<Message>, KatError>`
@@ -521,9 +523,10 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 - Modify: `Cargo.toml` (`tokio-util`)
 
 **Interfaces:**
-- Consumes: `fence::{Fence, check}` (Task 2); `Registry`, `Selected`, `ModelProvider`, `ChatRequest`, `ChatMsg`, `ChatChunk`, `ToolSpec`, `ModelError`, `StreamTimeouts`, `guard_stream` (Task 7); `EventSink`, `AgUiEvent`, `KatworkEvent`, `DotState`, `DeltaCoalescer` (Task 9); `Dot`, `Dot::config_hash` (Task 5); `Tenant` (Task 4); ids and `types::{SideEffect, SpacePolicy}` (Task 2).
+- Consumes: `fence::{Fence, check}`, `types::Question` (Task 2); `Registry`, `Selected`, `ModelProvider`, `ChatRequest`, `ChatMsg`, `ChatChunk`, `ToolSpec`, `ModelError`, `StreamTimeouts`, `guard_stream` (Task 7); `EventSink`, `AgUiEvent`, `KatworkEvent`, `DotState`, `DeltaCoalescer` (Task 9); `Dot`, `Dot::config_hash` (Task 5); `Tenant` (Task 4); ids and `types::{SideEffect, SpacePolicy}` (Task 2).
 - Produces:
-  - `#[async_trait] trait Tool: Send + Sync { fn spec(&self) -> ToolSpec; fn side_effect(&self) -> SideEffect; async fn call(&self, ctx: &ToolCtx, args: serde_json::Value) -> Result<String, ToolError>; }`
+  - `#[async_trait] trait Tool: Send + Sync { fn spec(&self) -> ToolSpec; fn side_effect(&self) -> SideEffect; async fn call(&self, ctx: &ToolCtx, args: serde_json::Value) -> Result<ToolOutput, ToolError>; }`
+  - `ToolOutput::{Text(String), Ask(Question)}`: `Text` goes back to the model as the tool result; `Ask` ends the run with that question
   - `ToolCtx { tenant: Tenant, thread_id: ThreadId, dot_id: DotId, job_id: JobId, task_id: TaskId, run_id: RunId, step: u32, tool_call_id: String, idempotency_key: String, lease_epoch: LeaseEpoch, actor: UserId, initiator: Initiator, computer: Option<ComputerHandle>, pool: PgPool, cancel: CancellationToken }`
     - `idempotency_key` is `"{run_id}:{step}:{tool_call_id}"`
     - `computer` is always `None` in SP1; `ComputerHandle` is an empty placeholder struct
@@ -532,25 +535,30 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `Initiator::{Person, Routine, Handoff, System}` (`Serialize`, `Deserialize`)
   - `ToolError::{NotAllowed, NeedsApproval, InvalidArgs(String), Failed(String), Timeout, OutcomeUnknown}`
   - `ToolRegistry::new() -> ToolRegistry`, `register(&mut self, tool: Arc<dyn Tool>)`, `get(&self, id: &str) -> Option<Arc<dyn Tool>>` and `ToolRegistry::builtin() -> ToolRegistry`
-  - Built-in tools: `read_thread` (`Read`) and `ask_user { question: String, options: Vec<String> }` (`Read`), which ends the run with `pending_question` set. There is no `post_reply`: the final assistant text is the reply, written once by `job::conclude` (Task 10).
+  - Built-in tools. There is no `post_reply`: the final assistant text is the reply, written once by `job::conclude` (Task 10).
+    - `read_thread` (`Read`). Arguments `{"limit": integer 1–50, default 20, "before": message id, optional}`, no other properties. It reads only `ctx.thread_id`, newest last, and returns the JSON text `{"messages": [{"id", "author": "user:<name>" | "dot:<name>" | "system", "body", "created_at"}], "next_before": id or null}`, which the loop then truncates like any result.
+    - `ask_user` (`Read`). Arguments `{"question": string of 1–500 characters, "options": array of 0–4 strings of 1–100 characters each}`, no other properties; the first option is the recommended one. It returns `ToolOutput::Ask(Question)`. The loop records the call `succeeded` with the question's JSON as its result, sets `RunFacts.pending_question`, records any sibling calls of the same turn as `refused` with code `superseded_by_question`, and ends the run. `job::conclude` stores the question as the Dot's message: the body is the question text, and `messages.question` holds the question with its options.
   - `RunKind::{Initial, Repair, Recovery}`
   - `RunInput { tenant: Tenant, run_id: RunId, thread_id: ThreadId, space_id: SpaceId, job_id: JobId, task_id: TaskId, lease_epoch: LeaseEpoch, kind: RunKind, space_policy: SpacePolicy, history: Vec<ChatMsg>, reply_message_id: MessageId, policy_version: i64, actor: UserId, initiator: Initiator, deadline: tokio::time::Instant, cancel: CancellationToken }`
   - `RunEnv<'a> { pool: &'a PgPool, models: &'a Registry, tools: &'a ToolRegistry, sink: &'a dyn EventSink }`
-  - `run::execute(env: &RunEnv<'_>, dot: &Dot, input: RunInput, limits: &Limits) -> RunFacts`. It inserts the `runs` row first and closes it at the end.
-  - `RunFacts { run_id: Option<RunId>, reply_message_id: MessageId, final_text: Option<String>, stop: Option<StopReason>, tool_calls: Vec<ToolCallRecord>, artifacts_created: u32, pending_tool_call: Option<PendingCall>, pending_question: Option<PendingQuestion>, synthetic: bool, executor_unavailable: bool, usage: Vec<ModelCallId> }`. The loop returns facts only; the policy (Task 10) turns them into a job status.
+  - `run::execute(env: &RunEnv<'_>, dot: &Dot, input: RunInput, limits: &Limits) -> Result<RunFacts, RunAbort>`. It inserts the `runs` row first and closes it at the end.
+  - `RunAbort::{LeaseLost, Infrastructure { run_id: Option<RunId>, code: &'static str }}`: a run-scoped write that fails with `lease_lost` gives `LeaseLost`; any other failed write (the `runs` row, a ledger row, an event) gives `Infrastructure` with the error's code. Either way nothing more is dispatched, and the abort never becomes a policy verdict.
+  - `RunFacts { run_id: Option<RunId>, reply_message_id: MessageId, final_text: Option<String>, stop: Option<StopReason>, tool_calls: Vec<ToolCallRecord>, artifacts_created: u32, pending_tool_call: Option<PendingCall>, pending_question: Option<Question>, synthetic: bool, executor_unavailable: bool, usage: Vec<ModelCallId> }`. The loop returns facts only; the policy (Task 10) turns them into a job status.
   - `RunFacts::not_run(stop: StopReason) -> RunFacts`: no run id, a fresh `reply_message_id`, everything else empty; used when the harness decides without a run (Tasks 11 and 12)
-  - `ToolCallRecord { id: ToolCallRecordId, step: u32, tool_call_id: String, name: String, side_effect: SideEffect, state: ToolCallState }` and `ToolCallState::{Started, Succeeded, Failed, TimedOut, OutcomeUnknown, Refused}`
-  - `PendingCall { tool_call_id: String, name: String, args_sha256: String }` and `PendingQuestion { question: String, options: Vec<String> }`
+  - `ToolCallRecord { id: ToolCallRecordId, step: u32, tool_call_id: String, name: String, side_effect: Option<SideEffect>, state: ToolCallState }` and `ToolCallState::{Started, Succeeded, Failed, TimedOut, OutcomeUnknown, Refused}`
+  - `PendingCall { record_id: ToolCallRecordId, tool_call_id: String, name: String, args_canonical: String, args_sha256: String }`, stored as `tasks.pending_tool_call`
   - `StopReason::{ProviderUnavailable, ProviderRateLimited, ProviderQuota, ProviderAuthFailed, ModelProtocol, StepLimit, LoopDetected, NeedsApproval, TokenBudget, OutputTruncated, TimeLimit, PolicyChanged, ResidencyDenied, QuotaExceeded, WorkspacePaused, DotPaused, Interrupted, OutcomeUnknown, Cancelled}`
   - `Limits { max_steps: u32, tool_timeout: Duration, result_max_chars: usize, repeat_limit: u32, repeat_window: (u32, u32), max_total_tokens: u64, run_wall_clock: Duration, task_deadline: Duration, job_deadline: Duration, model_retries: u32, stream: StreamTimeouts }`. `Limits::default()` holds the initial defaults: 24, 60 s, 8,000, 3, (5, 10), 200,000, 90 s, 5 min, 10 min, 1, and 30 s / 30 s. The run deadline is separate from the lease TTL.
   - `guards::authorize(conn: &mut PgConnection, fence: &Fence, dot_id: DotId, space_id: SpaceId, policy_version: i64) -> Result<Option<StopReason>, KatError>`: runs `fence::check`, then reads the Dot and its workspace. A paused workspace gives `WorkspacePaused`, a paused Dot `DotPaused`, and a missing grant to `space_id` or a `policy_version` other than `input.policy_version` gives `PolicyChanged`. Status, grant and allowlist changes all increment `policy_version` (Task 5), so a change made while the task was queued is caught on the first check.
   - `guards::canonical_args(args: &serde_json::Value) -> String`: object keys sorted and whitespace normalized; array order and values kept
   - `guards::RepeatKey { tool_name: String, canonical_args: String, target_revision: Option<String> }`, where `target_revision` is always `None` in SP1 (SP2 fills it so a render after each edit is not a loop), and `guards::RepeatGuard::new(limit: u32, window: (u32, u32))` with `check(&mut self, key: &RepeatKey) -> bool`, false meaning stop before this call. The provider's call id is never part of the key.
   - `guards::truncate_result(text: &str, max_scalars: usize) -> String`: at most `max_scalars` Unicode scalar values, the marker `"…[truncated]"` included. A JSON result over the cap becomes a plain-string preview prefixed `"[JSON truncated] "`, never cut inside its structure.
-  - `ledger::start_tool_call(pool, ctx: &ToolCtx, name: &str, side_effect: SideEffect, args_sha256: &str) -> Result<ToolCallRecordId, KatError>`: inserts a `started` row. The first row whose `side_effect` is not `read` also sets `tasks.effects_started_at`, in the same transaction.
+  - `ledger::start_tool_call(pool, ctx: &ToolCtx, name: &str, side_effect: SideEffect, args_canonical: &str) -> Result<ToolCallRecordId, KatError>`: inserts a `started` row with the canonical arguments and their SHA-256. The first row whose `side_effect` is not `read` also sets `tasks.effects_started_at`, in the same transaction.
+  - `ledger::record_refused(pool, ctx: &ToolCtx, name: &str, side_effect: Option<SideEffect>, args_canonical: &str, code: &str) -> Result<ToolCallRecordId, KatError>`: inserts a finished `refused` row whose `result` is the error text sent to the model, and never touches `effects_started_at`. `side_effect` is `None` only for an unknown tool name. It records allowlist and effect-gate refusals (`NotAllowed`, `NeedsApproval`), invalid arguments, unknown tools, repeat-guard stops and `superseded_by_question`.
+  - `ledger::retry_read(pool, fence: &Fence, id: ToolCallRecordId) -> Result<(), KatError>`: a `Read` call's one retry reuses its row: `attempts = 2` and the state goes back to `started`; the `(run_id, step, tool_call_id)` identity never changes
   - `ledger::end_tool_call(pool, fence: &Fence, id: ToolCallRecordId, state: ToolCallState, result: Option<&str>) -> Result<(), KatError>`
   - `ledger::record_model_call(pool, fence: &Fence, row: &ModelCallRow) -> Result<ModelCallId, KatError>`, where `ModelCallRow` mirrors the `model_calls` columns
-  - Fencing: every run-scoped write (the `runs` row, each ledger function, each event through the fenced `PgEventSink`, each tool write) runs `fence::check` in the same transaction as the write, and `lease_lost` aborts it. Before each model attempt the loop also runs `guards::authorize`, which includes `fence::check`, so a reclaimed or cancelled worker makes no further model calls. On `lease_lost` the loop stops at once and writes nothing further.
+  - Fencing: every run-scoped write (the `runs` row, each ledger function, each event through the fenced `PgEventSink`, each tool write) runs `fence::check` in the same transaction as the write, and `lease_lost` aborts it. Before each model attempt the loop also runs `guards::authorize`, which includes `fence::check`, so a reclaimed or cancelled worker makes no further model calls. On `lease_lost` the loop stops at once, writes nothing further and returns `Err(RunAbort::LeaseLost)`.
 - Loop rules:
   - **Steps.** A step is one model attempt, retries included. An answer on attempt 24 is accepted; a tool batch that would need attempt 25 is not executed (`StepLimit`).
   - **Model attempts.** Each attempt calls `models.for_tier(dot.model_tier, &input.space_policy)`, so a provider change re-checks residency, and wraps the stream in `guard_stream`, raced against `input.deadline` (`TimeLimit`). It retries only before the first chunk, at most `model_retries` times. Every attempt gets one `model_calls` row and one `katwork.usage` event. Each request uses `max_output_tokens = min(entry.max_output_tokens, the run's remaining token budget)` and `temperature = entry.temperature`; with less than 256 tokens of budget left, the run stops `TokenBudget` before the attempt.
@@ -573,7 +581,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - **Effect gate before dispatch.** `Read`, `WorkspaceRead`, `Draft` and `WorkspaceWrite` tools run. `Navigate`, `Exec` and `CredentialUse` return `ToolError::NotAllowed`, since SP1 has no computer. `Destructive` and `Outward(_)` return `ToolError::NeedsApproval` before the tool is called: the run stops `NeedsApproval` and records `pending_tool_call` with the provider's `tool_call_id`.
   - **Repeat guard before dispatch.** The run stops `LoopDetected` before executing the 3rd consecutive identical call, or the 5th identical call within the last 10. Two calls are identical when their `RepeatKey`s are equal: the tool name, the canonical arguments and the target revision. The provider's call id, the step and the earlier call's outcome are never part of the key.
   - **Timeouts and cancellation.** Each call's future is owned and raced against `min(tool_timeout, run remaining)` and the run's `CancellationToken`, and dropped on either. Cancellation is checked before dispatch and between sibling calls. No task is ever detached. A call that times out or loses its reply after dispatch is `OutcomeUnknown`. A `Read` tool may retry once. For any other effect the run stops `OutcomeUnknown` at once: the call stays `outcome_unknown` in the ledger, no result goes back to the model, and nothing else is dispatched. The effect may already have committed, and a repeat requested by the model would carry a new call id and so a new idempotency key.
-  - **Ledger.** Every dispatched call records `started`, then `succeeded`, `failed`, `timed_out` or `outcome_unknown`; a refused call records `refused`.
+  - **Ledger.** Every dispatched call goes through `start_tool_call`, then `end_tool_call` with `succeeded`, `failed`, `timed_out` or `outcome_unknown`. Every call that is not dispatched goes through `record_refused`, so a refused outward call never marks effects as started. A failed ledger write aborts the run before the tool is called.
   - **Result pairing.** An unknown tool name, a validation failure, a timeout and a refusal each become exactly one `ChatMsg::Tool { is_error: true }` with the original call id and name, and the loop continues unless a stop rule above applies. The text given to the model is `truncate_result(…, result_max_chars)`, and that exact text is stored in `tool_calls.result`.
   - **Prompt hygiene.** The system text is the Dot's persona and instructions plus a capability preamble generated from the effective tool set, never hand-written into `instructions`. Tool results, history and retrieved text never use the system role. Prompts never say "never ask".
   - **Events.** `RUN_STARTED`, `dot_state working`, then `TEXT_MESSAGE_START` with `messageId = reply_message_id`, the text through `DeltaCoalescer` as `TEXT_MESSAGE_CONTENT`, and `TEXT_MESSAGE_END`. Tool-call events follow only once the turn is accepted; `TOOL_CALL_RESULT` and `katwork.tool_status` follow execution. On cancel, the loop emits `TOOL_CALL_RESULT` (content: `cancelled`) and `katwork.tool_status{ok: false, code: "cancelled"}` for every open call, then `RUN_ERROR{code: "cancelled"}`, and returns with `stop = Cancelled`. The loop never emits `RUN_FINISHED`; `job::conclude` does (Task 10).
@@ -604,7 +612,15 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `old_worker_cannot_commit_tool_write_after_reclaim`: a test tool blocks, the lease is reclaimed, then the tool resumes; its write transaction fails `fence::check` and commits nothing
   - `cancellation_token_stops_with_cancelled`
   - `no_done_after_cancellation`: no `RUN_FINISHED` and no text event after the cancel
-  - `ask_user_ends_run_needs_input`: `pending_question` is set and `final_text` is `None`
+  - `ask_user_ends_run_needs_input`: `pending_question` is set, `final_text` is `None`, and a sibling call in the same turn is recorded `refused` with `superseded_by_question`
+  - `ask_user_rejects_arguments_outside_its_schema`: a 501-character question or a fifth option gives an `InvalidArgs` error result
+  - `read_thread_returns_a_bounded_page`: `limit` above 50 is rejected; the page and `next_before` match the stored thread
+  - `refused_outward_call_does_not_mark_effects_started`
+  - `unknown_tool_is_ledgered_refused_with_no_effect`
+  - `read_retry_reuses_its_ledger_row`
+  - `run_insert_failure_aborts_without_dispatch`: a closed pool; `execute` returns `Infrastructure` and the provider receives no request
+  - `ledger_start_failure_prevents_tool_dispatch`: the tool's `call` never runs
+  - `event_write_failure_aborts_run`: a failing test `EventSink`; `execute` returns `Infrastructure`
   - `tool_output_never_enters_system_role`
   - `capability_preamble_lists_effective_tools`
   - `usage_recorded_once_per_attempt`
@@ -660,7 +676,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `job::conclude(tx: &mut Transaction<'_, Postgres>, tenant: &Tenant, job_id: JobId, thread_id: ThreadId, dot_id: Option<DotId>, idem_key: &str, facts: &RunFacts) -> Result<EventSeq, KatError>`: the single place that writes a job's outcome. In the caller's transaction it:
     1. runs `policy::decide_job(facts, &Thresholds::SP1)`
     2. appends `katwork.decision`
-    3. when `dot_id` is set and there is `final_text` or a `pending_question`, appends the Dot's message with `id = facts.reply_message_id`, `idempotency_key = "reply:{idem_key}"` and `synthetic = facts.synthetic`
+    3. when `dot_id` is set and there is `final_text` or a `pending_question`, appends the Dot's message with `id = facts.reply_message_id`, `idempotency_key = "reply:{idem_key}"` and `synthetic = facts.synthetic`. For a question, the body is the question text and `question` holds the question with its options.
     4. for a `stopped` verdict, appends a `System` message whose body is the reason code, with `idempotency_key = "notice:{idem_key}"`
     5. calls `job::finish_by_policy`
     6. when `facts.run_id` is set, appends `katwork.dot_state` (`needs_approval` for an approval stop, `waiting` for a question, `paused` for a workspace pause, `idle` otherwise), then `RUN_FINISHED` unless `facts.stop` is `Cancelled` or `WorkspacePaused` (those runs already ended with `RUN_ERROR`)
@@ -684,7 +700,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 - Create: `crates/katwork/src/jobs/{lease,worker}.rs`, `crates/katwork/tests/leases.rs`
 
 **Interfaces:**
-- Consumes: `task::enqueue`, `TaskInput`, `job::{conclude, finish_by_harness}` (Task 10); `run::execute`, `RunEnv`, `RunInput`, `RunFacts`, `RunFacts::not_run`, `RunKind`, `Limits`, `StopReason`, `ToolRegistry::builtin` (Task 8); `PgEventSink`, `log::append` (Task 9); `dot::get` (Task 5); `thread::get` (Task 6); `space::get`, `tenancy::resolve` (Task 4); `Core`.
+- Consumes: `task::enqueue`, `TaskInput`, `job::{conclude, finish_by_harness}` (Task 10); `run::execute`, `RunAbort`, `RunEnv`, `RunInput`, `RunFacts`, `RunFacts::not_run`, `RunKind`, `Limits`, `StopReason`, `ToolRegistry::builtin` (Task 8); `PgEventSink`, `log::append` (Task 9); `dot::get` (Task 5); `thread::get` (Task 6); `space::get`, `tenancy::resolve` (Task 4); `Core`.
 - Produces:
   - `lease::claim(core: &Core, worker_id: &str, ttl: Duration, limits: &Limits) -> Result<Option<ClaimedTask>, KatError>`. Candidates are tasks with `state = 'queued'`, or `state = 'leased'` with an expired lease, **whose job is still running** (`jobs.status IS NULL`), selected with `FOR UPDATE OF tasks, jobs SKIP LOCKED`; every time comes from `now()`. Each candidate is handled in its own transaction. A branch that ends without a run commits and claim moves on to the next candidate (at most 16 per call); the first candidate that gets a lease is returned. For each candidate, in order:
     - on an expired lease, first emits `TOOL_CALL_RESULT` and `katwork.tool_status{ok: false}` for each of the previous run's open calls (started in `tool_calls` with no end), marks those calls `outcome_unknown` and the run `interrupted`, and emits `RUN_ERROR{code: "lease_lost"}`, before any later `RUN_STARTED`
@@ -708,7 +724,8 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
     - runs `run::execute` with `Limits::default()`, `ToolRegistry::builtin()`, `core.registry`, `reply_message_id = MessageId::new()` and `deadline = min(now + run_wall_clock, deadline_at)`
     - creates its `PgEventSink` with `fence = Some(Fence { task_id, epoch })`
     - heartbeats every `ttl / 3`; on `Stop(reason)` it cancels the run and sets `facts.stop = Some(reason)`. It cancels the run and drops its facts on `lease_lost`, on a failed renewal, or as soon as the last successful renewal is older than `ttl`.
-    - finishes with `lease::complete`
+    - on `Ok(facts)` finishes with `lease::complete`; on `Err(RunAbort::LeaseLost)` drops the run, because the reclaim or cancel path already closed it; on `Err(RunAbort::Infrastructure { .. })` calls `lease::abandon`
+  - `lease::abandon(core: &Core, task_id: TaskId, worker_id: &str, epoch: LeaseEpoch) -> Result<(), KatError>`: in a fenced transaction, sets the lease's `expires_at = now()`, so the next `claim` applies the normal reclaim rules (re-queue when no effect started, otherwise `interrupted`, and `retries_exhausted` after the third attempt). An infrastructure failure is never turned into a policy verdict. If `abandon` fails as well, the lease simply expires.
   - TTL defaults to 60 s, with a heartbeat every 20 s.
 
 - [ ] **Step 1: Write the failing tests** in `crates/katwork/tests/leases.rs`:
@@ -727,6 +744,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `paused_workspace_claims_nothing`
   - `dot_paused_while_queued_is_not_run`: the Dot is paused between enqueue and claim; the task ends `failed`, the job `stopped/dot_paused`, and the provider receives no request
   - `grant_revoked_while_queued_is_not_run`: the thread's Space grant is revoked between enqueue and claim; the job ends `stopped/policy_changed` and the provider receives no request
+  - `infrastructure_abort_goes_through_reclaim`: an `Infrastructure` abort before any effect re-queues the task as a `Recovery`; the job gets no verdict from the aborted run
   - `worker_cancels_run_when_renewal_fails`: heartbeats start failing; the run is cancelled within `ttl`, before the lease can be reclaimed
   - `pausing_workspace_interrupts_running_task`: the task ends `interrupted` and the job `stopped/workspace_paused`
   - `task_past_deadline_finishes_time_limit`

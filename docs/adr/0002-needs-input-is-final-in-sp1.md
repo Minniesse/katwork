@@ -13,7 +13,7 @@ Resuming the same job needs a parked task, a rule for who may answer, and a chan
 
 - In sub-project 1, `needs_input` is a final job status.
 - The person's next message in that thread starts a **follow-up job** linked to the first one by `jobs.parent_job_id`.
-- A run that stops for approval keeps the exact pending call on its task (`tasks.pending_tool_call`: tool call id, name and argument hash), so sub-project 3 can resume it without a data migration of old rows.
+- A run that stops for approval keeps the exact pending call on its task. `tasks.pending_tool_call` holds the ledger row id, the provider's tool call id, the tool name, the canonical arguments and their SHA-256, and the ledger row holds the same canonical arguments. Sub-project 3 can therefore rebuild and resume exactly that call after a restart, without a data migration of old rows.
 - Sub-project 3 adds resume for both questions and approvals in one change, together with the approval host. Who may answer or approve is the requester or a Space admin, always recorded with identity, channel and time.
 
 ## Consequences
