@@ -210,14 +210,10 @@ impl HttpClientExt for BoundedHttp {
         let req = req.map(Into::into);
         async move {
             let response = http.open(req).await?;
-            let sse = response
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| v.split(';').next() == Some("text/event-stream"));
             let mut head = Response::builder().status(response.status());
             *head.headers_mut().unwrap() = response.headers().clone();
-            head.body(http.body(response, sse))
+            // Model streaming endpoints use SSE regardless of response header spelling.
+            head.body(http.body(response, true))
                 .map_err(http_client::Error::Protocol)
         }
     }
@@ -639,7 +635,7 @@ mod tests {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0u8; 4096];
             assert!(socket.read(&mut request).await.unwrap() > 0);
-            socket.write_all(format!("HTTP/1.1 {status} fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await.unwrap();
+            socket.write_all(format!("HTTP/1.1 {status} fixture\r\nContent-Type: text/event-stream ; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await.unwrap();
             socket.write_all(&body).await.unwrap();
         });
         (url, task)
@@ -677,6 +673,22 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.non_success_body().unwrap().len() <= 32);
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn sse_caps_cannot_be_bypassed_by_content_type_whitespace() {
+        let (url, server) = response(200, b"data: ".repeat(20)).await;
+        let http = BoundedHttp::new(HttpLimits {
+            max_sse_frame_bytes: 32,
+            ..HttpLimits::default()
+        })
+        .unwrap();
+        let response = http
+            .send_streaming(Request::get(url).body(Bytes::new()).unwrap())
+            .await
+            .unwrap();
+        let chunks = response.into_body().collect::<Vec<_>>().await;
+        assert!(chunks.iter().any(|chunk|matches!(chunk, Err(http_client::Error::Instance(e)) if e.downcast_ref::<ModelError>() == Some(&ModelError::Protocol("sse_frame_too_large".into())))));
         server.await.unwrap();
     }
 }
