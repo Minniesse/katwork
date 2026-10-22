@@ -59,6 +59,7 @@
 5. **Provider down, limited or no keys.** The model provider errors, times out, rate-limits, runs out of quota, rejects the key, or isn't configured. Expected: the job ends `stopped` with reason one of `provider_unavailable | provider_rate_limited | provider_quota | provider_auth_failed` within the timeout, the thread shows a localized message, nothing hangs. In demo mode the reply has `synthetic: true`. (Task 7, Task 12.)
 6. **Tool gate bypass.** A tool outside the Dot's allowlist, a destructive or outward tool, a tool call from a failed or `MaxTokens` turn, or a call after the allowlist changed mid-run. Expected: never dispatched; an error result, `needs_input/approval_pending` or `stopped/policy_changed`. (Task 8.)
 7. **Cross-site and wrong-host requests.** A POST from another origin, or any request with an unknown `Host`. Expected: 403 before a handler runs. (Task 3.)
+8. **Duplicate or stranded messages.** A client retries a post, two retries race, or the server crashes mid-intake. Expected: one message, one job and one task, or none at all; never a message without its job. (Task 12.)
 
 ---
 
@@ -178,9 +179,10 @@ web/
   - `teams(id, workspace_id, space_id, name)`; `team_members(team_id, dot_id, is_lead, position)` with a partial unique index that allows one lead per team
   - `threads(id, workspace_id, space_id, team_id, title, last_event_seq BIGINT NOT NULL DEFAULT 0)`
   - `messages(id, workspace_id, thread_id, author_kind, author_user_id NULL, author_dot_id NULL, body, client_msg_id TEXT NULL CHECK (char_length(client_msg_id) <= 64), idempotency_key TEXT NULL UNIQUE, synthetic BOOLEAN NOT NULL DEFAULT false, job_id UUID NULL, created_at, UNIQUE (thread_id, author_user_id, client_msg_id))`; the `job_id` FK is added once `jobs` exists
-  - `jobs(id, workspace_id, thread_id, request_message_id, requested_by UUID NOT NULL REFERENCES users(id), parent_job_id UUID NULL REFERENCES jobs(id), status NULL, reason TEXT NULL, decided_by TEXT NULL CHECK (decided_by IN ('policy','harness')), decision_seq BIGINT NULL, contract_sha256 TEXT NULL, created_at, finished_at NULL)`
+  - `jobs(id, workspace_id, thread_id, request_message_id UUID NOT NULL UNIQUE REFERENCES messages(id), requested_by UUID NOT NULL REFERENCES users(id), parent_job_id UUID NULL REFERENCES jobs(id), status NULL, reason TEXT NULL, decided_by TEXT NULL CHECK (decided_by IN ('policy','harness')), decision_seq BIGINT NULL, contract_sha256 TEXT NULL, created_at, finished_at NULL)`
     - `status` NULL means running, with `CHECK (status IS NULL OR status IN ('accepted','ready','answered','stopped','needs_input','cancelled','error'))`
     - `reason` holds a `ReasonCode` wire value; `decision_seq` is the per-thread seq of the job's `katwork.decision` event; `contract_sha256` is reserved and always NULL in SP1
+    - one job per request message: the unique `request_message_id` means a retried or concurrent intake can never create a second job
   - `tasks(id, workspace_id, job_id, dot_id, input JSONB, state, attempts INT NOT NULL DEFAULT 0, max_attempts INT NOT NULL DEFAULT 3, idempotency_key TEXT UNIQUE, effects_started_at TIMESTAMPTZ NULL, hold_reason TEXT NULL, lease_epoch BIGINT NOT NULL DEFAULT 0, pending_tool_call JSONB NULL, created_at)`
     - `CHECK (state IN ('queued','leased','done','failed','interrupted'))` and `CHECK (hold_reason IN ('dot_busy','provider_quota','workspace_paused'))`
     - `pending_tool_call` is `{tool_call_id, name, args_sha256}`, kept when a run stops on `NeedsApproval`
@@ -200,6 +202,7 @@ web/
   - `dot_default_space_must_be_granted`: committing a Dot whose `default_space_id` has no `dot_spaces` row errors
   - `tool_call_unique_per_run_step_call`
   - `client_msg_id_unique_per_thread_and_author`
+  - `job_request_message_is_unique`: a second job for the same `request_message_id` errors
   - `missing_usage_is_stored_as_null`
   - `space_allow_external_has_no_default`: an insert without `allow_external` errors
   - `side_effect_wire_values_pass_the_schema_check`: every `SideEffect::wire` value inserts into `tool_calls.side_effect`, and `'shell'` is rejected
@@ -347,8 +350,8 @@ web/
   - `Author::{User(UserId), Dot(DotId), System}` (`Eq`, `Hash`)
   - `Message { id: MessageId, thread_id: ThreadId, author: Author, body: String, synthetic: bool, job_id: Option<JobId>, created_at: DateTime<Utc> }`
   - `NewMessage { id: Option<MessageId>, author: Author, body: String, client_msg_id: Option<String>, idempotency_key: Option<String>, synthetic: bool }`; `id: None` generates a new id
-  - `message::append(conn: &mut PgConnection, &Tenant, ThreadId, NewMessage) -> Result<Appended, KatError>` and `Appended { message_id: MessageId, job_id: Option<JobId>, created: bool }`. A repeat of the same `(thread, author, client_msg_id)` or of the same `idempotency_key` returns the original row with `created: false`. It takes a connection so that `job::conclude` (Task 10) can write inside its transaction.
-  - `message::set_job(pool, &Tenant, MessageId, JobId) -> Result<(), KatError>`
+  - `message::append(conn: &mut PgConnection, &Tenant, ThreadId, NewMessage) -> Result<Appended, KatError>` and `Appended { message_id: MessageId, job_id: Option<JobId>, created: bool }`. It runs `INSERT … ON CONFLICT DO NOTHING RETURNING`, and when no row comes back it selects the committed row: a repeat of the same `(thread, author, client_msg_id)` or of the same `idempotency_key` returns the original row with `created: false`, and a concurrent duplicate waits on the unique index, then returns the first row. It takes a connection so that intake (Task 12) and `job::conclude` (Task 10) can write inside their transactions.
+  - `message::set_job(conn: &mut PgConnection, &Tenant, MessageId, JobId) -> Result<(), KatError>`
   - `message::list(pool, &Tenant, ThreadId, before: Option<MessageId>, limit: u16) -> Result<Vec<Message>, KatError>`
   - `mentions::parse(body: &str) -> Vec<String>`: `@name` tokens, Thai-safe. It ignores fenced and inline code and strips trailing punctuation (`"@Writer,"` → `Writer`).
 - Routes:
@@ -604,9 +607,9 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
     | `Cancelled` | `stopped` | `cancelled` | `Retry`; never reached in practice, because cancelled jobs end through the harness |
 
   - `policy::decision_event(job_id: JobId, facts: &RunFacts, v: &Verdict, t: &Thresholds) -> KatworkEvent`: `katwork.decision`, with a summary of the facts as `inputs`
-  - `job::create(pool, &Tenant, ThreadId, MessageId) -> Result<JobId, KatError>`: a running job (`status` NULL) with `requested_by = tenant.user_id`
-  - `job::create_follow_up(pool, &Tenant, parent: JobId, MessageId) -> Result<JobId, KatError>`: `parent` must be `needs_input` in the same thread, otherwise `job_not_awaiting_input`; sets `parent_job_id` (ADR-0002)
-  - `JobSummary { id: JobId, status: Option<JobStatus> }` and `job::latest_in_thread(pool, &Tenant, ThreadId) -> Result<Option<JobSummary>, KatError>`
+  - `job::create(conn: &mut PgConnection, &Tenant, ThreadId, MessageId) -> Result<JobId, KatError>`: a running job (`status` NULL) with `requested_by = tenant.user_id`
+  - `job::create_follow_up(conn: &mut PgConnection, &Tenant, parent: JobId, MessageId) -> Result<JobId, KatError>`: `parent` must be `needs_input` in the same thread, otherwise `job_not_awaiting_input`; sets `parent_job_id` (ADR-0002)
+  - `JobSummary { id: JobId, status: Option<JobStatus> }` and `job::latest_in_thread(conn: &mut PgConnection, &Tenant, ThreadId) -> Result<Option<JobSummary>, KatError>`
   - `job::finish_by_policy(tx: &mut Transaction<'_, Postgres>, job_id: JobId, v: &Verdict, decision_seq: EventSeq) -> Result<EventSeq, KatError>`: sets `status`, `reason`, `decided_by = 'policy'` and `decision_seq`, then appends `katwork.job_status` and returns its seq. The caller has already appended `katwork.decision`.
   - `HarnessEnd::{Cancelled, Error { code: ReasonCode }}` and `job::finish_by_harness(pool, hub: &EventHub, job_id: JobId, end: HarnessEnd) -> Result<(), KatError>`: sets `decided_by = 'harness'`, appends `katwork.job_status`, commits, then notifies the hub
   - Finishing a finished job is `job_already_finished`.
@@ -620,7 +623,8 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 
     It returns the last seq; the caller commits and notifies the hub.
   - `TaskInput { thread_id: ThreadId, history: Vec<ChatMsg>, history_cut: u32, actor: UserId, initiator: Initiator }` (`Serialize`, `Deserialize`; stored in `tasks.input`)
-  - `task::enqueue(pool, job_id: JobId, dot_id: DotId, input: &TaskInput, idempotency_key: &str) -> Result<TaskId, KatError>`: idempotent on the key
+  - `task::enqueue(conn: &mut PgConnection, job_id: JobId, dot_id: DotId, input: &TaskInput, idempotency_key: &str) -> Result<TaskId, KatError>`: idempotent on the key
+  - `job::create`, `job::create_follow_up`, `job::latest_in_thread` and `task::enqueue` take a connection so that intake (Task 12) runs them in one transaction.
 
 - [ ] **Step 1: Write the failing tests:**
   - in `crates/katwork/tests/policy.rs`: `policy_same_facts_same_verdict`, `answered_only_without_artifacts_else_ready`, `executor_unavailable_is_stopped_provider_unavailable`, `needs_approval_is_needs_input_approval_pending`, `every_stop_reason_maps_to_its_reason_code` (table-driven over the table above), `policy_never_returns_cancelled_or_error`
@@ -679,20 +683,26 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 
 **Files:**
 - Create: `crates/katwork/src/pipeline.rs`, `crates/katwork/src/jobs/quota.rs`, `crates/katwork-server/src/routes/jobs.rs`, `crates/katwork-server/tests/pipeline.rs`
-- Modify: `crates/katwork/src/jobs/job.rs` (`job::cancel`), `crates/katwork-server/src/routes/threads.rs` (`POST` messages now returns `job_id`), `crates/katwork-server/src/main.rs` (`serve` spawns the worker pool)
+- Modify: `crates/katwork/src/jobs/job.rs` (`job::cancel`), `crates/katwork-server/src/routes/threads.rs` (`POST` messages calls `pipeline::submit` and returns its `job_id`), `crates/katwork-server/src/main.rs` (`serve` spawns the worker pool)
 
 **Interfaces:**
 - Consumes: Tasks 4–11.
 - Produces:
-  - `pipeline::on_user_message(core: &Core, tenant: &Tenant, thread_id: ThreadId, message_id: MessageId) -> Result<JobId, KatError>`:
-    - if the thread's latest job is `needs_input`, it calls `job::create_follow_up`; otherwise `job::create` (ADR-0002)
+  - `UserPost { body: String, client_msg_id: Option<String> }` and `Submitted { message_id: MessageId, job_id: JobId, created: bool }`
+  - `pipeline::intake(tx: &mut Transaction<'_, Postgres>, core: &Core, tenant: &Tenant, thread_id: ThreadId, post: UserPost) -> Result<Submitted, KatError>`: the whole intake inside the caller's transaction, in this order:
+    1. `message::append` for the user message; when it returns `created: false`, intake returns the stored `{message_id, job_id}` at once. Because a message, its job and its task commit together, a stored message always has its `job_id`.
+    2. `job::latest_in_thread`; if that job is `needs_input`, `job::create_follow_up`, otherwise `job::create` (ADR-0002). The unique `jobs.request_message_id` rejects any second job for the message.
+    3. routing, quotas and notices (below)
+    4. `task::enqueue` and `message::set_job`, or `job::conclude` for a job that ends at intake
+  - `pipeline::submit(core: &Core, tenant: &Tenant, thread_id: ThreadId, post: UserPost) -> Result<Submitted, KatError>`: begins a transaction, runs `intake`, commits, then notifies the hub. A crash at any point before the commit leaves no message, job or task, so the client's retry with the same `client_msg_id` starts clean; a concurrent retry waits on the message's unique index and returns the first post's ids. The route answers 201 when `created`, otherwise 200.
+  - Intake rules inside `intake`:
     - SP1 routing (spec §6.2 Stage 0 subset; Laya arrives in SP4): the closed set is the thread team's Dots that are `active` and granted to the thread's Space. An `@mention` of a Dot in the set goes to that Dot; otherwise to the team's Lead.
     - a mentioned Dot that is paused leaves the set: the pipeline posts a `System` notice `dot_paused` and routes to the Lead. If no eligible Dot remains, the job ends with `job::conclude` on `RunFacts::not_run(StopReason::DotPaused)`.
     - quotas before enqueue: `quota::check`; when exceeded, the job ends with `job::conclude` on `RunFacts::not_run(StopReason::QuotaExceeded)`, which posts a localized notice. Nothing is dropped silently.
     - in a paused workspace the task is still enqueued and waits (Task 11), and the pipeline posts a `System` notice `workspace_paused`
     - every `job::conclude` call here uses the job id as `idem_key`, and each notice uses the idempotency key `"notice:{job_id}:{code}"`, so a retried post never doubles them
     - builds `TaskInput` with `build_history`, calls `task::enqueue` with key `"job:{job_id}:dot:{dot_id}"`, then `message::set_job`
-  - `quota::check(pool, dot: &Dot, sender: UserId) -> Result<Option<StopReason>, KatError>`: the Dot's rolling 24-hour token total from `model_calls` against `daily_token_budget` (NULL means no cap), and at most 6 jobs per minute per (Dot, sender), both counted in Postgres
+  - `quota::check(conn: &mut PgConnection, dot: &Dot, sender: UserId) -> Result<Option<StopReason>, KatError>`: the Dot's rolling 24-hour token total from `model_calls` against `daily_token_budget` (NULL means no cap), and at most 6 jobs per minute per (Dot, sender), both counted in Postgres
   - `History { messages: Vec<ChatMsg>, cut: u32 }` and `pipeline::build_history(messages: &[Message], dot_id: DotId, names: &HashMap<Author, String>, budget_chars: usize) -> History`:
     - the newest messages up to `budget_chars` (24,000); the latest user message is always kept whole, and the number of cut messages is recorded
     - the Dot's own messages map to `Assistant`; other Dots and people map to `User` with their server-side `name`
@@ -713,6 +723,9 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `stream_message_id_equals_stored_reply_id`
   - `restart_mid_run_posts_exactly_one_reply`
   - `retry_with_same_client_msg_id_creates_one_job`
+  - `concurrent_retries_with_same_client_msg_id_create_one_job`: two posts with the same `client_msg_id` race; one message, one job and one task exist, and both responses carry the same ids
+  - `intake_rolled_back_leaves_no_message_job_or_task`: runs `pipeline::intake` to its last step and drops the transaction without committing (a crash between any two steps rolls back the same way); no message, job or task remains, and a retry then creates exactly one of each
+  - `retry_after_intake_stop_returns_same_job`: a post whose job ends at intake (quota) is retried; the same job comes back and no second job or notice appears
   - `reply_to_needs_input_job_starts_linked_follow_up`
   - `history_budget_keeps_latest_user_message_whole`
   - `other_dots_messages_are_user_role_with_name`
