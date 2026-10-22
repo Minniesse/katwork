@@ -919,13 +919,13 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 - An optional `https` profile adds a `caddy:2` service that publishes ports 80 and 443 and proxies `KATWORK_HTTPS_HOST` to `katwork:3000`. With it, `KATWORK_PUBLIC_URL=https://<host>`, so the session cookie is `Secure`.
 
 - [ ] **Step 1: Write `scripts/smoke.sh`.** It must:
-  1. Run `docker compose -f docker-compose.yml -f docker-compose.smoke.yml up -d --build` with `KATWORK_DEMO_PASSWORD` set.
+  1. Export `COMPOSE_FILE=docker-compose.yml:docker-compose.smoke.yml` once, at the top, so that every `docker compose` command in the script, restarts included, uses the override. Then run `docker compose up -d --build` with `KATWORK_DEMO_PASSWORD` set, and assert the effective configuration: `docker inspect` on the `katwork` container shows `KATWORK_SMOKE_HOLD_SECS=20`, `KATWORK_DEMO=1`, and empty `OPENAI_API_KEY` and `ANTHROPIC_API_KEY`.
   2. Wait for `/healthz`.
   3. Run `seed-demo`.
   4. Log in as demo and post `"สวัสดี ช่วยแนะนำทีมหน่อย"` with `Origin: $KATWORK_PUBLIC_URL` and a `client_msg_id`.
   5. Read SSE until `katwork.job_status`.
   6. Assert status `answered`, and that the Dot reply from the messages API has `synthetic: true`.
-  7. In a second scenario, post again, then poll Postgres (`docker compose exec -T postgres psql …`) until the task is `leased` and its `runs` row is `running`. Only then run `docker compose kill katwork` and `docker compose up -d katwork`. After recovery, assert that:
+  7. In a second scenario, post again, then poll Postgres (`docker compose exec -T postgres psql …`) until the task is `leased` and its `runs` row is `running`. Only then run `docker compose kill katwork` and `docker compose up -d katwork`, and assert the same effective configuration on the new container. After recovery, assert that:
      - a second `runs` row with `kind = 'recovery'` exists for the task, so a recovery attempt really happened
      - the job has exactly one Dot reply message
      - the job has exactly one `katwork.decision` event and one terminal `katwork.job_status`, and its status is `answered`
