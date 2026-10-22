@@ -113,12 +113,15 @@ fn side_effect_wire_strings_round_trip_every_variant() {
     ];
     for (value, wire) in effects {
         assert_eq!(value.wire(), wire);
+        assert_eq!(SideEffect::from_wire(wire), Some(value));
         assert_eq!(to_value(value).unwrap(), json!(wire));
         assert_eq!(from_value::<SideEffect>(json!(wire)).unwrap(), value);
     }
     for invalid in [json!("shell"), json!({"outward": "send"}), json!(null)] {
         assert!(from_value::<SideEffect>(invalid).is_err());
     }
+    assert_eq!(SideEffect::from_wire("shell"), None);
+    assert_eq!(SideEffect::from_wire("outward"), None);
 }
 
 #[test]

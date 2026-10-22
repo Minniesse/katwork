@@ -7,13 +7,25 @@ pub enum KatError {
     #[error("database_unavailable")]
     DatabaseUnavailable(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("database_error")]
-    Database(#[from] sqlx::Error),
+    Database(#[source] sqlx::Error),
     #[error("migration_failed")]
     Migration(#[from] sqlx::migrate::MigrateError),
     #[error("lease_lost")]
     LeaseLost,
     #[error("io_error")]
     Io(#[from] std::io::Error),
+}
+
+impl From<sqlx::Error> for KatError {
+    fn from(error: sqlx::Error) -> Self {
+        match error {
+            sqlx::Error::PoolTimedOut
+            | sqlx::Error::PoolClosed
+            | sqlx::Error::Io(_)
+            | sqlx::Error::Tls(_) => Self::DatabaseUnavailable(Box::new(error)),
+            _ => Self::Database(error),
+        }
+    }
 }
 
 impl KatError {

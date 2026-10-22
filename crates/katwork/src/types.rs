@@ -74,8 +74,7 @@ pub enum OutwardKind {
     ExternalApi,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SideEffect {
     Read,
     Navigate,
@@ -89,6 +88,25 @@ pub enum SideEffect {
 }
 
 impl SideEffect {
+    pub fn from_wire(wire: &str) -> Option<Self> {
+        Some(match wire {
+            "read" => Self::Read,
+            "navigate" => Self::Navigate,
+            "workspace_read" => Self::WorkspaceRead,
+            "draft" => Self::Draft,
+            "workspace_write" => Self::WorkspaceWrite,
+            "exec" => Self::Exec,
+            "credential_use" => Self::CredentialUse,
+            "destructive" => Self::Destructive,
+            "outward_send" => Self::Outward(OutwardKind::Send),
+            "outward_publish" => Self::Outward(OutwardKind::Publish),
+            "outward_pay" => Self::Outward(OutwardKind::Pay),
+            "outward_share" => Self::Outward(OutwardKind::Share),
+            "outward_external_api" => Self::Outward(OutwardKind::ExternalApi),
+            _ => return None,
+        })
+    }
+
     pub fn wire(&self) -> &'static str {
         match self {
             Self::Read => "read",
@@ -105,6 +123,19 @@ impl SideEffect {
             Self::Outward(OutwardKind::Share) => "outward_share",
             Self::Outward(OutwardKind::ExternalApi) => "outward_external_api",
         }
+    }
+}
+
+impl Serialize for SideEffect {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.wire())
+    }
+}
+
+impl<'de> Deserialize<'de> for SideEffect {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = String::deserialize(deserializer)?;
+        Self::from_wire(&wire).ok_or_else(|| serde::de::Error::custom("unknown side effect"))
     }
 }
 

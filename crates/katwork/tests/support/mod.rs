@@ -80,7 +80,7 @@ impl Fixture {
             .execute(pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO task_leases (workspace_id, task_id, worker_id, lease_epoch, expires_at) VALUES ($1, $2, 'worker', 1, now() + interval '1 hour')").bind(self.workspace).bind(self.task).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO task_leases (task_id, worker_id, lease_epoch, expires_at) VALUES ($1, 'worker', 1, clock_timestamp() + interval '1 hour')").bind(self.task).execute(pool).await.unwrap();
     }
 }
 

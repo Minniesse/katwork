@@ -42,13 +42,14 @@ CREATE TABLE spaces (
     id UUID PRIMARY KEY,
     workspace_id UUID NOT NULL REFERENCES workspaces(id),
     name TEXT NOT NULL,
-    allow_external BOOLEAN NOT NULL
+    allow_external BOOLEAN NOT NULL,
+    UNIQUE (id, workspace_id)
 );
 
 CREATE TABLE dots (
     id UUID PRIMARY KEY,
     workspace_id UUID NOT NULL REFERENCES workspaces(id),
-    default_space_id UUID NOT NULL REFERENCES spaces(id),
+    default_space_id UUID NOT NULL,
     name TEXT NOT NULL,
     role TEXT NOT NULL,
     persona TEXT NOT NULL,
@@ -60,14 +61,18 @@ CREATE TABLE dots (
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'paused')),
     max_concurrency INT NOT NULL DEFAULT 1 CHECK (max_concurrency > 0),
     policy_version BIGINT NOT NULL DEFAULT 1,
-    daily_token_budget BIGINT
+    daily_token_budget BIGINT,
+    UNIQUE (id, workspace_id),
+    FOREIGN KEY (default_space_id, workspace_id) REFERENCES spaces(id, workspace_id)
 );
 
 CREATE TABLE dot_spaces (
     workspace_id UUID NOT NULL REFERENCES workspaces(id),
-    dot_id UUID NOT NULL REFERENCES dots(id),
-    space_id UUID NOT NULL REFERENCES spaces(id),
-    PRIMARY KEY (dot_id, space_id)
+    dot_id UUID NOT NULL,
+    space_id UUID NOT NULL,
+    PRIMARY KEY (dot_id, space_id),
+    FOREIGN KEY (dot_id, workspace_id) REFERENCES dots(id, workspace_id),
+    FOREIGN KEY (space_id, workspace_id) REFERENCES spaces(id, workspace_id)
 );
 
 ALTER TABLE dots ADD FOREIGN KEY (id, default_space_id)
@@ -76,17 +81,21 @@ ALTER TABLE dots ADD FOREIGN KEY (id, default_space_id)
 CREATE TABLE teams (
     id UUID PRIMARY KEY,
     workspace_id UUID NOT NULL REFERENCES workspaces(id),
-    space_id UUID NOT NULL REFERENCES spaces(id),
-    name TEXT NOT NULL
+    space_id UUID NOT NULL,
+    name TEXT NOT NULL,
+    UNIQUE (id, workspace_id),
+    FOREIGN KEY (space_id, workspace_id) REFERENCES spaces(id, workspace_id)
 );
 
 CREATE TABLE team_members (
     workspace_id UUID NOT NULL REFERENCES workspaces(id),
-    team_id UUID NOT NULL REFERENCES teams(id),
-    dot_id UUID NOT NULL REFERENCES dots(id),
+    team_id UUID NOT NULL,
+    dot_id UUID NOT NULL,
     is_lead BOOLEAN NOT NULL,
     position INT NOT NULL,
-    PRIMARY KEY (team_id, dot_id)
+    PRIMARY KEY (team_id, dot_id),
+    FOREIGN KEY (team_id, workspace_id) REFERENCES teams(id, workspace_id),
+    FOREIGN KEY (dot_id, workspace_id) REFERENCES dots(id, workspace_id)
 );
 
 CREATE UNIQUE INDEX team_members_one_lead ON team_members (team_id) WHERE is_lead;
@@ -94,19 +103,22 @@ CREATE UNIQUE INDEX team_members_one_lead ON team_members (team_id) WHERE is_lea
 CREATE TABLE threads (
     id UUID PRIMARY KEY,
     workspace_id UUID NOT NULL REFERENCES workspaces(id),
-    space_id UUID NOT NULL REFERENCES spaces(id),
-    team_id UUID NOT NULL REFERENCES teams(id),
+    space_id UUID NOT NULL,
+    team_id UUID NOT NULL,
     title TEXT NOT NULL,
-    last_event_seq BIGINT NOT NULL DEFAULT 0
+    last_event_seq BIGINT NOT NULL DEFAULT 0,
+    UNIQUE (id, workspace_id),
+    FOREIGN KEY (space_id, workspace_id) REFERENCES spaces(id, workspace_id),
+    FOREIGN KEY (team_id, workspace_id) REFERENCES teams(id, workspace_id)
 );
 
 CREATE TABLE messages (
     id UUID PRIMARY KEY,
     workspace_id UUID NOT NULL REFERENCES workspaces(id),
-    thread_id UUID NOT NULL REFERENCES threads(id),
+    thread_id UUID NOT NULL,
     author_kind TEXT NOT NULL CHECK (author_kind IN ('user', 'dot', 'system')),
     author_user_id UUID REFERENCES users(id),
-    author_dot_id UUID REFERENCES dots(id),
+    author_dot_id UUID,
     body TEXT NOT NULL,
     client_msg_id TEXT CHECK (char_length(client_msg_id) <= 64),
     idempotency_key TEXT UNIQUE,
@@ -114,32 +126,42 @@ CREATE TABLE messages (
     question JSONB,
     job_id UUID,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (thread_id, author_user_id, client_msg_id)
+    UNIQUE (thread_id, author_user_id, client_msg_id),
+    UNIQUE (id, workspace_id),
+    FOREIGN KEY (thread_id, workspace_id) REFERENCES threads(id, workspace_id),
+    FOREIGN KEY (author_dot_id, workspace_id) REFERENCES dots(id, workspace_id),
+    CONSTRAINT messages_user_author_check CHECK ((author_kind = 'user') = (author_user_id IS NOT NULL)),
+    CONSTRAINT messages_dot_author_check CHECK ((author_kind = 'dot') = (author_dot_id IS NOT NULL)),
+    CONSTRAINT messages_client_author_check CHECK (client_msg_id IS NULL OR author_kind = 'user')
 );
 
 CREATE TABLE jobs (
     id UUID PRIMARY KEY,
     workspace_id UUID NOT NULL REFERENCES workspaces(id),
-    thread_id UUID NOT NULL REFERENCES threads(id),
-    request_message_id UUID NOT NULL UNIQUE REFERENCES messages(id),
+    thread_id UUID NOT NULL,
+    request_message_id UUID NOT NULL UNIQUE,
     requested_by UUID NOT NULL REFERENCES users(id),
-    parent_job_id UUID REFERENCES jobs(id),
+    parent_job_id UUID,
     status TEXT CHECK (status IS NULL OR status IN ('accepted', 'ready', 'answered', 'stopped', 'needs_input', 'cancelled', 'error')),
     reason TEXT,
     decided_by TEXT CHECK (decided_by IN ('policy', 'harness')),
     decision_seq BIGINT,
     contract_sha256 TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    finished_at TIMESTAMPTZ
+    finished_at TIMESTAMPTZ,
+    UNIQUE (id, workspace_id),
+    FOREIGN KEY (thread_id, workspace_id) REFERENCES threads(id, workspace_id),
+    FOREIGN KEY (request_message_id, workspace_id) REFERENCES messages(id, workspace_id),
+    FOREIGN KEY (parent_job_id, workspace_id) REFERENCES jobs(id, workspace_id)
 );
 
-ALTER TABLE messages ADD FOREIGN KEY (job_id) REFERENCES jobs(id);
+ALTER TABLE messages ADD FOREIGN KEY (job_id, workspace_id) REFERENCES jobs(id, workspace_id);
 
 CREATE TABLE tasks (
     id UUID PRIMARY KEY,
     workspace_id UUID NOT NULL REFERENCES workspaces(id),
-    job_id UUID NOT NULL REFERENCES jobs(id),
-    dot_id UUID NOT NULL REFERENCES dots(id),
+    job_id UUID NOT NULL,
+    dot_id UUID NOT NULL,
     dot_policy_version BIGINT NOT NULL,
     input JSONB NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('queued', 'leased', 'done', 'failed', 'interrupted', 'cancelled')),
@@ -150,23 +172,29 @@ CREATE TABLE tasks (
     hold_reason TEXT CHECK (hold_reason IN ('dot_busy', 'provider_quota', 'workspace_paused')),
     lease_epoch BIGINT NOT NULL DEFAULT 0,
     pending_tool_call JSONB,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (id, workspace_id),
+    FOREIGN KEY (job_id, workspace_id) REFERENCES jobs(id, workspace_id),
+    FOREIGN KEY (dot_id, workspace_id) REFERENCES dots(id, workspace_id)
 );
 
 CREATE TABLE task_leases (
-    workspace_id UUID NOT NULL REFERENCES workspaces(id),
     task_id UUID PRIMARY KEY REFERENCES tasks(id),
     worker_id TEXT NOT NULL,
     lease_epoch BIGINT NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL
 );
 
+CREATE INDEX tasks_claim_state_created_at ON tasks (state, created_at)
+    WHERE state IN ('queued', 'leased');
+CREATE INDEX tasks_live_leases_by_dot ON tasks (dot_id) WHERE state = 'leased';
+
 CREATE TABLE runs (
     id UUID PRIMARY KEY,
     workspace_id UUID NOT NULL REFERENCES workspaces(id),
-    job_id UUID NOT NULL REFERENCES jobs(id),
-    task_id UUID NOT NULL REFERENCES tasks(id),
-    dot_id UUID NOT NULL REFERENCES dots(id),
+    job_id UUID NOT NULL,
+    task_id UUID NOT NULL,
+    dot_id UUID NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('initial', 'repair', 'recovery')),
     lease_epoch BIGINT NOT NULL,
     dot_config_hash TEXT NOT NULL,
@@ -174,13 +202,17 @@ CREATE TABLE runs (
     state TEXT NOT NULL CHECK (state IN ('running', 'finished', 'interrupted', 'cancelled', 'error')),
     stop_reason TEXT,
     started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    ended_at TIMESTAMPTZ
+    ended_at TIMESTAMPTZ,
+    UNIQUE (id, workspace_id),
+    FOREIGN KEY (job_id, workspace_id) REFERENCES jobs(id, workspace_id),
+    FOREIGN KEY (task_id, workspace_id) REFERENCES tasks(id, workspace_id),
+    FOREIGN KEY (dot_id, workspace_id) REFERENCES dots(id, workspace_id)
 );
 
 CREATE TABLE tool_calls (
     id UUID PRIMARY KEY,
     workspace_id UUID NOT NULL REFERENCES workspaces(id),
-    run_id UUID NOT NULL REFERENCES runs(id),
+    run_id UUID NOT NULL,
     step INT NOT NULL,
     tool_call_id TEXT NOT NULL,
     tool_name TEXT NOT NULL,
@@ -193,17 +225,18 @@ CREATE TABLE tool_calls (
     started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     ended_at TIMESTAMPTZ,
     UNIQUE (run_id, step, tool_call_id),
-    CHECK (side_effect IS NOT NULL OR state = 'refused')
+    CHECK (side_effect IS NOT NULL OR state = 'refused'),
+    FOREIGN KEY (run_id, workspace_id) REFERENCES runs(id, workspace_id)
 );
 
 CREATE TABLE model_calls (
     id UUID PRIMARY KEY,
     workspace_id UUID NOT NULL REFERENCES workspaces(id),
-    space_id UUID NOT NULL REFERENCES spaces(id),
-    job_id UUID NOT NULL REFERENCES jobs(id),
-    task_id UUID NOT NULL REFERENCES tasks(id),
-    run_id UUID NOT NULL REFERENCES runs(id),
-    dot_id UUID NOT NULL REFERENCES dots(id),
+    space_id UUID NOT NULL,
+    job_id UUID NOT NULL,
+    task_id UUID NOT NULL,
+    run_id UUID NOT NULL,
+    dot_id UUID NOT NULL,
     provider_id TEXT NOT NULL,
     model TEXT NOT NULL,
     residency TEXT NOT NULL,
@@ -217,16 +250,25 @@ CREATE TABLE model_calls (
     cost_micros BIGINT,
     latency_ms INT NOT NULL,
     outcome TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    FOREIGN KEY (space_id, workspace_id) REFERENCES spaces(id, workspace_id),
+    FOREIGN KEY (job_id, workspace_id) REFERENCES jobs(id, workspace_id),
+    FOREIGN KEY (task_id, workspace_id) REFERENCES tasks(id, workspace_id),
+    FOREIGN KEY (run_id, workspace_id) REFERENCES runs(id, workspace_id),
+    FOREIGN KEY (dot_id, workspace_id) REFERENCES dots(id, workspace_id)
 );
 
 CREATE TABLE events (
-    thread_id UUID NOT NULL REFERENCES threads(id),
+    thread_id UUID NOT NULL,
     seq BIGINT NOT NULL,
     workspace_id UUID NOT NULL REFERENCES workspaces(id),
-    run_id UUID REFERENCES runs(id),
+    run_id UUID,
     kind TEXT NOT NULL,
     payload JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (thread_id, seq)
+    PRIMARY KEY (thread_id, seq),
+    FOREIGN KEY (thread_id, workspace_id) REFERENCES threads(id, workspace_id),
+    FOREIGN KEY (run_id, workspace_id) REFERENCES runs(id, workspace_id)
 );
+
+CREATE INDEX model_calls_dot_daily_tokens ON model_calls (dot_id, created_at) INCLUDE (charged_tokens);
