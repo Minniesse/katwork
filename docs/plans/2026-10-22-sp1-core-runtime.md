@@ -61,6 +61,7 @@
 6. **Tool gate bypass.** A tool outside the Dot's allowlist, a destructive or outward tool, a tool call from a failed or `MaxTokens` turn, a call after the allowlist changed mid-run, or a write repeated after its first outcome was lost. Expected: never dispatched; an error result, `needs_input/approval_pending`, `stopped/policy_changed` or `stopped/outcome_unknown`. (Task 8.)
 7. **Cross-site and wrong-host requests.** A POST from another origin, or any request with an unknown `Host`. Expected: 403 before a handler runs. (Task 3.)
 8. **Duplicate or stranded messages.** A client retries a post, two retries race, or the server crashes mid-intake. Expected: one message, one job and one task, or none at all; never a message without its job. (Task 12.)
+9. **Deadlocks between terminal writers.** Cancel racing completion, a recovery claim racing a claim for a paused Dot, a quota rejection racing a claim. Expected: every path takes its locks in the global order, so none fails with SQLSTATE `40P01`. (Tasks 11 and 12.)
 
 ---
 
