@@ -1,5 +1,11 @@
 #[derive(Debug, thiserror::Error)]
 pub enum KatError {
+    #[error("not_found")]
+    NotFound,
+    #[error("forbidden")]
+    Forbidden,
+    #[error("space_policy_required")]
+    SpacePolicyRequired,
     #[error("unauthenticated")]
     Unauthenticated,
     #[error("reset_token_invalid")]
@@ -56,6 +62,9 @@ impl From<sqlx::Error> for KatError {
 impl KatError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::NotFound => "not_found",
+            Self::Forbidden => "forbidden",
+            Self::SpacePolicyRequired => "space_policy_required",
             Self::Unauthenticated => "unauthenticated",
             Self::ResetTokenInvalid => "reset_token_invalid",
             Self::PasswordInvalid => "password_invalid",
