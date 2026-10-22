@@ -1,6 +1,7 @@
 services:
   postgres:
     image: postgres:17
+    networks: [backend]
     environment:
       POSTGRES_USER: katwork
       POSTGRES_DB: katwork
@@ -15,20 +16,41 @@ services:
 
   qdrant:
     image: qdrant/qdrant:v1.19.2
+    networks: [backend]
     volumes:
       - qdrant_data:/qdrant/storage
 
   katwork:
     build: .
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    init: true
+    networks: [backend, default]
     environment:
       DATABASE_URL: ${DATABASE_URL:-}
       KATWORK_SECRET: ${KATWORK_SECRET:-}
       KATWORK_DEMO: ${KATWORK_DEMO:-}
+      KATWORK_PUBLIC_URL: ${KATWORK_PUBLIC_URL:-}
+      KATWORK_DEMO_PASSWORD: ${KATWORK_DEMO_PASSWORD:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
     ports:
-      - "3000:3000"
+      - "${KATWORK_BIND:-127.0.0.1}:3000:3000"
     depends_on:
       postgres:
         condition: service_healthy
+
+networks:
+  backend:
+    internal: true
+  default:
 
 volumes:
   postgres_data:

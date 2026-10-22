@@ -35,3 +35,22 @@ fn serve_rejects_missing_configuration() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("config_invalid"));
 }
+
+#[test]
+fn serve_reports_database_cause_without_password() {
+    let output = server()
+        .arg("serve")
+        .env(
+            "DATABASE_URL",
+            "postgres://katwork:db-test-password@localhost/katwork?sslmode=db-test-password",
+        )
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("database_unavailable"));
+    assert!(stderr.contains("caused by:"), "{stderr}");
+    assert!(stderr.contains("ssl_mode"), "{stderr}");
+    assert!(stderr.contains("[redacted]"), "{stderr}");
+    assert!(!stderr.contains("db-test-password"));
+}

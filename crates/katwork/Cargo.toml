@@ -6,4 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+percent-encoding.workspace = true
 thiserror.workspace = true
+url.workspace = true

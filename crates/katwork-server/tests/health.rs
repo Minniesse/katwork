@@ -10,11 +10,12 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn health_returns_ok_and_version() {
-    let config = Config {
-        database_url: "postgres://localhost/katwork".into(),
-        secret: "test-only-secret-at-least-32-bytes".into(),
-        demo: false,
-    };
+    let config = Config::from_lookup(|name| match name {
+        "DATABASE_URL" => Some("postgres://localhost/katwork".into()),
+        "KATWORK_SECRET" => Some("test-only-secret-at-least-32-bytes".into()),
+        _ => None,
+    })
+    .unwrap();
     let pool = PgPoolOptions::new()
         .connect_lazy(&config.database_url)
         .unwrap();
