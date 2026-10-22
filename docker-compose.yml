@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: katwork
+      POSTGRES_DB: katwork
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U katwork -d katwork"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:v1.19.2
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  katwork:
+    build: .
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-}
+      KATWORK_SECRET: ${KATWORK_SECRET:-}
+      KATWORK_DEMO: ${KATWORK_DEMO:-}
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  qdrant_data:
