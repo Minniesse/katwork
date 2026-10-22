@@ -93,11 +93,18 @@ async fn reset_token_never_appears_in_logs(pool: PgPool) {
         assert!(!logs.text().contains(secret));
     }
     assert!(!format!("{:?}", sent[0]).contains(token));
-    reset::confirm(&pool, token, &Uuid::now_v7().to_string())
+    let new_password = Uuid::now_v7().to_string();
+    reset::confirm(&pool, token, &new_password)
         .with_subscriber(subscriber(&logs))
         .await
         .unwrap();
-    assert!(!logs.text().contains(token));
+    let response = support::login(&app, &new_password)
+        .with_subscriber(subscriber(&logs))
+        .await;
+    assert_eq!(response.status(), 200);
+    for secret in [token, new_password.as_str()] {
+        assert!(!logs.text().contains(secret));
+    }
     reset::request(
         &pool,
         capture.as_ref(),
