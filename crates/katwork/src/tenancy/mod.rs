@@ -9,7 +9,7 @@ use unicode_properties::{GeneralCategory, GeneralCategoryGroup, UnicodeGeneralCa
 
 use crate::{
     error::KatError,
-    ids::{UserId, WorkspaceId},
+    ids::{TaskId, UserId, WorkspaceId},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
@@ -21,7 +21,8 @@ pub enum Role {
     Member,
 }
 
-/// Membership resolved by [`resolve`]; callers cannot construct a tenant directly.
+/// Workspace scope resolved by [`resolve`] for requests or by persisted task authority internally.
+/// Callers cannot construct a tenant directly.
 ///
 /// ```compile_fail
 /// use katwork::{ids::{UserId, WorkspaceId}, tenancy::{Role, Tenant}};
@@ -167,5 +168,27 @@ pub async fn resolve<'e, E: Executor<'e, Database = Postgres>>(
         workspace_id,
         user_id,
         role,
+    })
+}
+
+/// Internal run scope comes from persisted job/Kat authority, not current requester membership.
+/// This never grants administrative rights or replaces request-time membership checks.
+pub(crate) async fn for_task<'e, E: Executor<'e, Database = Postgres>>(
+    conn: E,
+    task: TaskId,
+) -> Result<Tenant, KatError> {
+    let (workspace_id, user_id) = sqlx::query_as(
+        "SELECT t.workspace_id,j.requested_by FROM tasks t
+         JOIN jobs j ON j.id=t.job_id AND j.workspace_id=t.workspace_id
+         JOIN kats k ON k.id=t.kat_id AND k.workspace_id=t.workspace_id WHERE t.id=$1",
+    )
+    .bind(task)
+    .fetch_optional(conn)
+    .await?
+    .ok_or(KatError::NotFound)?;
+    Ok(Tenant {
+        workspace_id,
+        user_id,
+        role: Role::Member,
     })
 }

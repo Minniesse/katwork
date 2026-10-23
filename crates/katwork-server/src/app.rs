@@ -7,7 +7,7 @@ use axum::{
 use katwork::runtime::Core;
 
 use crate::{
-    routes::{auth, events, health, kats, members, teams, threads, workspaces},
+    routes::{auth, events, health, jobs, kats, members, teams, threads, workspaces},
     static_files,
 };
 
@@ -109,6 +109,14 @@ fn router(state: AppState, web_dir: &Path, reset_work: ResetWork) -> Router {
         .route(
             "/api/workspaces/{workspace_id}/threads/{thread_id}/messages",
             get(threads::messages).post(threads::post_message),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/jobs/{job_id}",
+            get(jobs::get),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/jobs/{job_id}/cancel",
+            post(jobs::cancel),
         )
         .fallback_service(static_files::service(web_dir.to_owned()))
         .layer(Extension(auth::LoginLimiter::default()))

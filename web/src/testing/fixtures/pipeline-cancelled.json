@@ -1,0 +1,154 @@
+[
+  {
+    "seq": 1,
+    "event": {
+      "name": "katwork.message_stored",
+      "type": "CUSTOM",
+      "value": {
+        "body": "Hello",
+        "meta": null,
+        "jobId": "00000000-0000-7000-8000-000000000002",
+        "author": {
+          "id": "00000000-0000-7000-8000-000000000001",
+          "kind": "user"
+        },
+        "stopped": false,
+        "question": null,
+        "createdAt": "2026-10-23T00:00:00Z",
+        "messageId": "00000000-0000-7000-8000-000000000003",
+        "synthetic": false,
+        "authorName": "Person",
+        "clientMsgId": null
+      }
+    }
+  },
+  {
+    "seq": 2,
+    "event": {
+      "name": "katwork.job_status",
+      "type": "CUSTOM",
+      "value": {
+        "jobId": "00000000-0000-7000-8000-000000000002",
+        "reason": null,
+        "status": null,
+        "holdReason": null
+      }
+    }
+  },
+  {
+    "seq": 3,
+    "event": {
+      "type": "RUN_STARTED",
+      "runId": "00000000-0000-7000-8000-000000000004",
+      "threadId": "00000000-0000-7000-8000-000000000005"
+    }
+  },
+  {
+    "seq": 4,
+    "event": {
+      "name": "katwork.run_started",
+      "type": "CUSTOM",
+      "value": {
+        "jobId": "00000000-0000-7000-8000-000000000002",
+        "katId": "00000000-0000-7000-8000-000000000006",
+        "runId": "00000000-0000-7000-8000-000000000004",
+        "synthetic": false,
+        "replyMessageId": "00000000-0000-7000-8000-000000000007"
+      }
+    }
+  },
+  {
+    "seq": 5,
+    "event": {
+      "name": "katwork.kat_state",
+      "type": "CUSTOM",
+      "value": {
+        "katId": "00000000-0000-7000-8000-000000000006",
+        "state": "working"
+      }
+    }
+  },
+  {
+    "seq": 6,
+    "event": {
+      "role": "assistant",
+      "type": "TEXT_MESSAGE_START",
+      "messageId": "00000000-0000-7000-8000-000000000007"
+    }
+  },
+  {
+    "seq": 7,
+    "event": {
+      "type": "TEXT_MESSAGE_CONTENT",
+      "delta": "Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply ",
+      "messageId": "00000000-0000-7000-8000-000000000007"
+    }
+  },
+  {
+    "seq": 8,
+    "event": {
+      "name": "katwork.message_stored",
+      "type": "CUSTOM",
+      "value": {
+        "body": "Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply Partial reply ",
+        "meta": null,
+        "jobId": "00000000-0000-7000-8000-000000000002",
+        "author": {
+          "id": "00000000-0000-7000-8000-000000000006",
+          "kind": "kat"
+        },
+        "stopped": true,
+        "question": null,
+        "createdAt": "2026-10-23T00:00:00Z",
+        "messageId": "00000000-0000-7000-8000-000000000007",
+        "synthetic": false,
+        "authorName": "Lead",
+        "clientMsgId": null
+      }
+    }
+  },
+  {
+    "seq": 9,
+    "event": {
+      "name": "katwork.kat_state",
+      "type": "CUSTOM",
+      "value": {
+        "katId": "00000000-0000-7000-8000-000000000006",
+        "state": "idle"
+      }
+    }
+  },
+  {
+    "seq": 10,
+    "event": {
+      "name": "katwork.run_closed",
+      "type": "CUSTOM",
+      "value": {
+        "end": "cancelled",
+        "code": "cancelled",
+        "runId": "00000000-0000-7000-8000-000000000004"
+      }
+    }
+  },
+  {
+    "seq": 11,
+    "event": {
+      "code": "cancelled",
+      "type": "RUN_ERROR",
+      "message": "cancelled"
+    }
+  },
+  {
+    "seq": 12,
+    "event": {
+      "name": "katwork.job_status",
+      "type": "CUSTOM",
+      "value": {
+        "jobId": "00000000-0000-7000-8000-000000000002",
+        "reason": "cancelled",
+        "status": "cancelled",
+        "holdReason": null
+      }
+    }
+  }
+]

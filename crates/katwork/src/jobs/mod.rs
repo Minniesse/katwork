@@ -1,5 +1,8 @@
 pub mod job;
+pub mod lease;
+pub mod quota;
 pub mod task;
+pub mod worker;
 
 use serde::{Deserialize, Serialize};
 
@@ -45,4 +48,17 @@ pub struct TaskInput {
     pub routing: Routing,
     pub actor: UserId,
     pub initiator: Initiator,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct JobView {
+    pub id: JobId,
+    #[sqlx(json(nullable))]
+    pub status: Option<JobStatus>,
+    #[sqlx(json(nullable))]
+    pub reason: Option<ReasonCode>,
+    #[sqlx(json(nullable))]
+    pub hold_reason: Option<crate::types::HoldReason>,
+    #[sqlx(json(nullable))]
+    pub queue_position: Option<u32>,
 }

@@ -102,16 +102,11 @@ pub async fn latest_in_thread(
         .fetch_optional(&mut *conn)
         .await?
         .ok_or(KatError::NotFound)?;
-    Ok(sqlx::query_as(
-        "SELECT j.id,to_jsonb(j.status) AS status,
-        (SELECT t.kat_id FROM tasks t WHERE t.workspace_id=j.workspace_id AND t.job_id=j.id
-         ORDER BY t.created_at DESC,t.id DESC LIMIT 1) AS kat_id
-        FROM jobs j WHERE j.workspace_id=$1 AND j.thread_id=$2 ORDER BY j.id DESC LIMIT 1",
-    )
-    .bind(tenant.workspace_id())
-    .bind(thread)
-    .fetch_optional(conn)
-    .await?)
+    Ok(sqlx::query_as(include_str!("latest_in_thread.sql"))
+        .bind(tenant.workspace_id())
+        .bind(thread)
+        .fetch_optional(conn)
+        .await?)
 }
 
 #[derive(sqlx::FromRow)]
@@ -483,4 +478,155 @@ async fn store_message(
     )
     .await?;
     Ok(())
+}
+
+/// Stop only an unfinished, tenant-owned job. All terminal writers serialize on its job row.
+pub async fn cancel(
+    pool: &sqlx::PgPool,
+    hub: &crate::events::EventHub,
+    tenant: &Tenant,
+    job_id: JobId,
+) -> Result<(), KatError> {
+    use crate::events::{
+        RunStartedEvent,
+        sink::{close_locked_calls, close_locked_run},
+    };
+    let mut connection = crate::db::GuardedConnection::acquire(pool).await?;
+    let mut tx = connection.connection().begin().await?;
+    crate::db::set_configured_lock_timeout(&mut tx).await?;
+    let workspace = tenant.workspace_id();
+    sqlx::query("SELECT id FROM jobs WHERE workspace_id=$1 AND id=$2 FOR NO KEY UPDATE")
+        .bind(workspace)
+        .bind(job_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(KatError::NotFound)?;
+    let requester: UserId =
+        sqlx::query_scalar("SELECT requested_by FROM jobs WHERE workspace_id=$1 AND id=$2")
+            .bind(workspace)
+            .bind(job_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    let current = crate::tenancy::resolve(&mut *tx, tenant.user_id(), workspace).await?;
+    if requester != current.user_id() {
+        current.require_admin()?;
+    }
+    let job = owned_job(&mut tx, job_id).await?;
+    let tasks: Vec<TaskId> = sqlx::query_scalar(include_str!("cancel_tasks.sql"))
+        .bind(workspace)
+        .bind(job_id)
+        .fetch_all(&mut *tx)
+        .await?;
+    let ids: Vec<_> = tasks.iter().map(|id| id.0).collect();
+    sqlx::query(
+        "SELECT task_id FROM task_leases WHERE task_id=ANY($1) ORDER BY task_id FOR NO KEY UPDATE",
+    )
+    .bind(&ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    let runs: Vec<(RunId, KatId)> = sqlx::query_as("SELECT id,kat_id FROM runs WHERE workspace_id=$1 AND job_id=$2 ORDER BY id FOR NO KEY UPDATE")
+        .bind(workspace).bind(job_id).fetch_all(&mut *tx).await?;
+    let run_ids: Vec<_> = runs.iter().map(|(id, _)| id.0).collect();
+    let calls: Vec<(ToolCallRecordId, RunId)> = sqlx::query_as("SELECT id,run_id FROM tool_calls WHERE workspace_id=$1 AND run_id=ANY($2) AND ended_at IS NULL ORDER BY id FOR NO KEY UPDATE")
+        .bind(workspace).bind(&run_ids).fetch_all(&mut *tx).await?;
+    sqlx::query("SELECT id FROM threads WHERE workspace_id=$1 AND id=$2 FOR NO KEY UPDATE")
+        .bind(workspace)
+        .bind(job.thread_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE tasks SET state='cancelled',hold_reason=NULL WHERE workspace_id=$1 AND job_id=$2 AND state IN ('queued','leased')")
+        .bind(workspace).bind(job_id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM task_leases WHERE task_id=ANY($1)")
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
+    for (run, kat) in runs {
+        let running: bool = sqlx::query_scalar(
+            "SELECT state='running' AND ended_at IS NULL FROM runs WHERE workspace_id=$1 AND id=$2",
+        )
+        .bind(workspace)
+        .bind(run)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !running {
+            continue;
+        }
+        let open: Vec<_> = calls
+            .iter()
+            .filter(|(_, r)| *r == run)
+            .map(|(id, _)| *id)
+            .collect();
+        close_locked_calls(&mut tx, workspace, job.thread_id, run, &open, "cancelled").await?;
+        let started: Option<Json<RunStartedEvent>> = sqlx::query_scalar("SELECT payload->'value' FROM events WHERE workspace_id=$1 AND thread_id=$2 AND run_id=$3 AND kind='katwork.run_started' ORDER BY seq DESC LIMIT 1")
+            .bind(workspace).bind(job.thread_id).bind(run).fetch_optional(&mut *tx).await?;
+        if let Some(Json(started)) = started {
+            let text: Option<String> = sqlx::query_scalar("SELECT string_agg(payload->>'delta','' ORDER BY seq) FROM events WHERE workspace_id=$1 AND thread_id=$2 AND run_id=$3 AND kind='TEXT_MESSAGE_CONTENT' AND payload->>'messageId'=$4 AND seq>(SELECT coalesce(max(seq),0) FROM events WHERE workspace_id=$1 AND thread_id=$2 AND run_id=$3 AND kind='TEXT_MESSAGE_START' AND payload->>'messageId'=$4)")
+                .bind(workspace).bind(job.thread_id).bind(run).bind(started.reply_message_id.to_string()).fetch_one(&mut *tx).await?;
+            if let Some(body) = text.filter(|s| !s.is_empty()) {
+                store_message(
+                    &mut tx,
+                    tenant,
+                    &job,
+                    NewMessage {
+                        id: Some(started.reply_message_id),
+                        author: Author::Kat(kat),
+                        body,
+                        client_msg_id: None,
+                        idempotency_key: Some(format!("stopped:{run}")),
+                        synthetic: started.synthetic,
+                        stopped: true,
+                        question: None,
+                        meta: None,
+                        job_id: Some(job_id),
+                    },
+                )
+                .await?;
+            }
+        }
+        log::append(
+            &mut tx,
+            workspace,
+            job.thread_id,
+            None,
+            &KatworkEvent::KatState(KatStateEvent {
+                kat_id: kat,
+                state: KatState::Idle,
+            })
+            .into(),
+        )
+        .await?;
+        close_locked_run(
+            &mut tx,
+            workspace,
+            job.thread_id,
+            run,
+            &[],
+            RunEnd::Cancelled,
+            "cancelled",
+        )
+        .await?;
+    }
+    let seq = finish_by_harness(&mut tx, job_id, HarnessEnd::Cancelled).await?;
+    tx.commit().await?;
+    connection.release();
+    hub.notify(job.thread_id, seq);
+    Ok(())
+}
+
+pub use super::JobView;
+
+pub async fn view(
+    pool: &sqlx::PgPool,
+    tenant: &Tenant,
+    job_id: JobId,
+) -> Result<JobView, KatError> {
+    let mut connection = crate::db::GuardedConnection::acquire(pool).await?;
+    let job = sqlx::query_as(include_str!("job_view.sql"))
+        .bind(tenant.workspace_id())
+        .bind(job_id)
+        .fetch_optional(connection.connection())
+        .await?
+        .ok_or(KatError::NotFound);
+    connection.release();
+    job
 }

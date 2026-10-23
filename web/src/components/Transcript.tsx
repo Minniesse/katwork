@@ -294,7 +294,9 @@ function authorName(message: ChatMessage, me: string | null, katName: Props['kat
 function noticeText(message: ChatMessage): string {
   const code = message.meta?.code ?? message.body;
   const key = `reason.${code}`;
-  return hasMessage(key) ? t(key) : message.body;
+  // Some notices name their Kats in the sentence (Task 12's `mention_needs_space`).
+  const name = message.meta?.kats.map((kat) => kat.name).join(', ') ?? '';
+  return hasMessage(key) ? t(key, { name }) : message.body;
 }
 
 function messageText(message: ChatMessage): string {

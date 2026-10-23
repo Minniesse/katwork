@@ -331,3 +331,16 @@ describe('new-arrival announcer', () => {
     expect(added).toHaveLength(0);
   });
 });
+
+test('missing_mention_space_names_the_kat_in_both_locales', () => {
+  const messages = messagesFrom([{
+    type: 'CUSTOM', name: 'katwork.message_stored', value: {
+      messageId: 'notice', author: { kind: 'system' }, body: 'mention_needs_space',
+      meta: { code: 'mention_needs_space', kats: [{ id: 'writer', name: 'เลขา' }] },
+    },
+  }]);
+  render(<Transcript messages={messages} />);
+  expect(screen.getByText('Add a space after @เลขา to mention this Kat.')).toBeVisible();
+  act(() => setLocale('th'));
+  expect(screen.getByText('เว้นวรรคหลัง @เลขา เพื่อเรียก Kat คนนี้')).toBeVisible();
+});
