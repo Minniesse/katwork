@@ -1,3 +1,5 @@
+#[path = "schema/chat_indexes.rs"]
+mod chat_indexes;
 #[path = "schema/legacy.rs"]
 mod legacy;
 mod support;
@@ -791,8 +793,17 @@ async fn threads_reject_cross_workspace_parents(pool: PgPool) {
         (other.space, f.team, "threads_space_id_workspace_id_fkey"),
         (f.space, other.team, "threads_team_id_workspace_id_fkey"),
     ] {
-        workspace_fk(sqlx::query("INSERT INTO threads (id, workspace_id, space_id, team_id, title) VALUES ($1, $2, $3, $4, 'Thread')")
-            .bind(Uuid::now_v7()).bind(f.workspace).bind(space).bind(team).execute(&pool).await.unwrap_err(), constraint);
+        let error = sqlx::query("INSERT INTO threads (id, workspace_id, space_id, team_id, title) VALUES ($1, $2, $3, $4, 'Thread')")
+            .bind(Uuid::now_v7()).bind(f.workspace).bind(space).bind(team).execute(&pool).await.unwrap_err();
+        // Either composite FK can reject first when both parent relationships are invalid.
+        assert!(
+            [
+                Some(constraint),
+                Some("threads_team_id_space_id_workspace_id_fkey")
+            ]
+            .contains(&error.as_database_error().unwrap().constraint())
+        );
+        sqlstate(error, "23503");
     }
 }
 
@@ -985,4 +996,15 @@ async fn users_reject_non_lowercase_email_on_insert_and_update(pool: PgPool) {
             .unwrap_err(),
         "23514",
     );
+}
+
+#[sqlx::test]
+async fn stopped_is_only_allowed_on_kat_replies(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let error = sqlx::query("UPDATE messages SET stopped=true WHERE id=$1")
+        .bind(f.message)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    sqlstate(error, "23514");
 }

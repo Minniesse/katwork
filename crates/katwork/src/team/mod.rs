@@ -12,20 +12,41 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::{error::KatError, tenancy::Tenant};
 
-fn name_key(name: &str) -> String {
+pub(crate) fn name_key(name: &str) -> String {
+    fold_name(name)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+// Preserve edge whitespace so incremental mention matching can collapse it across chunks.
+pub(crate) fn fold_name(name: &str) -> String {
+    fold_name_checked(name).0
+}
+
+fn fold_name_checked(name: &str) -> (String, bool) {
+    let mut key = name.to_owned();
+    // NFC can expose another Thai run; bound work and report whether a fixed point was confirmed.
+    for _ in 0..4 {
+        let next = fold_name_once(&key);
+        if next == key {
+            return (next, true);
+        }
+        key = next;
+    }
+    (key, false)
+}
+
+fn fold_name_once(name: &str) -> String {
     // Validated names exclude default ignorables; compatibility folding preserves display text.
     let mut key: Vec<_> = name.nfkc().default_case_fold().nfkc().collect();
     // Thai above-vowels have combining class zero; Unicode normalization alone keeps tone-first input distinct.
     for marks in key.split_mut(|ch| !is_thai_mark(*ch)) {
         marks.sort_by_key(|ch| (if *ch == '\u{0e4d}' { '\u{0e47}' } else { *ch }, *ch));
     }
+    let mut key: Vec<_> = key.into_iter().nfc().collect();
     key.dedup_by(|a, b| a == b && is_thai_mark(*a));
-    key.into_iter()
-        .nfc()
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    key.into_iter().collect()
 }
 
 fn is_thai_mark(ch: char) -> bool {
@@ -57,4 +78,78 @@ async fn check_space(
         .await?
         .ok_or(KatError::NotFound)?;
     Ok(())
+}
+
+fn validate_name(name: &str) -> Result<&str, KatError> {
+    let name = crate::tenancy::validate_name(name)?;
+    let (key, converged) = fold_name_checked(name);
+    if !converged || key.contains('@') {
+        return Err(KatError::RequestInvalid);
+    }
+    Ok(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fold_name, validate_name};
+
+    #[test]
+    fn fold_name_is_idempotent_with_mixed_thai_marks() {
+        let name = "ß\u{0e38}\u{0308}\u{0e4e}\u{0e38}";
+        let folded = fold_name(name);
+        assert_eq!(fold_name(&folded), folded);
+    }
+
+    #[test]
+    fn fold_name_is_idempotent_with_class_zero_thai_marks() {
+        let name = "ก\u{0e38}\u{0e31}\u{3099}\u{0e31}";
+        assert!(validate_name(name).is_ok());
+        let folded = fold_name(name);
+        assert_eq!(fold_name(&folded), folded);
+        assert_eq!(folded, "ก\u{0e31}\u{3099}\u{0e31}\u{0e38}");
+    }
+
+    #[test]
+    fn fold_name_is_idempotent_with_interleaved_voicing_mark() {
+        let name = "\u{0e38}\u{0e34}\u{3099}\u{0e34}";
+        let folded = fold_name(name);
+        assert_eq!(fold_name(&folded), folded);
+        assert_eq!(folded, "\u{0e34}\u{3099}\u{0e34}\u{0e38}");
+    }
+
+    #[test]
+    fn names_reject_folds_that_exhaust_the_pass_limit() {
+        // Halfwidth voicing marks are letters before NFKC, so ordinary name validation accepts this chain.
+        let name = format!("ก\u{0e38}{}\u{0e31}", "\u{0e31}\u{ff9e}".repeat(5));
+        assert!(crate::tenancy::validate_name(&name).is_ok());
+        assert!(matches!(
+            validate_name(&name),
+            Err(crate::error::KatError::RequestInvalid)
+        ));
+    }
+
+    #[test]
+    fn fold_name_is_idempotent_for_all_three_mark_combinations() {
+        assert_mark_combinations_are_idempotent(3);
+    }
+
+    #[test]
+    #[ignore = "exhaustive four-mark probe takes more than 3 seconds in a debug build"]
+    fn fold_name_is_idempotent_for_all_four_mark_combinations() {
+        assert_mark_combinations_are_idempotent(4);
+    }
+
+    fn assert_mark_combinations_are_idempotent(count: u32) {
+        let marks: Vec<_> = "\u{0e31}\u{0e34}\u{0e35}\u{0e36}\u{0e37}\u{0e38}\u{0e39}\u{0e3a}\u{0e47}\u{0e48}\u{0e49}\u{0e4a}\u{0e4b}\u{0e4c}\u{0e4d}\u{0e4e}\u{0300}\u{0308}\u{0315}\u{0323}\u{0345}\u{3099}".chars().collect();
+        for mut index in 0..marks.len().pow(count) {
+            let mut name = String::from("ก");
+            for _ in 0..count {
+                name.push(marks[index % marks.len()]);
+                index /= marks.len();
+            }
+            assert!(validate_name(&name).is_ok(), "{name:?}");
+            let folded = fold_name(&name);
+            assert_eq!(fold_name(&folded), folded, "{name:?}");
+        }
+    }
 }
