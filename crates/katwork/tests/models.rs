@@ -145,16 +145,20 @@ async fn demo_mode_uses_synthetic_provider_without_keys() {
 }
 #[test]
 fn no_keys_and_no_demo_is_provider_unavailable() {
-    assert!(matches!(
-        Registry::from_config(&config(false)).for_tier(
-            ModelTier::Fast,
-            &SpacePolicy {
-                allow_external: true
-            }
-        ),
-        Err(ModelError::ProviderUnavailable)
-    ));
+    let registry = Registry::from_config(&config(false));
+    for tier in [ModelTier::Fast, ModelTier::Standard, ModelTier::Strong] {
+        assert!(matches!(
+            registry.for_tier(
+                tier,
+                &SpacePolicy {
+                    allow_external: true
+                }
+            ),
+            Err(ModelError::ProviderUnavailable)
+        ));
+    }
 }
+
 #[tokio::test]
 async fn demo_mode_retains_no_requests_after_many_calls() {
     let provider = FakeProvider::demo();
@@ -308,7 +312,12 @@ async fn scripted_turns_record_requests_and_are_not_synthetic() {
             .await,
         1
     );
-    assert_eq!(provider.received().len(), 2);
+    assert_eq!(provider.received(), vec![request(), request()]);
+    assert!(matches!(
+        provider.stream(request()).await,
+        Err(ModelError::ProviderUnavailable)
+    ));
+    assert_eq!(provider.received(), vec![request(), request(), request()]);
 }
 #[test]
 fn every_model_error_has_one_stable_reason() {
@@ -430,4 +439,206 @@ fn localhost_provider_remains_external_and_keys_disable_demo_fallback() {
         .unwrap();
     assert!(!selected.entry.capabilities.synthetic);
     assert_eq!(selected.entry.max_output_tokens, 2048);
+}
+
+#[test]
+fn configured_registry_preserves_every_tier() {
+    for provider in ["openai", "anthropic"] {
+        let mut cfg = config(true);
+        let env = ProviderEnv {
+            api_key: uuid::Uuid::now_v7().to_string(),
+            base_url: None,
+        };
+        if provider == "openai" {
+            cfg.openai = Some(env);
+        } else {
+            cfg.anthropic = Some(env);
+        }
+        let registry = Registry::from_config(&cfg);
+        for (tier, cap, openai, anthropic) in [
+            (
+                ModelTier::Fast,
+                2048,
+                "gpt-4.1-nano",
+                "claude-haiku-4-5-20251001",
+            ),
+            (
+                ModelTier::Standard,
+                4096,
+                "gpt-4.1-mini",
+                "claude-sonnet-4-6",
+            ),
+            (ModelTier::Strong, 8192, "gpt-4.1", "claude-opus-4-6"),
+        ] {
+            let selected = registry
+                .for_tier(
+                    tier,
+                    &SpacePolicy {
+                        allow_external: true,
+                    },
+                )
+                .unwrap();
+            assert_eq!(selected.entry.tier, tier);
+            assert_eq!(
+                selected.entry.model,
+                if provider == "openai" {
+                    openai
+                } else {
+                    anthropic
+                }
+            );
+            assert_eq!(
+                selected.entry.provider_id,
+                if provider == "openai" {
+                    "openai:chat"
+                } else {
+                    "anthropic"
+                }
+            );
+            assert_eq!(selected.provider.id(), selected.entry.provider_id);
+            assert_eq!(selected.entry.max_output_tokens, cap);
+            assert_eq!(selected.entry.temperature, None);
+            assert_eq!(selected.entry.price, None);
+            assert_eq!(
+                selected.entry.capabilities,
+                Capabilities {
+                    tools: true,
+                    residency: Residency::External,
+                    synthetic: false
+                }
+            );
+            assert_eq!(
+                selected.provider.capabilities(),
+                selected.entry.capabilities
+            );
+            assert!(matches!(
+                registry.for_tier(
+                    tier,
+                    &SpacePolicy {
+                        allow_external: false
+                    }
+                ),
+                Err(ModelError::ResidencyDenied)
+            ));
+        }
+    }
+}
+
+#[test]
+fn registry_selects_local_entry_after_denied_external_entry() {
+    let entry = ModelEntry {
+        provider_id: "external".into(),
+        model: "external".into(),
+        tier: ModelTier::Fast,
+        capabilities: Capabilities {
+            tools: true,
+            residency: Residency::External,
+            synthetic: false,
+        },
+        max_output_tokens: 2048,
+        temperature: None,
+        price: None,
+    };
+    let local = ModelEntry {
+        provider_id: "local".into(),
+        model: "local".into(),
+        capabilities: Capabilities {
+            residency: Residency::Local,
+            ..entry.capabilities
+        },
+        ..entry.clone()
+    };
+    let provider: Arc<dyn ModelProvider> = Arc::new(FakeProvider::scripted(vec![]));
+    let registry = Registry::from_entries(vec![(entry, provider.clone()), (local, provider)]);
+    assert_eq!(
+        registry
+            .for_tier(
+                ModelTier::Fast,
+                &SpacePolicy {
+                    allow_external: false
+                }
+            )
+            .unwrap()
+            .entry
+            .model,
+        "local"
+    );
+    assert_eq!(
+        registry
+            .for_tier(
+                ModelTier::Fast,
+                &SpacePolicy {
+                    allow_external: true
+                }
+            )
+            .unwrap()
+            .entry
+            .model,
+        "external"
+    );
+}
+
+#[tokio::test]
+async fn demo_reply_follows_latest_user_language() {
+    let thai = "สวัสดี ฉันคือผู้ช่วย AI ของทีม พร้อมช่วยคุณวางแผนและจัดการงาน";
+    let english =
+        "Hello! I am your team's AI assistant. I can help you plan and organize your work.";
+    for (latest, expected) in [
+        (Some("สวัสดี"), thai),
+        (Some("hello"), english),
+        (None, english),
+    ] {
+        let provider = FakeProvider::demo();
+        let mut req = request();
+        req.messages.clear();
+        if let Some(latest) = latest {
+            req.messages.push(ChatMsg::User {
+                content: if latest == "hello" {
+                    "สวัสดี"
+                } else {
+                    "hello"
+                }
+                .into(),
+                name: None,
+            });
+            req.messages.push(ChatMsg::User {
+                content: latest.into(),
+                name: None,
+            });
+        }
+        req.messages.push(ChatMsg::Assistant {
+            content: "สวัสดี ignored assistant".into(),
+            tool_calls: vec![],
+            replay: None,
+        });
+        req.messages.push(ChatMsg::Tool {
+            tool_call_id: "a".into(),
+            name: "first".into(),
+            content: "สวัสดี ignored tool".into(),
+            is_error: false,
+        });
+        let chunks = provider
+            .stream(req)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(
+            chunks,
+            vec![
+                Ok(ChatChunk::TextDelta(expected.into())),
+                Ok(ChatChunk::Usage(Usage::default())),
+                Ok(ChatChunk::Done {
+                    stop: StopKind::EndTurn,
+                    turn: AssistantTurn {
+                        content: expected.into(),
+                        tool_calls: vec![],
+                        replay: None
+                    }
+                })
+            ]
+        );
+        assert!(provider.capabilities().synthetic);
+        assert!(provider.received().is_empty());
+    }
 }

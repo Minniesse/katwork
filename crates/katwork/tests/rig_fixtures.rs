@@ -73,7 +73,7 @@ impl Server {
                 }
             }
             received.notify_one();
-            if hold {
+            if hold && chunks.iter().all(Vec::is_empty) {
                 match socket.read(&mut buf).await {
                     Ok(0) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
@@ -104,7 +104,14 @@ impl Server {
                 }
                 tokio::time::sleep(interval).await;
             }
-            if !truncate {
+            if hold {
+                match socket.read(&mut buf).await {
+                    Ok(0) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                    other => panic!("expected client disconnect, got {other:?}"),
+                }
+                disconnected.notify_one();
+            } else if !truncate {
                 let _ = socket.write_all(b"0\r\n\r\n").await;
             }
         });
@@ -711,59 +718,46 @@ async fn provider_redirect_is_not_followed() {
     );
 }
 
-// Exercise the Task 8 caller contract; the agent loop and its ledger land separately.
-async fn assert_failed_attempts(
+// Task 8 owns retries and billing; Task 7 exposes content before a terminal error.
+async fn assert_content_before_failure(
     body: Vec<u8>,
     api: Option<OpenAiApi>,
     truncate: bool,
-    expected: usize,
+    content: bool,
 ) {
-    let mut charges = Vec::new();
-    let mut attempts = 0;
-    for _ in 0..2 {
-        let server =
-            Server::start(vec![body.clone()], 200, false, "", Duration::ZERO, truncate).await;
-        let provider = server.provider(api);
-        attempts += 1;
-        let chunks = collect(&provider).await;
-        assert!(server.request.lock().await.is_some());
-        assert_eq!(chunks.last(), Some(&Err(ModelError::ProviderUnavailable)));
-        assert!(
-            !chunks
-                .iter()
-                .any(|chunk| matches!(chunk, Ok(ChatChunk::ToolCall(_) | ChatChunk::Done { .. })))
-        );
-        let received_content = chunks.iter().any(|chunk| match chunk {
+    let server = Server::start(vec![body], 200, false, "", Duration::ZERO, truncate).await;
+    let chunks = collect(&server.provider(api)).await;
+    assert_eq!(chunks.last(), Some(&Err(ModelError::ProviderUnavailable)));
+    assert!(
+        !chunks
+            .iter()
+            .any(|chunk| matches!(chunk, Ok(ChatChunk::ToolCall(_) | ChatChunk::Done { .. })))
+    );
+    assert_eq!(
+        chunks[..chunks.len() - 1].iter().any(|chunk| match chunk {
             Ok(ChatChunk::TextDelta(text)) => !text.is_empty(),
-            Ok(ChatChunk::Progress | ChatChunk::ToolCall(_) | ChatChunk::Done { .. }) => true,
+            Ok(ChatChunk::Progress) => true,
             _ => false,
-        });
-        charges.push(request().input_charge_bound() + u64::from(request().max_output_tokens));
-        if received_content {
-            break;
-        }
-    }
-    assert_eq!(attempts, expected, "must not retry after content");
-    assert_eq!(charges.len(), expected, "one charge per attempted request");
+        }),
+        content
+    );
 }
 
 #[tokio::test]
-async fn content_then_connection_failure_is_not_retried_or_double_charged() {
+async fn content_precedes_connection_failure() {
     let arguments = String::from_utf8(fixture("chat_arguments.sse")).unwrap();
     let arguments: String = arguments.split_inclusive("\n\n").take(2).collect();
-    for body in [
-        arguments.into_bytes(),
-        b"data: {\"id\":\"test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n".to_vec(),
-    ] {
-        assert_failed_attempts(body, Some(OpenAiApi::Chat), true, 1).await;
+    for body in [arguments.into_bytes(),
+        b"data: {\"id\":\"test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n".to_vec()] {
+        assert_content_before_failure(body, Some(OpenAiApi::Chat), true, true).await;
     }
 }
 
 #[tokio::test]
-async fn tool_progress_then_provider_failure_is_not_retried_or_double_charged() {
-    assert_failed_attempts(fixture("anthropic_arguments_error.sse"), None, false, 1).await;
-    // The same overload before content still permits the caller's one retry.
-    assert_failed_attempts(fixture("anthropic_error.sse"), None, false, 2).await;
+async fn tool_progress_precedes_provider_failure() {
+    assert_content_before_failure(fixture("anthropic_arguments_error.sse"), None, false, true)
+        .await;
+    assert_content_before_failure(fixture("anthropic_error.sse"), None, false, false).await;
 }
 
 #[tokio::test]
@@ -867,4 +861,503 @@ async fn anthropic_quota_matching_preserves_other_errors() {
             Some(&Err(expected))
         );
     }
+}
+
+fn tool_turn_fixture(
+    api: Option<OpenAiApi>,
+    ids: &[&str],
+    args: &str,
+    stop: &str,
+    close: bool,
+) -> Vec<u8> {
+    let mut events = Vec::new();
+    match api {
+        Some(OpenAiApi::Chat) => {
+            let calls: Vec<_> = ids.iter().enumerate().map(|(index, id)| json!({
+                "index":index,"id":id,"type":"function","function":{"name":"first","arguments":args}
+            })).collect();
+            events.push(json!({"id":"chat_test","choices":[{"index":0,"delta":{"tool_calls":calls},"finish_reason":null}]}));
+            if close {
+                events.push(json!({"id":"chat_test","choices":[{"index":0,"delta":{},"finish_reason":stop}]}));
+            }
+        }
+        Some(OpenAiApi::Responses) => {
+            let calls: Vec<_> = ids.iter().enumerate().map(|(index, id)| json!({
+                "id":format!("fc_{index}"),"type":"function_call","call_id":id,"name":"first","arguments":args,
+                "status":if close {"completed"} else {"in_progress"}
+            })).collect();
+            events.push(json!({"type":if stop == "completed" {"response.completed"} else {"response.incomplete"},"response":{
+                "id":"resp_test","object":"response","created_at":1,"model":"gpt-4.1",
+                "status":if stop == "completed" {"completed"} else {"incomplete"},
+                "incomplete_details":{"reason":stop},"output":calls
+            }}));
+        }
+        None => {
+            events.push(json!({"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}));
+            for (index, id) in ids.iter().enumerate() {
+                events.push(json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":"first","input":{}}}));
+                events.push(json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":args}}));
+                if close {
+                    events.push(json!({"type":"content_block_stop","index":index}));
+                }
+            }
+            events.push(json!({"type":"message_delta","delta":{"stop_reason":stop},"usage":{"output_tokens":1}}));
+            events.push(json!({"type":"message_stop"}));
+        }
+    }
+    let mut body: String = events
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect();
+    if matches!(api, Some(OpenAiApi::Chat)) {
+        body.push_str("data: [DONE]\n\n");
+    }
+    body.into_bytes()
+}
+
+const ROUTES: [(Option<OpenAiApi>, &str, &str); 3] = [
+    (Some(OpenAiApi::Chat), "tool_calls", "chat_thai.sse"),
+    (
+        Some(OpenAiApi::Responses),
+        "completed",
+        "responses_final.sse",
+    ),
+    (None, "tool_use", "anthropic_usage.sse"),
+];
+
+#[tokio::test]
+async fn rejected_stops_emit_no_tool_calls_on_every_route() {
+    for (api, stops) in [
+        (
+            Some(OpenAiApi::Chat),
+            ["length", "content_filter", "future_stop"],
+        ),
+        (
+            Some(OpenAiApi::Responses),
+            ["max_output_tokens", "content_filter", "future_stop"],
+        ),
+        (None, ["max_tokens", "refusal", "future_stop"]),
+    ] {
+        for (index, stop) in stops.into_iter().enumerate() {
+            let server = Server::new(
+                tool_turn_fixture(api, &["a"], "{}", stop, true),
+                200,
+                None,
+                false,
+            )
+            .await;
+            let chunks = collect(&server.provider(api)).await;
+            assert!(
+                !chunks
+                    .iter()
+                    .any(|chunk| matches!(chunk, Ok(ChatChunk::ToolCall(_)))),
+                "{api:?}/{stop}: {chunks:?}"
+            );
+            // Rig rejects Anthropic refusals and unknown Responses terminal states as protocol failures.
+            if (api.is_none() && index == 1)
+                || (matches!(api, Some(OpenAiApi::Responses)) && index == 2)
+            {
+                protocol(&chunks);
+                assert!(
+                    !chunks
+                        .iter()
+                        .any(|chunk| matches!(chunk, Ok(ChatChunk::Done { .. })))
+                );
+            } else {
+                let expected = match index {
+                    0 => StopKind::MaxTokens,
+                    1 => StopKind::Refusal,
+                    _ => StopKind::Other(stop.into()),
+                };
+                assert!(
+                    matches!(chunks.last(), Some(Ok(ChatChunk::Done { stop, .. })) if *stop == expected),
+                    "{api:?}: {chunks:?}"
+                );
+                assert!(turn(&chunks).tool_calls.is_empty());
+                assert!(turn(&chunks).replay.is_none());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn unfinished_accepted_call_is_protocol_error_on_every_route() {
+    for (api, stop, _) in ROUTES {
+        let server = Server::new(
+            tool_turn_fixture(api, &["a"], "{\"x\":", stop, false),
+            200,
+            None,
+            false,
+        )
+        .await;
+        let chunks = collect(&server.provider(api)).await;
+        protocol(&chunks);
+        assert!(
+            !chunks
+                .iter()
+                .any(|chunk| matches!(chunk, Ok(ChatChunk::Done { .. })))
+        );
+    }
+}
+
+#[tokio::test]
+async fn malformed_arguments_are_not_executable_on_every_route() {
+    for (api, stop, _) in ROUTES {
+        let server = Server::new(
+            tool_turn_fixture(api, &["a"], "{broken}", stop, true),
+            200,
+            None,
+            false,
+        )
+        .await;
+        let chunks = collect(&server.provider(api)).await;
+        protocol(&chunks);
+        assert!(
+            !chunks
+                .iter()
+                .any(|chunk| matches!(chunk, Ok(ChatChunk::Done { .. })))
+        );
+    }
+}
+
+#[tokio::test]
+async fn provider_call_ids_are_validated_on_every_route() {
+    for (api, stop, _) in ROUTES {
+        let server = Server::new(
+            tool_turn_fixture(api, &["", ""], "{}", stop, true),
+            200,
+            None,
+            false,
+        )
+        .await;
+        let chunks = collect(&server.provider(api)).await;
+        assert_eq!(
+            turn(&chunks)
+                .tool_calls
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            ["kw_call_0", "kw_call_1"],
+            "{api:?}"
+        );
+        let server = Server::new(
+            tool_turn_fixture(api, &["duplicate", "duplicate"], "{}", stop, true),
+            200,
+            None,
+            false,
+        )
+        .await;
+        let chunks = collect(&server.provider(api)).await;
+        protocol(&chunks);
+        assert_eq!(
+            chunks.last(),
+            Some(&Err(ModelError::Protocol("duplicate_tool_call_id".into())))
+        );
+    }
+}
+
+#[tokio::test]
+async fn outbound_invalid_history_fails_before_network() {
+    for (api, _, _) in ROUTES {
+        for (id, name, args, code) in [
+            ("", "first", "{}", "invalid_tool_call"),
+            ("a", "", "{}", "empty_tool_name"),
+            ("a", "first", "[]", "invalid_tool_call"),
+            ("a", "first", "{broken}", "invalid_arguments"),
+        ] {
+            let server = Server::new(vec![], 200, None, true).await;
+            let provider = server.provider(api);
+            let mut req = request();
+            req.messages.push(ChatMsg::Assistant {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: id.into(),
+                    name: name.into(),
+                    args_json: args.into(),
+                }],
+                replay: None,
+            });
+            let Err(error) = provider.stream(req).await else {
+                panic!("invalid history accepted")
+            };
+            assert_eq!(error, ModelError::Protocol(code.into()));
+            assert!(server.request.lock().await.is_none());
+        }
+        for (id, name, code) in [
+            ("", "first", "empty_tool_call_id"),
+            ("a", "", "empty_tool_name"),
+        ] {
+            let server = Server::new(vec![], 200, None, true).await;
+            let mut req = request();
+            req.messages.push(ChatMsg::Tool {
+                tool_call_id: id.into(),
+                name: name.into(),
+                content: "result".into(),
+                is_error: false,
+            });
+            let Err(error) = server.provider(api).stream(req).await else {
+                panic!("invalid tool result accepted")
+            };
+            assert_eq!(error, ModelError::Protocol(code.into()));
+            assert!(server.request.lock().await.is_none());
+        }
+        let server = Server::new(vec![], 200, None, true).await;
+        let provider = server.provider(api);
+        let mut req = request();
+        req.messages.push(ChatMsg::Assistant {
+            content: String::new(),
+            tool_calls: vec![],
+            replay: Some(ProviderReplay {
+                provider_id: provider.id().into(),
+                version: 1,
+                data: json!({"invalid":"replay"}),
+            }),
+        });
+        let Err(error) = provider.stream(req).await else {
+            panic!("malformed replay accepted")
+        };
+        assert_eq!(error, ModelError::Protocol("invalid_replay".into()));
+        assert!(server.request.lock().await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn replay_version_and_canonical_calls_are_checked_on_every_route() {
+    for (api, stop, response) in ROUTES {
+        let server = Server::new(
+            tool_turn_fixture(api, &["a"], "{\"x\":1}", stop, true),
+            200,
+            None,
+            false,
+        )
+        .await;
+        let chunks = collect(&server.provider(api)).await;
+        let previous = turn(&chunks);
+        for field in ["id", "name", "args"] {
+            let server = Server::new(vec![], 200, None, true).await;
+            let mut calls = previous.tool_calls.clone();
+            match field {
+                "id" => calls[0].id = "b".into(),
+                "name" => calls[0].name = "second".into(),
+                _ => calls[0].args_json = "{\"x\":2}".into(),
+            }
+            let mut req = request();
+            req.messages.push(ChatMsg::Assistant {
+                content: previous.content.clone(),
+                tool_calls: calls,
+                replay: previous.replay.clone(),
+            });
+            let Err(error) = server.provider(api).stream(req).await else {
+                panic!("mismatched replay accepted")
+            };
+            assert_eq!(error, ModelError::Protocol("replay_mismatch".into()));
+            assert!(server.request.lock().await.is_none());
+        }
+        let server = Server::new(fixture(response), 200, None, false).await;
+        let mut req = request();
+        req.messages.push(ChatMsg::Assistant {
+            content: "canonical-version-fallback".into(),
+            tool_calls: vec![],
+            replay: Some(ProviderReplay {
+                version: 2,
+                data: json!({"invalid":"must not decode"}),
+                ..previous.replay.clone().unwrap()
+            }),
+        });
+        turn(
+            &server
+                .provider(api)
+                .stream(req)
+                .await
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await,
+        );
+        let body = server.request.lock().await.clone().unwrap().to_string();
+        assert!(body.contains("canonical-version-fallback"));
+        assert!(!body.contains("must not decode"));
+    }
+}
+
+#[tokio::test]
+async fn provider_request_preserves_roles_limits_and_tools() {
+    for (api, _, response) in ROUTES {
+        let server = Server::new(fixture(response), 200, None, false).await;
+        let mut req = request();
+        req.max_output_tokens = 321;
+        req.temperature = Some(0.25);
+        req.messages[0] = ChatMsg::User {
+            content: "user only".into(),
+            name: Some("Mali".into()),
+        };
+        req.tools[0].parameters = json!({"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false});
+        req.messages.push(ChatMsg::Assistant {
+            content: "checking".into(),
+            tool_calls: vec![ToolCall {
+                id: "a".into(),
+                name: "first".into(),
+                args_json: "{\"city\":\"Bangkok\"}".into(),
+            }],
+            replay: None,
+        });
+        req.messages.push(ChatMsg::Tool {
+            tool_call_id: "a".into(),
+            name: "first".into(),
+            content: "denied".into(),
+            is_error: true,
+        });
+        turn(
+            &server
+                .provider(api)
+                .stream(req.clone())
+                .await
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await,
+        );
+        let body = server.request.lock().await.clone().unwrap();
+        let schema = &req.tools[0].parameters;
+        let expected = match api {
+            Some(OpenAiApi::Chat) => json!({
+                "model":"gpt-4.1", "messages":[
+                    {"role":"system","content":[{"type":"text","text":"system only"}]},
+                    {"role":"user","content":"Mali: user only"},
+                    {"role":"assistant","content":"checking","tool_calls":[{"type":"function","id":"a","function":{"name":"first","arguments":"{\"city\":\"Bangkok\"}"}}]},
+                    {"role":"tool","tool_call_id":"a","content":"Error: denied"}
+                ], "tools":[{"type":"function","function":{"name":"first","description":"test","parameters":schema}}],
+                "temperature":0.25,"max_tokens":321,"stream_options":{"include_usage":true},"stream":true
+            }),
+            Some(OpenAiApi::Responses) => json!({
+                "model":"gpt-4.1","instructions":"system only","temperature":0.25,
+                "tools":[{"type":"function","name":"first","parameters":schema,"strict":false,"description":"test"}],
+                "store":false,"stream":true,"include":["reasoning.encrypted_content"],"input":[
+                    {"type":"message","role":"user","content":[{"type":"input_text","text":"Mali: user only"}]},
+                    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"checking","annotations":[]}],"status":"completed","id":"msg_rig_2"},
+                    {"type":"function_call","call_id":"a","name":"first","arguments":"{\"city\":\"Bangkok\"}"},
+                    {"type":"function_call_output","call_id":"a","output":"Error: denied","status":"completed"}
+                ], "max_output_tokens":321
+            }),
+            None => json!({
+                "model":"claude-sonnet-4-6","messages":[
+                    {"role":"user","content":[{"type":"text","text":"Mali: user only"}]},
+                    {"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"a","name":"first","input":{"city":"Bangkok"}}]},
+                    {"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":[{"type":"text","text":"denied"}],"is_error":true}]}
+                ],"max_tokens":321,"system":[{"type":"text","text":"system only"}],"temperature":0.25,
+                "tools":[{"name":"first","description":"test","input_schema":schema,"eager_input_streaming":true}],
+                "stream":true,"tool_choice":{"type":"auto"}
+            }),
+        };
+        // Exact objects also exclude hosted tools, continuation IDs and extra provider options.
+        assert_eq!(body, expected, "{api:?}");
+    }
+}
+
+#[tokio::test]
+async fn provider_errors_redact_keys_and_base_urls_in_display_and_debug() {
+    // Local OpenAI-compatible endpoints share the OpenAI adapter; there is no LOCAL_API_KEY config field.
+    for (api, _, _) in ROUTES {
+        for status in [400, 401, 429, 500] {
+            let key = uuid::Uuid::now_v7().to_string();
+            let private_path = uuid::Uuid::now_v7().to_string();
+            let body = json!({"error":{"type":"invalid_request_error","message":format!("{key} /{private_path}")}});
+            let server = Server::new(serde_json::to_vec(&body).unwrap(), status, None, false).await;
+            let base_url = format!("{}/{}", server.url, private_path);
+            let env = ProviderEnv {
+                api_key: key.clone(),
+                base_url: Some(base_url.clone()),
+            };
+            let provider = match api {
+                Some(api) => RigProvider::openai(&env, "gpt-4.1", api),
+                None => RigProvider::anthropic(&env, "claude-sonnet-4-6"),
+            }
+            .unwrap();
+            let chunks = collect(&provider).await;
+            let Some(Err(error)) = chunks.last() else {
+                panic!("{chunks:?}")
+            };
+            for output in [format!("{error}"), format!("{error:?}")] {
+                for secret in [&key, &base_url, &server.url, &private_path] {
+                    assert!(
+                        !output.contains(secret),
+                        "error leaked provider configuration"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn http_headers_stall_times_out_first_chunk() {
+    let server = Server::new(vec![], 200, None, true).await;
+    let provider = server.provider(Some(OpenAiApi::Chat)).with_http(
+        BoundedHttp::new(HttpLimits {
+            read: Duration::from_secs(2),
+            ..HttpLimits::default()
+        })
+        .unwrap(),
+    );
+    // No guard_stream: only the real reqwest read deadline can end this request.
+    let task = tokio::spawn(async move {
+        provider
+            .stream(request())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+    });
+    server.arrived.notified().await;
+    tokio::time::pause();
+    let chunks = tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .expect("configured header deadline must fire")
+        .unwrap();
+    assert_eq!(
+        chunks,
+        [Err(ModelError::Timeout {
+            phase: TimeoutPhase::FirstChunk
+        })]
+    );
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(10), server.closed.notified())
+        .await
+        .expect("client must disconnect");
+}
+
+#[tokio::test]
+async fn http_body_stall_times_out_idle() {
+    let frame = b"data: {\"id\":\"test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n";
+    let server = Server::start(vec![frame.to_vec()], 200, true, "", Duration::ZERO, false).await;
+    let provider = server.provider(Some(OpenAiApi::Chat)).with_http(
+        BoundedHttp::new(HttpLimits {
+            read: Duration::from_secs(2),
+            ..HttpLimits::default()
+        })
+        .unwrap(),
+    );
+    let mut stream = provider.stream(request()).await.unwrap();
+    loop {
+        match stream.next().await.unwrap().unwrap() {
+            ChatChunk::TextDelta(text) => {
+                assert_eq!(text, "hello");
+                break;
+            }
+            ChatChunk::Progress => {}
+            other => panic!("expected content, got {other:?}"),
+        }
+    }
+    tokio::time::pause();
+    let tail = tokio::time::timeout(Duration::from_secs(3), stream.collect::<Vec<_>>())
+        .await
+        .expect("configured body deadline must fire");
+    assert_eq!(
+        tail.last(),
+        Some(&Err(ModelError::Timeout {
+            phase: TimeoutPhase::Idle
+        }))
+    );
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(10), server.closed.notified())
+        .await
+        .expect("client must disconnect");
 }

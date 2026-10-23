@@ -696,6 +696,189 @@ mod tests {
         net::TcpListener,
     };
 
+    #[test]
+    fn accepted_turn_rejects_unfinished_call_with_valid_arguments() {
+        let id = CallId::from_wire("unfinished");
+        let response = CompletionResponse::new(
+            vec![AssistantContent::ToolCall(
+                rig_core::message::ToolCall::new(
+                    id.clone(),
+                    ToolFunction::new(tool_name("first").unwrap(), serde_json::json!({"x":1})),
+                ),
+            )],
+            Default::default(),
+            rig_core::message::Origin::new("openai.chat", "openai", "fixture"),
+            serde_json::json!({}),
+        )
+        .with_finish_reason(FinishReason::ToolCalls)
+        .with_unfinished_calls([id]);
+        // Valid JSON isolates the unfinished-call guard from malformed-argument rejection.
+        assert_eq!(
+            accepted_turn(response, "openai:chat"),
+            Err(ModelError::Protocol("unfinished_tool_call".into()))
+        );
+    }
+
+    #[test]
+    fn http_limits_preserve_documented_defaults() {
+        let limits = HttpLimits::default();
+        assert_eq!(limits.connect, Duration::from_secs(10));
+        assert_eq!(limits.read, Duration::from_secs(30));
+        assert_eq!(limits.max_response_bytes, 16 * 1024 * 1024);
+        assert_eq!(limits.max_error_body_bytes, 64 * 1024);
+        assert_eq!(limits.max_sse_frame_bytes, 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn incomplete_utf8_suffix_is_rejected_at_eof() {
+        let (url, server) = response(200, b"data: \xe0\xb8".to_vec()).await;
+        let http = BoundedHttp::new(HttpLimits::default()).unwrap();
+        let reply = http
+            .send_streaming(Request::get(url).body(Bytes::new()).unwrap())
+            .await
+            .unwrap();
+        let chunks = reply.into_body().collect::<Vec<_>>().await;
+        let error = chunks.last().unwrap().as_ref().unwrap_err();
+        assert!(matches!(error, http_client::Error::Instance(cause)
+            if cause.downcast_ref::<ModelError>() == Some(&ModelError::Protocol("invalid_utf8".into()))));
+        server.await.unwrap();
+    }
+
+    async fn connected_request(
+        limits: HttpLimits,
+        tls: bool,
+    ) -> (
+        tokio::net::TcpStream,
+        tokio::task::JoinHandle<http_client::Result<reqwest::Response>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let scheme = if tls { "https" } else { "http" };
+        let url = format!("{scheme}://{}", listener.local_addr().unwrap());
+        let http = BoundedHttp::new(limits).unwrap();
+        let client = tokio::spawn(async move {
+            http.open(Request::get(url).body(Bytes::new()).unwrap())
+                .await
+        });
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let n = socket.read(&mut request).await.unwrap();
+        assert!(n > 0);
+        if tls {
+            assert_eq!(
+                request[0], 22,
+                "observe TLS ClientHello before advancing time"
+            );
+        } else {
+            assert!(request[..n].starts_with(b"GET / HTTP/1.1"));
+        }
+        (socket, client)
+    }
+
+    async fn assert_socket_closed(mut socket: tokio::net::TcpStream) {
+        let mut byte = [0];
+        match tokio::time::timeout(Duration::from_secs(10), socket.read(&mut byte))
+            .await
+            .expect("client must close the stalled connection")
+        {
+            Ok(0) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("expected disconnect, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn error_body_cap_returns_before_eof() {
+        for last_chunk in [b"defgh".as_slice(), b"defgh-remaining-private-body"] {
+            let (mut socket, client) = connected_request(
+                HttpLimits {
+                    max_error_body_bytes: 8,
+                    read: Duration::from_secs(2),
+                    ..HttpLimits::default()
+                },
+                false,
+            )
+            .await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 429 fixture\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n",
+                )
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            assert!(!client.is_finished(), "the first chunk is below the cap");
+            socket
+                .write_all(format!("{:x}\r\n", last_chunk.len()).as_bytes())
+                .await
+                .unwrap();
+            socket.write_all(last_chunk).await.unwrap();
+            socket.write_all(b"\r\n").await.unwrap();
+            // Withhold the terminating chunk: buffering until EOF must fail this assertion.
+            let error = client.await.unwrap().unwrap_err();
+            assert_eq!(error.non_success_body(), Some("abcdefgh"));
+            assert_socket_closed(socket).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ascii_error_body_cap_matches_configured_boundary() {
+        for cap in [0usize, 1, 7, 8, 9, 16] {
+            for len in [cap.saturating_sub(1), cap, cap + 1] {
+                let body: Vec<u8> = (0..len).map(|i| b'a' + (i % 26) as u8).collect();
+                let (url, server) = response(429, body.clone()).await;
+                let http = BoundedHttp::new(HttpLimits {
+                    max_error_body_bytes: cap,
+                    ..HttpLimits::default()
+                })
+                .unwrap();
+                let error = http
+                    .open(Request::get(url).body(Bytes::new()).unwrap())
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.non_success_body().unwrap().as_bytes(),
+                    &body[..len.min(cap)]
+                );
+                server.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn http_connect_stall_times_out_during_tls_handshake() {
+        // Reqwest's connect deadline includes TLS; a local peer can stall it deterministically.
+        let (socket, client) = connected_request(
+            HttpLimits {
+                connect: Duration::from_secs(2),
+                read: Duration::from_secs(60),
+                ..HttpLimits::default()
+            },
+            true,
+        )
+        .await;
+        tokio::time::pause();
+        let error = tokio::time::timeout(Duration::from_secs(3), client)
+            .await
+            .expect("connect deadline must fire before the read deadline")
+            .unwrap()
+            .unwrap_err();
+        let http_client::Error::Instance(ref cause) = error else {
+            panic!("{error:?}")
+        };
+        let cause = cause.downcast_ref::<reqwest::Error>().unwrap();
+        assert!(cause.is_connect() && cause.is_timeout());
+        assert_eq!(
+            model_error(
+                ProviderError::Http(Arc::new(error)),
+                TimeoutPhase::FirstChunk
+            ),
+            ModelError::Timeout {
+                phase: TimeoutPhase::FirstChunk
+            }
+        );
+        tokio::time::resume();
+        assert_socket_closed(socket).await;
+    }
+
     #[derive(Clone)]
     struct TimedHttp {
         frames: Vec<(Duration, &'static str)>,

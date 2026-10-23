@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, env, fmt};
+use std::{collections::BTreeSet, env, fmt, net::IpAddr, time::Duration};
 
 use percent_encoding::percent_decode_str;
 use url::Url;
@@ -9,6 +9,8 @@ pub struct Config {
     pub database_url: String,
     pub secret: String,
     pub demo: bool,
+    pub transport: TransportConfig,
+    pub trusted_proxies: Vec<(IpAddr, u8)>,
     pub public_url: Option<String>,
     pub demo_password: Option<String>,
     pub smtp: Option<SmtpConfig>,
@@ -16,6 +18,26 @@ pub struct Config {
     pub anthropic: Option<ProviderEnv>,
 }
 
+#[derive(Clone, Debug)]
+pub struct TransportConfig {
+    pub header_timeout: Duration,
+    pub idle_timeout: Duration,
+    pub max_connections: usize,
+    pub max_connections_per_ip: usize,
+}
+
+impl Default for TransportConfig {
+    fn default() -> Self {
+        Self {
+            header_timeout: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(60),
+            max_connections: 256,
+            max_connections_per_ip: 32,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct SmtpConfig {
     pub host: String,
     pub port: Option<u16>,
@@ -203,6 +225,32 @@ pub fn redact_database_secrets(message: &str, database_url: &str) -> String {
 }
 
 impl Config {
+    pub fn public_url_or_default(&self) -> &str {
+        self.public_url
+            .as_deref()
+            .unwrap_or("http://localhost:3000")
+    }
+
+    pub fn trusts_proxy(&self, ip: IpAddr) -> bool {
+        self.trusted_proxies
+            .iter()
+            .any(|(network, prefix)| match (network, ip) {
+                (IpAddr::V4(network), IpAddr::V4(ip)) => {
+                    let shift = 32 - u32::from(*prefix);
+                    u32::from(*network).checked_shr(shift) == u32::from(ip).checked_shr(shift)
+                }
+                (IpAddr::V6(network), IpAddr::V6(ip)) => {
+                    let shift = 128 - u32::from(*prefix);
+                    u128::from(*network).checked_shr(shift) == u128::from(ip).checked_shr(shift)
+                }
+                _ => false,
+            })
+    }
+
+    pub fn cookie_secure(&self) -> bool {
+        self.public_url_or_default().starts_with("https://")
+    }
+
     pub fn redact_secrets(&self, message: &str) -> String {
         let Some(mut secrets) = database_secrets(&self.database_url) else {
             return "[redacted]".into();
@@ -245,7 +293,76 @@ impl Config {
                 }
             }
         }
+        for name in ["SMTP_PASSWORD", "KATWORK_DEMO_PASSWORD"] {
+            if optional(name).is_some_and(|value| value.chars().count() < 8) {
+                return Err(KatError::ConfigInvalid);
+            }
+        }
+        let mut public_url = optional("KATWORK_PUBLIC_URL");
+        if let Some(value) = &public_url {
+            let url = Url::parse(value).map_err(|_| KatError::ConfigInvalid)?;
+            if !matches!(url.scheme(), "http" | "https")
+                || !url.has_host()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.path() != "/"
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                return Err(KatError::ConfigInvalid);
+            }
+            public_url = Some(url.origin().ascii_serialization());
+        }
+        let demo = lookup("KATWORK_DEMO").is_some_and(|value| value == "1");
+        if demo
+            && public_url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("https://"))
+            && lookup("KATWORK_ALLOW_DEMO_ON_HTTPS").as_deref() != Some("1")
+        {
+            return Err(KatError::ConfigInvalid);
+        }
+        let trusted_proxies = optional("KATWORK_TRUSTED_PROXIES")
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|cidr| {
+                        let (ip, prefix) =
+                            cidr.trim().split_once('/').ok_or(KatError::ConfigInvalid)?;
+                        let ip: IpAddr = ip.parse().map_err(|_| KatError::ConfigInvalid)?;
+                        let prefix: u8 = prefix.parse().map_err(|_| KatError::ConfigInvalid)?;
+                        if prefix > if ip.is_ipv4() { 32 } else { 128 } {
+                            return Err(KatError::ConfigInvalid);
+                        }
+                        Ok((ip, prefix))
+                    })
+                    .collect::<Result<Vec<_>, KatError>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let positive = |name: &str, default: u32| -> Result<u32, KatError> {
+            let value = optional(name)
+                .map(|value| value.parse::<u32>())
+                .transpose()
+                .map_err(|_| KatError::ConfigInvalid)?
+                .unwrap_or(default);
+            if value == 0 {
+                return Err(KatError::ConfigInvalid);
+            }
+            Ok(value)
+        };
+        let transport = TransportConfig {
+            header_timeout: Duration::from_secs(
+                positive("KATWORK_HEADER_TIMEOUT_SECONDS", 10)?.into(),
+            ),
+            idle_timeout: Duration::from_secs(positive("KATWORK_IDLE_TIMEOUT_SECONDS", 60)?.into()),
+            max_connections: positive("KATWORK_MAX_CONNECTIONS", 256)? as usize,
+            max_connections_per_ip: positive("KATWORK_MAX_CONNECTIONS_PER_IP", 32)? as usize,
+        };
         let smtp = if let Some(host) = optional("SMTP_HOST") {
+            if host.contains('@') {
+                return Err(KatError::ConfigInvalid);
+            }
             let port = optional("SMTP_PORT")
                 .map(|value| value.parse::<u16>().map_err(|_| KatError::ConfigInvalid))
                 .transpose()?;
@@ -265,8 +382,10 @@ impl Config {
         Ok(Self {
             database_url,
             secret,
-            demo: lookup("KATWORK_DEMO").is_some_and(|value| value == "1"),
-            public_url: optional("KATWORK_PUBLIC_URL"),
+            demo,
+            transport,
+            trusted_proxies,
+            public_url,
             demo_password: optional("KATWORK_DEMO_PASSWORD"),
             smtp,
             openai: optional("OPENAI_API_KEY").map(|api_key| ProviderEnv {
@@ -308,7 +427,7 @@ impl fmt::Debug for SmtpConfig {
                 },
             )
             .field("port", &self.port)
-            .field("username", &self.username)
+            .field("username", &self.username.as_ref().map(|_| "[redacted]"))
             .field("password", &"[redacted]")
             .field("from", &self.from)
             .finish()

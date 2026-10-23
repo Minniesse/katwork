@@ -1,6 +1,7 @@
 use std::{error::Error, process::ExitCode, sync::Arc};
+use tracing_subscriber::prelude::*;
 
-use katwork::{db, error::KatError, runtime::Core};
+use katwork::{auth, db, error::KatError, runtime::Core};
 use katwork_server::{
     app::{AppState, build_router},
     config::{Config, redact_database_secrets},
@@ -8,7 +9,6 @@ use katwork_server::{
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -59,16 +59,31 @@ fn dependency_log_allowed(metadata: &tracing::Metadata<'_>) -> bool {
 async fn run() -> Result<(), KatError> {
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "serve".into());
+    let reset_password = match args.next().as_deref() {
+        None => false,
+        Some("--reset-password") if command == "seed-demo" => true,
+        Some(_) => return Err(KatError::CommandInvalid),
+    };
     if args.next().is_some() {
         return Err(KatError::CommandInvalid);
     }
     match command.as_str() {
         "serve" => {
             let config = Arc::new(Config::from_env()?);
+            if !config.cookie_secure() {
+                tracing::warn!("session cookie is not Secure on an HTTP public URL");
+            }
             let pool = db::connect(&config.database_url).await?;
+            let transport = config.transport.clone();
             let core = Arc::new(Core::new(pool, config));
             let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
-            axum::serve(listener, build_router(AppState { core })).await?;
+            katwork_server::transport::serve_with_shutdown(
+                listener,
+                build_router(AppState { core }),
+                transport,
+                shutdown_signal(),
+            )
+            .await?;
             Ok(())
         }
         "migrate" => {
@@ -76,10 +91,37 @@ async fn run() -> Result<(), KatError> {
             let pool = db::connect(&config.database_url).await?;
             db::migrate(&pool).await
         }
-        // Demo data is wired in Task 3.
-        "seed-demo" => Ok(()),
+        "seed-demo" => {
+            let config = Config::from_env()?;
+            if !config.demo {
+                return Err(KatError::ConfigInvalid);
+            }
+            let pool = db::connect(&config.database_url).await?;
+            if let Some(password) = auth::seed_demo(&pool, &config, reset_password).await? {
+                println!("{password}");
+            }
+            Ok(())
+        }
         _ => Err(KatError::CommandInvalid),
     }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install Ctrl-C handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! { () = ctrl_c => {}, () = terminate => {} }
 }
 
 #[cfg(test)]
@@ -95,6 +137,109 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn configured_registry_logs_one_safe_init_failure_per_provider() {
+        use katwork::{
+            config::ProviderEnv,
+            models::*,
+            types::{ModelTier, SpacePolicy},
+        };
+        use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+        for id in ["openai", "anthropic"] {
+            let key = uuid::Uuid::now_v7().to_string();
+            let url = format!("file:///{}", uuid::Uuid::now_v7());
+            let mut cfg = Config::from_lookup(|name| match name {
+                "DATABASE_URL" => Some("postgres://localhost/katwork".into()),
+                "KATWORK_SECRET" => Some("x".repeat(32)),
+                "KATWORK_DEMO" => Some("1".into()),
+                _ => None,
+            })
+            .unwrap();
+            let env = ProviderEnv {
+                api_key: key.clone(),
+                base_url: Some(url.clone()),
+            };
+            if id == "openai" {
+                cfg.openai = Some(env);
+            } else {
+                cfg.anthropic = Some(env);
+            }
+            let output = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .without_time()
+                    .with_ansi(false)
+                    .with_target(false)
+                    .with_writer({
+                        let output = output.clone();
+                        move || Capture(output.clone())
+                    }),
+            );
+            let _guard = subscriber.set_default();
+            let registry = Registry::from_config(&cfg);
+            for tier in [ModelTier::Fast, ModelTier::Standard, ModelTier::Strong] {
+                assert!(matches!(
+                    registry.for_tier(
+                        tier,
+                        &SpacePolicy {
+                            allow_external: true
+                        }
+                    ),
+                    Err(ModelError::ProviderUnavailable)
+                ));
+            }
+            let logged = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+            assert_eq!(
+                logged.trim(),
+                format!("WARN provider_init_failed provider_id=\"{id}\"")
+            );
+            assert!(!logged.contains(&key));
+            assert!(!logged.contains(&url));
+        }
+    }
+
+    #[test]
+    fn real_main_tracing_setup_blocks_dependency_secrets() {
+        for filter in [None, Some("trace,rig=trace,rig_core=trace")] {
+            let secret = uuid::Uuid::now_v7().to_string();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", "tests::main_tracing_probe", "--nocapture"])
+                .env("KATWORK_TEST_TRACING_SECRET", &secret)
+                .env_remove("RUST_LOG");
+            if let Some(filter) = filter {
+                command.env("RUST_LOG", filter);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(stderr.contains("main_tracing_probe_safe"), "{stderr}");
+            assert!(
+                !stderr.contains(&secret),
+                "main installed an unsafe subscriber"
+            );
+        }
+    }
+
+    #[test]
+    fn main_tracing_probe() {
+        let Ok(secret) = std::env::var("KATWORK_TEST_TRACING_SECRET") else {
+            return;
+        };
+        // The test runner's arguments make run() reject the command after real main installs tracing.
+        assert_eq!(main(), ExitCode::FAILURE);
+        tracing::trace!(target: "rig::completions", %secret);
+        tracing::debug!(target: "rig_core::completions", %secret);
+        tracing::warn!(target: "rig_core::providers", %secret);
+        tracing::error!(target: "rig::providers", %secret);
+        tracing::warn!(target: "sqlx_postgres::options::parse", %secret);
+        tracing::info!(target: "katwork", "main_tracing_probe_safe");
     }
 
     #[test]
