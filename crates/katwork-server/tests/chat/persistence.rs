@@ -12,6 +12,212 @@ async fn job(pool: &PgPool, f: &Fixture, message: MessageId) -> JobId {
     id
 }
 
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn message_author_must_be_workspace_member(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let outsider = UserId::new();
+    sqlx::query("INSERT INTO users (id,email,display_name,password_hash,locale) VALUES ($1,$2,'Outsider',$3,'en')")
+        .bind(outsider).bind(format!("{outsider}@example.test")).bind(outsider.to_string())
+        .execute(&pool).await.unwrap();
+    let mut forged = f.new_message("forged author");
+    forged.author = Author::User(outsider);
+    assert!(matches!(
+        message::append(
+            &mut pool.acquire().await.unwrap(),
+            &f.tenant,
+            f.thread,
+            forged
+        )
+        .await,
+        Err(KatError::NotFound)
+    ));
+    sqlx::query("DELETE FROM memberships WHERE workspace_id=$1 AND user_id=$2")
+        .bind(f.tenant.workspace_id())
+        .bind(f.tenant.user_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_code(
+        f.post(json!({"body":"removed member"})).await,
+        404,
+        "not_found",
+    )
+    .await;
+    assert!(matches!(
+        message::append(
+            &mut pool.acquire().await.unwrap(),
+            &f.tenant,
+            f.thread,
+            f.new_message("stale tenant")
+        )
+        .await,
+        Err(KatError::NotFound)
+    ));
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE workspace_id=$1")
+        .bind(f.tenant.workspace_id())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn removing_member_preserves_message_and_job_history(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let original = message::append(
+        &mut pool.acquire().await.unwrap(),
+        &f.tenant,
+        f.thread,
+        f.new_message("history"),
+    )
+    .await
+    .unwrap()
+    .message;
+    let job_id = job(&pool, &f, original.id).await;
+    sqlx::query("DELETE FROM memberships WHERE workspace_id=$1 AND user_id=$2")
+        .bind(f.tenant.workspace_id())
+        .bind(f.tenant.user_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let author: UserId =
+        sqlx::query_scalar("SELECT author_user_id FROM messages WHERE workspace_id=$1 AND id=$2")
+            .bind(f.tenant.workspace_id())
+            .bind(original.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let requester: UserId =
+        sqlx::query_scalar("SELECT requested_by FROM jobs WHERE workspace_id=$1 AND id=$2")
+            .bind(f.tenant.workspace_id())
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(author, f.tenant.user_id());
+    assert_eq!(requester, author);
+    assert_code(
+        f.post(json!({"body":"no longer allowed"})).await,
+        404,
+        "not_found",
+    )
+    .await;
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn message_list_clamps_to_200(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let mut tx = pool.begin().await.unwrap();
+    let mut ids = Vec::new();
+    for i in 0..205 {
+        ids.push(
+            message::append(&mut tx, &f.tenant, f.thread, f.new_message(&i.to_string()))
+                .await
+                .unwrap()
+                .message
+                .id,
+        );
+    }
+    tx.commit().await.unwrap();
+    let page = f.page("?limit=65535").await;
+    let actual: Vec<MessageId> = page["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| serde_json::from_value(m["id"].clone()).unwrap())
+        .collect();
+    assert_eq!(actual, ids[5..]);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn thread_list_clamps_to_100(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let mut ids = vec![f.thread];
+    for i in 0..104 {
+        ids.push(
+            thread::create(&pool, &f.tenant, f.space, f.team, &i.to_string())
+                .await
+                .unwrap()
+                .id,
+        );
+    }
+    ids.reverse();
+    let response = f
+        .call(
+            "GET",
+            &format!("spaces/{}/threads?limit=65535", f.space),
+            None,
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    let actual: Vec<ThreadId> = body(response)
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| serde_json::from_value(t["id"].clone()).unwrap())
+        .collect();
+    assert_eq!(actual, ids[..100]);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn different_bodies_racing_one_client_msg_id_store_one_message(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(12));
+    let mut requests = Vec::new();
+    for i in 0..12 {
+        let app = f.app.clone();
+        let cookie = f.cookie.clone();
+        let uri = format!(
+            "/api/workspaces/{}/threads/{}/messages",
+            f.tenant.workspace_id(),
+            f.thread
+        );
+        let barrier = barrier.clone();
+        requests.push(tokio::spawn(async move {
+            let text = if i % 2 == 0 { "first" } else { "second" };
+            barrier.wait().await;
+            let response = request(
+                &app,
+                "POST",
+                &uri,
+                Some(json!({"body":text,"client_msg_id":"race"})),
+                Some(&cookie),
+            )
+            .await;
+            (text, response.status(), body(response).await)
+        }));
+    }
+    let mut responses = Vec::new();
+    for task in requests {
+        responses.push(task.await.unwrap());
+    }
+    let page = f.page("").await;
+    let rows = page["messages"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|(_, status, _)| *status == 201)
+            .count(),
+        1
+    );
+    let original = &responses
+        .iter()
+        .find(|(_, status, _)| *status == 201)
+        .unwrap()
+        .2;
+    for (text, status, response) in &responses {
+        if rows[0]["body"] == *text {
+            assert!(*status == 200 || *status == 201);
+            assert_eq!(response, original);
+        } else {
+            assert_eq!(*status, 409);
+            assert_eq!(*response, json!({"code":"client_msg_id_conflict"}));
+        }
+    }
+}
+
 async fn run(pool: &PgPool, f: &Fixture, job: JobId) -> RunId {
     let kat: KatId =
         sqlx::query_scalar("SELECT id FROM kats WHERE workspace_id=$1 ORDER BY id LIMIT 1")
