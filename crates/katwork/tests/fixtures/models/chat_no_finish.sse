@@ -1,0 +1,4 @@
+data: {"id":"chat_test","object":"chat.completion.chunk","created":1,"model":"gpt-4.1","choices":[{"index":0,"delta":{"role":"assistant","content":"สวัสดี 👋"},"finish_reason":null}]}
+
+data: [DONE]
+

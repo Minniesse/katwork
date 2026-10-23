@@ -56,8 +56,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.0
-      - run: cargo +1.94.0 check --workspace --locked
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - run: cargo +1.97.1 check --workspace --locked
 
   deny:
     runs-on: ubuntu-latest
