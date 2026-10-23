@@ -412,3 +412,28 @@ async fn ten_thousand_sprayed_emails_do_not_block_another_users_login(pool: PgPo
     .await;
     assert_eq!(response.status(), 200);
 }
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn database_errors_never_lock_out_login(pool: PgPool) {
+    let (_, password) = support::user(&pool).await;
+    let single = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_millis(100))
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let app = support::app(&single, None);
+    let held = single.acquire().await.unwrap();
+    // The account lookup cannot get a connection, so no password is ever checked.
+    for _ in 0..11 {
+        support::assert_code(
+            support::login(&app, &password).await,
+            503,
+            "database_unavailable",
+        )
+        .await;
+    }
+    drop(held);
+    assert_eq!(support::login(&app, &password).await.status(), 200);
+    single.close().await;
+}

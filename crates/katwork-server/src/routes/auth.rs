@@ -125,7 +125,7 @@ const HOUR: Duration = Duration::from_secs(3600);
 #[derive(Clone, Default)]
 pub(crate) struct LoginLimiter(Arc<Mutex<Attempts>>);
 
-/// One admitted login attempt. Dropped, it stays counted; [`LoginAttempt::succeeded`] gives it back.
+/// One admitted login attempt. Dropped, it stays counted; [`LoginAttempt::finish`] settles it.
 pub(crate) struct LoginAttempt {
     limiter: LoginLimiter,
     keys: [(LimitKey, Instant); 3],
@@ -163,6 +163,27 @@ impl LoginLimiter {
 }
 
 impl LoginAttempt {
+    /// Settles the attempt by the login's outcome. Only a password that was checked and wrong
+    /// (`unauthenticated`) stays counted; a success is [`Self::succeeded`], and an error that
+    /// came before any check (`auth_busy`, a database error) is handed back without clearing
+    /// earlier failures, so making the server busy never wipes a lockout.
+    pub(crate) fn finish<T>(self, result: &Result<T, KatError>) {
+        match result {
+            Ok(_) => self.succeeded(),
+            Err(KatError::Unauthenticated) => {}
+            Err(_) => self.unchecked(),
+        }
+    }
+
+    fn unchecked(self) {
+        let Ok(mut attempts) = self.limiter.0.lock() else {
+            return;
+        };
+        for (key, started) in &self.keys {
+            attempts.refund(key, *started);
+        }
+    }
+
     /// The password verified: give the attempt back to the IP and email buckets, and clear
     /// the email+IP bucket.
     pub(crate) fn succeeded(self) {
@@ -254,8 +275,9 @@ pub(crate) async fn login(
     let email = email(&body.email)?;
     let peer = peer.ok_or(KatError::RequestInvalid)?.0.0.ip();
     let attempt = limiter.reserve(&email, client_ip(peer, &headers, &state.core.config))?;
-    let (user, token) = auth::login(&state.core.pool, &email, &body.password).await?;
-    attempt.succeeded();
+    let login = auth::login(&state.core.pool, &email, &body.password).await;
+    attempt.finish(&login);
+    let (user, token) = login?;
     Ok((
         [(
             SET_COOKIE,
@@ -746,5 +768,73 @@ mod lockout_tests {
         }
         drop(attempts);
         limiter.reserve("owner@example.test", first).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod unchecked_attempt_tests {
+    use super::*;
+
+    #[test]
+    fn auth_busy_and_database_errors_never_count_toward_lockout() {
+        let limiter = LoginLimiter::default();
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        // No password was checked, so none of these is a failed guess.
+        for _ in 0..10 {
+            limiter
+                .reserve("owner@example.test", ip)
+                .unwrap()
+                .finish(&Err::<(), _>(KatError::AuthBusy));
+        }
+        for _ in 0..10 {
+            limiter
+                .reserve("owner@example.test", ip)
+                .unwrap()
+                .finish(&Err::<(), _>(KatError::DatabaseUnavailable(Box::new(
+                    std::io::Error::other("down"),
+                ))));
+        }
+        {
+            let attempts = limiter.0.lock().unwrap();
+            assert_eq!(attempts.entries[&LimitKey::Ip(ip)].count, 0);
+            assert_eq!(
+                attempts.entries[&LimitKey::Pair("owner@example.test".into(), ip)].count,
+                0
+            );
+            assert_eq!(
+                attempts.entries[&LimitKey::Email("owner@example.test".into())].count,
+                0
+            );
+        }
+        // A checked, wrong password still counts: ten of them lock the pair.
+        for _ in 0..10 {
+            limiter
+                .reserve("owner@example.test", ip)
+                .unwrap()
+                .finish(&Err::<(), _>(KatError::Unauthenticated));
+        }
+        assert!(limiter.reserve("owner@example.test", ip).is_err());
+    }
+
+    #[test]
+    fn an_unchecked_attempt_never_clears_earlier_failures() {
+        let limiter = LoginLimiter::default();
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        for _ in 0..9 {
+            limiter
+                .reserve("owner@example.test", ip)
+                .unwrap()
+                .finish(&Err::<(), _>(KatError::Unauthenticated));
+        }
+        // An attacker who makes the server busy must not wipe the pair the way a success does.
+        limiter
+            .reserve("owner@example.test", ip)
+            .unwrap()
+            .finish(&Err::<(), _>(KatError::AuthBusy));
+        limiter
+            .reserve("owner@example.test", ip)
+            .unwrap()
+            .finish(&Err::<(), _>(KatError::Unauthenticated));
+        assert!(limiter.reserve("owner@example.test", ip).is_err());
     }
 }
