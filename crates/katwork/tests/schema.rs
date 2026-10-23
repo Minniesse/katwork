@@ -213,6 +213,88 @@ async fn fence_waiter_rechecks_task_state_and_epoch(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn fence_check_rejects_expiry_during_lock_wait_after_commit(pool: PgPool) {
+    fence_rejects_expiry_during_lock_wait(pool, false, false).await;
+}
+
+#[sqlx::test]
+async fn fence_check_rejects_expiry_during_lock_wait_after_rollback(pool: PgPool) {
+    fence_rejects_expiry_during_lock_wait(pool, false, true).await;
+}
+
+#[sqlx::test]
+async fn fence_lock_rejects_expiry_during_lock_wait_after_commit(pool: PgPool) {
+    fence_rejects_expiry_during_lock_wait(pool, true, false).await;
+}
+
+#[sqlx::test]
+async fn fence_lock_rejects_expiry_during_lock_wait_after_rollback(pool: PgPool) {
+    fence_rejects_expiry_during_lock_wait(pool, true, true).await;
+}
+
+async fn fence_rejects_expiry_during_lock_wait(pool: PgPool, exclusive: bool, rollback: bool) {
+    use std::time::Duration;
+    let f = Fixture::new(&pool).await;
+    f.live_lease(&pool).await;
+    let fence = Fence {
+        task_id: TaskId(f.task),
+        epoch: LeaseEpoch(1),
+    };
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM tasks WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(f.task)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let mut waiting = pool.begin().await.unwrap();
+    let waiting_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *waiting)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE task_leases SET expires_at = clock_timestamp() + interval '1 second' WHERE task_id = $1")
+        .bind(f.task).execute(&pool).await.unwrap();
+    let check = async {
+        if exclusive {
+            fence::lock(&mut waiting, &fence).await
+        } else {
+            fence::check(&mut waiting, &fence).await
+        }
+    };
+    let release = async {
+        while !sqlx::query_scalar::<_, bool>("SELECT cardinality(pg_blocking_pids($1)) > 0")
+            .bind(waiting_pid)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let expired = || {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT expires_at <= clock_timestamp() FROM task_leases WHERE task_id = $1",
+            )
+            .bind(f.task)
+            .fetch_one(&pool)
+        };
+        assert!(!expired().await.unwrap(), "lease must be live when blocked");
+        while !expired().await.unwrap() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if rollback {
+            holder.rollback().await.unwrap();
+        } else {
+            holder.commit().await.unwrap();
+        }
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(check, release)
+    })
+    .await
+    .expect("fence must finish after the lock holder exits");
+    assert_eq!(result.unwrap_err().code(), "lease_lost");
+}
+
+#[sqlx::test]
 async fn claim_live_lease_and_quota_queries_have_indexes(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let mut tx = pool.begin().await.unwrap();
@@ -222,23 +304,31 @@ async fn claim_live_lease_and_quota_queries_have_indexes(pool: PgPool) {
         .unwrap();
     for (query, index) in [
         (
-            "EXPLAIN (FORMAT JSON) SELECT id FROM tasks WHERE state = 'queued' ORDER BY created_at LIMIT 1",
+            "EXPLAIN SELECT id FROM tasks WHERE state = 'queued' ORDER BY created_at LIMIT 1",
             "tasks_claim_state_created_at",
         ),
         (
-            "EXPLAIN (FORMAT JSON) SELECT count(*) FROM tasks JOIN task_leases ON task_leases.task_id = tasks.id WHERE tasks.dot_id = $1 AND tasks.state = 'leased' AND task_leases.expires_at > clock_timestamp()",
+            "EXPLAIN SELECT count(*) FROM tasks JOIN task_leases ON task_leases.task_id = tasks.id WHERE tasks.dot_id = $1 AND tasks.state = 'leased' AND task_leases.expires_at > clock_timestamp()",
             "tasks_live_leases_by_dot",
         ),
         (
-            "EXPLAIN (FORMAT JSON) SELECT sum(charged_tokens) FROM model_calls WHERE dot_id = $1 AND created_at > clock_timestamp() - interval '24 hours'",
+            // Task 12: run this quota query after locking the Dot, with one fresh cutoff.
+            "EXPLAIN SELECT sum(charged_tokens) FROM model_calls WHERE dot_id = $1 AND created_at > statement_timestamp() - interval '24 hours'",
             "model_calls_dot_daily_tokens",
         ),
     ] {
         let has_dot = query.contains("$1");
-        let query = sqlx::query_scalar::<_, serde_json::Value>(query);
+        let query = sqlx::query_scalar::<_, String>(query);
         let query = if has_dot { query.bind(f.dot) } else { query };
-        let plan = query.fetch_one(&mut *tx).await.unwrap().to_string();
+        let plan = query.fetch_all(&mut *tx).await.unwrap().join("\n");
         assert!(plan.contains(index), "{index}: {plan}");
+        if index == "model_calls_dot_daily_tokens" {
+            assert!(
+                plan.lines()
+                    .any(|line| line.contains("Index Cond:") && line.contains("created_at")),
+                "quota cutoff must be an index condition: {plan}"
+            );
+        }
     }
 }
 
