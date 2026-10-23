@@ -25,6 +25,7 @@ sha2.workspace = true
 socket2.workspace = true
 
 [dev-dependencies]
+katwork = { path = "../katwork", features = ["test-support"] }
 eventsource-stream.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 argon2.workspace = true
