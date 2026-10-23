@@ -11,7 +11,7 @@ use katwork::{
     ids::*,
     jobs::{
         RouteRule, Routing, TaskInput, job,
-        lease::{self, ClaimedTask, HeartbeatStatus},
+        lease::{self, ClaimedTask},
         task, worker,
     },
     models::*,
@@ -385,57 +385,66 @@ async fn expired_lease_after_side_effect_is_interrupted_not_rerun(pool: PgPool) 
 }
 #[sqlx::test(migrations = "./migrations")]
 async fn renewal_committed_between_snapshot_and_lock_is_not_reclaimed(pool: PgPool) {
-    let f = setup(&pool).await;
-    let core = core(&pool);
-    for iteration in 0..200 {
-        if iteration > 0 {
-            enqueue(&pool, &f, KatId(f.kat)).await;
-        }
-        let a = claim(&core, "a").await.unwrap();
-        let run = start_run(&core, &a).await;
-        sqlx::query("UPDATE task_leases SET expires_at=clock_timestamp()+interval '50 milliseconds' WHERE task_id=$1")
-            .bind(a.task_id).execute(&pool).await.unwrap();
-        let barrier = Barrier::new(2);
-        let (renew, reclaim) = tokio::join!(
-            async {
-                barrier.wait().await;
-                lease::heartbeat(&pool, a.task_id, "a", a.lease_epoch, TTL).await
-            },
-            async {
-                barrier.wait().await;
-                claim(&core, "b").await
-            }
-        );
-        if matches!(renew, Ok(HeartbeatStatus::Continue)) {
-            assert!(reclaim.is_none());
-            let epoch: i64 = sqlx::query_scalar("SELECT lease_epoch FROM tasks WHERE id=$1")
-                .bind(a.task_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-            assert_eq!(epoch, a.lease_epoch.0);
-            let runs: i64 =
-                sqlx::query_scalar("SELECT count(*) FROM runs WHERE task_id=$1 AND lease_epoch>0")
-                    .bind(a.task_id)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
-            assert_eq!(runs, 1);
-            lease::heartbeat(&pool, a.task_id, "a", a.lease_epoch, TTL)
-                .await
-                .unwrap();
-            lease::complete(&core, a.task_id, "a", a.lease_epoch, answered(run))
-                .await
-                .unwrap();
-        } else {
-            assert!(matches!(renew, Err(KatError::LeaseLost)));
-            let b = match reclaim {
-                Some(c) => c,
-                None => claim(&core, "b").await.unwrap(),
-            };
-            finish(&core, &b, "b").await;
-        }
-    }
+    setup(&pool).await;
+    let mut core = core(&pool);
+    Arc::get_mut(&mut core.config).unwrap().lock_timeout = Duration::from_secs(30);
+    let core = Arc::new(core);
+    let a = claim(&core, "a").await.unwrap();
+    let run = start_run(&core, &a).await;
+    expire(&pool, a.task_id).await;
+    // An updatable view gates only the candidate statement, after its MVCC snapshot.
+    sqlx::raw_sql(
+        "ALTER TABLE task_leases RENAME TO lease_rows;
+        CREATE FUNCTION candidate_gate() RETURNS boolean LANGUAGE plpgsql AS $$
+        BEGIN
+            IF current_query() LIKE 'SELECT t.id,t.workspace_id%' THEN
+                PERFORM pg_advisory_xact_lock(45);
+            END IF;
+            RETURN true;
+        END $$;
+        CREATE VIEW task_leases AS SELECT * FROM lease_rows WHERE candidate_gate()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut gate = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(45)")
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+    // Stage the renewal before the candidate's snapshot; commit it before the task lock.
+    let mut renewal = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM tasks WHERE id=$1 FOR SHARE")
+        .bind(a.task_id)
+        .execute(&mut *renewal)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE lease_rows SET expires_at=clock_timestamp()+interval '60 seconds' WHERE task_id=$1",
+    )
+    .bind(a.task_id)
+    .execute(&mut *renewal)
+    .await
+    .unwrap();
+    let other = core.clone();
+    let reclaim = tokio::spawn(async move { claim(&other, "b").await });
+    races::waiting(&pool, "SELECT t.id,t.workspace_id").await;
+    renewal.commit().await.unwrap();
+    gate.commit().await.unwrap();
+    assert!(reclaim.await.unwrap().is_none());
+    let epoch: i64 = sqlx::query_scalar("SELECT lease_epoch FROM tasks WHERE id=$1")
+        .bind(a.task_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(epoch, a.lease_epoch.0);
+    assert!(terminals(&pool, run).await.is_empty());
+    lease::heartbeat(&pool, a.task_id, "a", a.lease_epoch, TTL)
+        .await
+        .unwrap();
+    lease::complete(&core, a.task_id, "a", a.lease_epoch, answered(run))
+        .await
+        .unwrap();
 }
 #[sqlx::test(migrations = "./migrations")]
 async fn claims_follow_queue_order(pool: PgPool) {

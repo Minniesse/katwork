@@ -52,6 +52,11 @@ impl Prefix {
 /// Candidate normalization has a shared byte-work budget of 128 times the body length.
 /// Exhaustion returns no mentions, so routing falls back to the Lead without partial recipients.
 pub fn resolve(body: &str, names: &[(KatId, &str)]) -> Vec<KatId> {
+    resolve_with_warnings(body, names).0
+}
+
+/// Report missing delimiters using the same Markdown, normalization and work-budget rules.
+pub fn resolve_with_warnings(body: &str, names: &[(KatId, &str)]) -> (Vec<KatId>, Vec<KatId>) {
     let mut trie = vec![Node::default()];
     for (id, name) in names {
         let mut node = 0;
@@ -65,8 +70,9 @@ pub fn resolve(body: &str, names: &[(KatId, &str)]) -> Vec<KatId> {
         trie[node].kat.get_or_insert(*id);
     }
     let mut result = Vec::new();
+    let mut needs_space = Vec::new();
     if trie.len() == 1 {
-        return result;
+        return (result, needs_space);
     }
     let mut seen = HashSet::new();
     let mut budget = body.len().saturating_mul(128);
@@ -96,7 +102,7 @@ pub fn resolve(body: &str, names: &[(KatId, &str)]) -> Vec<KatId> {
                     for (start, cluster) in rest.grapheme_indices(true) {
                         let end = start + cluster.len();
                         let Some(chunk) = fold_with_budget(cluster, &mut budget) else {
-                            return exhausted(body.len());
+                            return (exhausted(body.len()), vec![]);
                         };
                         // A non-mark starter that cannot compose seals the preceding raw suffix.
                         // Repeated Hangul L/V jamo need not wait for a grapheme boundary.
@@ -118,7 +124,7 @@ pub fn resolve(body: &str, names: &[(KatId, &str)]) -> Vec<KatId> {
                             let Some(folded) =
                                 fold_with_budget(&rest[tail_start..end], &mut budget)
                             else {
-                                return exhausted(body.len());
+                                return (exhausted(body.len()), vec![]);
                             };
                             tail = folded;
                         }
@@ -126,9 +132,14 @@ pub fn resolve(body: &str, names: &[(KatId, &str)]) -> Vec<KatId> {
                         if !cluster.ends_with(char::is_whitespace)
                             && candidate.extend(&tail, &trie).is_some()
                             && let Some(id) = trie[candidate.node].kat
-                            && ends_mention(cluster, &rest[end..])
                         {
-                            found = Some((id, end));
+                            if ends_mention(cluster, &rest[end..]) {
+                                found = Some((id, end));
+                            } else if rest[end..].starts_with(char::is_alphabetic)
+                                && !needs_space.contains(&id)
+                            {
+                                needs_space.push(id);
+                            }
                         }
                     }
                     if let Some((id, end)) = found {
@@ -142,7 +153,10 @@ pub fn resolve(body: &str, names: &[(KatId, &str)]) -> Vec<KatId> {
             _ => {}
         }
     }
-    result
+    if !result.is_empty() {
+        needs_space.clear();
+    }
+    (result, needs_space)
 }
 
 fn fold_with_budget(text: &str, budget: &mut usize) -> Option<String> {

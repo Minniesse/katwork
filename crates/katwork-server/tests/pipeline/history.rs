@@ -67,20 +67,13 @@ async fn other_kats_messages_are_user_role_with_name(pool: PgPool) {
     let b = append(&f, Author::Kat(f.kats[2].id), "Other".into(), None).await;
     let c = append(&f, Author::User(f.tenant.user_id()), "Request".into(), None).await;
     let h = pipeline::build_history(&[a, b, c], f.kats[0].id, 24000);
-    assert!(matches!(&h.messages[0],ChatMsg::Assistant{content,..} if content=="Mine"));
+    assert_eq!(h.cut, 1);
     assert_eq!(
-        h.messages[1],
-        ChatMsg::User {
-            content: "Other".into(),
-            name: Some("Writer".into())
-        }
-    );
-    assert_eq!(
-        h.messages[2],
-        ChatMsg::User {
-            content: "Request".into(),
-            name: Some("Person".into())
-        }
+        h.messages,
+        vec![ChatMsg::User {
+            content: "Writer: Other\nPerson: Request".into(),
+            name: None,
+        }]
     );
 }
 #[sqlx::test(migrations = "../katwork/migrations")]

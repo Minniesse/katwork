@@ -4,6 +4,37 @@ use sqlx::{Connection, PgConnection, PgPool, migrate::Migrator, postgres::PgPool
 
 use crate::error::KatError;
 
+/// A cancelled SQL future must never return a possibly open transaction to the pool.
+pub(crate) struct GuardedConnection {
+    connection: sqlx::pool::PoolConnection<sqlx::Postgres>,
+    complete: bool,
+}
+
+impl GuardedConnection {
+    pub(crate) async fn acquire(pool: &PgPool) -> Result<Self, KatError> {
+        Ok(Self {
+            connection: pool.acquire().await?,
+            complete: false,
+        })
+    }
+
+    pub(crate) fn connection(&mut self) -> &mut PgConnection {
+        &mut self.connection
+    }
+
+    pub(crate) fn release(mut self) {
+        self.complete = true;
+    }
+}
+
+impl Drop for GuardedConnection {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.connection.close_on_drop();
+        }
+    }
+}
+
 pub async fn set_lock_timeout(conn: &mut PgConnection, timeout: Duration) -> Result<(), KatError> {
     sqlx::query("SELECT set_config('lock_timeout', $1, true)")
         .bind(format!("{}ms", timeout.as_millis().max(1)))
@@ -17,8 +48,18 @@ pub(crate) async fn set_configured_lock_timeout(conn: &mut PgConnection) -> Resu
     set_lock_timeout(conn, timeout).await
 }
 
+fn pool_options() -> PgPoolOptions {
+    PgPoolOptions::new().after_release(|conn, _| {
+        Box::pin(async move {
+            // sqlx 0.9 can miss transaction depth when BEGIN is cancelled before its reply.
+            sqlx::query("ROLLBACK").execute(conn).await?;
+            Ok(true)
+        })
+    })
+}
+
 pub async fn connect(url: &str) -> Result<PgPool, KatError> {
-    match PgPoolOptions::new().connect(url).await {
+    match pool_options().connect(url).await {
         Ok(pool) => Ok(pool),
         Err(mut error) => {
             if matches!(error, sqlx::Error::PoolTimedOut) {
@@ -63,4 +104,65 @@ pub async fn require_migrated(pool: &PgPool) -> Result<(), KatError> {
         return Err(KatError::MigrationRequired);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn cancelled_begin_does_not_leak_transaction_to_next_borrower(pool: PgPool) {
+        let single = pool_options()
+            .max_connections(1)
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE cancellation_probe(value boolean NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO cancellation_probe VALUES(false)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut conn = single.acquire().await.unwrap();
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        let mut beginning = Box::pin(conn.begin());
+        assert!(futures::poll!(beginning.as_mut()).is_pending());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let idle: bool = sqlx::query_scalar("SELECT state='idle in transaction' AND query='BEGIN' FROM pg_stat_activity WHERE pid=$1")
+                .bind(pid).fetch_one(&pool).await.unwrap();
+            if idle {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "BEGIN never reached server"
+            );
+            tokio::task::yield_now().await;
+        }
+        drop(beginning);
+        drop(conn);
+        assert_eq!(
+            sqlx::query("UPDATE cancellation_probe SET value=true")
+                .execute(&single)
+                .await
+                .unwrap()
+                .rows_affected(),
+            1
+        );
+        let external: bool = sqlx::query_scalar("SELECT value FROM cancellation_probe")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            external,
+            "successful autocommit write was hidden in leaked transaction"
+        );
+        single.close().await;
+    }
 }

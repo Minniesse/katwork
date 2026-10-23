@@ -108,6 +108,7 @@ async fn cancel_other_workspace_job_is_404(pool: PgPool) {
 async fn job_view_shows_queue_position_while_queued(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let (_, a) = f.submit("@Writer one").await;
+    f.submit("@Researcher unrelated queue").await;
     let (_, b) = f.submit("@Writer two").await;
     for (job, position) in [(a, 1), (b, 2)] {
         let r = f.call("GET", &format!("jobs/{job}"), None).await;
@@ -470,15 +471,43 @@ async fn cancel_rechecks_admin_role_after_job_lock(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let (_, job) = f.submit("hello").await;
     let (admin, _) = colleague(&f, "admin").await;
+    let before = f.events().await;
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM jobs WHERE id=$1 FOR NO KEY UPDATE")
+        .bind(job)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let cancel = katwork::jobs::job::cancel(&pool, &f.core.events, &admin, job);
+    tokio::pin!(cancel);
+    tokio::select! {
+        result = &mut cancel => panic!("cancel bypassed job lock: {result:?}"),
+        () = wait_for_locks(&pool, "jobs", 1) => {}
+    }
     sqlx::query("UPDATE memberships SET role='member' WHERE workspace_id=$1 AND user_id=$2")
         .bind(f.tenant.workspace_id())
         .bind(admin.user_id())
         .execute(&pool)
         .await
         .unwrap();
+    let mut task_holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM tasks WHERE job_id=$1 FOR NO KEY UPDATE")
+        .bind(job)
+        .execute(&mut *task_holder)
+        .await
+        .unwrap();
+    holder.commit().await.unwrap();
     assert!(matches!(
-        katwork::jobs::job::cancel(&pool, &f.core.events, &admin, job).await,
+        timeout(Duration::from_secs(2), cancel).await.unwrap(),
         Err(katwork::error::KatError::Forbidden)
     ));
     assert_eq!(f.status(job).await.0, None);
+    let state: String = sqlx::query_scalar("SELECT state FROM tasks WHERE job_id=$1")
+        .bind(job)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "queued");
+    assert_eq!(f.events().await, before);
+    task_holder.rollback().await.unwrap();
 }

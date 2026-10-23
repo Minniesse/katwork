@@ -24,21 +24,8 @@ pub async fn check(
         .bind(kat.id)
         .fetch_one(&mut *conn)
         .await?;
-    let budget: Option<i64> =
-        sqlx::query_scalar("SELECT daily_token_budget FROM kats WHERE workspace_id=$1 AND id=$2")
-            .bind(workspace)
-            .bind(kat.id)
-            .fetch_one(&mut *conn)
-            .await?;
-    if let Some(budget) = budget {
-        let charged: i64 = sqlx::query_scalar(include_str!("quota_daily.sql"))
-            .bind(workspace)
-            .bind(kat.id)
-            .fetch_one(&mut *conn)
-            .await?;
-        if charged >= budget {
-            return Ok(Some(StopReason::QuotaExceeded));
-        }
+    if daily_exhausted(conn, workspace, kat.id).await? {
+        return Ok(Some(StopReason::QuotaExceeded));
     }
     let recent: i64 = sqlx::query_scalar(include_str!("quota_sender.sql"))
         .bind(workspace)
@@ -47,4 +34,29 @@ pub async fn check(
         .fetch_one(conn)
         .await?;
     Ok((recent >= 6).then_some(StopReason::TooManyRequests))
+}
+
+/// Read the daily window only after the caller has locked the Kat row.
+pub(super) async fn daily_exhausted(
+    conn: &mut PgConnection,
+    workspace: WorkspaceId,
+    kat: crate::ids::KatId,
+) -> Result<bool, KatError> {
+    let budget: Option<i64> =
+        sqlx::query_scalar("SELECT daily_token_budget FROM kats WHERE workspace_id=$1 AND id=$2")
+            .bind(workspace)
+            .bind(kat)
+            .fetch_one(&mut *conn)
+            .await?;
+    if let Some(budget) = budget {
+        let charged: i64 = sqlx::query_scalar(include_str!("quota_daily.sql"))
+            .bind(workspace)
+            .bind(kat)
+            .fetch_one(&mut *conn)
+            .await?;
+        if charged >= budget {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

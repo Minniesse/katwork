@@ -24,6 +24,7 @@ const REASON_CODES = [
   'question_pending',
   'interrupted_review_required',
   'kat_paused',
+  'internal_error',
   'retries_exhausted',
   'cancelled',
   'outcome_unknown',
@@ -33,6 +34,8 @@ const REASON_CODES = [
   'too_many_requests',
   'workspace_paused_stopped',
   'kat_paused_stopped',
+  'mention_needs_space',
+  'extra_mention_ignored',
 ];
 
 // API error codes the auth routes and guards can return (KatError::code).

@@ -1,5 +1,5 @@
 //! Atomic, deterministic message intake. The thread lock serializes receipts and routing.
-use sqlx::{Postgres, Transaction};
+use sqlx::{Connection, Postgres, Transaction};
 
 use crate::{
     agent::{Initiator, RunFacts, StopReason},
@@ -32,16 +32,19 @@ pub async fn submit(
     thread_id: ThreadId,
     post: UserPost,
 ) -> Result<Submitted, KatError> {
-    let mut tx = core.pool.begin().await?;
+    let mut connection = db::GuardedConnection::acquire(&core.pool).await?;
+    let mut tx = connection.connection().begin().await?;
     db::set_lock_timeout(&mut tx, core.config.lock_timeout).await?;
     let submitted = intake(&mut tx, core, tenant, thread_id, post).await?;
     tx.commit().await?;
+    connection.release();
     if let Some(seq) = submitted.last_event_seq {
         core.events.notify(thread_id, seq);
     }
     Ok(submitted)
 }
 
+/// The caller must drain its transaction or discard its connection on cancellation, as submit does.
 pub async fn intake(
     tx: &mut Transaction<'_, Postgres>,
     _core: &Core,
@@ -77,9 +80,21 @@ pub async fn intake(
         .iter()
         .map(|k| (k.id, k.name.as_str()))
         .collect();
-    let mentions = tracing::info_span!("mentions", thread_id = %thread_id)
-        .in_scope(|| mentions::resolve(&post.body, &names));
+    let (mentions, missing_spaces) = tracing::info_span!("mentions", thread_id = %thread_id)
+        .in_scope(|| mentions::resolve_with_warnings(&post.body, &names));
     let mut notices = Vec::new();
+    for id in &missing_spaces {
+        if let Some(k) = roster.members.iter().find(|k| k.id == *id) {
+            notices.push((
+                ReasonCode::MentionNeedsSpace,
+                vec![NoticeKat {
+                    id: *id,
+                    name: k.name.clone(),
+                }],
+                Some(*id),
+            ));
+        }
+    }
     let mut chosen = None;
     let mut ignored = Vec::new();
     for id in mentions {
@@ -105,7 +120,7 @@ pub async fn intake(
             ));
         }
     }
-    if chosen.is_none() {
+    if chosen.is_none() && missing_spaces.is_empty() {
         chosen = parent
             .as_ref()
             .and_then(|p| eligible.iter().find(|k| Some(k.id) == p.kat_id))
@@ -292,27 +307,51 @@ pub fn build_history(messages: &[Message], kat_id: KatId, budget_chars: usize) -
         .collect();
     let mut start = turns.len();
     let mut size = 0usize;
+    let mut consecutive_users = 0;
     for (i, m) in turns.iter().enumerate().rev() {
         size = size.saturating_add(m.body.chars().count());
+        if m.author != Author::Kat(kat_id) {
+            if consecutive_users > 0 {
+                size = size.saturating_add(m.author_name.chars().count() + 3);
+                if consecutive_users == 1 {
+                    size = size.saturating_add(turns[i + 1].author_name.chars().count() + 2);
+                }
+            }
+            consecutive_users += 1;
+        } else {
+            consecutive_users = 0;
+        }
         if i + 1 != turns.len() && size > budget_chars {
             break;
         }
         start = i;
     }
-    let messages = turns[start..]
-        .iter()
-        .map(|m| match m.author {
-            Author::Kat(id) if id == kat_id => ChatMsg::Assistant {
+    while turns
+        .get(start)
+        .is_some_and(|m| m.author == Author::Kat(kat_id))
+    {
+        start += 1;
+    }
+    let mut messages = Vec::new();
+    for m in &turns[start..] {
+        if m.author == Author::Kat(kat_id) {
+            messages.push(ChatMsg::Assistant {
                 content: m.body.clone(),
                 tool_calls: vec![],
                 replay: None,
-            },
-            _ => ChatMsg::User {
+            });
+        } else if let Some(ChatMsg::User { content, name }) = messages.last_mut() {
+            if let Some(author) = name.take() {
+                *content = format!("{author}: {content}");
+            }
+            content.push_str(&format!("\n{}: {}", m.author_name, m.body));
+        } else {
+            messages.push(ChatMsg::User {
                 content: m.body.clone(),
                 name: Some(m.author_name.clone()),
-            },
-        })
-        .collect();
+            });
+        }
+    }
     History {
         messages,
         cut: u32::try_from(start).unwrap_or(u32::MAX),
