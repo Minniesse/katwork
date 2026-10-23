@@ -95,7 +95,7 @@ async fn create_on(
     is_default: bool,
 ) -> Result<TeamId, KatError> {
     super::check_space(conn, tenant, space).await?;
-    let name = tenancy::validate_name(&new.name)?;
+    let name = super::validate_name(&new.name)?;
     let mut seen = HashSet::new();
     let members: Vec<KatId> = std::iter::once(new.lead)
         .chain(new.members)
@@ -113,7 +113,7 @@ async fn create_on(
         if !kat.spaces.contains(&space) {
             return Err(KatError::KatNotInSpace);
         }
-        tenancy::validate_name(&kat.name)?;
+        super::validate_name(&kat.name)?;
         if !names.insert(super::name_key(&kat.name)) {
             return Err(KatError::KatNameConflict);
         }
@@ -210,7 +210,7 @@ pub async fn add_member(
     if !kat.spaces.contains(&team.space_id) {
         return Err(KatError::KatNotInSpace);
     }
-    tenancy::validate_name(&kat.name)?;
+    super::validate_name(&kat.name)?;
     let current: Vec<(KatId, String, bool)> = sqlx::query_as("SELECT d.id, d.name, m.is_lead FROM team_members m JOIN kats d ON d.id=m.kat_id AND d.workspace_id=m.workspace_id WHERE m.workspace_id=$1 AND m.team_id=$2 AND m.active")
         .bind(tenant.workspace_id()).bind(id).fetch_all(&mut *tx).await?;
     if is_lead

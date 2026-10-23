@@ -186,7 +186,11 @@ async fn rename_preserves_populated_database(pool: PgPool) {
         }
         match new_table {
             "kats" => row["appearance"]["avatar"] = serde_json::json!("kat"),
-            "messages" => row["author_kind"] = serde_json::json!("kat"),
+            "messages" => {
+                row["author_kind"] = serde_json::json!("kat");
+                row["meta"] = serde_json::Value::Null;
+                row["stopped"] = serde_json::json!(false);
+            }
             "tasks" => row["hold_reason"] = serde_json::json!("kat_busy"),
             "jobs" => row["reason"] = serde_json::json!("no_eligible_kat"),
             "runs" => row["stop_reason"] = serde_json::json!("kat_paused"),

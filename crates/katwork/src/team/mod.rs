@@ -12,7 +12,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::{error::KatError, tenancy::Tenant};
 
-fn name_key(name: &str) -> String {
+pub(crate) fn name_key(name: &str) -> String {
     // Validated names exclude default ignorables; compatibility folding preserves display text.
     let mut key: Vec<_> = name.nfkc().default_case_fold().nfkc().collect();
     // Thai above-vowels have combining class zero; Unicode normalization alone keeps tone-first input distinct.
@@ -57,4 +57,11 @@ async fn check_space(
         .await?
         .ok_or(KatError::NotFound)?;
     Ok(())
+}
+
+fn validate_name(name: &str) -> Result<&str, KatError> {
+    if name.contains('@') {
+        return Err(KatError::RequestInvalid);
+    }
+    crate::tenancy::validate_name(name)
 }

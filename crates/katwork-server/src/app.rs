@@ -7,7 +7,7 @@ use axum::{
 use katwork::runtime::Core;
 
 use crate::{
-    routes::{auth, health, kats, teams, workspaces},
+    routes::{auth, health, kats, teams, threads, workspaces},
     static_files,
 };
 
@@ -65,6 +65,22 @@ pub fn build_router_with_web_dir(state: AppState, web_dir: &Path) -> Router {
         .route(
             "/api/workspaces/{workspace_id}/teams/{team_id}/members/{kat_id}",
             put(teams::add_member).delete(teams::remove_member),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/threads",
+            post(threads::create),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/spaces/{space_id}/threads",
+            get(threads::list),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/threads/{thread_id}",
+            get(threads::get),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/threads/{thread_id}/messages",
+            get(threads::messages).post(threads::post_message),
         )
         .fallback_service(static_files::service(web_dir.to_owned()))
         .layer(Extension(auth::LoginLimiter::default()))
