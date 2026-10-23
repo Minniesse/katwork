@@ -393,3 +393,45 @@ async fn duplicate_session_cookies_fail_closed(pool: PgPool) {
     )
     .await;
 }
+
+#[sqlx::test(migrations = false)]
+async fn migration_normalizes_existing_email_and_login_accepts_any_case(pool: PgPool) {
+    let mut old = sqlx::migrate!("../katwork/migrations");
+    old.migrations = old
+        .iter()
+        .filter(|migration| migration.version <= 2)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into();
+    old.run(&pool).await.unwrap();
+    let (id, password) = user(&pool).await;
+    sqlx::query("UPDATE users SET email = ' Mixed@Example.test ' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    katwork::db::migrate(&pool).await.unwrap();
+    let stored: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, "mixed@example.test");
+    let app = app(&pool, None);
+    for email in [
+        "mixed@example.test",
+        "MIXED@EXAMPLE.TEST",
+        " Mixed@Example.test ",
+    ] {
+        let response = request(
+            &app,
+            "POST",
+            "/api/auth/login",
+            Some(json!({"email": email, "password": password})),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(body(response).await, json!({"user_id": id}));
+    }
+}

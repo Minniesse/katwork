@@ -695,7 +695,14 @@ fn https_scheme_is_canonicalized_before_cookie_security() {
 
 #[test]
 fn demo_on_https_requires_explicit_override() {
-    for allow in [None, Some(""), Some("1")] {
+    for allow in [
+        None,
+        Some(""),
+        Some("0"),
+        Some("false"),
+        Some(" 1"),
+        Some("1"),
+    ] {
         let result = Config::from_lookup(|name| match name {
             "KATWORK_DEMO" => Some("1".into()),
             "KATWORK_PUBLIC_URL" => Some("HTTPS://katwork.example".into()),
@@ -757,4 +764,50 @@ fn trusted_proxy_cidrs_match_only_the_configured_networks() {
             assert!(!config.trusts_proxy(ip.parse().unwrap()), "{ip}");
         }
     }
+}
+
+#[test]
+fn transport_settings_reject_zero_and_invalid_values() {
+    for setting in [
+        "KATWORK_HEADER_TIMEOUT_SECONDS",
+        "KATWORK_IDLE_TIMEOUT_SECONDS",
+        "KATWORK_MAX_CONNECTIONS",
+        "KATWORK_MAX_CONNECTIONS_PER_IP",
+    ] {
+        for value in ["0", "-1", "false", "18446744073709551615"] {
+            let result = Config::from_lookup(|name| {
+                if name == setting {
+                    Some(value.into())
+                } else {
+                    lookup(name)
+                }
+            });
+            assert_eq!(
+                result.unwrap_err().code(),
+                "config_invalid",
+                "{setting}={value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn transport_defaults_and_overrides() {
+    let config = Config::from_lookup(lookup).unwrap();
+    assert_eq!(config.transport.header_timeout.as_secs(), 10);
+    assert_eq!(config.transport.idle_timeout.as_secs(), 60);
+    assert_eq!(config.transport.max_connections, 256);
+    assert_eq!(config.transport.max_connections_per_ip, 32);
+    let config = Config::from_lookup(|name| match name {
+        "KATWORK_HEADER_TIMEOUT_SECONDS" => Some("3".into()),
+        "KATWORK_IDLE_TIMEOUT_SECONDS" => Some("4".into()),
+        "KATWORK_MAX_CONNECTIONS" => Some("5".into()),
+        "KATWORK_MAX_CONNECTIONS_PER_IP" => Some("2".into()),
+        _ => lookup(name),
+    })
+    .unwrap();
+    assert_eq!(config.transport.header_timeout.as_secs(), 3);
+    assert_eq!(config.transport.idle_timeout.as_secs(), 4);
+    assert_eq!(config.transport.max_connections, 5);
+    assert_eq!(config.transport.max_connections_per_ip, 2);
 }

@@ -21,7 +21,14 @@ static WORK: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
 pub(super) async fn run<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, KatError> {
-    let permit = tokio::time::timeout(Duration::from_secs(5), WORK.clone().acquire_owned())
+    run_with(WORK.clone(), work).await
+}
+
+async fn run_with<T: Send + 'static>(
+    slots: Arc<Semaphore>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, KatError> {
+    let permit = tokio::time::timeout(Duration::from_secs(5), slots.acquire_owned())
         .await
         .map_err(|_| KatError::AuthBusy)?
         .map_err(|_| KatError::AuthBusy)?;
@@ -77,18 +84,19 @@ mod tests {
         let count = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1);
-        assert_eq!(WORK.available_permits(), count);
-        let held = WORK.clone().acquire_many_owned(count as u32).await.unwrap();
+        let work = Arc::new(Semaphore::new(count));
+        assert_eq!(work.available_permits(), count);
+        let held = work.clone().acquire_many_owned(count as u32).await.unwrap();
         let start = tokio::time::Instant::now();
-        let result = run(|| panic!("work ran without a permit")).await;
+        let result = run_with(work.clone(), || panic!("work ran without a permit")).await;
         assert_eq!(result.unwrap_err().code(), "auth_busy");
         assert_eq!(start.elapsed(), std::time::Duration::from_secs(5));
         drop(held);
-        assert_eq!(run(|| 42).await.unwrap(), 42);
+        assert_eq!(run_with(work.clone(), || 42).await.unwrap(), 42);
 
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (finish_tx, finish_rx) = std::sync::mpsc::channel();
-        let task = tokio::spawn(run(move || {
+        let task = tokio::spawn(run_with(work.clone(), move || {
             started_tx.send(()).unwrap();
             finish_rx.recv().unwrap();
         }));
@@ -96,11 +104,11 @@ mod tests {
         task.abort();
         let _ = task.await;
         assert_eq!(
-            WORK.available_permits(),
+            work.available_permits(),
             count - 1,
             "cancelled request released running Argon work"
         );
         finish_tx.send(()).unwrap();
-        let _all = WORK.clone().acquire_many_owned(count as u32).await.unwrap();
+        let _all = work.clone().acquire_many_owned(count as u32).await.unwrap();
     }
 }

@@ -30,6 +30,7 @@ pub fn apply(router: Router, config: &Config) -> Router {
     };
     router
         .layer(middleware::from_fn(read_body))
+        // Task 9: SSE must bypass these timeout/concurrency layers, keeping the security guards.
         .layer(
             tower::ServiceBuilder::new()
                 .layer(HandleErrorLayer::new(|error: axum::BoxError| async move {

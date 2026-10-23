@@ -29,10 +29,15 @@ pub fn app(pool: &PgPool, public_url: Option<&str>) -> Router {
 pub async fn user(pool: &PgPool) -> (Uuid, String) {
     let id = Uuid::now_v7();
     let password = Uuid::now_v7().to_string();
-    let hash = Argon2::default()
-        .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
-        .unwrap()
-        .to_string();
+    // These fixtures test auth behavior; production hashing parameters have a separate regression test.
+    let hash = Argon2::new(
+        argon2::Algorithm::Argon2id,
+        argon2::Version::V0x13,
+        argon2::Params::new(1024, 1, 1, None).unwrap(),
+    )
+    .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
+    .unwrap()
+    .to_string();
     sqlx::query("INSERT INTO users (id, email, password_hash, display_name, locale) VALUES ($1, 'person@example.test', $2, 'Person', 'en')")
         .bind(id).bind(hash).execute(pool).await.unwrap();
     (id, password)

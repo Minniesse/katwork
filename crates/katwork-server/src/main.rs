@@ -69,9 +69,16 @@ async fn run() -> Result<(), KatError> {
                 tracing::warn!("session cookie is not Secure on an HTTP public URL");
             }
             let pool = db::connect(&config.database_url).await?;
+            let transport = config.transport.clone();
             let core = Arc::new(Core::new(pool, config));
             let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
-            katwork_server::transport::serve(listener, build_router(AppState { core })).await?;
+            katwork_server::transport::serve_with_shutdown(
+                listener,
+                build_router(AppState { core }),
+                transport,
+                shutdown_signal(),
+            )
+            .await?;
             Ok(())
         }
         "migrate" => {
@@ -92,6 +99,24 @@ async fn run() -> Result<(), KatError> {
         }
         _ => Err(KatError::CommandInvalid),
     }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install Ctrl-C handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! { () = ctrl_c => {}, () = terminate => {} }
 }
 
 #[cfg(test)]
