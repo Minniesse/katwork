@@ -920,18 +920,63 @@ fn local_base_url_must_be_http_or_https() {
 }
 
 #[test]
+fn local_base_url_rejects_query() {
+    rejects_local_base_url(&format!(
+        "http://localhost:8000/v1?token={}",
+        uuid::Uuid::now_v7()
+    ));
+}
+
+#[test]
+fn local_base_url_rejects_fragment() {
+    rejects_local_base_url("http://localhost:8000/v1#fragment");
+}
+
+#[test]
+fn local_base_url_rejects_username() {
+    rejects_local_base_url("http://operator@localhost:8000/v1");
+}
+
+#[test]
+fn local_base_url_rejects_password() {
+    rejects_local_base_url(&format!(
+        "http://:{}@localhost:8000/v1",
+        uuid::Uuid::now_v7()
+    ));
+}
+
+fn rejects_local_base_url(value: &str) {
+    let error = Config::from_lookup(|name| match name {
+        "KATWORK_LOCAL_BASE_URL" => Some(value.into()),
+        "KATWORK_LOCAL_MODEL" => Some("local-model".into()),
+        _ => lookup(name),
+    })
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        katwork::error::KatError::ConfigInvalid {
+            var: "KATWORK_LOCAL_BASE_URL"
+        }
+    ));
+    assert_eq!(error.to_string(), "config_invalid");
+    assert!(!format!("{error:?}").contains(value));
+}
+
+#[test]
 fn local_api_key_is_redacted_in_debug() {
     let key = uuid::Uuid::now_v7().to_string();
     let password = uuid::Uuid::now_v7().to_string();
     let query = uuid::Uuid::now_v7().to_string();
     let url = format!("https://user:{password}@local.test:8443/private?token={query}");
-    let cfg = Config::from_lookup(|name| match name {
-        "KATWORK_LOCAL_BASE_URL" => Some(url.clone()),
+    let mut cfg = Config::from_lookup(|name| match name {
+        "KATWORK_LOCAL_BASE_URL" => Some("https://local.test:8443/v1".into()),
         "KATWORK_LOCAL_MODEL" => Some("local-model".into()),
         "KATWORK_LOCAL_API_KEY" => Some(key.clone()),
         _ => lookup(name),
     })
     .unwrap();
+    // Debug must redact even manually constructed configuration.
+    cfg.local.as_mut().unwrap().base_url = url.clone();
     let local = cfg.local.as_ref().unwrap();
     assert_eq!(local.base_url, url);
     assert_eq!(local.model, "local-model");

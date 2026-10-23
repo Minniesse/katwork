@@ -1809,6 +1809,66 @@ async fn local_tool_history_replays_with_error_prefix() {
 }
 
 #[tokio::test]
+async fn local_provider_ignores_proxy_environment() {
+    if std::env::var_os("KATWORK_TEST_LOCAL_PROXY").is_none() {
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+        // Only the child inherits proxy settings; parallel tests keep their environment.
+        let mut child = tokio::task::spawn_blocking(move || {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "local_provider_ignores_proxy_environment",
+                    "--nocapture",
+                ])
+                .env("KATWORK_TEST_LOCAL_PROXY", "1")
+                .env("NO_PROXY", "")
+                .env("no_proxy", "")
+                .env_remove("REQUEST_METHOD");
+            for name in [
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+            ] {
+                command.env(name, &proxy_url);
+            }
+            command.output().unwrap()
+        });
+        let output = tokio::select! {
+            biased;
+            connection = proxy.accept() => {
+                drop(connection.unwrap());
+                let _ = child.await.unwrap();
+                panic!("local provider connected to the environment proxy");
+            }
+            output = &mut child => output.unwrap(),
+        };
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let server = Server::new(fixture("local_ollama.sse"), 200, None, false).await;
+    let key = uuid::Uuid::now_v7().to_string();
+    let provider = server.local(
+        Some(key.clone()),
+        HttpLimits::for_entry(&ModelTimeouts::LOCAL),
+    );
+    turn(&collect(&provider).await);
+    assert!(server.request.lock().await.is_some());
+    let head = server.head.lock().await.to_ascii_lowercase();
+    assert!(head.starts_with("post /v1/chat/completions "));
+    assert!(head.contains(&format!("authorization: bearer {key}")));
+}
+
+#[tokio::test]
 async fn local_url_userinfo_does_not_add_authorization() {
     let server = Server::new(fixture("local_ollama.sse"), 200, None, false).await;
     let mut base = url::Url::parse(&format!("{}/v1", server.url)).unwrap();

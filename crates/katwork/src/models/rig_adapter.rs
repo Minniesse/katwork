@@ -56,7 +56,13 @@ pub struct BoundedHttp {
 }
 impl BoundedHttp {
     pub fn new(limits: HttpLimits) -> Result<Self, ModelError> {
-        let client = reqwest::Client::builder()
+        Self::with_builder(limits, reqwest::Client::builder())
+    }
+    fn with_builder(
+        limits: HttpLimits,
+        builder: reqwest::ClientBuilder,
+    ) -> Result<Self, ModelError> {
+        let client = builder
             .connect_timeout(limits.connect)
             .read_timeout(limits.read)
             .redirect(reqwest::redirect::Policy::none())
@@ -334,7 +340,7 @@ impl RigProvider {
             residency: Residency::Local,
             backend: Backend::OpenAi(Box::new(config), OpenAiApi::Chat),
             model: env.model.clone(),
-            http: BoundedHttp::new(limits)?,
+            http: BoundedHttp::with_builder(limits, reqwest::Client::builder().no_proxy())?,
         })
     }
     pub fn with_http(mut self, http: BoundedHttp) -> Self {

@@ -311,6 +311,14 @@ impl Config {
                 if !matches!(url.scheme(), "http" | "https") || !url.has_host() {
                     return Err(KatError::ConfigInvalid { var: key });
                 }
+                if key == "KATWORK_LOCAL_BASE_URL"
+                    && (!url.username().is_empty()
+                        || url.password().is_some()
+                        || url.query().is_some()
+                        || url.fragment().is_some())
+                {
+                    return Err(KatError::ConfigInvalid { var: key });
+                }
             }
         }
         for name in ["SMTP_PASSWORD", "KATWORK_DEMO_PASSWORD"] {
