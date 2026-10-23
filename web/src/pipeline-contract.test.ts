@@ -28,7 +28,12 @@ for (const [outcome, frames, reply] of [
     expect(message.provisional).toBe(false);
     expect(Object.values(state.runs).every((run) => run.closed)).toBe(true);
     if (outcome === 'answered') expect(message.synthetic).toBe(true);
-    if (outcome === 'cancelled') expect(state.runError).toBe('cancelled');
+    if (outcome === 'cancelled') {
+      // Task 13b keeps errors per Kat, and a cancelled close fills no slot; Stop keeps the
+      // partial reply as a stopped message.
+      expect(state.errors).toEqual({});
+      expect(message.stopped).toBe(true);
+    }
     if (outcome === 'needs_input') {
       expect(message.question).toEqual({ question: 'Which option?', options: ['One', 'Two'] });
       expect(job.reason).toBe('question_pending');
