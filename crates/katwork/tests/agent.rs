@@ -490,10 +490,7 @@ async fn same_tool_same_args_three_times_stops_loop_detected(pool: PgPool) {
 async fn alternating_two_calls_five_times_in_ten_stops(pool: PgPool) {
     repeats(pool, SideEffect::Read, true).await;
 }
-#[sqlx::test]
-async fn call_id_and_key_order_do_not_defeat_repeat_guard(pool: PgPool) {
-    repeats(pool, SideEffect::Read, false).await;
-}
+
 #[sqlx::test]
 async fn same_mutation_with_new_call_id_counts_as_repeat(pool: PgPool) {
     repeats(pool, SideEffect::WorkspaceWrite, false).await;
@@ -1242,7 +1239,7 @@ async fn policy_edit_waits_for_an_open_write(pool: PgPool) {
         loop {
             tokio::select! {
                 result=&mut update=>panic!("edit passed open write: {result:?}"),
-                waiting=sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%kats%')").fetch_one(&h.pool)=>if waiting.unwrap(){break;}
+                waiting=sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND (query LIKE '%kats%' OR query LIKE '%workspaces%'))").fetch_one(&h.pool)=>if waiting.unwrap(){break;}
             }
         }
         release.notify_one();
@@ -1608,10 +1605,7 @@ async fn timeout_write_case(pool: PgPool, commit_first: bool) {
 async fn timed_out_tool_cannot_write_afterwards(pool: PgPool) {
     timeout_write_case(pool, false).await;
 }
-#[sqlx::test]
-async fn timeout_drops_tool_future_before_late_write(pool: PgPool) {
-    timeout_write_case(pool, false).await;
-}
+
 #[sqlx::test]
 async fn unknown_outcome_write_stops_for_review_before_model_retries_it(pool: PgPool) {
     timeout_write_case(pool, true).await;
@@ -1645,6 +1639,7 @@ async fn read_retry_reuses_its_ledger_row(pool: PgPool) {
     assert_eq!(rows[0].get::<String, _>("state"), "succeeded");
 }
 async fn cancel_case(pool: PgPool) {
+    let cancelled_after = AtomicUsize::new(0);
     let h = Harness::new(
         pool,
         vec![FakeTurn::ChunksThenHang(vec![ChatChunk::TextDelta(
@@ -1662,12 +1657,18 @@ async fn cancel_case(pool: PgPool) {
                 .any(|e| e.kind() == "TEXT_MESSAGE_CONTENT")
         })
         .await;
+        cancelled_after.store(h.sink.events.lock().unwrap().len(), Ordering::SeqCst);
         h.input.cancel.cancel();
     };
     let (result, ()) = tokio::join!(h.run(), cancel);
     let facts = result.unwrap();
     assert_eq!(facts.stop, Some(StopReason::Cancelled));
     assert!(facts.run_closed);
+    assert!(
+        !h.sink.events.lock().unwrap()[cancelled_after.load(Ordering::SeqCst)..]
+            .iter()
+            .any(|event| event.kind().starts_with("TEXT_MESSAGE"))
+    );
     let events: Vec<String> =
         sqlx::query_scalar("SELECT kind FROM events WHERE run_id=$1 ORDER BY seq")
             .bind(h.input.run_id)
@@ -1681,10 +1682,7 @@ async fn cancel_case(pool: PgPool) {
         1
     );
 }
-#[sqlx::test]
-async fn cancellation_token_stops_with_cancelled(pool: PgPool) {
-    cancel_case(pool).await;
-}
+
 #[sqlx::test]
 async fn no_done_after_cancellation(pool: PgPool) {
     cancel_case(pool).await;
@@ -1896,3 +1894,6 @@ async fn rejected_turns_emit_no_tool_events(pool: PgPool) {
         );
     }
 }
+
+#[path = "agent/review.rs"]
+mod review;

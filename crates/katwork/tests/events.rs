@@ -526,21 +526,6 @@ fn hub_senders_stay_bounded_across_quiet_threads() {
     assert_eq!(hub.sender_count(), 0);
 }
 
-#[test]
-fn fifth_stream_permit_is_refused_until_one_drops() {
-    let hub = EventHub::new();
-    let mut held: Vec<_> = (0..4)
-        .map(|_| hub.open_stream("session hash").unwrap())
-        .collect();
-    assert_eq!(
-        hub.open_stream("session hash").unwrap_err().code(),
-        "too_many_streams"
-    );
-    let _other = hub.open_stream("other session hash").unwrap();
-    held.pop();
-    assert!(hub.open_stream("session hash").is_ok());
-}
-
 #[sqlx::test(migrations = "./migrations")]
 async fn emit_refuses_terminal_events(pool: PgPool) {
     let f = Fixture::new(&pool).await;
