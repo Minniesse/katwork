@@ -1,11 +1,47 @@
+x-katwork-image: &katwork-image
+  image: ${KATWORK_IMAGE:-katwork:local}
+  build:
+    context: .
+    target: release
+
+x-katwork-environment: &katwork-environment
+  DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env, or run scripts/init-env.sh}
+  KATWORK_SECRET: ${KATWORK_SECRET:?set KATWORK_SECRET in .env, or run scripts/init-env.sh}
+  KATWORK_DEMO: ${KATWORK_DEMO:-}
+  KATWORK_PUBLIC_URL: ${KATWORK_PUBLIC_URL:-}
+  # Read only for the startup warning: the server listens on 0.0.0.0 inside the container.
+  KATWORK_BIND: ${KATWORK_BIND:-}
+  KATWORK_ALLOW_DEMO_ON_HTTPS: ${KATWORK_ALLOW_DEMO_ON_HTTPS:-}
+  KATWORK_TRUSTED_PROXIES: ${KATWORK_TRUSTED_PROXIES:-}
+  KATWORK_HEADER_TIMEOUT_SECONDS: ${KATWORK_HEADER_TIMEOUT_SECONDS:-}
+  KATWORK_LOCK_TIMEOUT_MS: ${KATWORK_LOCK_TIMEOUT_MS:-}
+  KATWORK_IDLE_TIMEOUT_SECONDS: ${KATWORK_IDLE_TIMEOUT_SECONDS:-}
+  KATWORK_MAX_CONNECTIONS: ${KATWORK_MAX_CONNECTIONS:-}
+  KATWORK_MAX_CONNECTIONS_PER_IP: ${KATWORK_MAX_CONNECTIONS_PER_IP:-}
+  KATWORK_DEMO_PASSWORD: ${KATWORK_DEMO_PASSWORD:-}
+  SMTP_HOST: ${SMTP_HOST:-}
+  SMTP_PORT: ${SMTP_PORT:-}
+  SMTP_USERNAME: ${SMTP_USERNAME:-}
+  SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+  SMTP_FROM: ${SMTP_FROM:-}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+  KATWORK_LOCAL_BASE_URL: ${KATWORK_LOCAL_BASE_URL:-}
+  KATWORK_LOCAL_MODEL: ${KATWORK_LOCAL_MODEL:-}
+  KATWORK_LOCAL_API_KEY: ${KATWORK_LOCAL_API_KEY:-}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env, or run scripts/init-env.sh}
+
 services:
   postgres:
     image: postgres:17
+    restart: unless-stopped
     networks: [backend]
     environment:
       POSTGRES_USER: katwork
       POSTGRES_DB: katwork
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env, or run scripts/init-env.sh}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -20,45 +56,54 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
 
+  backup:
+    image: postgres:17
+    restart: "no"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [backend]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env, or run scripts/init-env.sh}
+    entrypoint: ["sh", "/scripts/compose-backup.sh"]
+    volumes:
+      - ./scripts/compose-backup.sh:/scripts/compose-backup.sh:ro
+      - ./backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  migrate:
+    <<: *katwork-image
+    command: ["migrate"]
+    restart: "no"
+    networks: [backend]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment: *katwork-environment
+    depends_on:
+      backup:
+        condition: service_completed_successfully
+
   katwork:
-    build: .
+    <<: *katwork-image
+    restart: unless-stopped
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     init: true
     networks: [backend, default]
     extra_hosts: ["host.docker.internal:host-gateway"]
-    environment:
-      DATABASE_URL: ${DATABASE_URL:-}
-      KATWORK_SECRET: ${KATWORK_SECRET:-}
-      KATWORK_DEMO: ${KATWORK_DEMO:-}
-      KATWORK_PUBLIC_URL: ${KATWORK_PUBLIC_URL:-}
-      # Read only for the startup warning: the server listens on 0.0.0.0 inside the container.
-      KATWORK_BIND: ${KATWORK_BIND:-}
-      KATWORK_ALLOW_DEMO_ON_HTTPS: ${KATWORK_ALLOW_DEMO_ON_HTTPS:-}
-      KATWORK_TRUSTED_PROXIES: ${KATWORK_TRUSTED_PROXIES:-}
-      KATWORK_HEADER_TIMEOUT_SECONDS: ${KATWORK_HEADER_TIMEOUT_SECONDS:-}
-      KATWORK_LOCK_TIMEOUT_MS: ${KATWORK_LOCK_TIMEOUT_MS:-}
-      KATWORK_IDLE_TIMEOUT_SECONDS: ${KATWORK_IDLE_TIMEOUT_SECONDS:-}
-      KATWORK_MAX_CONNECTIONS: ${KATWORK_MAX_CONNECTIONS:-}
-      KATWORK_MAX_CONNECTIONS_PER_IP: ${KATWORK_MAX_CONNECTIONS_PER_IP:-}
-      KATWORK_DEMO_PASSWORD: ${KATWORK_DEMO_PASSWORD:-}
-      SMTP_HOST: ${SMTP_HOST:-}
-      SMTP_PORT: ${SMTP_PORT:-}
-      SMTP_USERNAME: ${SMTP_USERNAME:-}
-      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
-      SMTP_FROM: ${SMTP_FROM:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
-      KATWORK_LOCAL_BASE_URL: ${KATWORK_LOCAL_BASE_URL:-}
-      KATWORK_LOCAL_MODEL: ${KATWORK_LOCAL_MODEL:-}
-      KATWORK_LOCAL_API_KEY: ${KATWORK_LOCAL_API_KEY:-}
+    environment: *katwork-environment
+    healthcheck:
+      test: ["CMD", "/app/katwork-server", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
     ports:
       - "${KATWORK_BIND:-127.0.0.1}:3000:3000"
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
 networks:
   backend:

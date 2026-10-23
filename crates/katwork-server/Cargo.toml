@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+smoke-fixtures = ["katwork/smoke-fixtures"]
+
 [dependencies]
 tracing-subscriber.workspace = true
 tracing.workspace = true
@@ -26,6 +29,7 @@ socket2.workspace = true
 
 [dev-dependencies]
 katwork = { path = "../katwork", features = ["test-support"] }
+reqwest.workspace = true
 eventsource-stream.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 argon2.workspace = true

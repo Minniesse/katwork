@@ -20,6 +20,8 @@ pub enum FakeTurn {
 pub struct FakeProvider {
     state: Arc<Mutex<State>>,
     demo: bool,
+    #[cfg(feature = "smoke-fixtures")]
+    hold: std::time::Duration,
 }
 struct State {
     turns: VecDeque<FakeTurn>,
@@ -33,12 +35,21 @@ impl FakeProvider {
                 received: vec![],
             })),
             demo: false,
+            #[cfg(feature = "smoke-fixtures")]
+            hold: std::time::Duration::ZERO,
         }
     }
     pub fn demo() -> Self {
         Self {
             demo: true,
             ..Self::scripted(vec![])
+        }
+    }
+    #[cfg(feature = "smoke-fixtures")]
+    pub fn demo_held(hold: std::time::Duration) -> Self {
+        Self {
+            hold,
+            ..Self::demo()
         }
     }
     pub fn received(&self) -> Vec<ChatRequest> {
@@ -99,7 +110,21 @@ impl ModelProvider for FakeProvider {
         };
         match turn {
             FakeTurn::Error(error) => Err(error),
-            FakeTurn::Chunks(chunks) => Ok(stream::iter(chunks.into_iter().map(Ok)).boxed()),
+            FakeTurn::Chunks(chunks) => {
+                let chunks = stream::iter(chunks.into_iter().map(Ok));
+                #[cfg(feature = "smoke-fixtures")]
+                if self.demo && !self.hold.is_zero() {
+                    let hold = self.hold;
+                    return Ok(async_stream::stream! {
+                        tracing::debug!(target: "katwork::smoke", "smoke_fixture_started");
+                        tracing::trace!(target: "rig::smoke", "smoke_dependency_probe");
+                        tokio::time::sleep(hold).await;
+                        for await chunk in chunks { yield chunk; }
+                    }
+                    .boxed());
+                }
+                Ok(chunks.boxed())
+            }
             FakeTurn::Hang => Ok(stream::pending().boxed()),
             FakeTurn::ChunksThenHang(chunks) => Ok(stream::iter(chunks.into_iter().map(Ok))
                 .chain(stream::pending())

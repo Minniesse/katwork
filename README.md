@@ -8,7 +8,7 @@ The AI coworkers are called **Kats** in English and Thai. See [ADR-0006](docs/ad
 Pre-alpha planning status. Public-alpha target: week of 2027-01-25.
 No capability is verified “in alpha” in this README.
 
-[Status](#status) · [Setup](#setup) · [Sample](#sample) · [Scope](#scope) · [Data path](#data-path) · [ภาษาไทย](#thai) · [Evaluation](#evaluation)
+[Status](#status) · [Try it](#try-it) · [Setup](#setup) · [Sample](#sample) · [Scope](#scope) · [Data path](#data-path) · [ภาษาไทย](#thai) · [Evaluation](#evaluation)
 
 <a id="status"></a>
 ## Status
@@ -20,76 +20,230 @@ working automation. Unbuilt UI must say “concept mockup — planned.”
 <a id="setup"></a>
 ## Setup
 
-Planned: single-host Docker Compose installation, Rust core, React/Vite workspace
-and Apache-2.0 core licensing. No verified installation command is supplied here.
-Publish exercised steps and dependency notices with the actual release.
+KatWork runs on one Linux host with Docker Engine and Docker Compose **2.24.4 or
+newer**. The core is Rust, the web app is React/Vite, and the core licence is
+Apache-2.0. This is development software, not a public-alpha release. The Compose
+smoke checks run in CI; they do not establish production readiness.
 
-### First account (development)
+<a id="try-it"></a>
+### Try it: offline demo
 
-These steps match the current code; they are not yet a verified installation.
-Run them on the Docker host, from a fresh checkout of this repository:
+From this checkout on Linux, prepare the demo's backup folder and run:
 
-1. Create your settings file from the template:
+```sh
+sudo install -d -o 0 -g 0 -m 0755 backups-demo
+scripts/demo.sh
+```
+
+The first run builds or downloads the images, so it needs internet access.
+Once those images are available, the demo works without internet access. Open
+**http://localhost:3001** and sign in as **demo@katwork.local**. Open the private
+`.demo-credentials` file on the host to read the initial password. If you set
+`KATWORK_DEMO_PASSWORD` in `.env.demo`, use that instead. Scripts never print passwords.
+Rerunning the script preserves an existing account's password.
+
+The demo uses its own `katwork-demo` project, database volumes and `.env.demo`
+settings. It does not change your install's database. The script refuses to run
+while your install is running; pass `--allow-running-install` to deliberately
+run both. Stop the demo with:
+
+```sh
+docker compose -p katwork-demo --env-file .env.demo -f docker-compose.yml -f docker-compose.demo.yml down
+```
+
+The demo includes English `Demo` and Thai `เดโม` workspaces, each with a team of
+six Kats. Replies are synthetic and marked as such; no model or mail service is
+called. The demo override clears provider and mail settings. It is available
+only from this host. The app has no outbound network route. A small Caddy proxy
+publishes the local port and forwards requests to the private app network.
+The demo exercises the API and streaming pipeline; available web pages depend
+on your checkout.
+
+### First account
+
+Run these commands on the Docker host, from this checkout:
+
+1. Create a private settings file with random secrets:
 
    ```sh
-   cp .env.example .env
+   scripts/init-env.sh
    ```
 
-   Open `.env` in a text editor and fill in the three required values:
-
-   - `POSTGRES_PASSWORD`: a new random password, for example the output of
-     `openssl rand -hex 16`.
-   - `DATABASE_URL`: `postgres://katwork:<that password>@postgres:5432/katwork`,
-     with the same password. `postgres` is the database's name inside Compose.
-   - `KATWORK_SECRET`: at least 32 random characters, for example the output of
-     `openssl rand -hex 32`.
-
-   Leave the other values empty for now; `.env.example` explains each one.
+   This writes `.env` with permissions `600`. Keep it private and back it up
+   securely. A second run refuses to replace it. `--force` deliberately replaces
+   it, including the database password; do not use that on an existing install.
+   Open `.env` in a text editor for optional model or mail settings.
 
 2. Start KatWork:
 
+   On Linux, prepare the backup folder once, including if you created it yourself:
+
    ```sh
-   docker compose up -d
+   sudo install -d -o 0 -g 0 -m 0755 backups
    ```
 
-   `docker compose ps` should list `katwork` as running. If it stopped,
-   `docker compose logs katwork` names the setting to fix, as
+   The backup container runs as root with all capabilities dropped. It needs a
+   root-owned folder; backup files remain private with permissions `600`.
+
+   ```sh
+   docker compose up -d --build
+   ```
+
+   Compose waits for PostgreSQL, backs up an existing database, applies
+   migrations, then starts KatWork. A fresh database needs no backup. Visit
+   **http://localhost:3000**. If it does not start, run `docker compose ps -a` and
+   `docker compose logs backup migrate katwork`. A bad setting is reported as
    `config_invalid (NAME)`.
 
-3. Set up the database, once per install and after each upgrade:
-
-   ```sh
-   docker compose exec katwork /app/katwork-server migrate
-   ```
-
-4. Create the first owner and their workspace. `--space-policy local` keeps the
-   first Space's data on this server; `hosted` lets it use hosted AI providers.
+3. Create the first owner and their workspace:
 
    ```sh
    docker compose exec katwork /app/katwork-server create-user \
-     --email you@example.com --workspace "My team" --role owner --space-policy local
+     --email you@example.com --workspace "My team" --role owner \
+     --space-policy local --locale en
    ```
 
-   The workspace's first Space, `General`, comes with a default team of six
-   Kats, a Lead and five specialists, so it has a team to chat with from the
-   start. Add `--locale th` to make Thai the account's language and give the
-   Kats Thai names; the default is `--locale en`.
+   Choose `--locale en` or `--locale th`. Thai creates Thai Kat names. The first
+   Space, `General`, has six Kats: a Lead and five specialists. `local` keeps
+   model calls on your declared local provider; choose `hosted` to allow hosted
+   providers. Configure a model before expecting real replies.
 
-5. The command prints one link. Open it in a browser within 72 hours, choose a
-   password, then sign in with your email and that password. The link works once.
+4. Open the printed link within 72 hours, choose a password, then sign in.
+   The link works once.
 
-Use `docker compose exec`, never `docker compose run`: `run` starts a new
-container whose output Docker's logging driver keeps, and may ship off the host,
-so the link would end up in a log.
+Use `docker compose exec`, never `docker compose run`, for account commands:
+`run` starts a container whose output Docker's logging driver keeps, so the link
+would enter a log. Operator commands intentionally print links to your terminal;
+the convenience scripts do not print credentials.
 
-The link starts with `KATWORK_PUBLIC_URL` (default `http://localhost:3000`). If
-people open KatWork from other machines, set it to the address they use first.
+The link uses `KATWORK_PUBLIC_URL` (default `http://localhost:3000`). For people
+on other machines, use HTTPS below. Without mail, recover a forgotten password
+with `docker compose exec katwork /app/katwork-server reset-link --email you@example.com`.
+The link works once within 30 minutes. **Anyone who can run commands on this host
+can take over any account with `reset-link`. Give host access only to operators.**
 
-Without mail set up, a forgotten password is recovered on the host:
-`docker compose exec katwork /app/katwork-server reset-link --email you@example.com`
-prints a reset link that works once within 30 minutes. Anyone who can run
-commands on this host can do this for any account (ADR-0004), so give that
-access only to the people who operate KatWork.
+### HTTPS
+
+Point your domain's DNS at this host and allow incoming ports 80 and 443. On a
+fresh install, replace `work.example.com` with that domain:
+
+```sh
+scripts/init-env.sh --https work.example.com
+docker compose up -d --build
+```
+
+On an existing install, keep your secrets. Add `KATWORK_HTTPS_HOST=work.example.com`
+and `COMPOSE_FILE=docker-compose.yml:docker-compose.https.yml` to `.env`, stop the
+old stack with `docker compose down`, then start it again. Open your HTTPS address.
+Caddy obtains the certificate and is the only public entry point. KatWork has no
+published port in this configuration. Caddy's certificate state lives in the
+`caddy_data` and `caddy_config` volumes; keep both across upgrades.
+HTTP redirects to HTTPS. HTTPS responses tell browsers to keep using HTTPS for
+one year (HSTS); the policy does not preload the domain or cover subdomains.
+
+The override trusts only Caddy at `172.31.250.2`, on subnet `172.31.250.0/29`.
+The app uses `172.31.250.3`, so it cannot take Caddy's address during startup.
+That subnet must be free on your host. Keep `KATWORK_TRUSTED_PROXIES` limited to
+proxies you operate. Caddy keeps event streams uncompressed and flushes them
+immediately. It bounds header and idle waits and enables TCP keepalive on the
+browser connection. The app still limits total connections and authenticated
+streams; stock Caddy does not provide a per-client connection quota. Add edge
+rate limits before exposing a large public installation.
+
+Demo mode is refused on HTTPS unless `KATWORK_ALLOW_DEMO_ON_HTTPS=1` is explicitly
+set. Keep demo mode off for normal installations. `localhost` uses Caddy's local
+certificate authority, suitable for testing; a browser must trust that authority.
+
+For an office LAN, ask your network administrator to point `work.home.arpa`
+at this server's LAN address. Use `scripts/init-env.sh --https work.home.arpa`
+on a fresh install, or change `KATWORK_HTTPS_HOST` in the existing `.env`.
+Start with the HTTPS override as above. Caddy automatically uses its private
+certificate authority for `.home.arpa` and `.internal` names; see
+[Caddy's local HTTPS guide](https://caddyserver.com/docs/automatic-https#local-https).
+Export the public root certificate:
+
+```sh
+docker compose cp caddy:/data/caddy/pki/authorities/local/root.crt ./katwork-root.crt
+```
+
+Give only this `.crt` file to office users, never the authority's private key.
+Have your administrator install it in Windows' **Trusted Root Certification
+Authorities**, or the macOS **System** keychain with **Always Trust**. On iPhones
+and iPads, install the certificate profile, then enable it under **Settings →
+General → About → Certificate Trust Settings**. On Android, use **Settings →
+Security → Install a certificate → CA certificate** (names vary by device).
+Managed devices may require the administrator to do this. Then open
+**https://work.home.arpa**; do not bypass certificate warnings.
+
+### Backups and upgrades
+
+Before an upgrade, stop the running app, keep its volumes, build the new version,
+then start it:
+
+```sh
+docker compose down
+git pull --ff-only
+docker compose build katwork
+docker compose up -d
+```
+
+Do not add `-v` to `down`: that deletes the database and certificate volumes.
+Stopping first matters: a failed backup cannot stop an app that was already
+running. Every startup waits for the backup to succeed before it runs migrations
+or starts the app. Do not run migrations by hand around that gate.
+
+Existing databases are saved under `backups/katwork-<database>-<UTC timestamp>-<suffix>.dump`.
+The timestamp uses sortable `YYYYMMDDTHHMMSSZ` format. The demo writes only to
+`backups-demo/`, using the same naming pattern. Check the folder and database
+name when choosing an archive; do not restore a demo archive into your real installation.
+
+On Linux, prepare each folder you use with the root owner and permissions `755`:
+
+```sh
+sudo install -d -o 0 -g 0 -m 0755 backups
+sudo install -d -o 0 -g 0 -m 0755 backups-demo
+```
+
+These private files belong to the container's root user; use operator privileges
+to copy or restore them. If startup reports a folder permission error, run the
+matching command above and start again. The script writes a private `.partial` file and renames it only after `pg_dump`
+succeeds. A failed backup stops startup. Check free disk space and file permissions,
+fix the cause, then start again. No retention policy deletes old backups; copy them
+to secure storage and remove old files yourself after checking a restore.
+
+A dump contains **one database**, including users and migration history. It does
+not contain PostgreSQL roles or tablespaces, `.env`, or Caddy's certificates.
+Keep those separately. SP1 Compose supports only its bundled PostgreSQL 17
+service. Backup and migrate stay on the private database network; external
+database hosts are not supported by these files.
+
+To restore safely, stop the app, start only PostgreSQL, and restore into a new
+database. Replace `katwork-katwork-YOUR_TIMESTAMP-SUFFIX.dump` with the real
+archive filename from `backups/`, checking its database name. The bundled
+server already has the `katwork` role; do not create it again. On Linux, `sudo`
+lets Docker read the root-owned backup:
+
+```sh
+docker compose down
+docker compose up -d --wait postgres
+docker compose exec -T postgres createdb -U katwork -O katwork restored
+sudo docker compose cp backups/katwork-katwork-YOUR_TIMESTAMP-SUFFIX.dump postgres:/tmp/restore.dump
+docker compose exec -T postgres pg_restore --exit-on-error --no-owner -U katwork -d restored /tmp/restore.dump
+docker compose exec -T postgres rm /tmp/restore.dump
+```
+
+In `.env`, change only the final database name in `DATABASE_URL` from `/katwork`
+to `/restored`, preserving the user, password, `postgres` host and port `5432`.
+Run `docker compose up -d`. Backup reads this same URL, so it saves the restored
+database before migration. Check your data before removing the old database.
+If `restored` already exists, choose a new name rather than overwriting it.
+
+Keep the simple URL form written by `init-env.sh`:
+`postgres://USER:PASSWORD@HOST:PORT/DATABASE`. Fields accept letters, digits,
+`_`, `.`, `~` and `-`; the port must be 1–65535. Percent escapes, query options,
+IPv6 addresses and multi-host URLs are rejected before migration. The generated
+password already fits this form. The restore checks verify the documented
+commands, the selected database, the demo user and every migration version.
 
 ### Local model provider (development)
 
@@ -191,6 +345,97 @@ separate retention/training review. Use public or approved retrospective samples
 
 <a id="thai"></a>
 ## ภาษาไทย
+
+### เริ่มใช้งาน
+
+กรุณาติดตั้ง Docker และ Docker Compose ก่อน แล้วเปิดเทอร์มินัลในโฟลเดอร์ KatWork ครับ
+สร้างไฟล์ตั้งค่าส่วนตัวและเริ่มระบบด้วยคำสั่งนี้:
+
+```sh
+scripts/init-env.sh
+sudo install -d -o 0 -g 0 -m 0755 backups
+docker compose up -d --build
+docker compose exec katwork /app/katwork-server create-user \
+  --email you@example.com --workspace "ทีมของฉัน" --role owner \
+  --space-policy local --locale th
+```
+
+เปลี่ยนอีเมลเป็นของคุณ แล้วเปิดลิงก์ที่ปรากฏเพื่อตั้งรหัสผ่านภายใน 72 ชั่วโมงครับ
+คำสั่ง `sudo install` เตรียมโฟลเดอร์สำรองข้อมูลบน Linux ให้ root เป็นเจ้าของ โดยไม่เปิดสิทธิ์เขียนให้ทุกคน
+เข้าใช้งานที่ **http://localhost:3000** หากทีมใช้เครื่องอื่น กรุณาตั้งค่า HTTPS ตามขั้นตอนด้านล่าง
+ทีมจะมี Kats หกตัว หากต้องการคำตอบจริง กรุณาตั้งค่าโมเดลก่อนใช้งาน
+
+หากต้องการทดลองแยกจากข้อมูลจริง บน Linux ให้เตรียมโฟลเดอร์เดโมก่อน แล้วเริ่มระบบ:
+
+```sh
+sudo install -d -o 0 -g 0 -m 0755 backups-demo
+scripts/demo.sh
+```
+
+เปิด **http://localhost:3001**
+เข้าสู่ระบบด้วย `demo@katwork.local` และอ่านรหัสผ่านเริ่มต้นจากไฟล์ `.demo-credentials`
+หากตั้ง `KATWORK_DEMO_PASSWORD` ใน `.env.demo` ให้ใช้รหัสนั้นครับ
+การดาวน์โหลดอิมเมจครั้งแรกต้องใช้อินเทอร์เน็ต หลังจากนั้นเดโมใช้งานแบบออฟไลน์ได้
+พื้นที่ `เดโม` มี Kats ที่ตอบด้วยข้อมูลจำลอง โดยไม่ส่งคำขอออกไปยังบริการภายนอก
+เดโมใช้ฐานข้อมูลแยกต่างหาก และจะไม่เริ่มหากระบบหลักกำลังทำงาน เว้นแต่ระบุ `--allow-running-install`
+
+### HTTPS สำหรับเครือข่ายสำนักงาน
+
+ให้ผู้ดูแลเครือข่ายตั้งชื่อ `work.home.arpa` ให้ชี้มาที่เครื่องเซิร์ฟเวอร์
+หากเริ่มติดตั้งใหม่ ให้ใช้คำสั่งนี้แทน `scripts/init-env.sh` ข้างต้น:
+
+```sh
+scripts/init-env.sh --https work.home.arpa
+```
+
+หากมี `.env` อยู่แล้ว ให้แก้ `KATWORK_HTTPS_HOST=work.home.arpa` และ
+`COMPOSE_FILE=docker-compose.yml:docker-compose.https.yml` ในไฟล์นั้น แล้วเริ่มระบบและนำใบรับรองออกมา:
+
+```sh
+docker compose down
+docker compose up -d --build
+docker compose cp caddy:/data/caddy/pki/authorities/local/root.crt ./katwork-root.crt
+```
+
+ให้ผู้ดูแลติดตั้ง `katwork-root.crt` เป็นใบรับรองที่เชื่อถือบนเครื่องของผู้ใช้ แล้วเปิด **https://work.home.arpa**
+แจกเฉพาะไฟล์ `.crt` นี้ ห้ามแจกกุญแจส่วนตัว และอย่าข้ามคำเตือนใบรับรอง
+วิธีติดตั้งในแต่ละระบบมีรายละเอียดภาษาอังกฤษในหัวข้อ [HTTPS](#https)
+
+### สำรองข้อมูลก่อนอัปเกรด
+
+ทุกครั้งที่เริ่มระบบ ฐานข้อมูลเดิมจะถูกสำรองก่อนปรับโครงสร้างข้อมูล หากสำรองไม่สำเร็จ ระบบจะไม่เริ่ม
+ไฟล์จริงอยู่ใน `backups/katwork-<database>-<UTC timestamp>-<suffix>.dump` ส่วนเดโมอยู่ใน `backups-demo/` เท่านั้น
+ชื่อไฟล์บอกชื่อฐานข้อมูลและเวลา UTC รูปแบบ `YYYYMMDDTHHMMSSZ` อย่าเลือกไฟล์เดโมมาใช้กับข้อมูลจริง
+หากมีข้อผิดพลาดเรื่องสิทธิ์โฟลเดอร์ บน Linux ให้รันคำสั่ง `sudo install` ของโฟลเดอร์นั้นอีกครั้ง
+ก่อนอัปเกรด ให้หยุดระบบโดยเก็บข้อมูลไว้ แล้วเริ่มรุ่นใหม่:
+
+```sh
+docker compose down
+git pull --ff-only
+docker compose build katwork
+docker compose up -d
+```
+
+ห้ามเติม `-v` หลัง `down` เพราะจะลบฐานข้อมูลและใบรับรอง
+เก็บสำเนาไฟล์สำรองในที่ปลอดภัย และเก็บ `.env` กับใบรับรองแยกไว้ด้วย เพราะไฟล์ `.dump` มีเฉพาะฐานข้อมูล
+
+### กู้คืนข้อมูล
+
+เลือกไฟล์จาก `backups/` และตรวจชื่อฐานข้อมูลในชื่อไฟล์ก่อน
+แทน `katwork-katwork-YOUR_TIMESTAMP-SUFFIX.dump` ด้วยชื่อไฟล์จริง แล้วกู้คืนลงฐานข้อมูลใหม่:
+
+```sh
+docker compose down
+docker compose up -d --wait postgres
+docker compose exec -T postgres createdb -U katwork -O katwork restored
+sudo docker compose cp backups/katwork-katwork-YOUR_TIMESTAMP-SUFFIX.dump postgres:/tmp/restore.dump
+docker compose exec -T postgres pg_restore --exit-on-error --no-owner -U katwork -d restored /tmp/restore.dump
+docker compose exec -T postgres rm /tmp/restore.dump
+```
+
+ใน `.env` เปลี่ยนเฉพาะชื่อฐานข้อมูลท้าย `DATABASE_URL` จาก `/katwork` เป็น `/restored` แล้วรัน `docker compose up -d`
+หากมีฐานข้อมูล `restored` อยู่แล้ว ให้เลือกชื่อใหม่ อย่าเขียนทับข้อมูลเดิม
+ตรวจข้อมูลให้ครบก่อนลบฐานข้อมูลเก่า รายละเอียดข้อจำกัดของ URL อยู่ในหัวข้อ [Backups and upgrades](#backups-and-upgrades) ภาษาอังกฤษ
 
 KatWork ยังอยู่ระหว่างพัฒนาครับ การช่วยเตรียมร่างรายงานพร้อมแหล่งอ้างอิง
 และการอนุมัติโดยผู้รับผิดชอบยังอยู่ในแผนพัฒนา (planned)

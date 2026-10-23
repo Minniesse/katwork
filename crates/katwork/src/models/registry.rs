@@ -61,7 +61,14 @@ impl Registry {
             && config.local.is_none()
             && config.demo
         {
-            let provider: Arc<dyn ModelProvider> = Arc::new(FakeProvider::demo());
+            let provider = FakeProvider::demo();
+            #[cfg(feature = "smoke-fixtures")]
+            let provider = std::env::var("KATWORK_SMOKE_HOLD_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|seconds| FakeProvider::demo_held(std::time::Duration::from_secs(seconds)))
+                .unwrap_or(provider);
+            let provider: Arc<dyn ModelProvider> = Arc::new(provider);
             for (tier, max_output_tokens, _, _) in MODELS {
                 entries.push((
                     ModelEntry {
