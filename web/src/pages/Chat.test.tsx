@@ -9,6 +9,7 @@ import th from '../i18n/th.json';
 import {
   emptyTranscript,
   foldEvent,
+  runningJobs,
   subscribe,
   transcriptMessages,
   type AgUiEvent,
@@ -19,7 +20,7 @@ import { apiMessage, ev } from '../testing/agui';
 import { deferred, mockApi, type Reply } from '../testing/api-mock';
 import { FakeEventSource, installFakeEventSource } from '../testing/fake-event-source';
 import { ME, TEAM, THAI_TEAM, THREAD, THREAD_ROW, WORKSPACE } from '../testing/fixtures';
-import { Chat } from './Chat';
+import { Chat, reduceChat } from './Chat';
 
 const BASE = `/api/workspaces/${WORKSPACE}`;
 const MESSAGES = `GET ${BASE}/threads/${THREAD}/messages`;
@@ -103,7 +104,9 @@ async function pingFor(source: FakeEventSource, ms: number) {
 }
 
 const log = () => screen.getByRole('log', { name: en['chat.transcript'] });
-const bodies = () => [...log().querySelectorAll('.message-body')].map((node) => node.textContent);
+// Every bubble on screen: the live log, and the older pages listed above it.
+const bodies = () =>
+  [...document.querySelectorAll('.transcript .message-body')].map((node) => node.textContent);
 const katStatus = () => screen.getByTestId('kat-status');
 
 describe('posting and streaming', () => {
@@ -397,6 +400,34 @@ describe('the event stream', () => {
     stream(source, 3, [ev.jobStatus('job-1', 'answered')]);
     expect(screen.queryByRole('button', { name: en['chat.stop'] })).toBeNull();
     await act(async () => held.resolve(running));
+    expect(screen.queryByRole('button', { name: en['chat.stop'] })).toBeNull();
+  });
+
+  test('a_poll_answered_after_a_resync_never_overwrites_the_new_snapshot', async () => {
+    // A restored database rewinds the seq, so only dropping the polls of a page that stopped
+    // polling keeps this old answer out.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const held = deferred<Reply>();
+    const asked = apiMessage(ASK, 'Write it', {
+      author: { kind: 'user', id: ME },
+      job_id: 'job-1',
+    });
+    const replies: (Reply | Promise<Reply>)[] = [
+      page([asked], 10),
+      held.promise,
+      page([{ ...asked, job_status: 'answered' }], 4),
+    ];
+    const calls = api();
+    calls.route(MESSAGES, () => replies.shift() ?? page([], 4));
+    const { source } = await openThread();
+    act(() => source.named('stream_error', { code: 'too_many_streams' }));
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(calls.callsTo(MESSAGES)).toHaveLength(2);
+
+    act(() => source.named('resync_required', { reason: 'cursor_ahead' }));
+    await waitFor(() => expect(FakeEventSource.latest().url).toBe(`${EVENTS}?after=4`));
+    expect(screen.queryByRole('button', { name: en['chat.stop'] })).toBeNull();
+    await act(async () => held.resolve(page([asked], 10)));
     expect(screen.queryByRole('button', { name: en['chat.stop'] })).toBeNull();
   });
 
@@ -1141,6 +1172,21 @@ describe('history', () => {
     await waitFor(() => expect(bodies()).toHaveLength(100));
     expect(calls.callsTo(MESSAGES).at(-1)!.path).toContain(`before=${id(51)}`);
     expect(bodies()[0]).toBe('message 1');
+    // The older page sits above the live log, so a screen reader is not read 50 messages; one
+    // line says what arrived.
+    expect(within(log()).getAllByRole('listitem')).toHaveLength(50);
+    expect(within(log()).queryByText('message 1')).toBeNull();
+    const older = screen.getByRole('list', { name: en['chat.earlier_list'] });
+    expect(older.closest('[aria-live]')).toBeNull();
+    expect(within(older).getAllByRole('listitem')).toHaveLength(50);
+    expect(
+      screen.getByText(en['chat.earlier_loaded'].replace('{count}', '50')),
+    ).toBeInTheDocument();
+    act(() => setLocale('th'));
+    expect(
+      screen.getByText(th['chat.earlier_loaded'].replace('{count}', '50')),
+    ).toBeInTheDocument();
+    act(() => setLocale('en'));
     // The message that was in view stays in view: 880 px from the bottom, before and after.
     expect(top).toBe(100 * 20 - (50 * 20 - 120));
 
@@ -1149,6 +1195,49 @@ describe('history', () => {
     expect(screen.queryByRole('button', { name: en['chat.earlier'] })).toBeNull();
     expect(start).toHaveFocus();
     expect(bodies()).toHaveLength(100);
+  });
+
+  test('a_late_older_reply_never_moves_the_history_cursor_or_overwrites_newer_state', async () => {
+    // A slow run's reply id was minted before the first page's oldest message; its stored event
+    // lands while the person reads, and the older page then holds a stale copy of it.
+    const stale = messages(1, 50).map((message) => {
+      if (message.id === id(24)) return { ...message, job_id: 'job-old' };
+      if (message.id === id(25)) {
+        return apiMessage(id(25), 'Draft answer', {
+          author: { kind: 'kat', id: LEAD },
+          job_id: 'job-old',
+        });
+      }
+      return message;
+    });
+    const calls = api();
+    calls.route(MESSAGES, ({ path }) => {
+      const before = new URL(path, 'http://localhost').searchParams.get('before');
+      if (before === null) return page(messages(51, 100), 3);
+      if (before === id(51)) return page(stale, 3);
+      return page([], 3);
+    });
+    const user = userEvent.setup({ delay: null });
+    const { source } = await openThread();
+    stream(source, 4, [
+      ev.stored(id(25), 'Final answer', { author: { kind: 'kat', id: LEAD }, jobId: 'job-old' }),
+      ev.jobStatus('job-old', 'answered'),
+    ]);
+    expect(bodies()).toHaveLength(51);
+
+    await user.click(screen.getByRole('button', { name: en['chat.earlier'] }));
+    await waitFor(() => expect(bodies()).toHaveLength(100));
+    // The cursor came from the REST page, not from the live reply: nothing in 26-50 is skipped.
+    expect(calls.callsTo(MESSAGES).at(-1)!.path).toContain(`before=${id(51)}`);
+    expect(bodies().slice(23, 27)).toEqual([
+      'message 24',
+      'Final answer',
+      'message 26',
+      'message 27',
+    ]);
+    // The older page never overwrites what the stream said since: no stale body, no Stop.
+    expect(screen.queryByText('Draft answer')).toBeNull();
+    expect(screen.queryByRole('button', { name: en['chat.stop'] })).toBeNull();
   });
 
   test('a_short_conversation_offers_no_earlier_messages', async () => {
@@ -1181,4 +1270,31 @@ test('untitled_conversations_are_told_apart_by_their_start_time', async () => {
   expect(labels).toHaveLength(2);
   expect(new Set(labels).size).toBe(2);
   for (const label of labels) expect(label).toMatch(/^Untitled conversation from /);
+});
+
+test('a_poll_page_read_before_a_folded_event_is_dropped', () => {
+  // The poll can resolve in the same tick as the first live event, before the polling effect is
+  // cleaned up; the reducer's seq check alone drops it.
+  const asked = apiMessage(ASK, 'Write it', { author: { kind: 'user', id: ME }, job_id: 'job-1' });
+  const snapshot = reduceChat(emptyTranscript(), {
+    type: 'snapshot',
+    page: { messages: [asked], event_seq: 2 },
+  });
+  const live = reduceChat(snapshot, {
+    type: 'event',
+    event: { seq: 3, event: ev.jobStatus('job-1', 'answered') },
+  });
+  const late = reduceChat(live, { type: 'merge', messages: [asked], issuedAt: 2 });
+  expect(late).toBe(live);
+  expect(runningJobs(late)).toEqual([]);
+  // A page read after that event is applied.
+  const fresh = reduceChat(live, {
+    type: 'merge',
+    messages: [
+      { ...asked, job_status: 'answered' },
+      apiMessage(REPLY, 'Done', { job_id: 'job-1' }),
+    ],
+    issuedAt: 3,
+  });
+  expect(fresh.messages[REPLY]?.body).toBe('Done');
 });

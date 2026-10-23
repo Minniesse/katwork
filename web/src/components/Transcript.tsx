@@ -3,6 +3,8 @@ import { StickToBottom, useStickToBottomContext } from 'use-stick-to-bottom';
 import { formatTime, hasMessage, t, useLocale } from '../i18n';
 import type { ChatMessage } from '../sse';
 
+const NONE: ReadonlySet<string> = new Set();
+
 /** The person's own post before the server confirmed it, keyed by its `client_msg_id`. */
 export interface PendingMessage {
   clientMsgId: string;
@@ -31,6 +33,10 @@ interface Props {
   onRetry?: (clientMsgId: string) => void;
   earlier?: Earlier;
   onEarlier?: () => void | Promise<void>;
+  /** Ids loaded by "Show earlier messages": listed above the live log, outside it. */
+  older?: ReadonlySet<string>;
+  /** How many messages the last older page brought, announced once. */
+  earlierLoaded?: number | null;
 }
 
 /**
@@ -50,13 +56,40 @@ export function Transcript({
   onRetry,
   earlier = 'none',
   onEarlier,
+  older = NONE,
+  earlierLoaded = null,
 }: Props) {
   useLocale();
   const empty = messages.length === 0 && pending.length === 0;
+  const item = (message: ChatMessage) => (
+    <MessageItem
+      key={`${message.id}:${message.provisional ? 'streaming' : 'stored'}`}
+      message={message}
+      me={me}
+      katName={katName}
+      options={
+        message.id === activeQuestion
+          ? { disabled: optionsDisabled, onOption: onOption ?? (() => {}) }
+          : null
+      }
+    />
+  );
+  const history = messages.filter((message) => older.has(message.id));
+  const live = messages.filter((message) => !older.has(message.id));
   return (
     <StickToBottom className="transcript" initial="instant" resize="smooth">
       <StickToBottom.Content className="transcript-content">
         <EarlierMessages earlier={earlier} onEarlier={onEarlier} count={messages.length} />
+        <p className="sr-only" role="status">
+          {earlierLoaded !== null &&
+            earlierLoaded > 0 &&
+            t('chat.earlier_loaded', { count: earlierLoaded })}
+        </p>
+        {history.length > 0 && (
+          <ol className="transcript-list transcript-older" aria-label={t('chat.earlier_list')}>
+            {history.map(item)}
+          </ol>
+        )}
         <div
           role="log"
           aria-live="polite"
@@ -67,19 +100,7 @@ export function Transcript({
             <p className="transcript-empty">{t('chat.empty')}</p>
           ) : (
             <ol className="transcript-list">
-              {messages.map((message) => (
-                <MessageItem
-                  key={`${message.id}:${message.provisional ? 'streaming' : 'stored'}`}
-                  message={message}
-                  me={me}
-                  katName={katName}
-                  options={
-                    message.id === activeQuestion
-                      ? { disabled: optionsDisabled, onOption: onOption ?? (() => {}) }
-                      : null
-                  }
-                />
-              ))}
+              {live.map(item)}
               {pending.map((post) => (
                 <PendingItem key={post.clientMsgId} post={post} onRetry={onRetry} />
               ))}

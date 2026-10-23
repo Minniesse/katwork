@@ -235,7 +235,7 @@ type Action =
   | { type: 'earlier'; messages: ApiMessage[] }
   | { type: 'posted'; posted: Parameters<typeof putPosted>[1] };
 
-function reduce(state: TranscriptState, action: Action): TranscriptState {
+export function reduceChat(state: TranscriptState, action: Action): TranscriptState {
   switch (action.type) {
     case 'snapshot':
       return transcriptFromSnapshot(action.page.messages, action.page.event_seq);
@@ -271,7 +271,7 @@ function Conversation({
   useLocale();
   const [thread, setThread] = useState<Thread | null>(null);
   const [failure, setFailure] = useState<unknown>(null);
-  const [transcript, dispatch] = useReducer(reduce, undefined, emptyTranscript);
+  const [transcript, dispatch] = useReducer(reduceChat, undefined, emptyTranscript);
   // Bumped when a snapshot lands; the stream opens from its `event_seq`.
   const [snapshots, setSnapshots] = useState(0);
   // Bumped to load the snapshot again (`resync_required`).
@@ -284,6 +284,14 @@ function Conversation({
   const [stopFailure, setStopFailure] = useState<unknown>(null);
   const [answered, setAnswered] = useState<string | null>(null);
   const [earlier, setEarlier] = useState<Earlier>('none');
+  // Where the next older page starts: the oldest id of the last REST history page. Only those
+  // pages move it; a live reply minted long ago (an id older than the first page) must not, or
+  // the history between them would never load.
+  const historyCursor = useRef<string | null>(null);
+  // Messages that came from older pages: listed above the live log, so a screen reader is not
+  // read a whole page; `earlierLoaded` announces how many arrived instead.
+  const [older, setOlder] = useState<ReadonlySet<string>>(new Set());
+  const [earlierLoaded, setEarlierLoaded] = useState<number | null>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
   const cancelling = useRef(new Set<string>());
   const [, setCancels] = useState(0);
@@ -301,6 +309,9 @@ function Conversation({
         setThread(loaded);
         dispatch({ type: 'snapshot', page });
         setEarlier(page.messages.length >= MESSAGE_PAGE ? 'more' : 'none');
+        historyCursor.current = page.messages[0]?.id ?? null;
+        setOlder(new Set());
+        setEarlierLoaded(null);
         setSnapshots((n) => n + 1);
       },
       (error: unknown) => {
@@ -479,12 +490,15 @@ function Conversation({
   };
 
   const loadEarlier = async () => {
-    const oldest = messages.find((message) => !message.provisional);
-    if (!oldest || earlier !== 'more') return;
+    const before = historyCursor.current;
+    if (!before || earlier !== 'more') return;
     setEarlier('loading');
     try {
-      const page = await api.messages(workspaceId, threadId, oldest.id);
+      const page = await api.messages(workspaceId, threadId, before);
       dispatch({ type: 'earlier', messages: page.messages });
+      historyCursor.current = page.messages[0]?.id ?? before;
+      setOlder((ids) => new Set([...ids, ...page.messages.map((message) => message.id)]));
+      setEarlierLoaded(page.messages.length);
       setEarlier(page.messages.length >= MESSAGE_PAGE ? 'more' : 'start');
     } catch (error) {
       if (isUnauthenticated(error)) signedOut.current();
@@ -560,6 +574,8 @@ function Conversation({
         onOption={answer}
         onRetry={retry}
         earlier={earlier}
+        older={older}
+        earlierLoaded={earlierLoaded}
         onEarlier={loadEarlier}
       />
       <div className="chat-status">
