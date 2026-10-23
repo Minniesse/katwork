@@ -10,3 +10,8 @@ allow = ["Apache-2.0", "BSD-3-Clause", "CDLA-Permissive-2.0", "ISC", "MIT", "Uni
 [[licenses.exceptions]]
 name = "quoted_printable"
 allow = ["0BSD"]
+
+# jsonschema's URI resolver uses MIT without an attribution requirement.
+[[licenses.exceptions]]
+name = "borrow-or-share"
+allow = ["MIT-0"]

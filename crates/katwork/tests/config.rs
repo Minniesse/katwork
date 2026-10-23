@@ -1066,16 +1066,6 @@ fn config_errors_name_the_variable_not_its_value() {
 }
 
 #[test]
-fn empty_lock_timeout_uses_default() {
-    let config = Config::from_lookup(|name| match name {
-        "KATWORK_LOCK_TIMEOUT_MS" => Some(String::new()),
-        _ => lookup(name),
-    })
-    .unwrap();
-    assert_eq!(config.lock_timeout, std::time::Duration::from_millis(5000));
-}
-
-#[test]
 fn local_base_url_and_model_must_be_set_together() {
     for (present, value, missing) in [
         (
@@ -1218,4 +1208,14 @@ fn config_invalid_names_variable_without_value() {
         );
         assert_eq!(error.to_string(), format!("config_invalid ({var})"));
     }
+}
+
+#[test]
+fn empty_lock_timeout_uses_default() {
+    let config = Config::from_lookup(|name| match name {
+        "KATWORK_LOCK_TIMEOUT_MS" => Some(String::new()),
+        _ => lookup(name),
+    })
+    .unwrap();
+    assert_eq!(config.lock_timeout, std::time::Duration::from_millis(5000));
 }

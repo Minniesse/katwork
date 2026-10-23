@@ -12,6 +12,11 @@ pub async fn set_lock_timeout(conn: &mut PgConnection, timeout: Duration) -> Res
     Ok(())
 }
 
+pub(crate) async fn set_configured_lock_timeout(conn: &mut PgConnection) -> Result<(), KatError> {
+    let timeout = crate::config::lock_timeout(std::env::var("KATWORK_LOCK_TIMEOUT_MS").ok())?;
+    set_lock_timeout(conn, timeout).await
+}
+
 pub async fn connect(url: &str) -> Result<PgPool, KatError> {
     match PgPoolOptions::new().connect(url).await {
         Ok(pool) => Ok(pool),
