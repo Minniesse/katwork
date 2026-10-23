@@ -223,21 +223,28 @@ async fn remaining_micros_from_sql_for_future_and_expired_deadlines(pool: PgPool
 #[sqlx::test(migrations = "./migrations")]
 async fn worker_cancels_run_when_renewal_fails(pool: PgPool) {
     let f = setup(&pool).await;
-    let (core, provider) = hanging(&pool);
+    let single = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let (core, provider) = hanging(&single);
     let _clock = Clock::pause();
     let mut workers = worker::spawn_pool(core.clone(), 1, TTL);
     until(|| provider.started.load(Ordering::SeqCst) == 1).await;
-    // A lease-row lock blocks renewal; the independent watchdog must still drop the provider.
-    let mut tx = pool.begin().await.unwrap();
-    sqlx::query("SELECT task_id FROM task_leases WHERE task_id=$1 FOR NO KEY UPDATE")
-        .bind(f.task)
-        .execute(&mut *tx)
-        .await
-        .unwrap();
+    // Exhaust a one-connection pool: renewal cannot hit a database lock timeout.
+    let held = core.pool.acquire().await.unwrap();
     tokio::time::advance(Duration::from_millis(20_001)).await;
     tokio::time::advance(Duration::from_secs(40)).await;
     until(|| provider.dropped.load(Ordering::SeqCst)).await;
-    tx.rollback().await.unwrap();
+    let live: bool =
+        sqlx::query_scalar("SELECT expires_at>clock_timestamp() FROM task_leases WHERE task_id=$1")
+            .bind(f.task)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(live, "watchdog must cancel before database expiry");
+    drop(held);
     core.shutdown.cancel();
     while workers.join_next().await.is_some() {}
     assert_eq!(outcome(&pool, JobId(f.job)).await, (None, None));
@@ -462,4 +469,250 @@ async fn infrastructure_failure_in_worker_gets_no_policy_verdict(pool: PgPool) {
     let c = claim(&core, "restarted").await.unwrap();
     assert_eq!(c.kind, RunKind::Recovery);
     finish(&core, &c, "restarted").await;
+}
+
+struct Panicking;
+#[async_trait]
+impl ModelProvider for Panicking {
+    fn id(&self) -> &str {
+        "panicking"
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            tools: true,
+            residency: Residency::Local,
+            synthetic: false,
+        }
+    }
+    async fn stream(
+        &self,
+        _: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<ChatChunk, ModelError>>, ModelError> {
+        panic!("injected provider panic")
+    }
+}
+#[sqlx::test(migrations = "./migrations")]
+async fn panicking_tasks_finish_and_cannot_wipe_out_pool(pool: PgPool) {
+    let f = setup(&pool).await;
+    let other = setup(&pool).await;
+    let core = Arc::new(core(&pool).with_registry(registry(Arc::new(Panicking))));
+    let mut workers = worker::spawn_pool(core.clone(), 1, TTL);
+    finished(&pool, JobId(other.job)).await;
+    for f in [f, other] {
+        assert_eq!(
+            outcome(&pool, JobId(f.job)).await,
+            (Some("error".into()), Some("internal_error".into()))
+        );
+        assert_eq!(task_state(&pool, TaskId(f.task)).await, "failed");
+        let leases: i64 = sqlx::query_scalar("SELECT count(*) FROM task_leases WHERE task_id=$1")
+            .bind(f.task)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(leases, 0);
+        let run: RunId =
+            sqlx::query_scalar("SELECT id FROM runs WHERE task_id=$1 AND lease_epoch>0")
+                .bind(f.task)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(terminals(&pool, run).await, ["RUN_ERROR"]);
+        assert!(
+            events(&pool, ThreadId(f.thread))
+                .await
+                .iter()
+                .all(|e| e["name"] != "katwork.decision")
+        );
+    }
+    assert_eq!(workers.len(), 1);
+    core.shutdown.cancel();
+    while let Some(result) = workers.join_next().await {
+        result.unwrap();
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn removed_requester_worker_still_answers(pool: PgPool) {
+    let f = setup(&pool).await;
+    sqlx::query("DELETE FROM memberships WHERE workspace_id=$1 AND user_id=$2")
+        .bind(f.workspace)
+        .bind(f.user)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let core = Arc::new(
+        core(&pool).with_registry(registry(Arc::new(FakeProvider::scripted(vec![answer()])))),
+    );
+    let mut workers = worker::spawn_pool(core.clone(), 1, TTL);
+    finished(&pool, JobId(f.job)).await;
+    core.shutdown.cancel();
+    while let Some(result) = workers.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(
+        outcome(&pool, JobId(f.job)).await.0.as_deref(),
+        Some("answered")
+    );
+}
+
+struct ShutdownAnswer(CancellationToken);
+#[async_trait]
+impl ModelProvider for ShutdownAnswer {
+    fn id(&self) -> &str {
+        "shutdown_answer"
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            tools: true,
+            residency: Residency::Local,
+            synthetic: false,
+        }
+    }
+    async fn stream(
+        &self,
+        _: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<ChatChunk, ModelError>>, ModelError> {
+        let shutdown = self.0.clone();
+        Ok(futures::stream::once(async move {
+            shutdown.cancel();
+            Ok(ChatChunk::Done {
+                stop: StopKind::EndTurn,
+                turn: AssistantTurn {
+                    content: "Finished answer".into(),
+                    tool_calls: vec![],
+                    replay: None,
+                },
+            })
+        })
+        .boxed())
+    }
+}
+#[sqlx::test(migrations = "./migrations")]
+async fn shutdown_preserves_finished_answer(pool: PgPool) {
+    let f = setup(&pool).await;
+    let core = core(&pool);
+    let provider = Arc::new(ShutdownAnswer(core.shutdown.clone()));
+    let core = Arc::new(core.with_registry(registry(provider)));
+    let mut workers = worker::spawn_pool(core.clone(), 1, TTL);
+    timeout(Duration::from_secs(10), async {
+        while let Some(result) = workers.join_next().await {
+            result.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        outcome(&pool, JobId(f.job)).await.0.as_deref(),
+        Some("answered")
+    );
+    let replies: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM messages WHERE job_id=$1 AND author_kind='kat'")
+            .bind(f.job)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(replies, 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn shutdown_drains_claim_before_releasing_lease(pool: PgPool) {
+    let f = setup(&pool).await;
+    let mut core = core(&pool);
+    Arc::get_mut(&mut core.config).unwrap().lock_timeout = Duration::from_secs(30);
+    let core = Arc::new(core);
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM threads WHERE id=$1 FOR NO KEY UPDATE")
+        .bind(f.thread)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let mut workers = worker::spawn_pool(core.clone(), 1, TTL);
+    super::races::waiting(&pool, "SELECT id FROM threads WHERE workspace_id").await;
+    core.shutdown.cancel();
+    blocker.rollback().await.unwrap();
+    while let Some(result) = workers.join_next().await {
+        result.unwrap();
+    }
+    let (attempts, live): (i32, bool) = sqlx::query_as("SELECT t.attempts,COALESCE(l.expires_at>clock_timestamp(),false) FROM tasks t LEFT JOIN task_leases l ON l.task_id=t.id WHERE t.id=$1")
+        .bind(f.task).fetch_one(&pool).await.unwrap();
+    assert_eq!(attempts, 1, "shutdown dropped the in-flight claim");
+    assert!(!live, "shutdown stranded the committed claim");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn first_watchdog_window_includes_claim_latency(pool: PgPool) {
+    let f = setup(&pool).await;
+    let fake = FakeProvider::scripted(vec![answer()]);
+    let mut core = core(&pool).with_registry(registry(Arc::new(fake.clone())));
+    Arc::get_mut(&mut core.config).unwrap().lock_timeout = Duration::from_secs(30);
+    let core = Arc::new(core);
+    let _clock = Clock::pause();
+    let mut gate = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM threads WHERE id=$1 FOR NO KEY UPDATE")
+        .bind(f.thread)
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+    let mut workers = worker::spawn_pool(core.clone(), 1, TTL);
+    super::races::waiting(&pool, "SELECT id FROM threads WHERE workspace_id").await;
+    tokio::time::advance(TTL + Duration::from_secs(1)).await;
+    gate.rollback().await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let invalidated: bool = sqlx::query_scalar("SELECT lease_epoch>1 FROM tasks WHERE id=$1")
+            .bind(f.task)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        if invalidated {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first watchdog window excluded claim latency"
+        );
+        tokio::task::yield_now().await;
+    }
+    core.shutdown.cancel();
+    while let Some(result) = workers.join_next().await {
+        result.unwrap();
+    }
+    assert!(fake.received().is_empty());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn failed_heartbeat_abandons_without_waiting_for_ttl(pool: PgPool) {
+    let f = setup(&pool).await;
+    let (core, provider) = hanging(&pool);
+    let _clock = Clock::pause();
+    let mut workers = worker::spawn_pool(core.clone(), 1, TTL);
+    until(|| provider.started.load(Ordering::SeqCst) == 1).await;
+    sqlx::raw_sql("CREATE FUNCTION reject_renewal() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.expires_at>OLD.expires_at THEN RAISE EXCEPTION 'injected renewal failure'; END IF;
+            RETURN NEW;
+        END $$;
+        CREATE TRIGGER reject_renewal BEFORE UPDATE ON task_leases FOR EACH ROW EXECUTE FUNCTION reject_renewal()")
+        .execute(&pool).await.unwrap();
+    paused(&pool, &f, true).await;
+    tokio::time::advance(Duration::from_millis(20_001)).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let recovered: bool = sqlx::query_scalar("SELECT state='queued' AND hold_reason IS NOT DISTINCT FROM 'workspace_paused' FROM tasks WHERE id=$1")
+            .bind(f.task).fetch_one(&pool).await.unwrap();
+        if recovered {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "failed heartbeat did not abandon promptly"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert!(provider.dropped.load(Ordering::SeqCst));
+    assert_eq!(outcome(&pool, JobId(f.job)).await, (None, None));
+    core.shutdown.cancel();
+    while let Some(result) = workers.join_next().await {
+        result.unwrap();
+    }
 }

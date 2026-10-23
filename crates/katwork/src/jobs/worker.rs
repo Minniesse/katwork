@@ -1,8 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{panic::AssertUnwindSafe, sync::Arc, time::Duration};
 
+use futures::FutureExt;
 use tokio::{
+    sync::watch,
     task::JoinSet,
-    time::{Instant, sleep, sleep_until, timeout_at},
+    time::{Instant, sleep, sleep_until},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -38,23 +40,26 @@ pub fn spawn_pool(core: Arc<Core>, n: usize, ttl: Duration) -> JoinSet<()> {
         workers.spawn(async move {
             let worker_id = uuid::Uuid::now_v7().to_string();
             let limits = Limits::default();
-            loop {
-                let claimed = tokio::select! {
-                    biased;
-                    ()=core.shutdown.cancelled()=>break,
-                    result=lease::claim(&core,&worker_id,ttl,&limits)=>result,
-                };
-                match claimed {
+            while !core.shutdown.is_cancelled() {
+                let claim_started = Instant::now();
+                // A cancelled BEGIN can poison the pool; always drain admission SQL.
+                match lease::claim(&core, &worker_id, ttl, &limits).await {
                     Ok(Some(c)) => {
                         let claimed_at = Instant::now();
-                        work(&core, &worker_id, ttl, c, claimed_at, &limits).await;
+                        work(
+                            &core,
+                            &worker_id,
+                            ttl,
+                            c,
+                            claim_started,
+                            claimed_at,
+                            &limits,
+                        )
+                        .await;
                         continue;
                     }
                     Ok(None) => {}
                     Err(error) => tracing::warn!(code = error.code(), "worker_claim_failed"),
-                }
-                if core.shutdown.is_cancelled() {
-                    break;
                 }
                 tokio::select! {
                     ()=core.shutdown.cancelled()=>break,
@@ -67,7 +72,7 @@ pub fn spawn_pool(core: Arc<Core>, n: usize, ttl: Duration) -> JoinSet<()> {
 }
 
 enum Renewal {
-    Stop(StopReason, Instant),
+    Stop(StopReason),
     Lost,
 }
 
@@ -76,34 +81,39 @@ async fn renew(
     c: &ClaimedTask,
     worker: &str,
     ttl: Duration,
-    claimed_at: Instant,
+    window: watch::Sender<Instant>,
+    stop: CancellationToken,
 ) -> Renewal {
-    // Start each renewal's safety window before its SQL, so database latency cannot extend it.
-    let mut valid_until = claimed_at + ttl;
-    let mut next = claimed_at + ttl / 3;
+    let mut next = *window.borrow() - ttl + ttl / 3;
     loop {
         tokio::select! {
             biased;
-            ()=sleep_until(valid_until)=>return Renewal::Lost,
+            ()=stop.cancelled()=>return Renewal::Lost,
             ()=sleep_until(next)=>{},
         }
+        // The watchdog cancels execution independently while this SQL drains to completion.
         let started = Instant::now();
-        match timeout_at(
-            valid_until,
-            lease::heartbeat(&core.pool, c.task_id, worker, c.lease_epoch, ttl),
-        )
-        .await
-        {
-            Ok(Ok(HeartbeatStatus::Continue)) => {}
-            Ok(Ok(HeartbeatStatus::Stop(reason))) => return Renewal::Stop(reason, started + ttl),
-            Ok(Err(error)) => {
+        match lease::heartbeat(&core.pool, c.task_id, worker, c.lease_epoch, ttl).await {
+            Ok(HeartbeatStatus::Continue) => {}
+            Ok(HeartbeatStatus::Stop(reason)) => return Renewal::Stop(reason),
+            Err(error) => {
                 tracing::warn!(code = error.code(), "worker_renewal_failed");
                 return Renewal::Lost;
             }
-            Err(_) => return Renewal::Lost,
         }
-        valid_until = started + ttl;
+        let _ = window.send(started + ttl);
         next = started + ttl / 3;
+    }
+}
+
+async fn expired(mut window: watch::Receiver<Instant>) {
+    loop {
+        let until = *window.borrow_and_update();
+        tokio::select! {
+            biased;
+            ()=sleep_until(until)=>return,
+            changed=window.changed()=>if changed.is_err() { return; },
+        }
     }
 }
 
@@ -112,36 +122,70 @@ async fn work(
     worker: &str,
     ttl: Duration,
     c: ClaimedTask,
+    claim_started: Instant,
     claimed_at: Instant,
     limits: &Limits,
 ) {
     let cancel = CancellationToken::new();
-    let result = {
-        let execution = execute(core, &c, claimed_at, limits, cancel.clone());
-        tokio::pin!(execution);
-        // Renewal must keep being polled while execution owns SQL locks, and vice versa.
-        tokio::select! {
-            biased;
-            ()=core.shutdown.cancelled()=>{
-                cancel.cancel();
-                None
+    let stop_renewal = CancellationToken::new();
+    // Even the first window starts before SQL; commit latency must not extend authority.
+    let (window, watchdog) = watch::channel(claim_started + ttl);
+    let execution =
+        AssertUnwindSafe(execute(core, &c, claimed_at, limits, cancel.clone())).catch_unwind();
+    let renewal = renew(core, &c, worker, ttl, window, stop_renewal.clone());
+    tokio::pin!(execution, renewal);
+    let mut renewal_done = false;
+    let mut lost = false;
+    let mut stop_reason = None;
+    let result = tokio::select! {
+        biased;
+        result=&mut execution=>Some(result),
+        ()=core.shutdown.cancelled()=>None,
+        renewal=&mut renewal=>{
+            renewal_done = true;
+            match renewal {
+                Renewal::Lost=>lost=true,
+                Renewal::Stop(reason)=>stop_reason=Some(reason),
             }
-            renewal=renew(core,&c,worker,ttl,claimed_at)=>{
-                cancel.cancel();
-                match renewal {
-                    Renewal::Lost=>return,
-                    Renewal::Stop(reason,until)=>match timeout_at(until,&mut execution).await {
-                        Ok(Ok(mut facts))=>{facts.stop=Some(reason);Some(Ok(facts))},
-                        Ok(Err(error))=>Some(Err(error)),
-                        Err(_)=>return,
-                    }
-                }
-            }
-            result=&mut execution=>Some(result),
-        }
+            None
+        },
+        ()=expired(watchdog)=>{lost=true;None},
     };
+    if result.is_none() {
+        cancel.cancel();
+    }
+    stop_renewal.cancel();
+    // No branch drops execution or heartbeat SQL, including on watchdog expiry and shutdown.
+    let (result, (), ()) = tokio::join!(
+        async {
+            match result {
+                Some(result) => result,
+                None => execution.await,
+            }
+        },
+        async {
+            if !renewal_done {
+                renewal.await;
+            }
+        },
+        async {
+            if lost {
+                abandon(core, &c, worker).await;
+            }
+        },
+    );
+    if lost {
+        return;
+    }
     match result {
-        Some(Ok(facts)) => {
+        Ok(Ok(mut facts)) => {
+            if let Some(reason) = stop_reason {
+                facts.stop = Some(reason);
+            }
+            if facts.stop == Some(StopReason::Cancelled) && core.shutdown.is_cancelled() {
+                abandon(core, &c, worker).await;
+                return;
+            }
             if let Err(error) = lease::complete(core, c.task_id, worker, c.lease_epoch, facts).await
             {
                 tracing::warn!(code = error.code(), "worker_completion_failed");
@@ -150,12 +194,18 @@ async fn work(
                 }
             }
         }
-        Some(Err(RunAbort::LeaseLost)) => {}
-        Some(Err(RunAbort::Infrastructure { code, .. })) => {
+        Ok(Err(RunAbort::LeaseLost)) => {}
+        Ok(Err(RunAbort::Infrastructure { code, .. })) => {
             tracing::warn!(code, "worker_run_aborted");
             abandon(core, &c, worker).await;
         }
-        None => abandon(core, &c, worker).await,
+        Err(_) => {
+            tracing::error!(code = "internal_error", "worker_run_panicked");
+            if let Err(error) = lease::fail(core, c.task_id, worker, c.lease_epoch).await {
+                tracing::warn!(code = error.code(), "worker_failure_cleanup_failed");
+                abandon(core, &c, worker).await;
+            }
+        }
     }
 }
 
@@ -173,7 +223,7 @@ async fn execute(
     cancel: CancellationToken,
 ) -> Result<RunFacts, RunAbort> {
     let prepare = async {
-        let tenant = tenancy::resolve(&core.pool, c.requested_by, c.workspace_id).await?;
+        let tenant = tenancy::for_task(&core.pool, c.task_id).await?;
         let kat = kat::get(&core.pool, &tenant, c.kat_id).await?;
         let thread = thread::get(&core.pool, &tenant, c.thread_id).await?;
         let space = space::get(&core.pool, &tenant, thread.space_id).await?;

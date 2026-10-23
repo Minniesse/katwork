@@ -47,7 +47,7 @@ struct Candidate {
     thread_id: ThreadId,
     space_id: SpaceId,
     requested_by: UserId,
-    input: Json<TaskInput>,
+    input: Json<serde_json::Value>,
     kat_policy_version: i64,
     attempts: i32,
     max_attempts: i32,
@@ -85,10 +85,11 @@ pub async fn claim(
     let task_deadline = micros(limits.task_deadline)?;
     let job_deadline = micros(limits.job_deadline)?;
     let mut visited: Vec<TaskId> = Vec::new();
-    for _ in 0..16 {
+    // Bound each poll while allowing bursts of new holds to reveal later workspaces.
+    for _ in 0..256 {
         let mut tx = core.pool.begin().await?;
         db::set_lock_timeout(&mut tx, core.config.lock_timeout).await?;
-        // Advisory pruning prevents 16 persistent holds from starving every later workspace.
+        // Advisory pruning keeps persistent holds out of the candidate budget.
         // Expired leases and terminal conditions always reach the locked checks below.
         let candidate: Option<Candidate> = sqlx::query_as(
             "SELECT t.id,t.workspace_id,t.job_id,t.kat_id,j.thread_id,th.space_id,
@@ -122,222 +123,251 @@ pub async fn claim(
         .await?;
         let Some(c) = candidate else { return Ok(None) };
         visited.push(c.id);
-        // A renewal may have committed after the candidate snapshot without changing its task.
-        let eligible: bool = sqlx::query_scalar(
-            "SELECT t.state='queued' OR (t.state='leased' AND l.expires_at<=clock_timestamp())
-             FROM tasks t LEFT JOIN task_leases l ON l.task_id=t.id
-             WHERE t.workspace_id=$1 AND t.id=$2",
-        )
-        .bind(c.workspace_id)
-        .bind(c.id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if !eligible {
-            tx.rollback().await?;
-            continue;
+        let result = claim_locked(&mut tx, &c, worker_id, ttl, task_deadline, job_deadline).await;
+        match result {
+            Ok((claimed, seq)) => match commit(core, tx, c.thread_id, seq).await {
+                Ok(()) if claimed.is_some() => return Ok(claimed),
+                Ok(()) => {}
+                Err(error) => {
+                    tracing::warn!(code = error.code(), task_id = %c.id, "worker_candidate_commit_failed")
+                }
+            },
+            Err(error) => {
+                tx.rollback().await?;
+                tracing::warn!(code = error.code(), task_id = %c.id, "worker_candidate_failed");
+            }
         }
-        lock_lease(&mut tx, c.id).await?;
-        let runs: Vec<RunId> = sqlx::query_scalar(
-            "SELECT id FROM runs WHERE workspace_id=$1 AND task_id=$2 AND state='running'
-             ORDER BY id FOR NO KEY UPDATE",
-        )
+    }
+    Ok(None)
+}
+
+async fn claim_locked(
+    tx: &mut Transaction<'_, Postgres>,
+    c: &Candidate,
+    worker_id: &str,
+    ttl: i64,
+    task_deadline: i64,
+    job_deadline: i64,
+) -> Result<(Option<ClaimedTask>, Option<EventSeq>), KatError> {
+    // A renewal may have committed after the candidate snapshot without changing its task.
+    let eligible: bool = sqlx::query_scalar(
+        "SELECT t.state='queued' OR (t.state='leased' AND l.expires_at<=clock_timestamp())
+         FROM tasks t LEFT JOIN task_leases l ON l.task_id=t.id
+         WHERE t.workspace_id=$1 AND t.id=$2",
+    )
+    .bind(c.workspace_id)
+    .bind(c.id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !eligible {
+        return Ok((None, None));
+    }
+    lock_lease(tx, c.id).await?;
+    let runs: Vec<RunId> = sqlx::query_scalar(
+        "SELECT id FROM runs WHERE workspace_id=$1 AND task_id=$2 AND state='running'
+         ORDER BY id FOR NO KEY UPDATE",
+    )
+    .bind(c.workspace_id)
+    .bind(c.id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let calls: Vec<(ToolCallRecordId, RunId)> = sqlx::query_as(
+        "SELECT id,run_id FROM tool_calls WHERE workspace_id=$1 AND run_id=ANY($2)
+         AND ended_at IS NULL ORDER BY id FOR NO KEY UPDATE",
+    )
+    .bind(c.workspace_id)
+    .bind(&runs)
+    .fetch_all(&mut **tx)
+    .await?;
+    lock_thread(tx, c.workspace_id, c.thread_id).await?;
+    sqlx::query("SELECT id FROM kats WHERE workspace_id=$1 AND id=$2 FOR NO KEY UPDATE")
         .bind(c.workspace_id)
-        .bind(c.id)
-        .fetch_all(&mut *tx)
+        .bind(c.kat_id)
+        .fetch_one(&mut **tx)
         .await?;
-        let calls: Vec<(ToolCallRecordId, RunId)> = sqlx::query_as(
-            "SELECT id,run_id FROM tool_calls WHERE workspace_id=$1 AND run_id=ANY($2)
-             AND ended_at IS NULL ORDER BY id FOR NO KEY UPDATE",
-        )
-        .bind(c.workspace_id)
-        .bind(&runs)
-        .fetch_all(&mut *tx)
-        .await?;
-        lock_thread(&mut tx, c.workspace_id, c.thread_id).await?;
-        sqlx::query("SELECT id FROM kats WHERE workspace_id=$1 AND id=$2 FOR NO KEY UPDATE")
+    let tenant = tenancy::for_task(&mut **tx, c.id).await?;
+    let was_leased: bool =
+        sqlx::query_scalar("SELECT state='leased' FROM tasks WHERE workspace_id=$1 AND id=$2")
             .bind(c.workspace_id)
-            .bind(c.kat_id)
-            .fetch_one(&mut *tx)
+            .bind(c.id)
+            .fetch_one(&mut **tx)
             .await?;
-        let tenant = tenancy::resolve(&mut *tx, c.requested_by, c.workspace_id).await?;
-        let was_leased: bool =
-            sqlx::query_scalar("SELECT state='leased' FROM tasks WHERE workspace_id=$1 AND id=$2")
+    let mut seq = None;
+    if was_leased {
+        for run in runs {
+            let open = calls
+                .iter()
+                .filter(|(_, r)| *r == run)
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            seq = Some(
+                close_locked_run(
+                    tx,
+                    c.workspace_id,
+                    c.thread_id,
+                    run,
+                    &open,
+                    RunEnd::Interrupted,
+                    "lease_lost",
+                )
+                .await?,
+            );
+        }
+        release(tx, c.id).await?;
+        // The committed effect marker, never a missing receipt, controls replay safety.
+        if !c.effects_started {
+            sqlx::query("UPDATE tasks SET state='queued' WHERE workspace_id=$1 AND id=$2")
                 .bind(c.workspace_id)
                 .bind(c.id)
-                .fetch_one(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
-        let mut seq = None;
-        if was_leased {
-            for run in runs {
-                let open = calls
-                    .iter()
-                    .filter(|(_, r)| *r == run)
-                    .map(|(id, _)| *id)
-                    .collect::<Vec<_>>();
-                seq = Some(
-                    close_locked_run(
-                        &mut tx,
-                        c.workspace_id,
-                        c.thread_id,
-                        run,
-                        &open,
-                        RunEnd::Interrupted,
-                        "lease_lost",
-                    )
-                    .await?,
-                );
-            }
-            release(&mut tx, c.id).await?;
-            // The committed effect marker, never a missing receipt, controls replay safety.
-            if !c.effects_started {
-                sqlx::query("UPDATE tasks SET state='queued' WHERE workspace_id=$1 AND id=$2")
-                    .bind(c.workspace_id)
-                    .bind(c.id)
-                    .execute(&mut *tx)
-                    .await?;
-            }
         }
-        let expired: bool = sqlx::query_scalar(
-            "SELECT (t.first_claimed_at IS NOT NULL AND
-                 t.first_claimed_at+$1*interval '1 microsecond'<=clock_timestamp()) OR
-                 j.created_at+$2*interval '1 microsecond'<=clock_timestamp()
-             FROM tasks t JOIN jobs j ON j.id=t.job_id AND j.workspace_id=t.workspace_id
-             WHERE t.workspace_id=$3 AND t.id=$4",
-        )
-        .bind(task_deadline)
-        .bind(job_deadline)
-        .bind(c.workspace_id)
-        .bind(c.id)
-        .fetch_one(&mut *tx)
-        .await?;
-        let stop = if expired {
+    }
+    let expired: bool = sqlx::query_scalar(
+        "SELECT (t.first_claimed_at IS NOT NULL AND
+             t.first_claimed_at+$1*interval '1 microsecond'<=clock_timestamp()) OR
+             j.created_at+$2*interval '1 microsecond'<=clock_timestamp()
+         FROM tasks t JOIN jobs j ON j.id=t.job_id AND j.workspace_id=t.workspace_id
+         WHERE t.workspace_id=$3 AND t.id=$4",
+    )
+    .bind(task_deadline)
+    .bind(job_deadline)
+    .bind(c.workspace_id)
+    .bind(c.id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let input = serde_json::from_value::<TaskInput>(c.input.0.clone());
+    let stop =
+        if expired {
             Some(StopReason::TimeLimit)
-        } else if c.attempts >= c.max_attempts {
+        } else if c.attempts >= c.max_attempts || input.is_err() {
             None
         } else if was_leased && c.effects_started {
             Some(StopReason::Interrupted)
         } else {
             let paused: bool = sqlx::query_scalar("SELECT paused FROM workspaces WHERE id=$1")
                 .bind(c.workspace_id)
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut **tx)
                 .await?;
             if paused {
-                if let Some(s) = hold(&mut tx, &c, HoldReason::WorkspacePaused).await? {
+                if let Some(s) = hold(tx, c, HoldReason::WorkspacePaused).await? {
                     seq = Some(s);
                 }
-                commit(core, tx, c.thread_id, seq).await?;
-                continue;
+                return Ok((None, seq));
             }
-            if !kat::is_granted(&mut tx, &tenant, c.kat_id, c.space_id).await? {
+            if !kat::is_granted(tx, &tenant, c.kat_id, c.space_id).await? {
                 Some(StopReason::PolicyChanged)
-            } else if !kat::is_eligible(&mut tx, &tenant, c.kat_id, c.space_id).await? {
+            } else if !kat::is_eligible(tx, &tenant, c.kat_id, c.space_id).await? {
                 Some(StopReason::KatPaused)
             } else {
-                let kat = kat::get_on(&mut *tx, &tenant, c.kat_id).await?;
+                let kat = kat::get_on(&mut **tx, &tenant, c.kat_id).await?;
                 if kat.policy_version != c.kat_policy_version {
                     Some(StopReason::PolicyChanged)
                 } else {
                     // Serialized by the Kat lock; expired leases never consume a slot.
                     let live: i64 = sqlx::query_scalar(
                         "SELECT count(*) FROM tasks t JOIN task_leases l ON l.task_id=t.id
-                         WHERE t.workspace_id=$1 AND t.kat_id=$2 AND t.id<>$3
-                         AND t.state='leased' AND l.expires_at>clock_timestamp()",
+                     WHERE t.workspace_id=$1 AND t.kat_id=$2 AND t.id<>$3
+                     AND t.state='leased' AND l.expires_at>clock_timestamp()",
                     )
                     .bind(c.workspace_id)
                     .bind(c.kat_id)
                     .bind(c.id)
-                    .fetch_one(&mut *tx)
+                    .fetch_one(&mut **tx)
                     .await?;
                     if live >= i64::from(kat.max_concurrency) {
-                        if let Some(s) = hold(&mut tx, &c, HoldReason::KatBusy).await? {
+                        if let Some(s) = hold(tx, c, HoldReason::KatBusy).await? {
                             seq = Some(s);
                         }
-                        commit(core, tx, c.thread_id, seq).await?;
-                        continue;
+                        return Ok((None, seq));
                     }
                     let (attempts, epoch): (i32, LeaseEpoch) = sqlx::query_as(
-                        "UPDATE tasks SET state='leased',attempts=attempts+1,lease_epoch=lease_epoch+1,
-                         hold_reason=NULL,first_claimed_at=COALESCE(first_claimed_at,clock_timestamp())
-                         WHERE workspace_id=$1 AND id=$2 RETURNING attempts,lease_epoch",
-                    ).bind(c.workspace_id).bind(c.id).fetch_one(&mut *tx).await?;
+                    "UPDATE tasks SET state='leased',attempts=attempts+1,lease_epoch=lease_epoch+1,
+                     hold_reason=NULL,first_claimed_at=COALESCE(first_claimed_at,clock_timestamp())
+                     WHERE workspace_id=$1 AND id=$2 RETURNING attempts,lease_epoch",
+                ).bind(c.workspace_id).bind(c.id).fetch_one(&mut **tx).await?;
                     sqlx::query(
                         "INSERT INTO task_leases(task_id,worker_id,lease_epoch,expires_at)
-                         VALUES($1,$2,$3,clock_timestamp()+$4*interval '1 microsecond')",
+                     VALUES($1,$2,$3,clock_timestamp()+$4*interval '1 microsecond')",
                     )
                     .bind(c.id)
                     .bind(worker_id)
                     .bind(epoch)
                     .bind(ttl)
-                    .execute(&mut *tx)
+                    .execute(&mut **tx)
                     .await?;
                     let remaining: i64 = sqlx::query_scalar(include_str!("remaining.sql"))
                         .bind(task_deadline)
                         .bind(job_deadline)
                         .bind(c.workspace_id)
                         .bind(c.id)
-                        .fetch_one(&mut *tx)
+                        .fetch_one(&mut **tx)
                         .await?;
-                    commit(core, tx, c.thread_id, seq).await?;
-                    return Ok(Some(ClaimedTask {
-                        task_id: c.id,
-                        job_id: c.job_id,
-                        kat_id: c.kat_id,
-                        workspace_id: c.workspace_id,
-                        thread_id: c.thread_id,
-                        requested_by: c.requested_by,
-                        input: c.input.0,
-                        attempts,
-                        lease_epoch: epoch,
-                        policy_version: c.kat_policy_version,
-                        kind: if c.attempts > 0 {
-                            RunKind::Recovery
-                        } else {
-                            RunKind::Initial
-                        },
-                        remaining: Duration::from_micros(u64::try_from(remaining).unwrap_or(0)),
-                    }));
+                    return Ok((
+                        Some(ClaimedTask {
+                            task_id: c.id,
+                            job_id: c.job_id,
+                            kat_id: c.kat_id,
+                            workspace_id: c.workspace_id,
+                            thread_id: c.thread_id,
+                            requested_by: c.requested_by,
+                            input: input.map_err(|_| KatError::RequestInvalid)?,
+                            attempts,
+                            lease_epoch: epoch,
+                            policy_version: c.kat_policy_version,
+                            kind: if c.attempts > 0 {
+                                RunKind::Recovery
+                            } else {
+                                RunKind::Initial
+                            },
+                            remaining: Duration::from_micros(u64::try_from(remaining).unwrap_or(0)),
+                        }),
+                        seq,
+                    ));
                 }
             }
         };
-        let state = if stop == Some(StopReason::Interrupted) {
-            "interrupted"
-        } else {
-            "failed"
-        };
-        sqlx::query("UPDATE tasks SET state=$3,hold_reason=NULL WHERE workspace_id=$1 AND id=$2")
-            .bind(c.workspace_id)
-            .bind(c.id)
-            .bind(state)
-            .execute(&mut *tx)
-            .await?;
-        release(&mut tx, c.id).await?;
-        seq = Some(match stop {
-            Some(stop) => {
-                job::conclude(
-                    &mut tx,
-                    &tenant,
-                    c.job_id,
-                    c.thread_id,
-                    Some(c.kat_id),
-                    &c.id.to_string(),
-                    &RunFacts::not_run(stop),
-                )
-                .await?
-            }
-            None => {
-                job::finish_by_harness(
-                    &mut tx,
-                    c.job_id,
-                    HarnessEnd::Error {
-                        code: ReasonCode::RetriesExhausted,
+    let state = if stop == Some(StopReason::Interrupted) {
+        "interrupted"
+    } else {
+        "failed"
+    };
+    sqlx::query("UPDATE tasks SET state=$3,hold_reason=NULL WHERE workspace_id=$1 AND id=$2")
+        .bind(c.workspace_id)
+        .bind(c.id)
+        .bind(state)
+        .execute(&mut **tx)
+        .await?;
+    release(tx, c.id).await?;
+    seq = Some(match stop {
+        Some(stop) => {
+            job::conclude(
+                tx,
+                &tenant,
+                c.job_id,
+                c.thread_id,
+                Some(c.kat_id),
+                &c.id.to_string(),
+                &RunFacts::not_run(stop),
+            )
+            .await?
+        }
+        None => {
+            job::finish_by_harness(
+                tx,
+                c.job_id,
+                HarnessEnd::Error {
+                    code: if input.is_err() {
+                        ReasonCode::InternalError
+                    } else {
+                        ReasonCode::RetriesExhausted
                     },
-                )
-                .await?
-            }
-        });
-        commit(core, tx, c.thread_id, seq).await?;
-    }
-    Ok(None)
+                },
+            )
+            .await?
+        }
+    });
+    Ok::<_, KatError>((None, seq))
 }
 
 async fn hold(
@@ -470,20 +500,15 @@ pub async fn complete(
     owner(worker_id)?;
     let mut tx = core.pool.begin().await?;
     db::set_lock_timeout(&mut tx, core.config.lock_timeout).await?;
-    let (workspace, job_id, thread, kat_id, requested_by): (
-        WorkspaceId,
-        JobId,
-        ThreadId,
-        KatId,
-        UserId,
-    ) = sqlx::query_as(
-        "SELECT t.workspace_id,t.job_id,j.thread_id,t.kat_id,j.requested_by
+    let (workspace, job_id, thread, kat_id): (WorkspaceId, JobId, ThreadId, KatId) =
+        sqlx::query_as(
+            "SELECT t.workspace_id,t.job_id,j.thread_id,t.kat_id
          FROM tasks t JOIN jobs j ON j.id=t.job_id AND j.workspace_id=t.workspace_id WHERE t.id=$1",
-    )
-    .bind(task_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or(KatError::LeaseLost)?;
+        )
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(KatError::LeaseLost)?;
     sqlx::query("SELECT id FROM jobs WHERE workspace_id=$1 AND id=$2 FOR NO KEY UPDATE")
         .bind(workspace)
         .bind(job_id)
@@ -499,7 +524,7 @@ pub async fn complete(
     }
     lock_thread(&mut tx, workspace, thread).await?;
     fence::lock(&mut tx, &fence).await?;
-    let tenant: Tenant = tenancy::resolve(&mut *tx, requested_by, workspace).await?;
+    let tenant: Tenant = tenancy::for_task(&mut *tx, task_id).await?;
     let seq = job::conclude(
         &mut tx,
         &tenant,
@@ -542,4 +567,72 @@ pub async fn abandon(
         .await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// Contain a run panic without a policy verdict or another attempt at the poison task.
+pub(crate) async fn fail(
+    core: &Core,
+    task: TaskId,
+    worker: &str,
+    epoch: LeaseEpoch,
+) -> Result<(), KatError> {
+    let mut tx = core.pool.begin().await?;
+    db::set_lock_timeout(&mut tx, core.config.lock_timeout).await?;
+    let (workspace, job, thread): (WorkspaceId, JobId, ThreadId) = sqlx::query_as(
+        "SELECT t.workspace_id,t.job_id,j.thread_id FROM tasks t JOIN jobs j
+         ON j.id=t.job_id AND j.workspace_id=t.workspace_id WHERE t.id=$1",
+    )
+    .bind(task)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query("SELECT id FROM jobs WHERE workspace_id=$1 AND id=$2 FOR NO KEY UPDATE")
+        .bind(workspace)
+        .bind(job)
+        .fetch_one(&mut *tx)
+        .await?;
+    let fence = Fence {
+        task_id: task,
+        epoch,
+    };
+    fence::lock(&mut tx, &fence).await?;
+    lock_lease(&mut tx, task).await?;
+    check_owner(&mut tx, task, worker).await?;
+    let runs: Vec<RunId> = sqlx::query_scalar("SELECT id FROM runs WHERE workspace_id=$1 AND task_id=$2 AND state='running' ORDER BY id FOR NO KEY UPDATE")
+        .bind(workspace).bind(task).fetch_all(&mut *tx).await?;
+    let calls: Vec<(ToolCallRecordId, RunId)> = sqlx::query_as("SELECT id,run_id FROM tool_calls WHERE workspace_id=$1 AND run_id=ANY($2) AND ended_at IS NULL ORDER BY id FOR NO KEY UPDATE")
+        .bind(workspace).bind(&runs).fetch_all(&mut *tx).await?;
+    lock_thread(&mut tx, workspace, thread).await?;
+    fence::lock(&mut tx, &fence).await?;
+    for run in runs {
+        let open = calls
+            .iter()
+            .filter(|(_, r)| *r == run)
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        close_locked_run(
+            &mut tx,
+            workspace,
+            thread,
+            run,
+            &open,
+            RunEnd::Interrupted,
+            "internal_error",
+        )
+        .await?;
+    }
+    sqlx::query("UPDATE tasks SET state='failed',hold_reason=NULL WHERE workspace_id=$1 AND id=$2")
+        .bind(workspace)
+        .bind(task)
+        .execute(&mut *tx)
+        .await?;
+    release(&mut tx, task).await?;
+    let seq = job::finish_by_harness(
+        &mut tx,
+        job,
+        HarnessEnd::Error {
+            code: ReasonCode::InternalError,
+        },
+    )
+    .await?;
+    commit(core, tx, thread, Some(seq)).await
 }
