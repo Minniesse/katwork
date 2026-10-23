@@ -241,7 +241,7 @@ describe('new-arrival announcer', () => {
     act(() => vi.advanceTimersByTime(1_000));
     expect(lines()).toEqual(['12 new messages']);
     act(() => setLocale('th'));
-    expect(lines()).toEqual(['ข้อความใหม่ 12 ข้อความ']);
+    expect(lines()).toEqual(['มีข้อความใหม่ 12 ข้อความ']);
   });
 
   test('arrivals_one_by_one_in_a_rush_say_three_then_sum_up_the_rest', () => {
@@ -289,6 +289,41 @@ describe('new-arrival announcer', () => {
     expect(lines()).toEqual([3, 4, 5, 6, 7].map((n) => `Kat: message ${n}`));
   });
 
+  test('unmounting_with_a_line_waiting_to_clear_leaves_no_timer', () => {
+    vi.useFakeTimers();
+    const { rerender, unmount } = render(<Transcript messages={stored([1])} />);
+    rerender(<Transcript messages={stored([1, 2])} />);
+    expect(lines()).toEqual(['Kat: message 2']);
+    unmount();
+    expect(vi.getTimerCount()).toBe(0);
+    act(() => vi.advanceTimersByTime(10_000));
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test('unmounting_with_a_burst_summary_pending_leaves_no_timer', () => {
+    vi.useFakeTimers();
+    const { rerender, unmount } = render(<Transcript messages={stored([1])} />);
+    rerender(<Transcript messages={stored(range(1, 6))} />);
+    // Five at once: the summary waits for a quiet second.
+    expect(lines()).toEqual([]);
+    unmount();
+    expect(vi.getTimerCount()).toBe(0);
+    act(() => vi.advanceTimersByTime(10_000));
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test('unmounting_with_a_summary_line_shown_leaves_no_timer', () => {
+    vi.useFakeTimers();
+    const { rerender, unmount } = render(<Transcript messages={stored([1])} />);
+    rerender(<Transcript messages={stored(range(1, 6))} />);
+    act(() => vi.advanceTimersByTime(1_000));
+    expect(lines()).toEqual(['5 new messages']);
+    unmount();
+    expect(vi.getTimerCount()).toBe(0);
+    act(() => vi.advanceTimersByTime(10_000));
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   test('announcements_are_cleared_after_they_are_read', () => {
     vi.useFakeTimers();
     const { rerender } = render(<Transcript messages={stored([1])} />);
@@ -326,19 +361,32 @@ describe('new-arrival announcer', () => {
     shown.push(...range(71, 100));
     const history = new Set([...snapshot, ...range(51, 100).map(id)]);
     rerender(<Transcript messages={stored([...shown].sort((a, b) => a - b))} history={history} />);
-    act(() => vi.advanceTimersByTime(10_000));
+    // Collected synchronously: a MutationObserver callback runs only after the test's own code,
+    // so records are taken before each step can hide them, and before disconnecting.
+    const take = () => observer.takeRecords().forEach((record) => added.push(...record.addedNodes));
+    take();
+    act(() => vi.advanceTimersByTime(1_000)); // the burst summary's deadline
+    take();
+    act(() => vi.advanceTimersByTime(5_000)); // the lines' clearing
+    take();
     observer.disconnect();
     expect(added).toHaveLength(0);
   });
 });
 
 test('missing_mention_space_names_the_kat_in_both_locales', () => {
-  const messages = messagesFrom([{
-    type: 'CUSTOM', name: 'katwork.message_stored', value: {
-      messageId: 'notice', author: { kind: 'system' }, body: 'mention_needs_space',
-      meta: { code: 'mention_needs_space', kats: [{ id: 'writer', name: 'เลขา' }] },
+  const messages = messagesFrom([
+    {
+      type: 'CUSTOM',
+      name: 'katwork.message_stored',
+      value: {
+        messageId: 'notice',
+        author: { kind: 'system' },
+        body: 'mention_needs_space',
+        meta: { code: 'mention_needs_space', kats: [{ id: 'writer', name: 'เลขา' }] },
+      },
     },
-  }]);
+  ]);
   render(<Transcript messages={messages} />);
   expect(screen.getByText('Add a space after @เลขา to mention this Kat.')).toBeVisible();
   act(() => setLocale('th'));
