@@ -18,7 +18,7 @@ compose exec -T katwork /app/katwork-server seed-demo > "$credentials"
 if [ -s "$credentials" ]; then mv -f "$credentials" "$root/.demo-credentials"; fi
 printf '%s\n' 'http://localhost:3000' 'Account: demo@katwork.local'
 if [ -f "$root/.demo-credentials" ]; then
-    printf '%s\n' 'Open .demo-credentials on this host to read the initial password.'
+    printf '%s\n' 'Use KATWORK_DEMO_PASSWORD when set; otherwise open .demo-credentials for the initial password.'
 else
     printf '%s\n' 'Use your KATWORK_DEMO_PASSWORD, or the password saved on your first run.'
 fi
