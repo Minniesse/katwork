@@ -95,7 +95,11 @@ fn pool_options() -> PgPoolOptions {
 }
 
 pub async fn connect(url: &str) -> Result<PgPool, KatError> {
-    match pool_options().connect(url).await {
+    connect_with(pool_options(), url).await
+}
+
+async fn connect_with(options: PgPoolOptions, url: &str) -> Result<PgPool, KatError> {
+    match options.connect(url).await {
         Ok(pool) => Ok(pool),
         Err(mut error) => {
             if matches!(error, sqlx::Error::PoolTimedOut) {

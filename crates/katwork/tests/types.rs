@@ -110,8 +110,11 @@ fn shared_wire_values_match_json() {
 fn shared_type_wire_matrix_round_trips_every_variant() {
     macro_rules! variants {
         ($kind:ident, $($variant:ident => $wire:literal),+ $(,)?) => {{
+            let expected = |value: $kind| match value {
+                $($kind::$variant => $wire),+
+            };
             $(
-                assert_eq!(to_value($kind::$variant).unwrap(), json!($wire));
+                assert_eq!(to_value($kind::$variant).unwrap(), json!(expected($kind::$variant)));
                 assert_eq!(from_value::<$kind>(json!($wire)).unwrap(), $kind::$variant);
             )+
             for invalid in [json!("unknown"), json!(null), json!(1)] {

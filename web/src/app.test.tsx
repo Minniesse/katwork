@@ -146,10 +146,15 @@ test('new_conversation_is_created_with_the_default_team', async () => {
     [`GET ${BASE}/threads/thread-new`]: [200, created],
     [`GET ${BASE}/threads/thread-new/messages`]: [200, { messages: [], event_seq: 0 }],
   });
-  const user = userEvent.setup({ delay: null });
+  const user = userEvent.setup();
   render(<App />);
-  await user.type(await screen.findByLabelText(en['chat.new_title']), 'แผนงาน');
+  // Let the initial thread request settle before typing into the controlled input.
+  await screen.findByText(en['chat.no_threads']);
+  const title = screen.getByLabelText(en['chat.new_title']);
+  await user.type(title, 'แผนงาน');
+  await waitFor(() => expect(title).toHaveValue('แผนงาน'));
   await user.click(screen.getByRole('button', { name: en['chat.create'] }));
+  await waitFor(() => expect(calls.callsTo(`POST ${BASE}/threads`)).toHaveLength(1));
   expect(calls.callsTo(`POST ${BASE}/threads`)[0]!.body).toEqual({ space_id: SPACE, team_id: TEAM, title: 'แผนงาน' });
   expect(await screen.findByRole('heading', { level: 1, name: 'แผนงาน' })).toBeVisible();
   expect(window.location.pathname).toBe('/chat/thread-new');

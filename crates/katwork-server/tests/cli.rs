@@ -20,6 +20,40 @@ fn server() -> Command {
 }
 
 #[test]
+fn server_forwards_llvm_profile_file() {
+    // Re-exec to set the parent environment without racing other tests.
+    if std::env::var_os("KATWORK_TEST_PROFILE_CHILD").is_some() {
+        let profile = std::env::var_os("LLVM_PROFILE_FILE").expect("parent sets a profile path");
+        assert_eq!(
+            server()
+                .get_envs()
+                .find(|(key, _)| *key == "LLVM_PROFILE_FILE")
+                .and_then(|(_, value)| value),
+            Some(profile.as_os_str()),
+        );
+        return;
+    }
+    let profile =
+        std::env::temp_dir().join(format!("katwork-test-{}-%p.profraw", uuid::Uuid::now_v7()));
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "server_forwards_llvm_profile_file",
+            "--nocapture",
+        ])
+        .env("KATWORK_TEST_PROFILE_CHILD", "1")
+        .env("LLVM_PROFILE_FILE", profile)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
 fn rejects_unknown_commands_and_extra_arguments() {
     for args in [
         vec!["unknown"],
@@ -1108,13 +1142,6 @@ async fn reset_link_for_an_unknown_email_is_not_found(pool: sqlx::PgPool) {
 async fn operator_commands_need_no_smtp_or_demo_mode(pool: sqlx::PgPool) {
     // `server()` clears the environment: no SMTP_* variables, no KATWORK_DEMO, no public URL.
     let command = server();
-    assert_eq!(
-        command
-            .get_envs()
-            .find(|(key, _)| *key == "LLVM_PROFILE_FILE")
-            .and_then(|(_, value)| value),
-        std::env::var_os("LLVM_PROFILE_FILE").as_deref(),
-    );
     for name in ["SMTP_HOST", "KATWORK_DEMO", "KATWORK_PUBLIC_URL"] {
         assert!(
             !command
