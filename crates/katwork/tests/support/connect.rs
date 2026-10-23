@@ -53,10 +53,13 @@ async fn connection_failure_fallback_recovers_a_redacted_cause() {
         _ => None,
     })
     .unwrap();
-    let error = tokio::time::timeout(Duration::from_secs(60), connect(&url))
-        .await
-        .expect("connection failure must finish")
-        .unwrap_err();
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_with(pool_options().acquire_timeout(Duration::from_secs(1)), &url),
+    )
+    .await
+    .expect("connection failure must finish")
+    .unwrap_err();
     assert_eq!(error.code(), "database_unavailable");
     let cause = error.source().unwrap();
     let database = cause
@@ -82,10 +85,13 @@ async fn connection_failure_fallback_recovers_a_redacted_cause() {
 async fn connection_failure_fallback_timeout_keeps_pool_cause() {
     use std::error::Error;
     let (url, attempts, _server) = failing_server(None).await;
-    let error = tokio::time::timeout(Duration::from_secs(60), connect(&url))
-        .await
-        .expect("fallback must stop even when the server never replies")
-        .unwrap_err();
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_with(pool_options().acquire_timeout(Duration::from_secs(1)), &url),
+    )
+    .await
+    .expect("fallback must stop even when the server never replies")
+    .unwrap_err();
     assert_eq!(error.code(), "database_unavailable");
     assert!(matches!(
         error.source().unwrap().downcast_ref::<sqlx::Error>(),
