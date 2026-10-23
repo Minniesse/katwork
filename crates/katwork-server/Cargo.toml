@@ -1,0 +1,16 @@
+[package]
+name = "katwork-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+katwork = { path = "../katwork" }
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tower.workspace = true

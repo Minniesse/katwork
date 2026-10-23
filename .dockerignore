@@ -1,0 +1,10 @@
+.git
+.superpowers
+target
+node_modules
+**/node_modules
+**/dist
+.env
+.env.*
+data
+*.log
