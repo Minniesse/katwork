@@ -8,3 +8,6 @@ node_modules
 .env.*
 data
 *.log
+.agents
+.claude
+.codex
