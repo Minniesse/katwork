@@ -9,6 +9,7 @@ use std::{
 
 use pulldown_cmark::{Event, Parser, Tag, TagEnd, TextMergeStream};
 use regex_syntax::hir::{Class, ClassUnicode, HirKind};
+use unicode_normalization::char::{canonical_combining_class, compose};
 use unicode_properties::{GeneralCategory, GeneralCategoryGroup, UnicodeGeneralCategory};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -89,33 +90,38 @@ pub fn resolve(body: &str, names: &[(KatId, &str)]) -> Vec<KatId> {
                         continue;
                     }
                     let mut prefix = Prefix::default();
+                    let mut tail_start = 0;
                     let mut tail = String::new();
                     let mut found = None;
                     for (start, cluster) in rest.grapheme_indices(true) {
                         let end = start + cluster.len();
-                        // Compatibility characters can compose across raw graphemes (e.g. ㄱ + ㅏ).
-                        // Only the last normalized grapheme is still mutable; commit everything before it.
-                        tail.push_str(cluster);
-                        let Some(left) = budget.checked_sub(tail.len()) else {
+                        let Some(chunk) = fold_with_budget(cluster, &mut budget) else {
                             return exhausted(body.len());
                         };
-                        budget = left;
-                        #[cfg(test)]
-                        tests::count_work(tail.len());
-                        let folded = fold_name(&tail);
-                        let Some(left) = budget.checked_sub(folded.len()) else {
-                            return exhausted(body.len());
-                        };
-                        budget = left;
-                        let split = folded
-                            .grapheme_indices(true)
-                            .next_back()
-                            .map_or(0, |(i, _)| i);
-                        if prefix.extend(&folded[..split], &trie).is_none() {
-                            break;
+                        // A non-mark starter that cannot compose seals the preceding raw suffix.
+                        // Repeated Hangul L/V jamo need not wait for a grapheme boundary.
+                        if chunk.chars().next().is_some_and(|first| {
+                            canonical_combining_class(first) == 0
+                                && first.general_category_group() != GeneralCategoryGroup::Mark
+                                && tail
+                                    .chars()
+                                    .next_back()
+                                    .is_none_or(|last| compose(last, first).is_none())
+                        }) {
+                            if prefix.extend(&tail, &trie).is_none() {
+                                break;
+                            }
+                            tail_start = start;
+                            tail = chunk;
+                        } else {
+                            // Retain raw input so each longer prefix reaches its own fixed point.
+                            let Some(folded) =
+                                fold_with_budget(&rest[tail_start..end], &mut budget)
+                            else {
+                                return exhausted(body.len());
+                            };
+                            tail = folded;
                         }
-                        tail.clear();
-                        tail.push_str(&folded[split..]);
                         let mut candidate = prefix.clone();
                         if !cluster.ends_with(char::is_whitespace)
                             && candidate.extend(&tail, &trie).is_some()
@@ -137,6 +143,15 @@ pub fn resolve(body: &str, names: &[(KatId, &str)]) -> Vec<KatId> {
         }
     }
     result
+}
+
+fn fold_with_budget(text: &str, budget: &mut usize) -> Option<String> {
+    *budget = budget.checked_sub(text.len())?;
+    #[cfg(test)]
+    tests::count_work(text.len());
+    let folded = fold_name(text);
+    *budget = budget.checked_sub(folded.len())?;
+    Some(folded)
 }
 
 fn exhausted(body_bytes: usize) -> Vec<KatId> {
@@ -204,6 +219,188 @@ mod tests {
         static WORK: Cell<usize> = const { Cell::new(0) };
     }
 
+    // Deliberately normalize each whole prefix, independently of the incremental trie walk.
+    fn reference(body: &str, names: &[(KatId, &str)]) -> Vec<KatId> {
+        let keys: Vec<_> = names
+            .iter()
+            .map(|(id, name)| (*id, name_key(name)))
+            .collect();
+        let mut result = Vec::new();
+        let mut in_code = false;
+        for event in TextMergeStream::new(Parser::new(body)) {
+            match event {
+                Event::Start(Tag::CodeBlock(_)) => in_code = true,
+                Event::End(TagEnd::CodeBlock) => in_code = false,
+                Event::Text(text) if !in_code => {
+                    let mut consumed = 0;
+                    for (at, _) in text.match_indices('@') {
+                        if at < consumed
+                            || text[..at].chars().next_back().is_some_and(|ch| {
+                                ch.is_ascii_alphanumeric() || "=/?&.:%+-_#~@".contains(ch)
+                            })
+                        {
+                            continue;
+                        }
+                        let rest = &text[at + 1..];
+                        if rest.starts_with(char::is_whitespace) {
+                            continue;
+                        }
+                        let mut found = None;
+                        for (start, cluster) in rest.grapheme_indices(true) {
+                            let end = start + cluster.len();
+                            if cluster.ends_with(char::is_whitespace)
+                                || !ends_mention(cluster, &rest[end..])
+                            {
+                                continue;
+                            }
+                            let key = name_key(&rest[..end]);
+                            if let Some((id, _)) = keys.iter().find(|(_, name)| *name == key) {
+                                found = Some((*id, end));
+                            }
+                        }
+                        if let Some((id, end)) = found {
+                            consumed = at + 1 + end;
+                            if !result.contains(&id) {
+                                result.push(id);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn mentions_match_whole_prefix_normalization() {
+        let atoms = [
+            "a",
+            "B",
+            "ß",
+            "é",
+            "\u{0308}",
+            "\u{0301}",
+            "ก",
+            "ข",
+            "\u{0e31}",
+            "\u{0e34}",
+            "\u{0e35}",
+            "\u{0e36}",
+            "\u{0e37}",
+            "\u{0e38}",
+            "\u{0e39}",
+            "\u{0e3a}",
+            "\u{0e47}",
+            "\u{0e48}",
+            "\u{0e49}",
+            "\u{0e4a}",
+            "\u{0e4b}",
+            "\u{0e4c}",
+            "\u{0e4d}",
+            "\u{0e4e}",
+            "\u{0300}",
+            "\u{0315}",
+            "\u{0323}",
+            "\u{0345}",
+            "\u{3099}",
+            "ㄱ",
+            "ㅏ",
+            "ㅋ",
+            "ㅎ",
+            "ㅠ",
+            "\u{1100}",
+            "\u{1161}",
+            "\u{11a8}",
+            "가",
+            "ﬃ",
+            "\u{fdfa}",
+            "\u{00a8}",
+            "🙏",
+            "👩‍💻",
+            "🇹🇭",
+            "🇺",
+            "🇸",
+            "1️⃣",
+            "1\u{fe0f}",
+            "1\u{fe0e}",
+            "©️",
+            " ",
+            "\t",
+            "\n",
+            "\r",
+            "\u{000b}",
+            "\u{000c}",
+            "\u{0085}",
+            "\u{00a0}",
+            "\u{1680}",
+            "\u{2000}",
+            "\u{2001}",
+            "\u{2002}",
+            "\u{2003}",
+            "\u{2004}",
+            "\u{2005}",
+            "\u{2006}",
+            "\u{2007}",
+            "\u{2008}",
+            "\u{2009}",
+            "\u{200a}",
+            "\u{2028}",
+            "\u{2029}",
+            "\u{202f}",
+            "\u{205f}",
+            "\u{3000}",
+            "\u{200b}",
+        ];
+        let mut seed = 0x6a09_e667_f3bc_c909_u64;
+        let mut pick = |bound| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as usize % bound
+        };
+        for case in 0..20_000 {
+            let mut literal = String::new();
+            for _ in 0..1 + pick(8) {
+                literal.push_str(atoms[pick(atoms.len())]);
+            }
+            // Keep the review shapes in the corpus, alongside random mixed-script strings.
+            if case % 100 == 0 {
+                literal = "ก\u{0e38}\u{0e34}\u{0e38}\u{3099}ข".into();
+            } else if case % 100 == 1 {
+                literal = "ß\u{0e38}\u{0308}\u{0e4e}\u{0e38}".into();
+            } else if case % 100 == 2 {
+                literal = "ก\u{0e38}\u{0e31}\u{3099}\u{0e31}".into();
+            } else if case % 100 == 3 {
+                literal = "ก\u{0e38}\u{0e34}\u{3099}\u{0e34}".into();
+            }
+            let once = fold_name(&literal);
+            assert_eq!(fold_name(&once), once, "case {case}: {literal:?}");
+            let folded = name_key(&literal);
+            let longer = format!("{literal} {}", atoms[pick(atoms.len())]);
+            let short = literal.graphemes(true).next().unwrap();
+            let roster = [
+                (KatId::new(), literal.as_str()),
+                (KatId::new(), folded.as_str()),
+                (KatId::new(), longer.as_str()),
+                (KatId::new(), short),
+                (KatId::new(), "Writer"),
+            ];
+            let spelling = [literal.as_str(), folded.as_str(), longer.as_str()][pick(3)];
+            let prefix = ["", "ถาม", "x", "?u=", " "][pick(5)];
+            let body = format!(
+                "@Writer {prefix}@{spelling}{} @{} `@Writer`",
+                atoms[pick(atoms.len())],
+                literal
+            );
+            assert_eq!(
+                resolve(&body, &roster),
+                reference(&body, &roster),
+                "case {case}: {body:?}; {roster:?}"
+            );
+        }
+    }
+
     #[test]
     fn mention_budget_warning_is_rate_limited() {
         let last = AtomicU64::new(0);
@@ -222,8 +419,8 @@ mod tests {
 
     #[test]
     fn mentions_exhausted_budget_returns_no_partial_mentions() {
-        // Fullwidth @ is a valid compatibility form in a name; these prefixes overlap.
-        let name = format!("a {}z", "＠a ".repeat(39));
+        // Deliberately bypass name validation to exercise exhaustion with overlapping prefixes.
+        let name = format!("a {}z", "＠a ".repeat(79));
         let body = format!("@Done {}", "@a ".repeat(10_000));
         let roster = [(KatId::new(), "Done"), (KatId::new(), name.as_str())];
         WORK.with(|work| work.set(0));

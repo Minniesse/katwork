@@ -180,6 +180,52 @@ fn mentions_normalization_can_compose_across_raw_graphemes() {
 }
 
 #[test]
+fn mentions_mixed_thai_marks_keep_the_literal_recipient() {
+    let a = "ก\u{0e38}\u{0e34}\u{0e38}\u{3099}ข";
+    let b = "ก\u{0e34}\u{3099}\u{0e38}ข";
+    check(&format!("@{a}"), &[a, b], &[0]);
+    check(&format!("@{a}"), &[a], &[0]);
+}
+
+#[test]
+fn mentions_mixed_thai_marks_share_one_fixed_point() {
+    for spellings in [
+        [
+            "ก\u{0e38}\u{0e31}\u{3099}\u{0e31}",
+            "ก\u{0e31}\u{3099}\u{0e38}\u{0e31}",
+            "ก\u{0e31}\u{3099}\u{0e31}\u{0e38}",
+        ],
+        [
+            "ก\u{0e38}\u{0e34}\u{3099}\u{0e34}",
+            "ก\u{0e34}\u{3099}\u{0e38}\u{0e34}",
+            "ก\u{0e34}\u{3099}\u{0e34}\u{0e38}",
+        ],
+    ] {
+        for name in spellings {
+            for spelling in spellings {
+                check(&format!("@{spelling}"), &[name], &[0]);
+            }
+        }
+    }
+}
+
+#[test]
+fn mentions_survive_long_compatibility_hangul_tails() {
+    for jamo in ['ㅋ', 'ㅎ', 'ㅠ'] {
+        check(
+            &format!("@Writer {}", jamo.to_string().repeat(300)),
+            &["Writer"],
+            &[0],
+        );
+        check(
+            &format!("@Writer hi @{}", jamo.to_string().repeat(150)),
+            &["Writer"],
+            &[0],
+        );
+    }
+}
+
+#[test]
 fn mentions_resolve_long_whitespace_runs_within_normalized_bound() {
     let body = format!("@AI{}Writer", " ".repeat(30_000));
     check(&body, &["AI", "AI Writer"], &[1]);
