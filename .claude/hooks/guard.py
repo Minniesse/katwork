@@ -83,11 +83,12 @@ class Command:
     """A simple command: its words, plus what it reads on stdin from heredocs
     and here-strings."""
 
-    __slots__ = ("words", "stdin", "stdin_files")
+    __slots__ = ("words", "stdin", "stdin_dynamic", "stdin_files")
 
     def __init__(self):
         self.words = []
         self.stdin = []
+        self.stdin_dynamic = []  # per stdin text: True if the shell expands it ($(...), $VAR)
         self.stdin_files = []  # targets of < redirections
 
 
@@ -188,6 +189,7 @@ def parse(s):
             cmd.stdin_files.append(text)
         elif redirect == "<<<":
             cmd.stdin.append(text)
+            cmd.stdin_dynamic.append(dynamic)
         redirect = None
         word, has_word, dynamic, word_quoted = [], False, False, False
 
@@ -354,6 +356,8 @@ def parse(s):
         op = next((o for o in OPERATORS if s.startswith(o, i)), None)
         if op:
             if op in ("|", "|&"):
+                if not cmd.words and not cmd.stdin and not pipeline:
+                    cmd.words.append(Word("(subshell)", True))  # `( ... ) |`: output unknown
                 end_command()
             else:
                 end_pipeline()
@@ -372,6 +376,7 @@ def parse(s):
     if heredocs:  # bodies never terminated: treat everything after as the body
         for delim, _, quoted, owner in heredocs:
             owner.stdin.append("")
+            owner.stdin_dynamic.append(False)
     return out
 
 
@@ -388,6 +393,7 @@ def read_heredoc_bodies(s, i, heredocs, out):
             lines.append(check)
         body = "\n".join(lines)
         owner.stdin.append(body)
+        owner.stdin_dynamic.append(not quoted and ("$" in body or "`" in body))
         if not quoted:  # an unquoted delimiter expands $(...) and backticks in the body
             try:
                 out.subs.extend(parse_substitutions(body))
@@ -612,42 +618,103 @@ def check_script(text, cwd, depth=0):
     for pipeline in parsed.pipelines:
         for k, cmd in enumerate(pipeline):
             feeds_shell = any(is_stdin_shell(later, depth) for later in pipeline[k + 1 :])
-            stdin = stdin_of(cmd, pipeline[k - 1] if k else None, cwd, depth)
+            stdin = stdin_of(pipeline, k, cwd, depth)
             cwd = check_command(cmd, cwd, depth, feeds_shell, shell_vars, stdin)
     return cwd
 
 
-def stdin_of(cmd, previous, cwd, depth):
-    """What a command reads on stdin, as (texts, complete). complete is False
-    when some of it can't be seen: a file that can't be read, or a pipe from a
-    program whose output isn't known."""
-    texts, complete = list(cmd.stdin), True
+def stdin_of(pipeline, k, cwd, depth):
+    """What pipeline[k] reads on stdin, as (texts, complete). complete is False
+    when some of it can't be seen: a file that can't be read, or output from a
+    program the guard can't predict."""
+    cmd = pipeline[k]
+    texts, complete = [], True
+    for n, text in enumerate(cmd.stdin):
+        dyn = cmd.stdin_dynamic[n] if n < len(cmd.stdin_dynamic) else False
+        t, c = resolve_text(text, dyn, cwd, depth)
+        texts, complete = texts + t, complete and c
     for path in cmd.stdin_files:
-        body = read_script_file(path, cwd)
-        if body is None:
-            complete = False
-        else:
-            texts.append(body)
-    if previous is not None:
-        argv, _, _, _ = unwrap(previous.words, depth)
-        producer = program_name(argv[0].text) if argv else ""
-        if producer in ("echo", "printf"):
-            texts.append(" ".join(w.text for w in argv[1:]))
-        elif producer == "cat":
-            texts.extend(previous.stdin)
-            for w in argv[1:]:
-                body = None if w.dynamic or w.text.startswith("-") else read_script_file(w.text, cwd)
-                if body is None:
-                    complete = False
-                else:
-                    texts.append(body)
-        else:
-            complete = False
+        t, c = redirect_input(path, cwd, depth)
+        texts, complete = texts + t, complete and c
+    if k > 0:
+        t, c = output_of(pipeline, k - 1, cwd, depth)
+        texts, complete = texts + t, complete and c
+    return texts, complete
+
+
+def output_of(pipeline, k, cwd, depth):
+    """What pipeline[k] prints, for the commands whose output is predictable:
+    echo, printf, and cat or tee passing on files and their own stdin."""
+    argv, _, _, _ = unwrap(pipeline[k].words, depth)
+    producer = program_name(argv[0].text) if argv else ""
+    if producer in ("echo", "printf"):
+        return [" ".join(w.text for w in argv[1:])], True
+    if producer not in ("cat", "tee"):
+        return [], False
+    operands = [w for w in argv[1:] if w.text == "-" or not w.text.startswith("-")]
+    texts, complete = [], True
+    if producer == "tee" or not operands or any(w.text == "-" for w in operands):
+        texts, complete = stdin_of(pipeline, k, cwd, depth)
+    if producer == "cat":
+        for w in operands:
+            if w.text == "-":
+                continue
+            body = None if w.dynamic else read_script_file(w.text, cwd)
+            if body is None:
+                complete = False
+            else:
+                texts.append(body)
+    return texts, complete
+
+
+def redirect_input(target, cwd, depth):
+    """The contents behind `< target` or `--input target`: a file, or a
+    process substitution <(...)."""
+    if target.startswith("<(") and target.endswith(")"):
+        return script_output(target[2:-1], cwd, depth + 1)
+    body = read_script_file(target, cwd)
+    return ([body], True) if body is not None else ([], False)
+
+
+def resolve_text(text, dynamic, cwd, depth):
+    """A word or heredoc body as the shell will expand it, as (texts, complete).
+    Command substitutions with predictable output are added as that output;
+    any other expansion ($VAR, ${...}) makes it incomplete."""
+    if not dynamic:
+        return [text], True
+    try:
+        subs = parse_substitutions(text)
+    except ParseError:
+        return [text], False
+    texts, complete, rest = [text], True, text
+    for inner in subs:
+        t, c = script_output(inner, cwd, depth + 1)
+        texts, complete = texts + t, complete and c
+        rest = rest.replace("$(" + inner + ")", "").replace("`" + inner + "`", "")
+    if "$" in rest or "`" in rest:
+        complete = False
+    return texts, complete
+
+
+def script_output(text, cwd, depth):
+    """What a script prints, when the last command of each pipeline is predictable."""
+    if depth > MAX_DEPTH:
+        return [], False
+    try:
+        parsed = parse(text)
+    except ParseError:
+        return [], False
+    texts, complete = [], True
+    for pipeline in parsed.pipelines:
+        t, c = output_of(pipeline, len(pipeline) - 1, cwd, depth)
+        texts, complete = texts + t, complete and c
     return texts, complete
 
 
 def read_script_file(path, cwd):
-    full = os.path.join(cwd, os.path.expanduser(path))
+    full = os.path.realpath(os.path.join(cwd, os.path.expanduser(path)))
+    if full.startswith(("/dev/", "/proc/")):
+        return None  # devices and the hook's own stdin are never a script
     try:
         if os.path.isfile(full) and os.path.getsize(full) <= MAX_SCRIPT_BYTES:
             with open(full, "r", errors="replace") as f:
@@ -1172,15 +1239,19 @@ GH_API_VALUE_FLAGS = {
 
 def split_api_flag(arg):
     """(flag, attached value or None) for a gh api option that takes a value,
-    in any spelling: -fkey=v, -f=key=v, --raw-field=key=v, -XPUT."""
+    in any spelling: -fkey=v, -f=key=v, --raw-field=key=v, -XPUT, and POSIX
+    short clusters such as -iXPUT, where boolean flags come first."""
     if arg.startswith("--"):
         name, eq, value = arg.partition("=")
         return (name, value if eq else None) if name in GH_API_VALUE_FLAGS else (None, None)
-    if arg.startswith("-") and len(arg) >= 2 and arg[:2] in GH_API_VALUE_FLAGS:
-        rest = arg[2:]
-        if not rest:
-            return arg[:2], None
-        return arg[:2], rest[1:] if rest.startswith("=") else rest
+    if arg.startswith("-") and len(arg) >= 2:
+        for k in range(1, len(arg)):
+            flag = "-" + arg[k]
+            if flag in GH_API_VALUE_FLAGS:
+                rest = arg[k + 1 :]
+                if not rest:
+                    return flag, None
+                return flag, rest[1:] if rest.startswith("=") else rest
     return None, None
 
 
@@ -1207,8 +1278,12 @@ def json_strings(text):
     return " ".join(found)
 
 
+STDIN_PATHS = {"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"}
+
+
 def check_gh_api(args, cwd, stdin=([], True)):
-    method, endpoint, writes, bodies, unreadable = None, None, False, [], False
+    method, endpoint, writes, unreadable = None, None, False, False
+    bodies = []  # (text, dynamic) pieces of the request body
     stdin_texts, stdin_complete = stdin
     i = 0
     while i < len(args):
@@ -1219,8 +1294,10 @@ def check_gh_api(args, cwd, stdin=([], True)):
                 endpoint = args[i]
             i += 1
             continue
+        dynamic = args[i].dynamic
         if value is None:
             value = args[i + 1].text if i + 1 < len(args) else ""
+            dynamic = args[i + 1].dynamic if i + 1 < len(args) else False
             i += 1
         i += 1
         kind = GH_API_VALUE_FLAGS[flag]
@@ -1231,26 +1308,30 @@ def check_gh_api(args, cwd, stdin=([], True)):
             continue
         writes = True  # any field or input body makes gh send a POST by default
         if kind == "field":
-            bodies.append(value)
+            bodies.append((value, dynamic))
             source = value.split("=", 1)[1] if "=" in value else ""
             if flag in ("-f", "--raw-field") or not source.startswith("@"):
                 continue
             source = source[1:]
         else:
             source = value
-        if source == "-":
-            bodies.extend(stdin_texts)
+        if source in STDIN_PATHS:
+            bodies.extend((t, False) for t in stdin_texts)
             unreadable = unreadable or not stdin_complete
+        elif dynamic and not source.startswith("<("):
+            unreadable = True
         else:
-            body = read_script_file(source, cwd)
-            if body is None:
-                unreadable = True
-            else:
-                bodies.append(body)
+            t, c = redirect_input(source, cwd, 0)
+            bodies.extend((x, False) for x in t)
+            unreadable = unreadable or not c
     if endpoint is None:
         return
     if endpoint.text == "graphql":
-        text = " ".join(bodies + [json_strings(b) for b in bodies])
+        texts = []
+        for body, dynamic in bodies:
+            t, c = resolve_text(body, dynamic, cwd, 0)
+            texts, unreadable = texts + t, unreadable or not c
+        text = " ".join(texts + [json_strings(b) for b in texts])
         if GRAPHQL_WRITES.search(text):
             raise Blocked("GraphQL mutations that merge PRs or move refs are blocked. Use `gh pr merge --merge`.")
         if unreadable:
@@ -1541,6 +1622,21 @@ def self_test():
         "echo '{\"query\": \"mutation { updateRef(input: {}) { clientMutationId } }\"}' | gh api graphql --input -",
         "gh api graphql --input missing.json", "cat missing.json | gh api graphql --input -", "some-tool | gh api graphql --input -",
         "gh api graphql -F query=@missing.graphql",
+        # short-flag clusters and cat redirects (final review)
+        "gh api repos/o/r/pulls/28/merge -iXPUT", "gh api repos/o/r/merges -ifbase=main -ifhead=feature",
+        "gh api repos/o/r/git/refs/heads/main -iXDELETE", "gh api repos/o/r/merges -iFbase=main",
+        "gh api -iX PUT repos/o/r/pulls/1/merge", "gh api repos/o/r/pulls/1/merge -iX=PUT",
+        "gh api repos/o/r/pulls/1/merge -iXput", "gh api repos/o/r/merges -if base=main",
+        "cat < mutation.json | gh api graphql --input -", "cat mutation.json | cat | gh api graphql --input -",
+        "gh api graphql --input - < <(cat mutation.json)", "cat < mutation.json | tee /dev/null | gh api graphql --input -",
+        "cat <<'EOF' | cat | gh api graphql --input -\n{\"query\": \"mutation { deleteRef(input: {}) { clientMutationId } }\"}\nEOF",
+        "gh api graphql --input - < <(some-tool)", "gh api graphql --input - < <(cat missing.json)",
+        "cat - < mutation.json | gh api graphql --input -", "gh api graphql -F query=@- < <(echo 'mutation { updateRef(input: {}) { x } }')",
+        "gh api graphql --input /dev/stdin < mutation.json", "gh api graphql --input <(cat mutation.json)",
+        "(cat mutation.json) | gh api graphql --input -", "{ cat mutation.json; } | gh api graphql --input -",
+        "gh api graphql --input - <<< \"$(cat mutation.json)\"", "gh api graphql -f query=\"$(cat mutation.json)\"",
+        "gh api graphql -f query=\"$Q\"", "gh api graphql --input - <<EOF\n$(cat mutation.json)\nEOF",
+        "gh api graphql --input - < \"$F\"", "gh api -iXPOST repos/o/r/merges", "gh api repos/o/r/merges -iHAccept:x -fbase=main",
         # a later negation cancels a dry run (re-review finding 9)
         "git push --dry-run --no-dry-run origin main", "git push -n --no-dry-run origin main",
         "git push --dry-run --no-dry origin main", "git push --dry-run --all --no-dry-run origin",
@@ -1572,6 +1668,13 @@ def self_test():
         "gh repo sync", "gh issue list", "gh pr review 12 --comment --body-file r.md",
         "gh api graphql --input - <<'EOF'\n{\"query\": \"query { viewer { login } }\"}\nEOF",
         "gh api graphql -f query='query { repository(owner: \"o\", name: \"r\") { id } }'", "gh api graphql --input query.json",
+        "cat < query.json | gh api graphql --input -", "cat query.json | cat | gh api graphql --input -",
+        "gh api graphql --input - < <(cat query.json)", "gh api -i repos/o/r/pulls/1", "gh api repos/o/r/pulls/1 -iq .title",
+        "gh api -iXGET repos/o/r/pulls/1/merge",
+        "gh api graphql --input /dev/stdin < query.json", "gh api graphql --input <(cat query.json)",
+        "gh api graphql --input - <<< \"$(cat query.json)\"", "gh api graphql -f query=\"$(cat query.json)\"",
+        "gh api graphql -f query='query($n: Int!) { viewer { login } }' -F n=1", "gh api repos/o/r/merges -iHx",
+        "gh api repos/o/r/pulls -ifstate=open --method GET",
         "cat query.json | gh api graphql --input -", "gh api repos/o/r/pulls -q '.[].number'", "gh api -H 'Accept: x' repos/o/r",
         "gh pr create --body-file - <<'EOF'\nWe never call mergePullRequest or updateRef here.\nEOF",
         "gh pr review 12 --comment --body-file - <<'EOF'\nThe guard blocks deleteRef.\nEOF",

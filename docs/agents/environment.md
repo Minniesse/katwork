@@ -66,7 +66,10 @@ These ways around the guard are known and accepted, because only someone deliber
 - unusual push configuration (`--repo` combined with `remote.<name>.push`, a configured `:` matching refspec)
 - command substitutions nested in parameter or arithmetic expansions, and `function` bodies
 - destructive options passed through variables, or abbreviated (`git clean --for`)
+- files written earlier in the same command line: the guard reads a request body or script before the command runs
 - code the guard can't read: compiled programs, other languages, a fresh shell or login
+
+A GraphQL request body the guard can't resolve is refused rather than accepted. It resolves inline queries, files, heredocs, here-strings, `$(cat file)`, and pipes from `cat`, `tee`, `echo` or `printf`; output from any other program counts as unresolved.
 
 Fix a hole when an agent could plausibly fall into it by mistake; otherwise leave it to the ruleset.
 
