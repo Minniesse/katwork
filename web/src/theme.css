@@ -1,0 +1,76 @@
+/*
+ * KatWork colour tokens. `npm run check:contrast` reads this file: every --text* token must
+ * reach 4.5:1 on --bg and every --surface* token, each --on-X token 4.5:1 on --X, and --focus
+ * and --border-strong 3:1 on every surface, in both themes. Only hex values are checked.
+ * public/theme-init.js sets data-theme before first paint.
+ */
+:root {
+  --bg: #f3f6ff;
+  --surface: #ffffff;
+  --surface-sunken: #e7edff;
+  --surface-accent: #fff2c4;
+  --surface-danger: #fdeceb;
+  --text: #121c3d;
+  --text-muted: #48557c;
+  --text-link: #1d47b8;
+  --text-danger: #a3201b;
+  --brand: #1d47b8;
+  --on-brand: #ffffff;
+  --primary: #1d47b8;
+  --on-primary: #ffffff;
+  --accent: #ffc93c;
+  --on-accent: #121c3d;
+  --border: #d3dbf3;
+  --border-strong: #6876a3;
+  --focus: #1d47b8;
+  --dot-lead: #ffc93c;
+  --dot-a: #ffffff;
+  --dot-b: #8fb0ff;
+  --dot-c: #ffe08a;
+  --dot-d: #5b8cff;
+  --dot-e: #c9d8ff;
+  --shadow: 0 1px 2px rgb(18 28 61 / 8%), 0 8px 24px rgb(18 28 61 / 8%);
+}
+
+:root[data-theme='dark'] {
+  --bg: #0d1430;
+  --surface: #151f45;
+  --surface-sunken: #0a1027;
+  --surface-accent: #3a3215;
+  --surface-danger: #3d1619;
+  --text: #eef2ff;
+  --text-muted: #b3bee0;
+  --text-link: #a3c0ff;
+  --text-danger: #ffa49c;
+  --brand: #18275e;
+  --on-brand: #f4f6ff;
+  --primary: #a3c0ff;
+  --on-primary: #0d1430;
+  --accent: #ffd45c;
+  --on-accent: #0d1430;
+  --border: #2b386a;
+  --border-strong: #8794c0;
+  --focus: #ffd45c;
+  --dot-lead: #ffd45c;
+  --dot-a: #eef2ff;
+  --dot-b: #5b8cff;
+  --dot-c: #ffe08a;
+  --dot-d: #8fb0ff;
+  --dot-e: #34478f;
+  --shadow: 0 1px 2px rgb(0 0 0 / 30%), 0 8px 24px rgb(0 0 0 / 30%);
+  color-scheme: dark;
+}
+
+:root {
+  color-scheme: light;
+  --font: 'Nunito Variable', 'Noto Sans Thai Looped Variable', system-ui, sans-serif;
+  --radius-field: 0.75rem;
+  --radius-panel: 1.5rem;
+  /* A 1.25 modular scale on a 1rem base. */
+  --step--1: 0.8rem;
+  --step-0: 1rem;
+  --step-1: 1.25rem;
+  --step-2: 1.5625rem;
+  --step-3: 1.953rem;
+  --step-4: 2.441rem;
+}
