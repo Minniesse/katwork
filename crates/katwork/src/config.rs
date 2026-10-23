@@ -144,12 +144,12 @@ fn replace_secrets(message: &str, secrets: Vec<String>) -> String {
 fn database_secrets(database_url: &str) -> Option<Vec<String>> {
     let url = parse_log_url(database_url, true)?;
     let mut secrets = vec![database_url.to_owned()];
-    if let Some((_, authority)) = database_url.split_once("://") {
-        if let Some((userinfo, _)) = authority.rsplit_once('@') {
-            secrets.push(userinfo.to_owned());
-            if let Some((_, password)) = userinfo.split_once(':') {
-                secrets.push(password.to_owned());
-            }
+    if let Some((_, authority)) = database_url.split_once("://")
+        && let Some((userinfo, _)) = authority.rsplit_once('@')
+    {
+        secrets.push(userinfo.to_owned());
+        if let Some((_, password)) = userinfo.split_once(':') {
+            secrets.push(password.to_owned());
         }
     }
     if let Some(password) = url.password() {
@@ -161,10 +161,10 @@ fn database_secrets(database_url: &str) -> Option<Vec<String>> {
         .map(|(_, rest)| rest.split('#').next().unwrap());
     for query in [raw_query, url.query()].into_iter().flatten() {
         for pair in query.split('&') {
-            if let Some((key, value)) = pair.split_once('=') {
-                if secret_query_value(key, value) {
-                    secrets.push(value.to_owned());
-                }
+            if let Some((key, value)) = pair.split_once('=')
+                && secret_query_value(key, value)
+            {
+                secrets.push(value.to_owned());
             }
         }
         secrets.extend(

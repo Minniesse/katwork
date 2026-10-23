@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::{body::Body, http::Request};
+use katwork::runtime::Core;
 use katwork_server::{
     app::{AppState, build_router},
     config::Config,
@@ -12,7 +13,7 @@ use tower::ServiceExt;
 async fn health_returns_ok_and_version() {
     let config = Config::from_lookup(|name| match name {
         "DATABASE_URL" => Some("postgres://localhost/katwork".into()),
-        "KATWORK_SECRET" => Some("test-only-secret-at-least-32-bytes".into()),
+        "KATWORK_SECRET" => Some(uuid::Uuid::now_v7().to_string()),
         _ => None,
     })
     .unwrap();
@@ -20,8 +21,7 @@ async fn health_returns_ok_and_version() {
         .connect_lazy(&config.database_url)
         .unwrap();
     let app = build_router(AppState {
-        pool,
-        config: Arc::new(config),
+        core: Arc::new(Core::new(pool, Arc::new(config))),
     });
     let response = app
         .oneshot(

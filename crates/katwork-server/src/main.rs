@@ -1,11 +1,10 @@
-use std::{error::Error, process::ExitCode, sync::Arc, time::Duration};
+use std::{error::Error, process::ExitCode, sync::Arc};
 
-use katwork::error::KatError;
+use katwork::{db, error::KatError, runtime::Core};
 use katwork_server::{
     app::{AppState, build_router},
     config::{Config, redact_database_secrets},
 };
-use sqlx::{Connection, PgConnection, postgres::PgPoolOptions};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -50,29 +49,19 @@ async fn run() -> Result<(), KatError> {
     match command.as_str() {
         "serve" => {
             let config = Arc::new(Config::from_env()?);
-            let pool = match PgPoolOptions::new().connect(&config.database_url).await {
-                Ok(pool) => pool,
-                Err(mut error) => {
-                    if matches!(error, sqlx::Error::PoolTimedOut) {
-                        // The pool drops transient causes; one bounded attempt recovers them.
-                        if let Ok(Err(cause)) = tokio::time::timeout(
-                            Duration::from_secs(5),
-                            PgConnection::connect(&config.database_url),
-                        )
-                        .await
-                        {
-                            error = cause;
-                        }
-                    }
-                    return Err(KatError::DatabaseUnavailable(Box::new(error)));
-                }
-            };
+            let pool = db::connect(&config.database_url).await?;
+            let core = Arc::new(Core::new(pool, config));
             let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
-            axum::serve(listener, build_router(AppState { pool, config })).await?;
+            axum::serve(listener, build_router(AppState { core })).await?;
             Ok(())
         }
-        // Database migrations and demo data are wired in Tasks 2 and 3.
-        "migrate" | "seed-demo" => Ok(()),
+        "migrate" => {
+            let config = Config::from_env()?;
+            let pool = db::connect(&config.database_url).await?;
+            db::migrate(&pool).await
+        }
+        // Demo data is wired in Task 3.
+        "seed-demo" => Ok(()),
         _ => Err(KatError::CommandInvalid),
     }
 }
