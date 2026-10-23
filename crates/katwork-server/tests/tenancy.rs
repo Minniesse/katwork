@@ -542,7 +542,13 @@ async fn repository_space_create_and_workspace_pause_enforce_roles(pool: PgPool)
             },
         )
         .await;
-        let paused = workspaces::set_paused(&pool, &tenant, requested_pause).await;
+        let paused = workspaces::set_paused(
+            &pool,
+            &tenant,
+            requested_pause,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
         if role == "member" {
             assert_eq!(created.unwrap_err().code(), "forbidden");
             assert_eq!(paused.unwrap_err().code(), "forbidden");
@@ -732,7 +738,7 @@ async fn workspace_pause_locks_only_workspace_without_blocking_foreign_keys(pool
         .unwrap();
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        workspaces::set_paused(&pool, &tenant, true),
+        workspaces::set_paused(&pool, &tenant, true, std::time::Duration::from_secs(5)),
     )
     .await
     .expect("pause must not wait on foreign-key or child locks")

@@ -44,18 +44,26 @@ pub async fn list_for(pool: &PgPool, user_id: UserId) -> Result<Vec<WorkspaceSum
         .bind(user_id).fetch_all(pool).await?)
 }
 
-pub async fn set_paused(pool: &PgPool, tenant: &Tenant, paused: bool) -> Result<(), KatError> {
+pub async fn set_paused(
+    pool: &PgPool,
+    tenant: &Tenant,
+    paused: bool,
+    lock_timeout: std::time::Duration,
+) -> Result<(), KatError> {
     tenant.require_admin()?;
     crate::db::guarded(pool, async |conn| {
+        let mut tx = conn.begin().await?;
+        crate::db::set_lock_timeout(&mut tx, lock_timeout).await?;
         // A non-key update locks only this workspace and permits concurrent foreign-key checks.
         let result = sqlx::query("UPDATE workspaces SET paused = $2 WHERE id = $1")
             .bind(tenant.workspace_id())
             .bind(paused)
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await?;
         if result.rows_affected() == 0 {
             return Err(KatError::NotFound);
         }
+        tx.commit().await?;
         Ok(())
     })
     .await

@@ -471,6 +471,7 @@ async fn workspace_pause_waits_for_authorized_write(pool: PgPool) {
             &h.pool,
             &h.input.tenant,
             true,
+            std::time::Duration::from_secs(5),
         ));
         loop {
             tokio::select! {

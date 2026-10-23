@@ -48,13 +48,20 @@ pub async fn authenticate(pool: &PgPool, token: &str) -> Result<AuthUser, KatErr
     Ok(AuthUser { user_id })
 }
 
-pub async fn revoke(pool: &PgPool, token: &str) -> Result<(), KatError> {
+pub async fn revoke(
+    pool: &PgPool,
+    token: &str,
+    lock_timeout: std::time::Duration,
+) -> Result<(), KatError> {
     if !valid_token(token) {
         return Ok(());
     }
     crate::db::guarded(pool, async |conn| {
+        let mut tx = conn.begin().await?;
+        crate::db::set_lock_timeout(&mut tx, lock_timeout).await?;
         sqlx::query("UPDATE sessions SET revoked_at = clock_timestamp() WHERE token_sha256 = $1 AND revoked_at IS NULL")
-            .bind(token_hash(token)).execute(&mut *conn).await?;
+            .bind(token_hash(token)).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(())
     })
     .await

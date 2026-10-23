@@ -82,6 +82,12 @@ pub(crate) async fn set_paused(
 ) -> Result<Json<Value>, ApiError> {
     tenant.require_admin()?;
     let body = payload(Json::<Paused>::from_bytes(&body))?;
-    workspace::set_paused(&state.core.pool, &tenant, body.paused).await?;
+    workspace::set_paused(
+        &state.core.pool,
+        &tenant,
+        body.paused,
+        state.core.config.lock_timeout,
+    )
+    .await?;
     Ok(Json(json!({})))
 }

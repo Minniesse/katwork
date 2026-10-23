@@ -375,7 +375,9 @@ async fn stream_closes_after_session_revoked_or_member_removed(pool: PgPool) {
         let mut stream = s.stream(None).await;
         next(&mut stream).await;
         if revoke {
-            session::revoke(&pool, &s.token).await.unwrap();
+            session::revoke(&pool, &s.token, std::time::Duration::from_secs(5))
+                .await
+                .unwrap();
         } else {
             sqlx::query("DELETE FROM memberships WHERE workspace_id=$1 AND user_id=$2")
                 .bind(s.data.workspace)

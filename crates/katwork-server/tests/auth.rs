@@ -361,7 +361,9 @@ async fn public_session_interface_authenticates_and_revokes(pool: PgPool) {
             .user_id,
         UserId(id)
     );
-    session::revoke(&pool, &token.0).await.unwrap();
+    session::revoke(&pool, &token.0, std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
     assert_eq!(
         session::authenticate(&pool, &token.0)
             .await

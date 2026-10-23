@@ -303,7 +303,7 @@ pub(crate) async fn logout(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     if let Some(token) = session_cookie(&headers) {
-        session::revoke(&state.core.pool, token).await?;
+        session::revoke(&state.core.pool, token, state.core.config.lock_timeout).await?;
     }
     Ok((
         [(SET_COOKIE, cookie("", state.core.config.cookie_secure(), 0))],
