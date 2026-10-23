@@ -26,7 +26,7 @@ impl Server {
             Some(n) => vec![body[..n].to_vec(), body[n..].to_vec()],
             None => vec![body],
         };
-        Self::start(chunks, status, hold, "", Duration::from_millis(5)).await
+        Self::start(chunks, status, hold, "", Duration::from_millis(5), false).await
     }
     async fn start(
         chunks: Vec<Vec<u8>>,
@@ -34,6 +34,7 @@ impl Server {
         hold: bool,
         headers: &str,
         interval: Duration,
+        truncate: bool,
     ) -> Self {
         let headers = headers.to_owned();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -103,7 +104,9 @@ impl Server {
                 }
                 tokio::time::sleep(interval).await;
             }
-            let _ = socket.write_all(b"0\r\n\r\n").await;
+            if !truncate {
+                let _ = socket.write_all(b"0\r\n\r\n").await;
+            }
         });
         Self {
             url,
@@ -355,11 +358,6 @@ async fn unknown_events_are_ignored_by_every_adapter() {
         let server = Server::new(fixture(fixture_name), 200, None, false).await;
         let chunks = collect(&server.provider(api)).await;
         assert_eq!(turn(&chunks).content, expected);
-        assert!(
-            !chunks
-                .iter()
-                .any(|chunk| matches!(chunk, Ok(ChatChunk::Progress)))
-        );
     }
 }
 #[tokio::test]
@@ -683,7 +681,7 @@ async fn anthropic_http_status_and_retry_after_are_preserved() {
         let body =
             serde_json::to_vec(&json!({"type":"error","error":{"type":kind,"message":"fixture"}}))
                 .unwrap();
-        let server = Server::start(vec![body], status, false, headers, Duration::ZERO).await;
+        let server = Server::start(vec![body], status, false, headers, Duration::ZERO, false).await;
         assert_eq!(
             collect(&server.provider(None)).await.last(),
             Some(&Err(expected))
@@ -698,7 +696,7 @@ async fn provider_redirect_is_not_followed() {
         "Location: http://{}/redirected\r\n",
         target.local_addr().unwrap()
     );
-    let server = Server::start(vec![], 307, false, &headers, Duration::ZERO).await;
+    let server = Server::start(vec![], 307, false, &headers, Duration::ZERO, false).await;
     let chunks = tokio::time::timeout(
         Duration::from_secs(1),
         collect(&server.provider(Some(OpenAiApi::Chat))),
@@ -711,4 +709,162 @@ async fn provider_redirect_is_not_followed() {
             .await
             .is_err()
     );
+}
+
+// Exercise the Task 8 caller contract; the agent loop and its ledger land separately.
+async fn assert_failed_attempts(
+    body: Vec<u8>,
+    api: Option<OpenAiApi>,
+    truncate: bool,
+    expected: usize,
+) {
+    let mut charges = Vec::new();
+    let mut attempts = 0;
+    for _ in 0..2 {
+        let server =
+            Server::start(vec![body.clone()], 200, false, "", Duration::ZERO, truncate).await;
+        let provider = server.provider(api);
+        attempts += 1;
+        let chunks = collect(&provider).await;
+        assert!(server.request.lock().await.is_some());
+        assert_eq!(chunks.last(), Some(&Err(ModelError::ProviderUnavailable)));
+        assert!(
+            !chunks
+                .iter()
+                .any(|chunk| matches!(chunk, Ok(ChatChunk::ToolCall(_) | ChatChunk::Done { .. })))
+        );
+        let received_content = chunks.iter().any(|chunk| match chunk {
+            Ok(ChatChunk::TextDelta(text)) => !text.is_empty(),
+            Ok(ChatChunk::Progress | ChatChunk::ToolCall(_) | ChatChunk::Done { .. }) => true,
+            _ => false,
+        });
+        charges.push(request().input_charge_bound() + u64::from(request().max_output_tokens));
+        if received_content {
+            break;
+        }
+    }
+    assert_eq!(attempts, expected, "must not retry after content");
+    assert_eq!(charges.len(), expected, "one charge per attempted request");
+}
+
+#[tokio::test]
+async fn content_then_connection_failure_is_not_retried_or_double_charged() {
+    let arguments = String::from_utf8(fixture("chat_arguments.sse")).unwrap();
+    let arguments: String = arguments.split_inclusive("\n\n").take(2).collect();
+    for body in [
+        arguments.into_bytes(),
+        b"data: {\"id\":\"test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n".to_vec(),
+    ] {
+        assert_failed_attempts(body, Some(OpenAiApi::Chat), true, 1).await;
+    }
+}
+
+#[tokio::test]
+async fn tool_progress_then_provider_failure_is_not_retried_or_double_charged() {
+    assert_failed_attempts(fixture("anthropic_arguments_error.sse"), None, false, 1).await;
+    // The same overload before content still permits the caller's one retry.
+    assert_failed_attempts(fixture("anthropic_error.sse"), None, false, 2).await;
+}
+
+#[tokio::test]
+async fn anthropic_spend_cap_maps_to_quota() {
+    let server = Server::new(fixture("anthropic_spend_cap.json"), 429, None, false).await;
+    assert_eq!(
+        collect(&server.provider(None)).await.last(),
+        Some(&Err(ModelError::QuotaExceeded { resets_at: None }))
+    );
+}
+
+#[tokio::test]
+async fn anthropic_organization_spend_limit_maps_to_quota() {
+    let server = Server::new(
+        fixture("anthropic_organization_spend_limit.json"),
+        400,
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(
+        collect(&server.provider(None)).await.last(),
+        Some(&Err(ModelError::QuotaExceeded { resets_at: None }))
+    );
+}
+
+#[tokio::test]
+async fn anthropic_workspace_spend_limit_maps_to_quota() {
+    let server = Server::new(
+        fixture("anthropic_workspace_spend_limit.json"),
+        400,
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(
+        collect(&server.provider(None)).await.last(),
+        Some(&Err(ModelError::QuotaExceeded { resets_at: None }))
+    );
+}
+
+#[tokio::test]
+async fn anthropic_credit_balance_maps_to_quota() {
+    let server = Server::new(fixture("anthropic_credit_balance.json"), 400, None, false).await;
+    assert_eq!(
+        collect(&server.provider(None)).await.last(),
+        Some(&Err(ModelError::QuotaExceeded { resets_at: None }))
+    );
+}
+
+#[tokio::test]
+async fn anthropic_quota_matching_preserves_other_errors() {
+    for (status, kind, message, details, expected) in [
+        (
+            400,
+            "invalid_request_error",
+            "Invalid request: You have reached your specified API usage limits",
+            json!({}),
+            ModelError::Protocol("invalid_provider_response".into()),
+        ),
+        (
+            400,
+            "invalid_request_error",
+            "The request exceeds the maximum token count",
+            json!({}),
+            ModelError::Protocol("invalid_provider_response".into()),
+        ),
+        (
+            429,
+            "rate_limit_error",
+            "You have reached your specified API usage limits",
+            json!({}),
+            ModelError::RateLimited {
+                retry_after_secs: None,
+            },
+        ),
+        (
+            429,
+            "rate_limit_error",
+            "fixture",
+            json!({"error_code":"requests_per_minute"}),
+            ModelError::RateLimited {
+                retry_after_secs: None,
+            },
+        ),
+        (
+            401,
+            "authentication_error",
+            "fixture",
+            json!({"error_code":"enforced_spend_limit_reached"}),
+            ModelError::AuthFailed,
+        ),
+    ] {
+        let body = serde_json::to_vec(
+            &json!({"type":"error","error":{"type":kind,"message":message,"details":details}}),
+        )
+        .unwrap();
+        let server = Server::new(body, status, None, false).await;
+        assert_eq!(
+            collect(&server.provider(None)).await.last(),
+            Some(&Err(expected))
+        );
+    }
 }

@@ -74,7 +74,9 @@ pub struct ToolSpec {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatChunk {
-    /// Non-text content (part boundaries, reasoning or tool arguments); consumed by `guard_stream`.
+    /// Non-text content (part boundaries, reasoning or tool arguments).
+    /// `guard_stream` forwards this: callers must disable retries once content arrives,
+    /// including `Progress`, without emitting user text or executing a tool.
     Progress,
     TextDelta(String),
     ToolCall(ToolCall),

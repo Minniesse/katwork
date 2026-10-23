@@ -1,0 +1,8 @@
+{
+  "type": "error",
+  "error": {
+    "type": "invalid_request_error",
+    "message": "You have reached your specified API usage limits. Fixture access resumes next month."
+  },
+  "request_id": "fixture-request"
+}

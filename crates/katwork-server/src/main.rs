@@ -52,16 +52,8 @@ fn error_report(error: &KatError, config: Option<&Config>, database_url: Option<
 }
 
 fn dependency_log_allowed(metadata: &tracing::Metadata<'_>) -> bool {
-    // SQLx's config parser logs unrecognized option values, including secrets, at WARN.
-    if metadata.target().starts_with("sqlx") {
-        return false;
-    }
-    // More specific RUST_LOG directives must not enable Rig's prompt traces.
-    !(metadata.target().starts_with("rig")
-        && matches!(
-            *metadata.level(),
-            tracing::Level::DEBUG | tracing::Level::TRACE
-        ))
+    // SQLx logs secret options and Rig logs provider messages, even at WARN.
+    !metadata.target().starts_with("sqlx") && !metadata.target().starts_with("rig")
 }
 
 async fn run() -> Result<(), KatError> {
@@ -129,10 +121,110 @@ mod tests {
         tracing::trace!(target: "rig::completions", "private prompt");
         tracing::debug!(target: "rig_core::completions", "private response");
         tracing::warn!(target: "sqlx_postgres::options::parse", "private database option");
-        tracing::info!(target: "rig::completions", "safe status");
+        tracing::warn!(target: "rig_core::providers", "private provider message");
+        tracing::error!(target: "rig::providers", "private provider body");
+        tracing::info!(target: "katwork", "safe status");
         let logged = String::from_utf8(output.lock().unwrap().clone()).unwrap();
         assert!(logged.contains("safe status"));
         assert!(!logged.contains("private"));
+    }
+
+    #[tokio::test]
+    async fn provider_error_messages_never_reach_server_logs() {
+        use katwork::{config::ProviderEnv, models::*};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+        for filter in ["info,rig=info", "trace,rig_core=trace"] {
+            for status in [200, 503] {
+                let secret = format!("fixture-sensitive-{}", uuid::Uuid::now_v7());
+                let body = serde_json::json!({"error": {
+                    "type": "server_error", "message": secret
+                }})
+                .to_string();
+                let body = if status == 200 {
+                    format!("data: {body}\n\n")
+                } else {
+                    body
+                };
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let mut socket = BufReader::new(socket);
+                    let mut content_length = 0;
+                    loop {
+                        let mut line = String::new();
+                        assert!(socket.read_line(&mut line).await.unwrap() > 0);
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            content_length = value.trim().parse::<usize>().unwrap();
+                        }
+                    }
+                    socket
+                        .read_exact(&mut vec![0; content_length])
+                        .await
+                        .unwrap();
+                    socket.write_all(format!(
+                        "HTTP/1.1 {status} fixture\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nx-request-id: fixture-request\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    ).as_bytes()).await.unwrap();
+                });
+                let output = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+                let subscriber = tracing_subscriber::registry()
+                    .with(tracing_subscriber::EnvFilter::new(filter))
+                    .with(tracing_subscriber::filter::filter_fn(
+                        dependency_log_allowed,
+                    ))
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .without_time()
+                            .with_ansi(false)
+                            .with_writer({
+                                let output = output.clone();
+                                move || Capture(output.clone())
+                            }),
+                    );
+                let _guard = subscriber.set_default();
+                let provider = RigProvider::openai(
+                    &ProviderEnv {
+                        api_key: uuid::Uuid::now_v7().to_string(),
+                        base_url: Some(format!("http://{address}")),
+                    },
+                    "fixture",
+                    OpenAiApi::Chat,
+                )
+                .unwrap();
+                let mut stream = provider
+                    .stream(ChatRequest {
+                        system: "fixture".into(),
+                        messages: vec![],
+                        tools: vec![],
+                        max_output_tokens: 10,
+                        temperature: None,
+                    })
+                    .await
+                    .unwrap();
+                let result = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await;
+                assert_eq!(result, Some(Err(ModelError::ProviderUnavailable)));
+                server.await.unwrap();
+                let logged = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+                assert!(
+                    !logged.contains(&secret),
+                    "provider body leaked through {filter}"
+                );
+                assert!(logged.contains("provider_unavailable"), "{logged}");
+                assert!(logged.contains("error_body_bytes="), "{logged}");
+                if status == 503 {
+                    assert!(logged.contains("status=503"), "{logged}");
+                    assert!(logged.contains("fixture-request"), "{logged}");
+                }
+            }
+        }
     }
 
     #[test]

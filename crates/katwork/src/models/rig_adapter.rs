@@ -577,6 +577,25 @@ fn validate_wire_ids(raw: &serde_json::Value, provider_id: &str) -> Result<(), M
     Ok(())
 }
 fn model_error(error: ProviderError, phase: TimeoutPhase) -> ModelError {
+    let classified = classify_error(&error, phase);
+    let request_id = error
+        .provider_response_headers()
+        .and_then(|headers| {
+            headers
+                .get("request-id")
+                .or_else(|| headers.get("x-request-id"))
+        })
+        .and_then(|value| value.to_str().ok());
+    tracing::warn!(
+        error_kind = %classified,
+        status = error.provider_response_status().map(|status| status.as_u16()),
+        provider_request_id = request_id,
+        error_body_bytes = error.provider_response_body().map(str::len),
+        "model_provider_error"
+    );
+    classified
+}
+fn classify_error(error: &ProviderError, phase: TimeoutPhase) -> ModelError {
     if let ProviderError::Http(http) = &error {
         let mut source: Option<&(dyn std::error::Error + 'static)> = Some(http.as_ref());
         while let Some(cause) = source {
@@ -617,10 +636,34 @@ fn model_error(error: ProviderError, phase: TimeoutPhase) -> ModelError {
     {
         return ModelError::AuthFailed;
     }
-    if matches!(
-        code,
-        "insufficient_quota" | "quota_exceeded" | "billing_error" | "credit_balance_too_low"
-    ) {
+    // Anthropic encodes spend caps as rate limits or invalid requests, not billing_error.
+    let spend_cap = status == Some(429)
+        && code == "rate_limit_error"
+        && detail
+            .pointer("/details/error_code")
+            .and_then(|v| v.as_str())
+            == Some("enforced_spend_limit_reached");
+    let exhausted_balance = status == Some(400)
+        && code == "invalid_request_error"
+        && detail
+            .get("message")
+            .and_then(|v| v.as_str())
+            .is_some_and(|message| {
+                [
+                    "You have reached your specified API usage limits",
+                    "You have reached your specified workspace API usage limits",
+                    "Your credit balance is too low to access the Anthropic API.",
+                ]
+                .iter()
+                .any(|prefix| message.starts_with(prefix))
+            });
+    if spend_cap
+        || exhausted_balance
+        || matches!(
+            code,
+            "insufficient_quota" | "quota_exceeded" | "billing_error" | "credit_balance_too_low"
+        )
+    {
         return ModelError::QuotaExceeded { resets_at: None };
     }
     if status == Some(429) || matches!(code, "rate_limit_error" | "rate_limit_exceeded") {
@@ -758,7 +801,7 @@ mod tests {
             1
         );
         assert!(
-            !chunks
+            chunks
                 .iter()
                 .any(|chunk| matches!(chunk, Ok(ChatChunk::Progress)))
         );

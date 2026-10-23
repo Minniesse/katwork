@@ -16,6 +16,7 @@ impl Default for StreamTimeouts {
     }
 }
 /// Poll-owned deadlines: dropping the wrapper drops the network operation.
+/// Forwards `Progress` so callers disable retries after non-text content too.
 pub fn guard_stream(
     mut inner: BoxStream<'static, Result<ChatChunk, ModelError>>,
     t: StreamTimeouts,
@@ -51,7 +52,6 @@ pub fn guard_stream(
                 deadline = tokio::time::Instant::now() + t.idle;
             }
             match chunk {
-                Ok(ChatChunk::Progress) => continue,
                 Ok(ChatChunk::Done {
                     stop: StopKind::ToolUse,
                     ref turn,
