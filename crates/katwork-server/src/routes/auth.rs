@@ -19,8 +19,12 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::time::Instant;
 
-use crate::peer::{client_ip, ip_bucket};
-use crate::{app::AppState, error::ApiError, extract::session_cookie};
+use crate::{
+    app::AppState,
+    error::ApiError,
+    extract::{payload, session_cookie},
+    peer::{client_ip, ip_bucket},
+};
 
 #[derive(Hash, PartialEq, Eq, Clone)]
 enum LimitKey {
@@ -118,16 +122,6 @@ pub(crate) struct ResetRequest {
 pub(crate) struct ResetConfirm {
     token: String,
     new_password: String,
-}
-
-fn payload<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
-    body.map(|Json(value)| value).map_err(|error| {
-        ApiError(if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
-            KatError::BodyTooLarge
-        } else {
-            KatError::RequestInvalid
-        })
-    })
 }
 
 fn email(value: &str) -> Result<String, ApiError> {

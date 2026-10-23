@@ -5,4 +5,5 @@ pub mod error;
 pub mod fence;
 pub mod ids;
 pub mod runtime;
+pub mod tenancy;
 pub mod types;
