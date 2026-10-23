@@ -25,7 +25,8 @@ pub struct TransportConfig {
     pub idle_timeout: Duration,
     pub max_connections: usize,
     pub max_connections_per_ip: usize,
-    /// Trusted proxy socket peers share the global budget, not a per-peer budget.
+    /// `KATWORK_TRUSTED_PROXIES` as (network, prefix) pairs. A trusted proxy may supply
+    /// `X-Forwarded-For` and is exempt from the per-peer connection cap.
     pub trusted_proxies: Vec<(IpAddr, u8)>,
 }
 
@@ -298,17 +299,14 @@ impl Config {
     }
 
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, KatError> {
+        // Every failure names its variable and drops the parse error, which may quote the value.
+        let invalid = |var: &'static str| KatError::ConfigInvalid { var };
         let database_url = lookup("DATABASE_URL")
-            .filter(|v| !v.trim().is_empty())
-            .ok_or(KatError::ConfigInvalid {
-                var: "DATABASE_URL",
-            })?;
-        let secret =
-            lookup("KATWORK_SECRET")
-                .filter(|v| v.len() >= 32)
-                .ok_or(KatError::ConfigInvalid {
-                    var: "KATWORK_SECRET",
-                })?;
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(invalid("DATABASE_URL"))?;
+        let secret = lookup("KATWORK_SECRET")
+            .filter(|value| value.len() >= 32)
+            .ok_or(invalid("KATWORK_SECRET"))?;
         let optional = |name: &str| lookup(name).filter(|value| !value.is_empty());
         for key in [
             "OPENAI_BASE_URL",
@@ -316,9 +314,9 @@ impl Config {
             "KATWORK_LOCAL_BASE_URL",
         ] {
             if let Some(value) = optional(key) {
-                let url = Url::parse(&value).map_err(|_| KatError::ConfigInvalid { var: key })?;
+                let url = Url::parse(&value).map_err(|_| invalid(key))?;
                 if !matches!(url.scheme(), "http" | "https") || !url.has_host() {
-                    return Err(KatError::ConfigInvalid { var: key });
+                    return Err(invalid(key));
                 }
                 if key == "KATWORK_LOCAL_BASE_URL"
                     && (!url.username().is_empty()
@@ -326,20 +324,18 @@ impl Config {
                         || url.query().is_some()
                         || url.fragment().is_some())
                 {
-                    return Err(KatError::ConfigInvalid { var: key });
+                    return Err(invalid(key));
                 }
             }
         }
         for name in ["SMTP_PASSWORD", "KATWORK_DEMO_PASSWORD"] {
             if optional(name).is_some_and(|value| value.chars().count() < 8) {
-                return Err(KatError::ConfigInvalid { var: name });
+                return Err(invalid(name));
             }
         }
         let mut public_url = optional("KATWORK_PUBLIC_URL");
         if let Some(value) = &public_url {
-            let url = Url::parse(value).map_err(|_| KatError::ConfigInvalid {
-                var: "KATWORK_PUBLIC_URL",
-            })?;
+            let url = Url::parse(value).map_err(|_| invalid("KATWORK_PUBLIC_URL"))?;
             if !matches!(url.scheme(), "http" | "https")
                 || !url.has_host()
                 || !url.username().is_empty()
@@ -348,9 +344,7 @@ impl Config {
                 || url.query().is_some()
                 || url.fragment().is_some()
             {
-                return Err(KatError::ConfigInvalid {
-                    var: "KATWORK_PUBLIC_URL",
-                });
+                return Err(invalid("KATWORK_PUBLIC_URL"));
             }
             public_url = Some(url.origin().ascii_serialization());
         }
@@ -361,29 +355,28 @@ impl Config {
                 .is_some_and(|url| url.starts_with("https://"))
             && lookup("KATWORK_ALLOW_DEMO_ON_HTTPS").as_deref() != Some("1")
         {
-            return Err(KatError::ConfigInvalid {
-                var: "KATWORK_ALLOW_DEMO_ON_HTTPS",
-            });
+            return Err(invalid("KATWORK_ALLOW_DEMO_ON_HTTPS"));
         }
+        // Each entry is a CIDR or a bare IP, which means that one address.
         let trusted_proxies = optional("KATWORK_TRUSTED_PROXIES")
             .map(|value| {
                 value
                     .split(',')
-                    .map(|cidr| {
-                        let (ip, prefix) =
-                            cidr.trim().split_once('/').ok_or(KatError::ConfigInvalid {
-                                var: "KATWORK_TRUSTED_PROXIES",
-                            })?;
-                        let ip: IpAddr = ip.parse().map_err(|_| KatError::ConfigInvalid {
-                            var: "KATWORK_TRUSTED_PROXIES",
-                        })?;
-                        let prefix: u8 = prefix.parse().map_err(|_| KatError::ConfigInvalid {
-                            var: "KATWORK_TRUSTED_PROXIES",
-                        })?;
-                        if prefix > if ip.is_ipv4() { 32 } else { 128 } {
-                            return Err(KatError::ConfigInvalid {
-                                var: "KATWORK_TRUSTED_PROXIES",
-                            });
+                    .map(|entry| {
+                        let (ip, prefix) = match entry.trim().split_once('/') {
+                            Some((ip, prefix)) => (ip, Some(prefix)),
+                            None => (entry.trim(), None),
+                        };
+                        let ip: IpAddr =
+                            ip.parse().map_err(|_| invalid("KATWORK_TRUSTED_PROXIES"))?;
+                        let bits = if ip.is_ipv4() { 32 } else { 128 };
+                        let prefix: u8 = prefix
+                            .map(str::parse)
+                            .transpose()
+                            .map_err(|_| invalid("KATWORK_TRUSTED_PROXIES"))?
+                            .unwrap_or(bits);
+                        if prefix > bits {
+                            return Err(invalid("KATWORK_TRUSTED_PROXIES"));
                         }
                         Ok((ip, prefix))
                     })
@@ -395,10 +388,10 @@ impl Config {
             let value = optional(name)
                 .map(|value| value.parse::<u32>())
                 .transpose()
-                .map_err(|_| KatError::ConfigInvalid { var: name })?
+                .map_err(|_| invalid(name))?
                 .unwrap_or(default);
             if value == 0 {
-                return Err(KatError::ConfigInvalid { var: name });
+                return Err(invalid(name));
             }
             Ok(value)
         };
@@ -414,17 +407,17 @@ impl Config {
         let lock_timeout = lock_timeout(optional("KATWORK_LOCK_TIMEOUT_MS"))?;
         let smtp = if let Some(host) = optional("SMTP_HOST") {
             if host.contains('@') {
-                return Err(KatError::ConfigInvalid { var: "SMTP_HOST" });
+                return Err(invalid("SMTP_HOST"));
             }
             let port = optional("SMTP_PORT")
-                .map(|value| {
-                    value
-                        .parse::<u16>()
-                        .map_err(|_| KatError::ConfigInvalid { var: "SMTP_PORT" })
-                })
+                .map(|value| value.parse::<u16>().map_err(|_| invalid("SMTP_PORT")))
                 .transpose()?;
             if port == Some(0) {
-                return Err(KatError::ConfigInvalid { var: "SMTP_PORT" });
+                return Err(invalid("SMTP_PORT"));
+            }
+            // A mailed link must never point at the localhost default.
+            if public_url.is_none() {
+                return Err(invalid("KATWORK_PUBLIC_URL"));
             }
             Some(SmtpConfig {
                 host,
@@ -441,16 +434,8 @@ impl Config {
             optional("KATWORK_LOCAL_MODEL"),
         ) {
             (None, None) => None,
-            (Some(_), None) => {
-                return Err(KatError::ConfigInvalid {
-                    var: "KATWORK_LOCAL_MODEL",
-                });
-            }
-            (None, Some(_)) => {
-                return Err(KatError::ConfigInvalid {
-                    var: "KATWORK_LOCAL_BASE_URL",
-                });
-            }
+            (Some(_), None) => return Err(invalid("KATWORK_LOCAL_MODEL")),
+            (None, Some(_)) => return Err(invalid("KATWORK_LOCAL_BASE_URL")),
             (Some(base_url), Some(model)) => Some(LocalEnv {
                 base_url,
                 model,

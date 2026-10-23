@@ -24,6 +24,68 @@ Planned: single-host Docker Compose installation, Rust core, React/Vite workspac
 and Apache-2.0 core licensing. No verified installation command is supplied here.
 Publish exercised steps and dependency notices with the actual release.
 
+### First account (development)
+
+These steps match the current code; they are not yet a verified installation.
+Run them on the Docker host, from a fresh checkout of this repository:
+
+1. Create your settings file from the template:
+
+   ```sh
+   cp .env.example .env
+   ```
+
+   Open `.env` in a text editor and fill in the three required values:
+
+   - `POSTGRES_PASSWORD`: a new random password, for example the output of
+     `openssl rand -hex 16`.
+   - `DATABASE_URL`: `postgres://katwork:<that password>@postgres:5432/katwork`,
+     with the same password. `postgres` is the database's name inside Compose.
+   - `KATWORK_SECRET`: at least 32 random characters, for example the output of
+     `openssl rand -hex 32`.
+
+   Leave the other values empty for now; `.env.example` explains each one.
+
+2. Start KatWork:
+
+   ```sh
+   docker compose up -d
+   ```
+
+   `docker compose ps` should list `katwork` as running. If it stopped,
+   `docker compose logs katwork` names the setting to fix, as
+   `config_invalid (NAME)`.
+
+3. Set up the database, once per install and after each upgrade:
+
+   ```sh
+   docker compose exec katwork /app/katwork-server migrate
+   ```
+
+4. Create the first owner and their workspace. `--space-policy local` keeps the
+   first Space's data on this server; `hosted` lets it use hosted AI providers.
+
+   ```sh
+   docker compose exec katwork /app/katwork-server create-user \
+     --email you@example.com --workspace "My team" --role owner --space-policy local
+   ```
+
+5. The command prints one link. Open it in a browser within 72 hours, choose a
+   password, then sign in with your email and that password. The link works once.
+
+Use `docker compose exec`, never `docker compose run`: `run` starts a new
+container whose output Docker's logging driver keeps, and may ship off the host,
+so the link would end up in a log.
+
+The link starts with `KATWORK_PUBLIC_URL` (default `http://localhost:3000`). If
+people open KatWork from other machines, set it to the address they use first.
+
+Without mail set up, a forgotten password is recovered on the host:
+`docker compose exec katwork /app/katwork-server reset-link --email you@example.com`
+prints a reset link that works once within 30 minutes. Anyone who can run
+commands on this host can do this for any account (ADR-0004), so give that
+access only to the people who operate KatWork.
+
 ### Local model provider (development)
 
 Set `KATWORK_LOCAL_BASE_URL` to an OpenAI-compatible API root such as

@@ -435,3 +435,379 @@ async fn migration_normalizes_existing_email_and_login_accepts_any_case(pool: Pg
         assert_eq!(body(response).await, json!({"user_id": id}));
     }
 }
+
+async fn issued(pool: &PgPool, user_id: Uuid, kind: &str) -> String {
+    use katwork::{
+        auth::{invite, reset},
+        ids::UserId,
+    };
+    let mut conn = pool.acquire().await.unwrap();
+    match kind {
+        "invite" => invite::issue(&mut conn, UserId(user_id)).await.unwrap(),
+        _ => reset::issue(&mut conn, UserId(user_id)).await.unwrap(),
+    }
+}
+
+async fn accept(app: &axum::Router, token: &str, password: &str) -> axum::response::Response {
+    request(
+        app,
+        "POST",
+        "/api/auth/invite/accept",
+        Some(json!({"token": token, "new_password": password})),
+        None,
+    )
+    .await
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn invite_and_reset_tokens_cannot_be_swapped(pool: PgPool) {
+    let (id, password) = user(&pool).await;
+    let invite = issued(&pool, id, "invite").await;
+    let reset = issued(&pool, id, "reset").await;
+    let app = app(&pool, None);
+    let new_password = Uuid::now_v7().to_string();
+    assert_code(
+        confirm(&app, &invite, &new_password).await,
+        400,
+        "reset_token_invalid",
+    )
+    .await;
+    assert_code(
+        accept(&app, &reset, &new_password).await,
+        400,
+        "invite_token_invalid",
+    )
+    .await;
+    // Neither refusal consumed anything: each token still works at its own route.
+    assert_eq!(login(&app, &password).await.status(), 200);
+    assert_eq!(confirm(&app, &reset, &new_password).await.status(), 200);
+    let kinds: Vec<(String, bool)> =
+        sqlx::query_as("SELECT kind, used_at IS NOT NULL FROM password_resets ORDER BY kind")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    // The reset ended the account's other pending tokens, of both kinds.
+    assert_eq!(
+        kinds,
+        vec![("invite".to_owned(), true), ("reset".to_owned(), true)]
+    );
+    let invite = issued(&pool, id, "invite").await;
+    let pending = issued(&pool, id, "reset").await;
+    let session = cookie(&login(&app, &new_password).await);
+    let invited_password = Uuid::now_v7().to_string();
+    assert_eq!(accept(&app, &invite, &invited_password).await.status(), 204);
+    assert_code(
+        request(&app, "GET", "/api/auth/me", None, Some(&session)).await,
+        401,
+        "unauthenticated",
+    )
+    .await;
+    assert_code(
+        confirm(&app, &pending, &new_password).await,
+        400,
+        "reset_token_invalid",
+    )
+    .await;
+    assert_eq!(login(&app, &invited_password).await.status(), 200);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn concurrent_invite_accept_consumes_once(pool: PgPool) {
+    let (id, _) = user(&pool).await;
+    let token = issued(&pool, id, "invite").await;
+    let app = app(&pool, None);
+    let first = Uuid::now_v7().to_string();
+    let second = Uuid::now_v7().to_string();
+    let (a, b) = tokio::join!(accept(&app, &token, &first), accept(&app, &token, &second));
+    let mut results = Vec::new();
+    for response in [a, b] {
+        let status = response.status().as_u16();
+        results.push((status, body(response).await));
+    }
+    results.sort_by_key(|(status, _)| *status);
+    assert_eq!(
+        results,
+        vec![
+            (204, serde_json::Value::Null),
+            (400, json!({"code": "invite_token_invalid"}))
+        ]
+    );
+    let used: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM password_resets WHERE used_at IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(used, 1);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn weak_password_does_not_consume_invite_token(pool: PgPool) {
+    let (id, _) = user(&pool).await;
+    let token = issued(&pool, id, "invite").await;
+    let app = app(&pool, None);
+    for password in ["ก".repeat(7), "x".repeat(1025)] {
+        assert_code(
+            accept(&app, &token, &password).await,
+            400,
+            "password_invalid",
+        )
+        .await;
+    }
+    for token in [String::new(), "not-a-token".into(), "A".repeat(43)] {
+        assert_code(
+            accept(&app, &token, &Uuid::now_v7().to_string()).await,
+            400,
+            "invite_token_invalid",
+        )
+        .await;
+    }
+    assert_eq!(
+        accept(&app, &token, &Uuid::now_v7().to_string())
+            .await
+            .status(),
+        204
+    );
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn successful_logins_never_lock_out(pool: PgPool) {
+    let (_, password) = user(&pool).await;
+    let app = app(&pool, None);
+    for _ in 0..30 {
+        assert_eq!(login(&app, &password).await.status(), 200);
+    }
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn a_successful_login_clears_the_failure_count(pool: PgPool) {
+    let (_, password) = user(&pool).await;
+    let app = app(&pool, None);
+    let wrong = Uuid::now_v7().to_string();
+    for _ in 0..9 {
+        assert_eq!(login(&app, &wrong).await.status(), 401);
+    }
+    assert_eq!(login(&app, &password).await.status(), 200);
+    for _ in 0..10 {
+        assert_eq!(login(&app, &wrong).await.status(), 401);
+    }
+    assert_code(login(&app, &wrong).await, 429, "rate_limited").await;
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn reset_confirm_clears_login_lockout(pool: PgPool) {
+    let (id, password) = user(&pool).await;
+    let app = app(&pool, None);
+    let wrong = Uuid::now_v7().to_string();
+    for _ in 0..10 {
+        assert_eq!(login(&app, &wrong).await.status(), 401);
+    }
+    assert_code(login(&app, &password).await, 429, "rate_limited").await;
+    let new_password = Uuid::now_v7().to_string();
+    let token = reset_token(&pool, id).await;
+    assert_eq!(confirm(&app, &token, &new_password).await.status(), 200);
+    assert_eq!(login(&app, &new_password).await.status(), 200);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn invite_accept_clears_login_lockout(pool: PgPool) {
+    let (id, _) = user(&pool).await;
+    let app = app(&pool, None);
+    let wrong = Uuid::now_v7().to_string();
+    for _ in 0..10 {
+        assert_eq!(login(&app, &wrong).await.status(), 401);
+    }
+    let new_password = Uuid::now_v7().to_string();
+    let token = issued(&pool, id, "invite").await;
+    assert_eq!(accept(&app, &token, &new_password).await.status(), 204);
+    assert_eq!(login(&app, &new_password).await.status(), 200);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn login_429_sends_retry_after(pool: PgPool) {
+    let app = app(&pool, None);
+    let wrong = Uuid::now_v7().to_string();
+    for _ in 0..10 {
+        assert_eq!(login(&app, &wrong).await.status(), 401);
+    }
+    let limited = login(&app, &wrong).await;
+    let retry_after: u64 = limited.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=900).contains(&retry_after), "{retry_after}");
+    assert_code(limited, 429, "rate_limited").await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn invite_tokens_migration_keeps_existing_tokens_as_reset_tokens(pool: PgPool) {
+    let mut old = sqlx::migrate!("../katwork/migrations");
+    old.migrations = old
+        .iter()
+        .filter(|migration| migration.version <= 5)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into();
+    old.run(&pool).await.unwrap();
+    let (id, _) = user(&pool).await;
+    let token = reset_token(&pool, id).await;
+    katwork::db::migrate(&pool).await.unwrap();
+    let kind: String = sqlx::query_scalar("SELECT kind FROM password_resets")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(kind, "reset");
+    let refused = sqlx::query("INSERT INTO password_resets (id, user_id, token_sha256, kind, expires_at) VALUES ($1, $2, 'x', 'other', clock_timestamp())")
+        .bind(Uuid::now_v7())
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("23514")
+    );
+    let app = app(&pool, None);
+    assert_code(
+        accept(&app, &token, &Uuid::now_v7().to_string()).await,
+        400,
+        "invite_token_invalid",
+    )
+    .await;
+    assert_eq!(
+        confirm(&app, &token, &Uuid::now_v7().to_string())
+            .await
+            .status(),
+        200
+    );
+}
+
+const LINK_BASE: &str = "http://localhost:3000";
+
+fn local_space() -> Option<katwork::types::SpacePolicy> {
+    Some(katwork::types::SpacePolicy {
+        allow_external: false,
+    })
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn concurrent_create_user_creates_one_new_workspace(pool: PgPool) {
+    use katwork::{
+        auth::accounts::{WorkspaceRef, create_user},
+        tenancy::Role,
+    };
+    let acme = WorkspaceRef::parse("Acme");
+    let (first, second) = tokio::join!(
+        create_user(
+            &pool,
+            "first@example.test",
+            &acme,
+            Role::Owner,
+            local_space(),
+            LINK_BASE
+        ),
+        create_user(
+            &pool,
+            "second@example.test",
+            &acme,
+            Role::Owner,
+            local_space(),
+            LINK_BASE
+        ),
+    );
+    first.unwrap();
+    second.unwrap();
+    let count = |sql: &'static str| sqlx::query_scalar::<_, i64>(sql).fetch_one(&pool);
+    // The second command waits for the first and joins the workspace it created.
+    assert_eq!(count("SELECT count(*) FROM workspaces").await.unwrap(), 1);
+    assert_eq!(count("SELECT count(*) FROM spaces").await.unwrap(), 1);
+    assert_eq!(
+        count("SELECT count(*) FROM memberships WHERE role = 'owner'")
+            .await
+            .unwrap(),
+        2
+    );
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn concurrent_create_user_for_one_email_creates_one_account(pool: PgPool) {
+    use katwork::{
+        auth::accounts::{WorkspaceRef, create_user},
+        tenancy::Role,
+    };
+    let workspace = Uuid::now_v7();
+    sqlx::query("INSERT INTO workspaces (id, name) VALUES ($1, 'Acme')")
+        .bind(workspace)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (reference, email) in [
+        (
+            WorkspaceRef::parse(&workspace.to_string()),
+            "by-id@example.test",
+        ),
+        (WorkspaceRef::parse("Acme"), "by-name@example.test"),
+    ] {
+        let shouted = format!(" {} ", email.to_uppercase());
+        let (first, second) = tokio::join!(
+            create_user(&pool, email, &reference, Role::Member, None, LINK_BASE),
+            create_user(&pool, &shouted, &reference, Role::Admin, None, LINK_BASE),
+        );
+        let mut codes: Vec<_> = [first, second]
+            .into_iter()
+            .map(|result| result.map(|_| "ok").unwrap_or_else(|error| error.code()))
+            .collect();
+        codes.sort();
+        assert_eq!(codes, ["ok", "user_exists"], "{reference:?}");
+        for sql in [
+            "SELECT count(*) FROM users WHERE email = $1",
+            "SELECT count(*) FROM memberships m JOIN users u ON u.id = m.user_id WHERE u.email = $1",
+            "SELECT count(*) FROM password_resets r JOIN users u ON u.id = r.user_id WHERE u.email = $1",
+        ] {
+            let rows: i64 = sqlx::query_scalar(sql)
+                .bind(email)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(rows, 1, "{sql} {reference:?}");
+        }
+    }
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn reset_confirm_racing_invite_accept_has_one_winner(pool: PgPool) {
+    let (id, _) = user(&pool).await;
+    let app = app(&pool, None);
+    for _ in 0..10 {
+        let reset = issued(&pool, id, "reset").await;
+        let invite = issued(&pool, id, "invite").await;
+        let reset_password = Uuid::now_v7().to_string();
+        let invite_password = Uuid::now_v7().to_string();
+        let (confirmed, accepted) = tokio::join!(
+            confirm(&app, &reset, &reset_password),
+            accept(&app, &invite, &invite_password)
+        );
+        // Each use ends the account's other pending tokens, so exactly one of them wins.
+        let winner = match (confirmed.status().as_u16(), accepted.status().as_u16()) {
+            (200, 400) => {
+                assert_code(accepted, 400, "invite_token_invalid").await;
+                reset_password
+            }
+            (400, 204) => {
+                assert_code(confirmed, 400, "reset_token_invalid").await;
+                invite_password
+            }
+            other => panic!("expected exactly one winner, got {other:?}"),
+        };
+        assert_eq!(login(&app, &winner).await.status(), 200);
+        let pending: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM password_resets WHERE used_at IS NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pending, 0);
+    }
+}

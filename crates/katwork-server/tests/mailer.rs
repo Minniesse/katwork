@@ -54,6 +54,7 @@ impl Logs {
 async fn reset_token_never_appears_in_logs(pool: PgPool) {
     let (user_id, password) = support::user(&pool).await;
     let capture = Arc::new(CapturingMailer::default());
+    let _idle = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let logs = Logs::default();
     let mut core = Core::new(pool.clone(), Arc::new(support::config(None)));
     core.mailer = capture.clone();
@@ -126,6 +127,7 @@ async fn reset_token_never_appears_in_logs(pool: PgPool) {
 #[sqlx::test(migrations = "../katwork/migrations")]
 async fn reset_without_smtp_returns_202_and_sends_nothing(pool: PgPool) {
     support::user(&pool).await;
+    let _idle = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let logs = Logs::default();
     let app = support::app(&pool, None);
     let response = support::request(
@@ -164,6 +166,7 @@ async fn only_demo_console_backend_logs_mail_content() {
     for demo in [false, true] {
         let mut config = support::config(None);
         config.demo = demo;
+        let _idle = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let logs = Logs::default();
         mailer::from_config(&config)
             .send(&mail)
@@ -196,6 +199,7 @@ async fn smtp_errors_never_log_mail_or_credentials_and_override_demo() {
         subject: token.clone(),
         body: format!("https://katwork.example/reset?token={token}"),
     };
+    let _idle = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let logs = Logs::default();
     let error = mailer::from_config(&config)
         .send(&mail)
@@ -221,6 +225,7 @@ async fn demo_console_never_logs_non_demo_reset_links() {
         subject: "Reset password".into(),
         body: "http://localhost:3000/reset?token=private".into(),
     };
+    let _idle = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let logs = Logs::default();
     mailer::from_config(&config)
         .send(&mail)
@@ -270,10 +275,13 @@ async fn reset_link_uses_configured_origin_instead_of_host(pool: PgPool) {
     })
     .await
     .unwrap();
+    let body = &capture.sent()[0].body;
     assert!(
-        capture.sent()[0]
-            .body
-            .starts_with("https://katwork.example/reset?token=")
+        body.lines()
+            .last()
+            .unwrap()
+            .starts_with("https://katwork.example/reset?token="),
+        "{body}"
     );
 }
 
@@ -295,6 +303,7 @@ async fn smtp_timeout_logs_failed_without_reset_content() {
         subject: "Reset".into(),
         body: "private-reset-token".into(),
     };
+    let _idle = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let logs = Logs::default();
     let send =
         tokio::spawn(async move { mailer.send(&mail).await }.with_subscriber(subscriber(&logs)));
@@ -306,4 +315,63 @@ async fn smtp_timeout_logs_failed_without_reset_content() {
     assert_eq!(result.unwrap_err().code(), "mail_delivery_failed");
     assert!(logs.text().contains("failed"));
     assert!(!logs.text().contains("private-reset-token"));
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn reset_mail_is_bilingual_in_the_users_locale_order(pool: PgPool) {
+    use katwork::types::Locale;
+    const TH_SUBJECT: &str = "ตั้งรหัสผ่าน KatWork ใหม่";
+    const EN_SUBJECT: &str = "Reset your KatWork password";
+    const TH_BODY: &str = "ใช้ลิงก์นี้ภายใน 30 นาทีเพื่อตั้งรหัสผ่านใหม่ หากคุณไม่ได้ขอเปลี่ยนรหัสผ่าน ให้ละเว้นอีเมลนี้";
+    const EN_BODY: &str = "Use this link within 30 minutes to set a new password. If you did not ask for this, ignore this email.";
+    let link = format!("https://katwork.example/reset?token={}", Uuid::now_v7());
+    for (locale, subject, first, second) in [
+        (
+            Locale::Th,
+            format!("{TH_SUBJECT} / {EN_SUBJECT}"),
+            TH_BODY,
+            EN_BODY,
+        ),
+        (
+            Locale::En,
+            format!("{EN_SUBJECT} / {TH_SUBJECT}"),
+            EN_BODY,
+            TH_BODY,
+        ),
+    ] {
+        let mail = mailer::reset_mail("person@example.test".into(), locale, &link);
+        assert!(matches!(mail.kind, MailKind::PasswordReset));
+        assert_eq!(mail.to, "person@example.test");
+        assert_eq!(mail.subject, subject);
+        assert_eq!(mail.body.matches(&link).count(), 1, "{}", mail.body);
+        assert_eq!(mail.body.lines().last(), Some(link.as_str()));
+        let first_at = mail.body.find(first).unwrap();
+        let second_at = mail.body.find(second).unwrap();
+        assert!(first_at < second_at, "{}", mail.body);
+    }
+    // The reset route mails in the account's own locale.
+    let (user_id, _) = support::user(&pool).await;
+    sqlx::query("UPDATE users SET locale = 'th' WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let capture = CapturingMailer::default();
+    reset::request(
+        &pool,
+        &capture,
+        "person@example.test",
+        "https://katwork.example/",
+    )
+    .await
+    .unwrap();
+    let sent = capture.sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].subject, format!("{TH_SUBJECT} / {EN_SUBJECT}"));
+    assert!(sent[0].body.starts_with(TH_BODY), "{}", sent[0].body);
+    let last = sent[0].body.lines().last().unwrap();
+    assert!(
+        last.starts_with("https://katwork.example/reset?token="),
+        "{last}"
+    );
 }

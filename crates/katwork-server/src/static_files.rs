@@ -62,6 +62,10 @@ async fn respond(dir: &Path, request: Request) -> Response {
     };
     let cache = if hashed_asset && response.status().is_success() {
         "public, max-age=31536000, immutable"
+    } else if client_route {
+        // The app's HTML is never stored, so neither an HTTP cache nor the browser's
+        // back-forward cache keeps a page that held an invite or reset token in memory.
+        "no-store"
     } else {
         "no-cache"
     };
