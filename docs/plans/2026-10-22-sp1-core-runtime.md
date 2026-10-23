@@ -323,7 +323,7 @@ web/
 
 ### Task 4: Workspaces, Spaces and tenant scoping
 
-**Status:** in review as PR #22 (stacked on PR #20). The interfaces below match its reviewed code.
+**Status:** merged in PR #22. The interfaces below match its code.
 
 **Files:**
 - Create: `crates/katwork/src/tenancy/{mod,workspace,space}.rs`, `crates/katwork-server/src/routes/workspaces.rs`, `crates/katwork-server/tests/tenancy.rs`
@@ -435,7 +435,7 @@ This task comes after Task 4, can run in parallel with Task 5, and lands as its 
 
 ### Task 5: Dots, Teams and the default roster
 
-**Status:** in review as PR #24 (stacked on PR #22). The interfaces below include its review rulings. A follow-up PR (Steps 6–9) comes after it merges.
+**Status:** in review as PR #24. The interfaces below include its review rulings. A follow-up PR (Steps 6–9) comes after it merges.
 
 **Files:**
 - Create: `crates/katwork/src/team/{mod,dot,team,roles}.rs`, `crates/katwork/migrations/0004_team_membership.sql`, `crates/katwork-server/src/routes/{dots,teams}.rs`, `crates/katwork-server/tests/team.rs`
@@ -1182,11 +1182,11 @@ This task comes after Tasks 12 and 3b and builds on Task 13a. It adds no migrati
 - [ ] **Step 5: Run** `npm test && npm run check:contrast && npm run build && cargo test --workspace --locked`. Expected: PASS.
 - [ ] **Step 6: Commit** with `feat: team, chat and members pages`.
 
-### Task 14: Compose smoke, backup before migrate, HTTPS profile
+### Task 14: Compose smoke, backup before migrate, first-run scripts, HTTPS and demo profiles
 
 **Files:**
-- Create: `scripts/smoke.sh`, `scripts/compose-backup.sh`, `Caddyfile`, `docker-compose.smoke.yml`, `crates/katwork-server/tests/e2e_compose.rs` (`#[ignore]`, run in a CI job)
-- Modify: `docker-compose.yml`, `Dockerfile` (build argument `CARGO_FEATURES`), `crates/katwork/{Cargo.toml,src/models/fake.rs,src/models/registry.rs}` (the `smoke-fixtures` feature), `.env.example` (`KATWORK_HTTPS_HOST`), `.github/workflows/ci.yml` (`e2e` and `upgrade_from_previous_release` jobs), `README.md` (a "Try it" section, HTTPS, backups and upgrades)
+- Create: `scripts/smoke.sh`, `scripts/compose-backup.sh`, `scripts/init-env.sh`, `scripts/demo.sh`, `Caddyfile`, `docker-compose.smoke.yml`, `docker-compose.https.yml`, `docker-compose.demo.yml`, `crates/katwork-server/tests/e2e_compose.rs` (`#[ignore]`, run in a CI job)
+- Modify: `docker-compose.yml`, `Dockerfile` (build argument `CARGO_FEATURES`), `crates/katwork/{Cargo.toml,src/models/fake.rs,src/models/registry.rs}` (the `smoke-fixtures` feature), `.env.example` (`KATWORK_HTTPS_HOST`), `.github/workflows/ci.yml` (`e2e` and `upgrade_from_previous_release` jobs), `README.md` (a "Try it" section, first run, HTTPS, the offline demo, backups and upgrades)
 
 **Interfaces:**
 - Consumes: everything above.
@@ -1197,37 +1197,52 @@ This task comes after Tasks 12 and 3b and builds on Task 13a. It adds no migrati
 - Produces, for the restart scenario, a deterministic in-flight run:
   - the `katwork` crate gets a Cargo feature `smoke-fixtures`, off by default and never enabled in release images. With it, `FakeProvider::demo_held(hold: Duration) -> FakeProvider` behaves like `demo()`, except that each run's first attempt waits `hold` before its first chunk; `Registry::from_config` selects it when `KATWORK_SMOKE_HOLD_SECS` is set. Without the feature the variable is ignored.
   - the `Dockerfile` takes a build argument `CARGO_FEATURES` (empty by default) and passes it to `cargo build --features`
-  - `docker-compose.smoke.yml` builds with `CARGO_FEATURES=katwork/smoke-fixtures`, sets `KATWORK_SMOKE_HOLD_SECS=20` (under the 30 s first-chunk timeout) and `KATWORK_DEMO=1`, and sets `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` to empty strings, so demo mode selects the fake even when the host has provider keys
-- An optional `https` profile adds a `caddy:2` service that publishes ports 80 and 443 and proxies `KATWORK_HTTPS_HOST` to `katwork:3000`. With it, `KATWORK_PUBLIC_URL=https://<host>`, so the session cookie is `Secure`.
+  - `docker-compose.smoke.yml` builds with `CARGO_FEATURES=katwork/smoke-fixtures`, sets `KATWORK_SMOKE_HOLD_SECS=20` (under the demo entry's 30 s first-chunk timeout) and `KATWORK_DEMO=1`, sets `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `KATWORK_LOCAL_BASE_URL` and `KATWORK_LOCAL_MODEL` to empty strings, so demo mode selects the fake even when the host has provider keys, and sets `RUST_LOG=debug,rig=trace`, so a broken `dependency_log_allowed` filter would show up in the logs
+- HTTPS and the offline demo are Compose override files, `docker-compose.https.yml` (the Caddy profile) and `docker-compose.demo.yml` (Steps 5 and 6), not Compose `profiles:` entries, because a profile cannot change another service's environment.
 
 - [ ] **Step 1: Write `scripts/smoke.sh`.** It must:
-  1. Export `COMPOSE_FILE=docker-compose.yml:docker-compose.smoke.yml` once, at the top, so that every `docker compose` command in the script, restarts included, uses the override. Then run `docker compose up -d --build` with `KATWORK_DEMO_PASSWORD` set, and assert the effective configuration: `docker inspect` on the `katwork` container shows `KATWORK_SMOKE_HOLD_SECS=20`, `KATWORK_DEMO=1`, and empty `OPENAI_API_KEY` and `ANTHROPIC_API_KEY`.
-  2. Wait for `/healthz`.
-  3. Run `seed-demo`.
-  4. Log in as demo and post `"สวัสดี ช่วยแนะนำทีมหน่อย"` with `Origin: $KATWORK_PUBLIC_URL` and a `client_msg_id`.
-  5. Read SSE until `katwork.job_status`.
-  6. Assert status `answered`, and that the Dot reply from the messages API has `synthetic: true`.
-  7. In a second scenario, post again, then poll Postgres (`docker compose exec -T postgres psql …`) until the task is `leased` and its `runs` row is `running`. Only then run `docker compose kill katwork` and `docker compose up -d katwork`, and assert the same effective configuration on the new container. After recovery, assert that:
+  1. Before starting anything, check the first-run pieces (Steps 3–6):
+     - `KATWORK_ENV_FILE=<temp dir>/.env scripts/init-env.sh` creates the file with mode `600`, a `KATWORK_SECRET` of at least 32 bytes and a `DATABASE_URL` that holds the generated `POSTGRES_PASSWORD`; a second run exits 1 and leaves the file unchanged
+     - `docker compose --env-file /dev/null config -q` fails, and its message names `KATWORK_SECRET` and `scripts/init-env.sh`
+     - `docker compose -f docker-compose.yml -f docker-compose.https.yml config` with `KATWORK_HTTPS_HOST=smoke.example` gives the `katwork` service `KATWORK_TRUSTED_PROXIES=172.31.250.2` and `KATWORK_PUBLIC_URL=https://smoke.example`
+     - `docker compose -f docker-compose.yml -f docker-compose.demo.yml config` gives it `KATWORK_DEMO=1` and empty `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `KATWORK_LOCAL_BASE_URL` and `SMTP_HOST`
+  2. Export `COMPOSE_FILE=docker-compose.yml:docker-compose.smoke.yml` once, so that every later `docker compose` command in the script, restarts included, uses the override. Then run `docker compose up -d --build` with `KATWORK_DEMO_PASSWORD` set, and assert the effective configuration: `docker inspect` on the `katwork` container shows `KATWORK_SMOKE_HOLD_SECS=20`, `KATWORK_DEMO=1`, `RUST_LOG=debug,rig=trace`, and empty `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `KATWORK_LOCAL_BASE_URL` and `KATWORK_LOCAL_MODEL`.
+  3. Wait for `/healthz`.
+  4. Run `seed-demo`.
+  5. Log in as demo and post `"สวัสดี ช่วยแนะนำทีมหน่อย"` with `Origin: $KATWORK_PUBLIC_URL` and a `client_msg_id`.
+  6. Read SSE until `katwork.job_status`.
+  7. Assert status `answered`, and that the Dot reply from the messages API has `synthetic: true`. Assert that `docker compose logs katwork` has no line whose target starts with `rig` (Global Constraints).
+  8. In a second scenario, post again, then poll Postgres (`docker compose exec -T postgres psql …`) until the task is `leased` and its `runs` row is `running`. Only then run `docker compose kill katwork` and `docker compose up -d katwork`, and assert the same effective configuration on the new container. After recovery, assert that:
      - a second `runs` row with `kind = 'recovery'` exists for the task, so a recovery attempt really happened
      - the job has exactly one Dot reply message
      - the job has exactly one `katwork.decision` event and one terminal `katwork.job_status`, and its status is `answered`
-  8. In a third scenario, run `docker compose up -d` again on the existing volume and assert that a new dump appeared in `./backups`.
-  9. Print `SMOKE OK`.
-- [ ] **Step 2: Run** `scripts/smoke.sh`. Expected: FAIL before wiring, PASS after.
-- [ ] **Step 3: Implement** the `backup` and `migrate` services, `scripts/compose-backup.sh`, the `https` profile and `Caddyfile`, and any glue the smoke test exposes. Document HTTPS, backups and restore in `README.md`.
-- [ ] **Step 4: Add the CI jobs.** `e2e` runs `scripts/smoke.sh`. `upgrade_from_previous_release` is skipped while no release tag exists; after the first tag, it starts the previous release's image, seeds demo data, then runs this build's `migrate` and the smoke test.
-- [ ] **Step 5: Run** `scripts/smoke.sh`. Expected: `SMOKE OK`.
-- [ ] **Step 6: Commit** with `test: compose smoke, backup before migrate, https profile`.
+  9. In a third scenario, run `docker compose up -d` again on the existing volume and assert that a new dump appeared in `./backups`.
+  10. Print `SMOKE OK`.
+- [ ] **Step 2: Run** `scripts/smoke.sh`. Expected: FAIL.
+- [ ] **Step 3: Write `scripts/init-env.sh [--https <host>]`.** It writes `.env` beside `docker-compose.yml`, or at `$KATWORK_ENV_FILE` when that is set, from `.env.example`: `KATWORK_SECRET` from `openssl rand -base64 48`, `POSTGRES_PASSWORD` from `openssl rand -hex 24` (hex, so it needs no escaping in a URL), and `DATABASE_URL=postgres://katwork:<that password>@postgres:5432/katwork`; every other variable keeps its `.env.example` value. It creates the file with mode `600` and refuses to overwrite an existing file (exit 1). With `--https <host>` it also writes `KATWORK_HTTPS_HOST=<host>` and `COMPOSE_FILE=docker-compose.yml:docker-compose.https.yml`. It prints only the path it wrote, never a secret.
+- [ ] **Step 4: Compose required-value checks.** In `docker-compose.yml`, `DATABASE_URL`, `KATWORK_SECRET` and `POSTGRES_PASSWORD` (on both the `postgres` and `katwork` services) change from `${VAR:-}` to `${VAR:?set VAR in .env, or run scripts/init-env.sh}`, with the variable's own name in each message, so `docker compose` stops before starting anything when one is missing. Every optional variable keeps `${VAR:-}`. The CI job that runs `docker compose config -q` and `docker compose build` first creates its `.env` with `scripts/init-env.sh`.
+- [ ] **Step 5: The Caddy profile, `docker-compose.https.yml`.** It adds a `caddy:2` service that publishes ports 80 and 443 and proxies `${KATWORK_HTTPS_HOST:?set KATWORK_HTTPS_HOST in .env}` to `katwork:3000` (`Caddyfile`), on a new network `edge` with subnet `172.31.250.0/29`, where caddy has the fixed address `172.31.250.2`. It joins the `katwork` service to `edge` and sets its `KATWORK_TRUSTED_PROXIES: 172.31.250.2` (a bare IP, Task 3b) and `KATWORK_PUBLIC_URL: https://${KATWORK_HTTPS_HOST}`, so the client IP behind Caddy is the real one and the session cookie is `Secure`. Start it with `scripts/init-env.sh --https <host>`, then `docker compose up -d`.
+- [ ] **Step 6: The offline demo profile, `docker-compose.demo.yml` and `scripts/demo.sh`.** The override sets `KATWORK_DEMO: "1"` and empty `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `KATWORK_LOCAL_BASE_URL`, `KATWORK_LOCAL_MODEL` and `SMTP_HOST`, so no request leaves the host. `scripts/demo.sh` is the one command: it runs `scripts/init-env.sh` when `.env` is missing, runs `docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d`, waits for `/healthz`, runs `seed-demo` the way `scripts/smoke.sh` does, and prints `http://localhost:3000`, `demo@katwork.local` and the password `seed-demo` printed (or a note to use `KATWORK_DEMO_PASSWORD` when that is set). Once the images are built, it needs no network.
+- [ ] **Step 7: Implement** the `backup` and `migrate` services, `scripts/compose-backup.sh`, and any glue the smoke test exposes. Document first run (`scripts/init-env.sh`, `create-user`), HTTPS, the offline demo, backups and restore in `README.md`.
+- [ ] **Step 8: Add the CI jobs.** `e2e` runs `scripts/smoke.sh`. `upgrade_from_previous_release` is skipped while no release tag exists; after the first tag, it starts the previous release's image, seeds demo data, then runs this build's `migrate` and the smoke test.
+- [ ] **Step 9: Run** `scripts/smoke.sh`. Expected: `SMOKE OK`.
+- [ ] **Step 10: Commit** with `test: compose smoke, backup before migrate, first-run scripts, https and demo profiles`.
 
 ---
 
 ## Dependency order and parallelism
 
 ```
-1 → 2 → 3 → 4 → 5 → 6 → 9 → 8 → 10 → 11 → 12 → 13 → 14
-    2 → 7 ─────────────────────↗ (7 must merge before 8)
+1 → 2 → 3 → 4 → 5 → 6 → 9 → 8 → 10 → 11 → 12 → 13b → 14
+              4 → 3b ──────────────────────────↗   (3b before 13b)
+    2 → 7 → 7b ──────────↗                         (7b before 8)
+                    6 → 13a ───────────────────↗   (13a before 13b)
 ```
 
-- Task 7 (model gateway) depends only on Task 2: it takes `ModelTier` and `SpacePolicy` from `crate::types` and `Config` from Task 1. It can run in parallel with Tasks 3–6 and 9, and must merge before Task 8. Tasks 7 and 9 each add one field to `Core` in `runtime.rs`; whichever merges second rebases.
+- Task 7 (model gateway) depends only on Task 2: it takes `ModelTier` and `SpacePolicy` from `crate::types` and `Config` from Task 1. It can run in parallel with Tasks 3–6 and 9. Tasks 7 and 9 each add one field to `Core` in `runtime.rs`; whichever merges second rebases.
+- Task 7b (local model provider) is a small PR after PR #21 merges, and must merge before Task 8, which reads `ModelEntry.timeouts`.
+- Task 3b (operator accounts and first-run convenience) comes after Task 4, runs in parallel with Task 5, lands as its own PR, and must merge before Task 13b, whose Members page uses its account functions. Tasks 3b and 7b both edit `config.rs`; whichever merges second adopts `ConfigInvalid { var }`.
+- Task 5's follow-up PR (Steps 6–9: Lead concurrency default, reply-language line, Thai demo seed) merges after PR #24 and before Task 11, whose `lead_runs_three_tasks_at_once_specialists_one` uses the Lead default.
 - Task 9 comes before Task 8 because the agent loop emits through `EventSink`.
-- Task 13 can start its UI against mocked APIs after Task 6 and integrate after Task 12.
+- Task 13a starts against mocked APIs after Task 6. Task 13b needs Tasks 12, 3b and 13a.
+- Migration numbers follow this order (Global Constraints): 0004 (Task 5), 0005 (Task 11), 0006 (Task 12).
