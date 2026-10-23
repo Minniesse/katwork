@@ -27,6 +27,7 @@ async fn health_returns_ok_and_version() {
         .oneshot(
             Request::builder()
                 .uri("/healthz")
+                .header("host", "localhost")
                 .body(Body::empty())
                 .unwrap(),
         )

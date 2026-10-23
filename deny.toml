@@ -5,3 +5,8 @@ ignore = []
 # Unlisted licenses are denied, including GPL-2.0, GPL-3.0 and AGPL-3.0
 # (both -only and -or-later variants).
 allow = ["Apache-2.0", "BSD-3-Clause", "CDLA-Permissive-2.0", "ISC", "MIT", "Unicode-3.0", "Zlib"]
+
+# Lettre's MIME encoder uses the permissive BSD Zero Clause license.
+[[licenses.exceptions]]
+name = "quoted_printable"
+allow = ["0BSD"]

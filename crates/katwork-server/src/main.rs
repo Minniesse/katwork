@@ -1,6 +1,7 @@
 use std::{error::Error, process::ExitCode, sync::Arc};
+use tracing_subscriber::prelude::*;
 
-use katwork::{db, error::KatError, runtime::Core};
+use katwork::{auth, db, error::KatError, runtime::Core};
 use katwork_server::{
     app::{AppState, build_router},
     config::{Config, redact_database_secrets},
@@ -8,6 +9,16 @@ use katwork_server::{
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    tracing_subscriber::registry()
+        // SQLx logs raw unknown URL parameters and malformed pgpass lines in this target.
+        .with(tracing_subscriber::filter::filter_fn(|metadata| {
+            !metadata.target().starts_with("sqlx_postgres::options")
+        }))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .init();
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -43,16 +54,31 @@ fn error_report(error: &KatError, config: Option<&Config>, database_url: Option<
 async fn run() -> Result<(), KatError> {
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "serve".into());
+    let reset_password = match args.next().as_deref() {
+        None => false,
+        Some("--reset-password") if command == "seed-demo" => true,
+        Some(_) => return Err(KatError::CommandInvalid),
+    };
     if args.next().is_some() {
         return Err(KatError::CommandInvalid);
     }
     match command.as_str() {
         "serve" => {
             let config = Arc::new(Config::from_env()?);
+            if !config.cookie_secure() {
+                tracing::warn!("session cookie is not Secure on an HTTP public URL");
+            }
             let pool = db::connect(&config.database_url).await?;
+            let transport = config.transport.clone();
             let core = Arc::new(Core::new(pool, config));
             let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
-            axum::serve(listener, build_router(AppState { core })).await?;
+            katwork_server::transport::serve_with_shutdown(
+                listener,
+                build_router(AppState { core }),
+                transport,
+                shutdown_signal(),
+            )
+            .await?;
             Ok(())
         }
         "migrate" => {
@@ -60,10 +86,37 @@ async fn run() -> Result<(), KatError> {
             let pool = db::connect(&config.database_url).await?;
             db::migrate(&pool).await
         }
-        // Demo data is wired in Task 3.
-        "seed-demo" => Ok(()),
+        "seed-demo" => {
+            let config = Config::from_env()?;
+            if !config.demo {
+                return Err(KatError::ConfigInvalid);
+            }
+            let pool = db::connect(&config.database_url).await?;
+            if let Some(password) = auth::seed_demo(&pool, &config, reset_password).await? {
+                println!("{password}");
+            }
+            Ok(())
+        }
         _ => Err(KatError::CommandInvalid),
     }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install Ctrl-C handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! { () = ctrl_c => {}, () = terminate => {} }
 }
 
 #[cfg(test)]

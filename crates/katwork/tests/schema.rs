@@ -851,3 +851,26 @@ async fn events_reject_cross_workspace_parents(pool: PgPool) {
             .bind(thread).bind(f.workspace).bind(run).execute(&pool).await.unwrap_err(), constraint);
     }
 }
+
+#[sqlx::test]
+async fn normalized_emails_are_unique(pool: PgPool) {
+    sqlx::query("INSERT INTO users (id, email, password_hash, display_name, locale) VALUES ($1, 'a@x', 'hash', 'A', 'en')")
+        .bind(Uuid::now_v7()).execute(&pool).await.unwrap();
+    sqlstate(sqlx::query("INSERT INTO users (id, email, password_hash, display_name, locale) VALUES ($1, 'a@x', 'hash', 'a', 'en')")
+        .bind(Uuid::now_v7()).execute(&pool).await.unwrap_err(), "23505");
+}
+
+#[sqlx::test]
+async fn users_reject_non_lowercase_email_on_insert_and_update(pool: PgPool) {
+    sqlstate(sqlx::query("INSERT INTO users (id, email, password_hash, display_name, locale) VALUES ($1, 'Mixed@example.test', 'hash', 'Test', 'en')")
+        .bind(Uuid::now_v7()).execute(&pool).await.unwrap_err(), "23514");
+    let f = Fixture::new(&pool).await;
+    sqlstate(
+        sqlx::query("UPDATE users SET email = 'Mixed@example.test' WHERE id = $1")
+            .bind(f.user)
+            .execute(&pool)
+            .await
+            .unwrap_err(),
+        "23514",
+    );
+}

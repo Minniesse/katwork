@@ -303,12 +303,13 @@ fn config_and_provider_debug_show_only_url_origins() {
         ("https://host/path@secret", "[redacted]"),
         ("not-a-url", "[redacted]"),
     ] {
-        let config = Config::from_lookup(|name| match name {
-            "KATWORK_PUBLIC_URL" | "OPENAI_BASE_URL" | "ANTHROPIC_BASE_URL" => Some(url.into()),
+        let mut config = Config::from_lookup(|name| match name {
+            "OPENAI_BASE_URL" | "ANTHROPIC_BASE_URL" => Some(url.into()),
             "OPENAI_API_KEY" | "ANTHROPIC_API_KEY" => Some("test-api-key".into()),
             _ => lookup(name),
         })
         .unwrap();
+        config.public_url = Some(url.into());
         let debug = format!("{config:?}");
         assert!(
             debug.contains(&format!("public_url: Some({expected:?})")),
@@ -332,11 +333,12 @@ fn smtp_debug_redacts_url_credentials() {
         ),
         ("smtp.test", "smtp.test"),
     ] {
-        let config = Config::from_lookup(|name| match name {
-            "SMTP_HOST" => Some(host.into()),
+        let mut config = Config::from_lookup(|name| match name {
+            "SMTP_HOST" => Some("smtp.test".into()),
             _ => lookup(name),
         })
         .unwrap();
+        config.smtp.as_mut().unwrap().host = host.into();
         let debug = format!("{:?}", config.smtp.unwrap());
         assert!(debug.contains(&format!("host: {expected:?}")), "{debug}");
         assert!(!debug.contains("sm7p-pass"), "{debug}");
@@ -615,4 +617,219 @@ fn error_redaction_limits_malformed_url_replacement_to_the_url() {
         config.redact_secrets("failed (https://u:pass@host:bad/path) then retry"),
         "failed ([redacted]) then retry"
     );
+}
+
+#[test]
+fn rejects_smtp_host_with_embedded_credentials() {
+    let password = uuid::Uuid::now_v7().to_string();
+    for host in [
+        format!("mailer:{password}@smtp.test:465"),
+        format!("smtps://mailer:{password}@smtp.test:465"),
+    ] {
+        let result = Config::from_lookup(|name| match name {
+            "SMTP_HOST" => Some(host.clone()),
+            _ => lookup(name),
+        });
+        assert_eq!(result.unwrap_err().code(), "config_invalid");
+    }
+}
+
+#[test]
+fn rejects_short_smtp_and_demo_passwords() {
+    for variable in ["SMTP_PASSWORD", "KATWORK_DEMO_PASSWORD"] {
+        for size in 1..8 {
+            let value: String = uuid::Uuid::now_v7()
+                .to_string()
+                .chars()
+                .take(size)
+                .collect();
+            let result = Config::from_lookup(|name| {
+                if name == variable {
+                    Some(value.clone())
+                } else {
+                    lookup(name)
+                }
+            });
+            assert_eq!(result.unwrap_err().code(), "config_invalid");
+        }
+        let value = "ก".repeat(7);
+        let result = Config::from_lookup(|name| {
+            if name == variable {
+                Some(value.clone())
+            } else {
+                lookup(name)
+            }
+        });
+        assert_eq!(result.unwrap_err().code(), "config_invalid");
+    }
+}
+
+#[test]
+fn rejects_public_urls_that_cannot_safely_define_an_origin() {
+    for url in [
+        "not-a-url",
+        "ftp://host",
+        "https://user@host",
+        "https://host/path",
+        "https://host/?x=y",
+        "https://host/#fragment",
+    ] {
+        let result = Config::from_lookup(|name| match name {
+            "KATWORK_PUBLIC_URL" => Some(url.into()),
+            _ => lookup(name),
+        });
+        assert_eq!(result.unwrap_err().code(), "config_invalid");
+    }
+}
+
+#[test]
+fn https_scheme_is_canonicalized_before_cookie_security() {
+    let config = Config::from_lookup(|name| match name {
+        "KATWORK_PUBLIC_URL" => Some("HTTPS://KATWORK.EXAMPLE:443/".into()),
+        _ => lookup(name),
+    })
+    .unwrap();
+    assert!(config.cookie_secure());
+    assert_eq!(config.public_url_or_default(), "https://katwork.example");
+}
+
+#[test]
+fn demo_on_https_requires_explicit_override() {
+    for allow in [
+        None,
+        Some(""),
+        Some("0"),
+        Some("false"),
+        Some(" 1"),
+        Some("1"),
+    ] {
+        let result = Config::from_lookup(|name| match name {
+            "KATWORK_DEMO" => Some("1".into()),
+            "KATWORK_PUBLIC_URL" => Some("HTTPS://katwork.example".into()),
+            "KATWORK_ALLOW_DEMO_ON_HTTPS" => allow.map(str::to_owned),
+            _ => lookup(name),
+        });
+        if allow == Some("1") {
+            assert!(result.is_ok());
+        } else {
+            assert_eq!(result.unwrap_err().code(), "config_invalid");
+        }
+    }
+}
+
+#[test]
+fn trusted_proxy_config_rejects_invalid_cidrs() {
+    for value in [
+        "127.0.0.1",
+        "127.0.0.1/33",
+        "::1/129",
+        "evil/8",
+        "10.0.0.0/8,,::1/128",
+    ] {
+        let result = Config::from_lookup(|name| match name {
+            "KATWORK_TRUSTED_PROXIES" => Some(value.into()),
+            _ => lookup(name),
+        });
+        assert_eq!(result.unwrap_err().code(), "config_invalid", "{value}");
+    }
+}
+
+#[test]
+fn trusted_proxy_cidrs_match_only_the_configured_networks() {
+    let empty = Config::from_lookup(lookup).unwrap();
+    assert!(!empty.trusts_proxy("127.0.0.1".parse().unwrap()));
+    for (networks, yes, no) in [
+        (
+            "192.0.2.0/24, 2001:db8::/32",
+            vec!["192.0.2.0", "192.0.2.255", "2001:db8::1"],
+            vec!["192.0.3.0", "2001:db9::1", "::ffff:192.0.2.1"],
+        ),
+        (
+            "127.0.0.1/32, ::1/128",
+            vec!["127.0.0.1", "::1"],
+            vec!["127.0.0.2", "::2"],
+        ),
+        ("0.0.0.0/0", vec!["192.0.2.1"], vec!["::1"]),
+        ("::/0", vec!["2001:db8::1"], vec!["192.0.2.1"]),
+    ] {
+        let config = Config::from_lookup(|name| match name {
+            "KATWORK_TRUSTED_PROXIES" => Some(networks.into()),
+            _ => lookup(name),
+        })
+        .unwrap();
+        for ip in yes {
+            assert!(config.trusts_proxy(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in no {
+            assert!(!config.trusts_proxy(ip.parse().unwrap()), "{ip}");
+        }
+    }
+}
+
+#[test]
+fn transport_settings_reject_zero_and_invalid_values() {
+    for setting in [
+        "KATWORK_HEADER_TIMEOUT_SECONDS",
+        "KATWORK_IDLE_TIMEOUT_SECONDS",
+        "KATWORK_MAX_CONNECTIONS",
+        "KATWORK_MAX_CONNECTIONS_PER_IP",
+    ] {
+        for value in ["0", "-1", "false", "18446744073709551615"] {
+            let result = Config::from_lookup(|name| {
+                if name == setting {
+                    Some(value.into())
+                } else {
+                    lookup(name)
+                }
+            });
+            assert_eq!(
+                result.unwrap_err().code(),
+                "config_invalid",
+                "{setting}={value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn transport_defaults_and_overrides() {
+    let config = Config::from_lookup(lookup).unwrap();
+    assert_eq!(config.transport.header_timeout.as_secs(), 10);
+    assert_eq!(config.transport.idle_timeout.as_secs(), 60);
+    assert_eq!(config.transport.max_connections, 256);
+    assert_eq!(config.transport.max_connections_per_ip, 32);
+    let config = Config::from_lookup(|name| match name {
+        "KATWORK_HEADER_TIMEOUT_SECONDS" => Some("3".into()),
+        "KATWORK_IDLE_TIMEOUT_SECONDS" => Some("4".into()),
+        "KATWORK_MAX_CONNECTIONS" => Some("5".into()),
+        "KATWORK_MAX_CONNECTIONS_PER_IP" => Some("2".into()),
+        _ => lookup(name),
+    })
+    .unwrap();
+    assert_eq!(config.transport.header_timeout.as_secs(), 3);
+    assert_eq!(config.transport.idle_timeout.as_secs(), 4);
+    assert_eq!(config.transport.max_connections, 5);
+    assert_eq!(config.transport.max_connections_per_ip, 2);
+}
+
+#[test]
+fn smtp_and_enclosing_config_debug_redact_username_tokens() {
+    let token = uuid::Uuid::now_v7().to_string();
+    let config = Config::from_lookup(|name| match name {
+        "SMTP_HOST" => Some("smtp.example.test".into()),
+        "SMTP_USERNAME" | "SMTP_PASSWORD" => Some(token.clone()),
+        _ => lookup(name),
+    })
+    .unwrap();
+    for debug in [
+        format!("{:?}", config.smtp.as_ref().unwrap()),
+        format!("{config:?}"),
+    ] {
+        assert!(!debug.contains(&token), "SMTP credential leaked in Debug");
+        assert!(debug.contains("username: Some(\"[redacted]\")"));
+        assert!(debug.contains("password: \"[redacted]\""));
+    }
+    let mut smtp = config.smtp.unwrap();
+    smtp.username = None;
+    assert!(format!("{smtp:?}").contains("username: None"));
 }
