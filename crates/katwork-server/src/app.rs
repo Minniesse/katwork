@@ -59,6 +59,10 @@ fn router(state: AppState, web_dir: &Path, reset_work: ResetWork) -> Router {
             get(members::list).post(members::invite),
         )
         .route(
+            "/api/workspaces/{workspace_id}/members/invite-options",
+            get(members::invite_options),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/members/{user_id}/role",
             put(members::set_role),
         )

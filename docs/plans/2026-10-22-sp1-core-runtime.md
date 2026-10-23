@@ -1410,7 +1410,7 @@ This task comes after Tasks 12 and 3b and builds on Task 13a. It adds no migrati
   - `members::invite(pool, config: &Config, mailer: &dyn Mailer, &Tenant, Invite) -> Result<InviteResult, KatError>`, in one transaction that first locks the workspace row (`FOR NO KEY UPDATE`, the first class of the global lock order):
     - owner or admin only; only an owner may invite with `role = Owner`, otherwise `forbidden`
     - `delivery = Email` with SMTP unconfigured is 422 `smtp_unconfigured`, before anything is written; the demo console mailer prints only the demo account's mail, so it never counts as configured
-    - `accounts::ensure_user` on `accounts::normalize_email(&invite.email)`; an account that is already a member is 409 `member_exists`
+    - `accounts::ensure_user` on `accounts::normalize_email(&invite.email)`; an account that is already a member is 409 `member_exists`. The new account's unusable password hash (`accounts::unusable_password_hash`, passed to `accounts::ensure_user_with_hash`) is computed before the transaction begins: Argon2 can wait up to 5 s for a hash slot, and no lock that `guards::authorize` needs may be held meanwhile
     - an existing account (`created = false`) gets the membership and nothing else: never a link, never a mail, so an admin can never take over an account that another workspace or the operator created (ADR-0004)
     - a new account gets the membership and `invite::issue`. `Link` returns `invite::link(config.public_url_or_default(), &token)` in `link`. `Email` returns `link: None` and, after the commit, sends `mailer::invite_mail` without delaying the response; a failed delivery is logged with the mail kind and outcome only, and the invite stands (the person can still use password reset).
   - `members::set_role(pool, &Tenant, UserId, Role) -> Result<(), KatError>`, in one transaction that first locks the workspace row: owner or admin only; only an owner may grant `Owner` or change an owner's role; demoting the workspace's last owner is 422 `last_owner_required`; a user who is not a member is 404 `not_found`. It applies on that user's next request, because `tenancy::resolve` reads the membership every time.
@@ -1419,6 +1419,7 @@ This task comes after Tasks 12 and 3b and builds on Task 13a. It adds no migrati
   - New codes: `member_exists` (409), `last_owner_required` (422) and `smtp_unconfigured` (422), each with an `error.<code>` message in both locales
   - Routes, each calling `require_admin()` before parsing any body:
     - `GET /api/workspaces/{workspace_id}/members` → 200 `[Member]`
+    - `GET /api/workspaces/{workspace_id}/members/invite-options` → 200 `{"email": bool}` (`members::invite_options` and `InviteOptions`): `email` is true only when SMTP is configured, so the invite form can default to a link
     - `POST /api/workspaces/{workspace_id}/members` with `Invite` → 201 `InviteResult`
     - `PUT /api/workspaces/{workspace_id}/members/{user_id}/role` with `{"role": Role}` → 204
     - `DELETE /api/workspaces/{workspace_id}/members/{user_id}` → 204
@@ -1469,6 +1470,8 @@ This task comes after Tasks 12 and 3b and builds on Task 13a. It adds no migrati
     - `members_routes_hide_other_workspaces`: 404
     - `invite_tokens_never_reach_logs`
     - `removing_a_member_keeps_their_message_history`: the removed member's messages still list with their `author_name`, and their next request is 404
+    - `invite_options_say_whether_email_invites_work`, `stale_admin_tenant_is_refused_behind_the_lock` and `demotion_racing_an_invite_blocks_it`
+    - in `crates/katwork-server/tests/members_hash.rs`, its own binary because it holds the process's Argon2 slots: `invite_hashes_before_locking_the_workspace`
   - in `web/src/pages/Members.test.tsx`: `members_page_is_offered_only_to_owners_and_admins`, `members_page_invites_by_link_and_shows_it_once`, `members_page_explains_email_invites_without_smtp`, `members_page_changes_a_role`, `members_page_removes_a_member_after_confirming`
 
   Run `cargo test -p katwork-server --test members && (cd web && npm test)`. Expected: FAIL. Implement `tenancy/members.rs`, `routes/members.rs`, `MailKind::Invite` with `mailer::invite_mail`, the new codes and `Members.tsx`. Run again. Expected: PASS.

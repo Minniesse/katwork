@@ -10,13 +10,23 @@ use rand_core::{OsRng, RngCore};
 
 use crate::error::KatError;
 
-static WORK: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
-    Arc::new(Semaphore::new(
-        std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1),
-    ))
-});
+fn work_slots() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+}
+
+static WORK: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(work_slots())));
+
+/// Holds every Argon2 work slot of this process until the permit drops, so a test can show
+/// what a caller does while it waits for one. Production code never calls it.
+#[doc(hidden)]
+pub async fn hold_every_work_slot() -> tokio::sync::OwnedSemaphorePermit {
+    WORK.clone()
+        .acquire_many_owned(work_slots() as u32)
+        .await
+        .expect("the work semaphore is never closed")
+}
 
 pub(super) async fn run<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,

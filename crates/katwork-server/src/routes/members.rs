@@ -8,7 +8,7 @@ use katwork::{
     ids::UserId,
     tenancy::{
         Role, Tenant,
-        members::{self, Invite, InviteResult, Member},
+        members::{self, Invite, InviteOptions, InviteResult, Member},
     },
 };
 use serde::Deserialize;
@@ -39,6 +39,14 @@ pub(crate) async fn list(
 ) -> Result<Json<Vec<Member>>, ApiError> {
     tenant.require_admin()?;
     Ok(Json(members::list(&state.core.pool, &tenant).await?))
+}
+
+pub(crate) async fn invite_options(
+    State(state): State<AppState>,
+    tenant: Tenant,
+) -> Result<Json<InviteOptions>, ApiError> {
+    tenant.require_admin()?;
+    Ok(Json(members::invite_options(&state.core.config, &tenant)?))
 }
 
 pub(crate) async fn invite(

@@ -177,12 +177,14 @@ async fn member_cannot_list_invite_or_change_roles(pool: PgPool) {
     join(&pool, ws, &owner, "owner").await;
     join(&pool, ws, &member, "member").await;
 
-    assert_code(
-        call(&app, &member, "GET", ws, "", None).await,
-        403,
-        "forbidden",
-    )
-    .await;
+    for suffix in ["", "/invite-options"] {
+        assert_code(
+            call(&app, &member, "GET", ws, suffix, None).await,
+            403,
+            "forbidden",
+        )
+        .await;
+    }
     for body in [
         invite("new@example.test", "member", "link"),
         json!({"email": 5}),
@@ -980,4 +982,151 @@ async fn removing_a_member_keeps_their_message_history(pool: PgPool) {
         "not_found",
     )
     .await;
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn invite_options_say_whether_email_invites_work(pool: PgPool) {
+    let ws = workspace(&pool, "Office").await;
+    let other = workspace(&pool, "Elsewhere").await;
+    let owner = person(&pool, "owner@example.test", "en").await;
+    let admin = person(&pool, "admin@example.test", "en").await;
+    join(&pool, ws, &owner, "owner").await;
+    join(&pool, ws, &admin, "admin").await;
+    let demo = Config::from_lookup(|name| match name {
+        "DATABASE_URL" => Some("postgres://localhost/katwork".into()),
+        "KATWORK_SECRET" => Some(Uuid::now_v7().to_string()),
+        "KATWORK_DEMO" => Some("1".into()),
+        _ => None,
+    })
+    .unwrap();
+
+    let (smtp, _) = app_with(&pool, smtp_config());
+    let (demo, _) = app_with(&pool, demo);
+    for (app, email) in [(&smtp, true), (&plain_app(&pool), false), (&demo, false)] {
+        for who in [&owner, &admin] {
+            let response = call(app, who, "GET", ws, "/invite-options", None).await;
+            assert_eq!(response.status(), 200);
+            assert_eq!(body(response).await, json!({"email": email}));
+        }
+    }
+    assert_code(
+        call(&smtp, &owner, "GET", other, "/invite-options", None).await,
+        404,
+        "not_found",
+    )
+    .await;
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn stale_admin_tenant_is_refused_behind_the_lock(pool: PgPool) {
+    let ws = workspace(&pool, "Office").await;
+    let owner = person(&pool, "owner@example.test", "en").await;
+    let admin = person(&pool, "admin@example.test", "en").await;
+    let member = person(&pool, "member@example.test", "en").await;
+    join(&pool, ws, &owner, "owner").await;
+    join(&pool, ws, &admin, "admin").await;
+    join(&pool, ws, &member, "member").await;
+    let config = smtp_config();
+    let mailer = Arc::new(CapturingMailer::default());
+    // Resolved while still an admin, as a request that started before the demotion holds it.
+    let stale = tenancy::resolve(&pool, admin.id, ws).await.unwrap();
+    let new_invite = || Invite {
+        email: "new@example.test".into(),
+        role: Role::Member,
+        delivery: InviteDelivery::Link,
+    };
+
+    for demotion in [
+        "UPDATE memberships SET role = 'member' WHERE workspace_id = $1 AND user_id = $2",
+        "DELETE FROM memberships WHERE workspace_id = $1 AND user_id = $2",
+    ] {
+        sqlx::query(demotion)
+            .bind(ws)
+            .bind(admin.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let expected = if demotion.starts_with("UPDATE") {
+            "forbidden"
+        } else {
+            "not_found"
+        };
+        let invited = members::invite(&pool, &config, mailer.clone(), &stale, new_invite()).await;
+        assert_eq!(invited.unwrap_err().code(), expected);
+        let promoted = members::set_role(&pool, &stale, member.id, Role::Admin).await;
+        assert_eq!(promoted.unwrap_err().code(), expected);
+        let removed = members::remove(&pool, &stale, member.id).await;
+        assert_eq!(removed.unwrap_err().code(), expected);
+
+        assert_eq!(users_with_email(&pool, "new@example.test").await, 0);
+        assert_eq!(
+            role_of(&pool, ws, member.id).await.as_deref(),
+            Some("member")
+        );
+        assert!(mailer.sent().is_empty());
+    }
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn demotion_racing_an_invite_blocks_it(pool: PgPool) {
+    let ws = workspace(&pool, "Office").await;
+    let owner = person(&pool, "owner@example.test", "en").await;
+    let admin = person(&pool, "admin@example.test", "en").await;
+    join(&pool, ws, &owner, "owner").await;
+    join(&pool, ws, &admin, "admin").await;
+    let tenant = tenancy::resolve(&pool, admin.id, ws).await.unwrap();
+
+    // The demotion holds the workspace row, as `members::set_role` does, until it commits.
+    let mut demotion = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM workspaces WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(ws)
+        .execute(&mut *demotion)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE memberships SET role = 'member' WHERE workspace_id = $1 AND user_id = $2")
+        .bind(ws)
+        .bind(admin.id)
+        .execute(&mut *demotion)
+        .await
+        .unwrap();
+
+    let invite = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            members::invite(
+                &pool,
+                &smtp_config(),
+                Arc::new(CapturingMailer::default()),
+                &tenant,
+                Invite {
+                    email: "new@example.test".into(),
+                    role: Role::Member,
+                    delivery: InviteDelivery::Link,
+                },
+            )
+            .await
+        }
+    });
+    // Wait, by observed state, until the invite is queued behind the workspace row lock.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the invite never waited for the workspace row");
+    demotion.commit().await.unwrap();
+
+    assert_eq!(invite.await.unwrap().unwrap_err().code(), "forbidden");
+    assert_eq!(users_with_email(&pool, "new@example.test").await, 0);
 }

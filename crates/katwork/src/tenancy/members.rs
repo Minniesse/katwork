@@ -56,6 +56,21 @@ impl fmt::Debug for InviteResult {
     }
 }
 
+/// What the invite form can offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct InviteOptions {
+    /// Invites can go by email: SMTP is configured. The demo console mailer never counts.
+    pub email: bool,
+}
+
+/// Owner or admin only.
+pub fn invite_options(config: &Config, tenant: &Tenant) -> Result<InviteOptions, KatError> {
+    tenant.require_admin()?;
+    Ok(InviteOptions {
+        email: config.smtp.is_some(),
+    })
+}
+
 /// The workspace's members, ordered by email; owner or admin only.
 pub async fn list(pool: &PgPool, tenant: &Tenant) -> Result<Vec<Member>, KatError> {
     tenant.require_admin()?;
@@ -136,6 +151,9 @@ pub async fn invite(
         return Err(KatError::SmtpUnconfigured);
     }
     let email = accounts::normalize_email(&invite.email)?;
+    // Hashed before any lock: Argon2 can wait for a slot, and every tool call of a running Kat
+    // takes this workspace row (`guards::authorize`). Unused when the account already exists.
+    let hash = accounts::unusable_password_hash().await?;
     let mut tx = pool.begin().await?;
     let (actor, workspace) = lock_workspace(&mut tx, tenant).await?;
     if invite.role == Role::Owner && actor.role() != Role::Owner {
@@ -151,7 +169,7 @@ pub async fn invite(
         "th" => Locale::Th,
         _ => Locale::En,
     };
-    let user = accounts::ensure_user(&mut tx, &email, locale).await?;
+    let user = accounts::ensure_user_with_hash(&mut tx, &email, locale, hash).await?;
     if role_of(&mut tx, &actor, user.user_id).await?.is_some() {
         return Err(KatError::MemberExists);
     }
