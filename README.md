@@ -28,9 +28,10 @@ smoke checks run in CI; they do not establish production readiness.
 <a id="try-it"></a>
 ### Try it: offline demo
 
-From this checkout, run:
+From this checkout on Linux, prepare the demo's backup folder and run:
 
 ```sh
+sudo install -d -o 0 -g 0 -m 0755 backups-demo
 scripts/demo.sh
 ```
 
@@ -74,6 +75,15 @@ Run these commands on the Docker host, from this checkout:
    Open `.env` in a text editor for optional model or mail settings.
 
 2. Start KatWork:
+
+   On Linux, prepare the backup folder once, including if you created it yourself:
+
+   ```sh
+   sudo install -d -o 0 -g 0 -m 0755 backups
+   ```
+
+   The backup container runs as root with all capabilities dropped. It needs a
+   root-owned folder; backup files remain private with permissions `600`.
 
    ```sh
    docker compose up -d --build
@@ -182,9 +192,21 @@ Stopping first matters: a failed backup cannot stop an app that was already
 running. Every startup waits for the backup to succeed before it runs migrations
 or starts the app. Do not run migrations by hand around that gate.
 
-Existing databases are saved under `backups/katwork-<UTC timestamp>-<suffix>.dump`.
-On Linux, these private files belong to the container's root user; use operator
-privileges to copy or restore them. The script writes a private `.partial` file and renames it only after `pg_dump`
+Existing databases are saved under `backups/katwork-<database>-<UTC timestamp>-<suffix>.dump`.
+The timestamp uses sortable `YYYYMMDDTHHMMSSZ` format. The demo writes only to
+`backups-demo/`, using the same naming pattern. Check the folder and database
+name when choosing an archive; do not restore a demo archive into your real installation.
+
+On Linux, prepare each folder you use with the root owner and permissions `755`:
+
+```sh
+sudo install -d -o 0 -g 0 -m 0755 backups
+sudo install -d -o 0 -g 0 -m 0755 backups-demo
+```
+
+These private files belong to the container's root user; use operator privileges
+to copy or restore them. If startup reports a folder permission error, run the
+matching command above and start again. The script writes a private `.partial` file and renames it only after `pg_dump`
 succeeds. A failed backup stops startup. Check free disk space and file permissions,
 fix the cause, then start again. No retention policy deletes old backups; copy them
 to secure storage and remove old files yourself after checking a restore.
@@ -196,7 +218,8 @@ service. Backup and migrate stay on the private database network; external
 database hosts are not supported by these files.
 
 To restore safely, stop the app, start only PostgreSQL, and restore into a new
-database. Replace `YOUR_ARCHIVE.dump` with your archive filename. The bundled
+database. Replace `katwork-katwork-YOUR_TIMESTAMP-SUFFIX.dump` with the real
+archive filename from `backups/`, checking its database name. The bundled
 server already has the `katwork` role; do not create it again. On Linux, `sudo`
 lets Docker read the root-owned backup:
 
@@ -204,7 +227,7 @@ lets Docker read the root-owned backup:
 docker compose down
 docker compose up -d --wait postgres
 docker compose exec -T postgres createdb -U katwork -O katwork restored
-sudo docker compose cp backups/YOUR_ARCHIVE.dump postgres:/tmp/restore.dump
+sudo docker compose cp backups/katwork-katwork-YOUR_TIMESTAMP-SUFFIX.dump postgres:/tmp/restore.dump
 docker compose exec -T postgres pg_restore --exit-on-error --no-owner -U katwork -d restored /tmp/restore.dump
 docker compose exec -T postgres rm /tmp/restore.dump
 ```
@@ -330,6 +353,7 @@ separate retention/training review. Use public or approved retrospective samples
 
 ```sh
 scripts/init-env.sh
+sudo install -d -o 0 -g 0 -m 0755 backups
 docker compose up -d --build
 docker compose exec katwork /app/katwork-server create-user \
   --email you@example.com --workspace "ทีมของฉัน" --role owner \
@@ -337,15 +361,81 @@ docker compose exec katwork /app/katwork-server create-user \
 ```
 
 เปลี่ยนอีเมลเป็นของคุณ แล้วเปิดลิงก์ที่ปรากฏเพื่อตั้งรหัสผ่านภายใน 72 ชั่วโมงครับ
-เข้าใช้งานที่ **http://localhost:3000** หากทีมใช้เครื่องอื่น กรุณาตั้งค่า HTTPS ตามหัวข้อด้านบน
+คำสั่ง `sudo install` เตรียมโฟลเดอร์สำรองข้อมูลบน Linux ให้ root เป็นเจ้าของ โดยไม่เปิดสิทธิ์เขียนให้ทุกคน
+เข้าใช้งานที่ **http://localhost:3000** หากทีมใช้เครื่องอื่น กรุณาตั้งค่า HTTPS ตามขั้นตอนด้านล่าง
 ทีมจะมี Kats หกตัว หากต้องการคำตอบจริง กรุณาตั้งค่าโมเดลก่อนใช้งาน
 
-หากต้องการทดลองแยกจากข้อมูลจริง ให้ใช้ `scripts/demo.sh` แล้วเปิด **http://localhost:3001**
+หากต้องการทดลองแยกจากข้อมูลจริง บน Linux ให้เตรียมโฟลเดอร์เดโมก่อน แล้วเริ่มระบบ:
+
+```sh
+sudo install -d -o 0 -g 0 -m 0755 backups-demo
+scripts/demo.sh
+```
+
+เปิด **http://localhost:3001**
 เข้าสู่ระบบด้วย `demo@katwork.local` และอ่านรหัสผ่านเริ่มต้นจากไฟล์ `.demo-credentials`
 หากตั้ง `KATWORK_DEMO_PASSWORD` ใน `.env.demo` ให้ใช้รหัสนั้นครับ
 การดาวน์โหลดอิมเมจครั้งแรกต้องใช้อินเทอร์เน็ต หลังจากนั้นเดโมใช้งานแบบออฟไลน์ได้
 พื้นที่ `เดโม` มี Kats ที่ตอบด้วยข้อมูลจำลอง โดยไม่ส่งคำขอออกไปยังบริการภายนอก
 เดโมใช้ฐานข้อมูลแยกต่างหาก และจะไม่เริ่มหากระบบหลักกำลังทำงาน เว้นแต่ระบุ `--allow-running-install`
+
+### HTTPS สำหรับเครือข่ายสำนักงาน
+
+ให้ผู้ดูแลเครือข่ายตั้งชื่อ `work.home.arpa` ให้ชี้มาที่เครื่องเซิร์ฟเวอร์
+หากเริ่มติดตั้งใหม่ ให้ใช้คำสั่งนี้แทน `scripts/init-env.sh` ข้างต้น:
+
+```sh
+scripts/init-env.sh --https work.home.arpa
+```
+
+หากมี `.env` อยู่แล้ว ให้แก้ `KATWORK_HTTPS_HOST=work.home.arpa` และ
+`COMPOSE_FILE=docker-compose.yml:docker-compose.https.yml` ในไฟล์นั้น แล้วเริ่มระบบและนำใบรับรองออกมา:
+
+```sh
+docker compose down
+docker compose up -d --build
+docker compose cp caddy:/data/caddy/pki/authorities/local/root.crt ./katwork-root.crt
+```
+
+ให้ผู้ดูแลติดตั้ง `katwork-root.crt` เป็นใบรับรองที่เชื่อถือบนเครื่องของผู้ใช้ แล้วเปิด **https://work.home.arpa**
+แจกเฉพาะไฟล์ `.crt` นี้ ห้ามแจกกุญแจส่วนตัว และอย่าข้ามคำเตือนใบรับรอง
+วิธีติดตั้งในแต่ละระบบมีรายละเอียดภาษาอังกฤษในหัวข้อ [HTTPS](#https)
+
+### สำรองข้อมูลก่อนอัปเกรด
+
+ทุกครั้งที่เริ่มระบบ ฐานข้อมูลเดิมจะถูกสำรองก่อนปรับโครงสร้างข้อมูล หากสำรองไม่สำเร็จ ระบบจะไม่เริ่ม
+ไฟล์จริงอยู่ใน `backups/katwork-<database>-<UTC timestamp>-<suffix>.dump` ส่วนเดโมอยู่ใน `backups-demo/` เท่านั้น
+ชื่อไฟล์บอกชื่อฐานข้อมูลและเวลา UTC รูปแบบ `YYYYMMDDTHHMMSSZ` อย่าเลือกไฟล์เดโมมาใช้กับข้อมูลจริง
+หากมีข้อผิดพลาดเรื่องสิทธิ์โฟลเดอร์ บน Linux ให้รันคำสั่ง `sudo install` ของโฟลเดอร์นั้นอีกครั้ง
+ก่อนอัปเกรด ให้หยุดระบบโดยเก็บข้อมูลไว้ แล้วเริ่มรุ่นใหม่:
+
+```sh
+docker compose down
+git pull --ff-only
+docker compose build katwork
+docker compose up -d
+```
+
+ห้ามเติม `-v` หลัง `down` เพราะจะลบฐานข้อมูลและใบรับรอง
+เก็บสำเนาไฟล์สำรองในที่ปลอดภัย และเก็บ `.env` กับใบรับรองแยกไว้ด้วย เพราะไฟล์ `.dump` มีเฉพาะฐานข้อมูล
+
+### กู้คืนข้อมูล
+
+เลือกไฟล์จาก `backups/` และตรวจชื่อฐานข้อมูลในชื่อไฟล์ก่อน
+แทน `katwork-katwork-YOUR_TIMESTAMP-SUFFIX.dump` ด้วยชื่อไฟล์จริง แล้วกู้คืนลงฐานข้อมูลใหม่:
+
+```sh
+docker compose down
+docker compose up -d --wait postgres
+docker compose exec -T postgres createdb -U katwork -O katwork restored
+sudo docker compose cp backups/katwork-katwork-YOUR_TIMESTAMP-SUFFIX.dump postgres:/tmp/restore.dump
+docker compose exec -T postgres pg_restore --exit-on-error --no-owner -U katwork -d restored /tmp/restore.dump
+docker compose exec -T postgres rm /tmp/restore.dump
+```
+
+ใน `.env` เปลี่ยนเฉพาะชื่อฐานข้อมูลท้าย `DATABASE_URL` จาก `/katwork` เป็น `/restored` แล้วรัน `docker compose up -d`
+หากมีฐานข้อมูล `restored` อยู่แล้ว ให้เลือกชื่อใหม่ อย่าเขียนทับข้อมูลเดิม
+ตรวจข้อมูลให้ครบก่อนลบฐานข้อมูลเก่า รายละเอียดข้อจำกัดของ URL อยู่ในหัวข้อ [Backups and upgrades](#backups-and-upgrades) ภาษาอังกฤษ
 
 KatWork ยังอยู่ระหว่างพัฒนาครับ การช่วยเตรียมร่างรายงานพร้อมแหล่งอ้างอิง
 และการอนุมัติโดยผู้รับผิดชอบยังอยู่ในแผนพัฒนา (planned)

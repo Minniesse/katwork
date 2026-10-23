@@ -17,6 +17,9 @@ services:
       SMTP_PASSWORD: ""
   migrate:
     environment: *demo-environment
+  backup:
+    volumes:
+      - ./backups-demo:/backups
   demo-proxy:
     image: caddy:2.11.7-alpine
     restart: unless-stopped

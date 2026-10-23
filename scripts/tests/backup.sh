@@ -38,11 +38,19 @@ HAS_SCHEMA=f "$root/scripts/compose-backup.sh"
 if PROBE_FAIL=1 "$root/scripts/compose-backup.sh"; then exit 1; fi
 if DUMP_FAIL=1 "$root/scripts/compose-backup.sh"; then exit 1; fi
 [ "$(find "$KATWORK_BACKUP_DIR" -type f | wc -l | tr -d ' ')" = 0 ]
+touch "$tmp/not-a-directory"
+if KATWORK_BACKUP_DIR="$tmp/not-a-directory" "$root/scripts/compose-backup.sh" > "$tmp/out" 2>&1; then exit 1; fi
+grep -qF "$tmp/not-a-directory" "$tmp/out"
+grep -qF 'sudo chown 0' "$tmp/out"
+grep -qF 'sudo chmod 0755' "$tmp/out"
+grep -qF 'backups-demo/' "$tmp/out"
+if grep -qF "$BACKUP_TEST_PASSWORD" "$tmp/out"; then exit 1; fi
 "$root/scripts/compose-backup.sh"
 "$root/scripts/compose-backup.sh"
 [ "$(find "$KATWORK_BACKUP_DIR" -name '*.dump' | wc -l | tr -d ' ')" = 2 ]
 [ "$(find "$KATWORK_BACKUP_DIR" -name '*.partial' | wc -l | tr -d ' ')" = 0 ]
 for archive in "$KATWORK_BACKUP_DIR"/*.dump; do
+    basename "$archive" | grep -Eq '^katwork-restored-[0-9]{8}T[0-9]{6}Z-[A-Za-z0-9]+\.dump$'
     [ "$(cat "$archive")" = 'archive fixture' ]
     mode=$(stat -c %a "$archive" 2>/dev/null || stat -f %Lp "$archive")
     [ "$mode" = 600 ]

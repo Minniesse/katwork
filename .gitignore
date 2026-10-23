@@ -29,4 +29,5 @@ CLAUDE.local.md
 
 # Private operator data
 /backups/
+/backups-demo/
 /.demo-credentials

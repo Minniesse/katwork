@@ -39,9 +39,13 @@ case "$schema" in
     *) printf '%s\n' 'Could not determine database migration state.' >&2; exit 1 ;;
 esac
 directory=${KATWORK_BACKUP_DIR:-/backups}
-mkdir -p "$directory"
+folder_error() {
+    printf 'Cannot write backup folder %s. On Linux, fix its host folder (backups/; demo: backups-demo/) with: sudo chown 0 FOLDER && sudo chmod 0755 FOLDER\n' "$directory" >&2
+    exit 1
+}
+mkdir -p "$directory" || folder_error
 # The random suffix prevents two starts in one second from replacing a good archive.
-partial=$(mktemp "$directory/katwork-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXXXXXXXX")
+partial=$(mktemp "$directory/katwork-$PGDATABASE-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXXXXXXXX") || folder_error
 trap 'rm -f "$partial"' EXIT HUP INT TERM
 mv "$partial" "$partial.dump.partial"
 partial="$partial.dump.partial"

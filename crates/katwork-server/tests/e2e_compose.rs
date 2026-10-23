@@ -54,12 +54,7 @@ impl Stack {
                 .env("KATWORK_ENV_FILE", dir.join(".env")),
         );
         fs::create_dir(dir.join("backups")).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // The private parent protects this directory; the cap-dropped container must write here.
-            fs::set_permissions(dir.join("backups"), fs::Permissions::from_mode(0o777)).unwrap();
-        }
+        fs::create_dir(dir.join("backups-demo")).unwrap();
         let ports = if https {
             "  katwork:\n    ports: !reset []\n  caddy:\n    ports: !override [\"127.0.0.1::443\", \"127.0.0.1::80\"]\n"
         } else {
@@ -141,6 +136,14 @@ impl Stack {
         }
     }
     async fn start(&mut self) {
+        // Use the documented Linux ownership setup, without world-writable test folders.
+        for folder in ["backups", "backups-demo"] {
+            checked(
+                Command::new("sudo")
+                    .args(["-n", "install", "-d", "-o", "0", "-g", "0", "-m", "0755"])
+                    .arg(self.dir.join(folder)),
+            );
+        }
         self.run(&["up", "-d", "--no-build", "katwork"]);
         self.connect().await;
     }
@@ -161,11 +164,11 @@ impl Stack {
             if self.https { "https" } else { "http" }
         );
         let mut builder = reqwest::Client::builder()
-            // The assigned transport port differs from the canonical Host; HTTP/2 rejects that pair.
-            .http1_only()
             .no_proxy()
             .timeout(Duration::from_secs(180));
         if self.https {
+            // Connect to the assigned port while keeping TLS, Host and HTTP/2 authority canonical.
+            builder = builder.resolve("localhost", address.trim().parse().unwrap());
             let root = self.dir.join("root.crt");
             poll(|| {
                 output(
@@ -197,8 +200,13 @@ impl Stack {
         assert!(ready.is_ok(), "healthz becomes ready: {last}");
     }
     fn request(&self, method: &str, path: &str) -> reqwest::RequestBuilder {
+        let endpoint = if self.https {
+            self.public_url()
+        } else {
+            &self.endpoint
+        };
         self.client
-            .request(method.parse().unwrap(), format!("{}{path}", self.endpoint))
+            .request(method.parse().unwrap(), format!("{endpoint}{path}"))
             .header("Host", self.public_url().split_once("://").unwrap().1)
             .header("Origin", self.public_url())
             .header("Cookie", &self.cookie)
@@ -330,6 +338,21 @@ impl Drop for Stack {
             );
         }
         let _ = output(self.compose().args(["down", "-v", "--remove-orphans"]));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let owner = fs::metadata(&self.dir).unwrap();
+            for folder in ["backups", "backups-demo"] {
+                let path = self.dir.join(folder);
+                if fs::metadata(&path).is_ok_and(|m| m.uid() != owner.uid()) {
+                    let _ = output(
+                        Command::new("sudo")
+                            .args(["-n", "chown", &format!("{}:{}", owner.uid(), owner.gid())])
+                            .arg(path),
+                    );
+                }
+            }
+        }
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
@@ -426,6 +449,24 @@ fn first_run_and_profile_configuration() {
             config["services"]["backup"]["environment"]["DATABASE_URL"]
                 == config["services"]["migrate"]["environment"]["DATABASE_URL"],
             "backup and migrate must share DATABASE_URL"
+        );
+        let backup_volumes = config["services"]["backup"]["volumes"].as_array().unwrap();
+        let archive_mount = backup_volumes
+            .iter()
+            .find(|v| v["target"] == "/backups")
+            .unwrap();
+        let folder = if overrides.contains(&"demo") {
+            "backups-demo"
+        } else {
+            "backups"
+        };
+        assert_eq!(
+            archive_mount["source"],
+            fs::canonicalize(ROOT)
+                .unwrap()
+                .join(folder)
+                .to_str()
+                .unwrap()
         );
         assert_eq!(config["networks"]["backend"]["internal"], true);
         assert_eq!(
@@ -537,6 +578,10 @@ async fn offline_demo_uses_synthetic_provider_with_host_keys_cleared() {
     );
     let overrides = stack.dir.join("test.yml");
     let mut config = fs::read_to_string(&overrides).unwrap().replace("  katwork:\n    ports: !override [\"127.0.0.1::3000\"]", "  katwork:\n    ports: !reset []\n  demo-proxy:\n    ports: !override [\"127.0.0.1::3000\"]");
+    config = config.replace(
+        stack.dir.join("backups").to_str().unwrap(),
+        stack.dir.join("backups-demo").to_str().unwrap(),
+    );
     config.push_str("  egress-target:\n    image: postgres:17\n    networks: [default]\n    environment:\n      POSTGRES_HOST_AUTH_METHOD: trust\n");
     fs::write(overrides, config).unwrap();
     stack.start().await;
@@ -593,6 +638,21 @@ async fn offline_demo_uses_synthetic_provider_with_host_keys_cleared() {
     let thread = stack.thread().await;
     let job = stack.post(&thread).await;
     stack.answered(&thread, &job).await;
+    stack.run(&["down"]);
+    stack.start().await;
+    assert_eq!(fs::read_dir(stack.dir.join("backups")).unwrap().count(), 0);
+    let archives: Vec<_> = fs::read_dir(stack.dir.join("backups-demo"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(archives.len(), 1);
+    assert!(
+        archives[0]
+            .to_str()
+            .unwrap()
+            .starts_with("katwork-katwork-")
+    );
+    assert!(archives[0].to_str().unwrap().ends_with(".dump"));
 }
 
 #[tokio::test]
@@ -675,6 +735,7 @@ async fn backup_archive_restores_seeded_data() {
         .collect();
     assert_eq!(archives.len(), 1);
     let archive = archives[0].to_str().unwrap();
+    assert!(archive.starts_with("katwork-seeded-"));
     assert!(archive.ends_with(".dump"));
     stack.run(&["up", "-d", "restore"]);
     poll(|| {
@@ -783,6 +844,27 @@ async fn backup_failure_blocks_migrate() {
     stack.start().await;
     stack.seed_login().await;
     stack.run(&["down"]);
+    checked(
+        Command::new("sudo")
+            .args(["-n", "chown", "65534"])
+            .arg(stack.dir.join("backups")),
+    );
+    assert!(
+        !output(stack.compose().args(["up", "-d", "--no-build", "katwork"]))
+            .status
+            .success()
+    );
+    let logs = stack.run(&["logs", "--no-color", "backup"]);
+    assert!(logs.contains("Cannot write backup folder /backups"));
+    assert!(logs.contains("sudo chown 0 FOLDER && sudo chmod 0755 FOLDER"));
+    assert!(
+        stack
+            .run(&["ps", "--status", "running", "-q", "migrate", "katwork"])
+            .trim()
+            .is_empty()
+    );
+    stack.start().await;
+    stack.run(&["down"]);
     let failure = stack.dir.join("failure.yml");
     fs::write(
         &failure,
@@ -836,6 +918,7 @@ async fn https_profile_survives_caddy_restart() {
     let mut stack = Stack::new(true);
     stack.start().await;
     let health = stack.request("GET", "/healthz").send().await.unwrap();
+    assert_eq!(health.version(), reqwest::Version::HTTP_2);
     assert_eq!(
         health.headers()["strict-transport-security"],
         "max-age=31536000"
