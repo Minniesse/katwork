@@ -170,7 +170,8 @@ fn emoji(cluster: &str) -> bool {
     let ranges = EMOJI.ranges();
     let index = ranges.partition_point(|range| range.end() < ch);
     ranges.get(index).is_some_and(|range| range.start() <= ch)
-        || ("0123456789#*".contains(ch) && cluster.ends_with('\u{20e3}'))
+        || ("0123456789#*".contains(ch)
+            && (cluster.ends_with('\u{20e3}') || cluster.chars().nth(1) == Some('\u{fe0f}')))
 }
 
 fn ends_mention(previous: &str, rest: &str) -> bool {
