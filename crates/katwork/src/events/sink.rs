@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use std::time::Duration;
 
 use super::{AgUiEvent, EventHub, KatworkEvent, RunClosedEvent, RunEnd, ToolStatusEvent, log};
@@ -108,68 +108,92 @@ impl EventSink for PgEventSink {
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(KatError::NotFound)?;
-        let code = code.replace('\0', "\u{fffd}");
-        for call in calls {
-            log::append(
-                &mut tx,
-                self.workspace_id,
-                self.thread_id,
-                Some(run),
-                &AgUiEvent::ToolCallResult {
-                    message_id: MessageId::new().to_string(),
-                    tool_call_id: call.to_string(),
-                    content: code.clone(),
-                },
-            )
-            .await?;
-            log::append(
-                &mut tx,
-                self.workspace_id,
-                self.thread_id,
-                Some(run),
-                &KatworkEvent::ToolStatus(ToolStatusEvent {
-                    tool_call_id: call,
-                    ok: false,
-                    code: Some(code.clone()),
-                })
-                .into(),
-            )
-            .await?;
-            sqlx::query("UPDATE tool_calls SET state='outcome_unknown', result=$3, ended_at=now() WHERE workspace_id=$1 AND id=$2")
-                .bind(self.workspace_id).bind(call).bind(&code).execute(&mut *tx).await?;
-        }
-        log::append(
+        let seq = close_locked_run(
             &mut tx,
             self.workspace_id,
             self.thread_id,
+            run,
+            &calls,
+            end,
+            code,
+        )
+        .await?;
+        tx.commit().await?;
+        self.hub.notify(self.thread_id, seq);
+        Ok(seq)
+    }
+}
+
+/// Caller owns the task fence (or reclaim lock) and has locked run, calls, then thread.
+/// Keep recovery and cancellation call closure and terminal event ordering identical.
+pub(crate) async fn close_locked_run(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace: WorkspaceId,
+    thread: ThreadId,
+    run: RunId,
+    calls: &[ToolCallRecordId],
+    end: RunEnd,
+    code: &str,
+) -> Result<EventSeq, KatError> {
+    let code = code.replace('\0', "\u{fffd}");
+    for call in calls {
+        log::append(
+            tx,
+            workspace,
+            thread,
             Some(run),
-            &KatworkEvent::RunClosed(RunClosedEvent {
-                run_id: run,
-                end,
+            &AgUiEvent::ToolCallResult {
+                message_id: MessageId::new().to_string(),
+                tool_call_id: call.to_string(),
+                content: code.clone(),
+            },
+        )
+        .await?;
+        log::append(
+            tx,
+            workspace,
+            thread,
+            Some(run),
+            &KatworkEvent::ToolStatus(ToolStatusEvent {
+                tool_call_id: *call,
+                ok: false,
                 code: Some(code.clone()),
             })
             .into(),
         )
         .await?;
-        let seq = log::append(
-            &mut tx,
-            self.workspace_id,
-            self.thread_id,
-            Some(run),
-            &AgUiEvent::RunError {
-                message: code.clone(),
-                code: Some(code),
-            },
-        )
-        .await?;
-        sqlx::query("UPDATE runs SET state=$3, ended_at=now() WHERE workspace_id=$1 AND id=$2")
-            .bind(self.workspace_id)
-            .bind(run)
-            .bind(end.wire())
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        self.hub.notify(self.thread_id, seq);
-        Ok(seq)
+        sqlx::query("UPDATE tool_calls SET state='outcome_unknown', result=$3, ended_at=now() WHERE workspace_id=$1 AND id=$2")
+                .bind(workspace).bind(*call).bind(&code).execute(&mut **tx).await?;
     }
+    log::append(
+        tx,
+        workspace,
+        thread,
+        Some(run),
+        &KatworkEvent::RunClosed(RunClosedEvent {
+            run_id: run,
+            end,
+            code: Some(code.clone()),
+        })
+        .into(),
+    )
+    .await?;
+    let seq = log::append(
+        tx,
+        workspace,
+        thread,
+        Some(run),
+        &AgUiEvent::RunError {
+            message: code.clone(),
+            code: Some(code),
+        },
+    )
+    .await?;
+    sqlx::query("UPDATE runs SET state=$3, ended_at=now() WHERE workspace_id=$1 AND id=$2")
+        .bind(workspace)
+        .bind(run)
+        .bind(end.wire())
+        .execute(&mut **tx)
+        .await?;
+    Ok(seq)
 }

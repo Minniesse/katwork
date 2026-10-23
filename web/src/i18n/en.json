@@ -87,6 +87,7 @@
   "reason.question_pending": "A Kat asked you a question. Answer it to continue.",
   "reason.interrupted_review_required": "The work stopped partway after it had started changing things. Review what happened before trying again.",
   "reason.kat_paused": "That Kat is paused. Ask your admin to resume it, or ask another Kat.",
+  "reason.internal_error": "An internal error stopped this job. Please try again.",
   "reason.retries_exhausted": "KatWork tried several times and couldn't finish. Try again later.",
   "reason.cancelled": "Stopped.",
   "reason.outcome_unknown": "A Kat started an action, but KatWork couldn't confirm whether it finished. Check the result before trying again.",

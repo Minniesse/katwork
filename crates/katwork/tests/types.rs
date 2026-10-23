@@ -78,6 +78,7 @@ fn shared_wire_values_match_json() {
         "question_pending",
         "interrupted_review_required",
         "kat_paused",
+        "internal_error",
         "retries_exhausted",
         "cancelled",
         "outcome_unknown",

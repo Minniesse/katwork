@@ -1,5 +1,7 @@
 pub mod job;
+pub mod lease;
 pub mod task;
+pub mod worker;
 
 use serde::{Deserialize, Serialize};
 

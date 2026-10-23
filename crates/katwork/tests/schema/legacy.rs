@@ -191,7 +191,10 @@ async fn rename_preserves_populated_database(pool: PgPool) {
                 row["meta"] = serde_json::Value::Null;
                 row["stopped"] = serde_json::json!(false);
             }
-            "tasks" => row["hold_reason"] = serde_json::json!("kat_busy"),
+            "tasks" => {
+                row["hold_reason"] = serde_json::json!("kat_busy");
+                row["first_claimed_at"] = serde_json::Value::Null;
+            }
             "jobs" => row["reason"] = serde_json::json!("no_eligible_kat"),
             "runs" => row["stop_reason"] = serde_json::json!("kat_paused"),
             _ => {}

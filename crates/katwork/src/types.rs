@@ -160,6 +160,7 @@ wire_enum!(ReasonCode {
     QuestionPending => "question_pending",
     InterruptedReviewRequired => "interrupted_review_required",
     KatPaused => "kat_paused",
+    InternalError => "internal_error",
     RetriesExhausted => "retries_exhausted",
     Cancelled => "cancelled",
     OutcomeUnknown => "outcome_unknown",
@@ -172,7 +173,7 @@ wire_enum!(ReasonCode {
 });
 
 impl ReasonCode {
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::ProviderUnavailable,
         Self::ProviderRateLimited,
         Self::ProviderQuota,
@@ -191,6 +192,7 @@ impl ReasonCode {
         Self::QuestionPending,
         Self::InterruptedReviewRequired,
         Self::KatPaused,
+        Self::InternalError,
         Self::RetriesExhausted,
         Self::Cancelled,
         Self::OutcomeUnknown,
