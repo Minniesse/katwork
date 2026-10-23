@@ -571,7 +571,7 @@ pub async fn abandon(
     Ok(())
 }
 
-/// Contain a run panic without a policy verdict or another attempt at the poison task.
+/// Contain a run panic; committed effects require review before another attempt.
 pub(crate) async fn fail(
     core: &Core,
     task: TaskId,
@@ -605,6 +605,13 @@ pub(crate) async fn fail(
         .bind(workspace).bind(&runs).fetch_all(&mut *tx).await?;
     lock_thread(&mut tx, workspace, thread).await?;
     fence::lock(&mut tx, &fence).await?;
+    let (kat, effects_started): (KatId, bool) = sqlx::query_as(
+        "SELECT kat_id,effects_started_at IS NOT NULL FROM tasks WHERE workspace_id=$1 AND id=$2",
+    )
+    .bind(workspace)
+    .bind(task)
+    .fetch_one(&mut *tx)
+    .await?;
     for run in runs {
         let open = calls
             .iter()
@@ -622,19 +629,38 @@ pub(crate) async fn fail(
         )
         .await?;
     }
-    sqlx::query("UPDATE tasks SET state='failed',hold_reason=NULL WHERE workspace_id=$1 AND id=$2")
+    sqlx::query("UPDATE tasks SET state=$3,hold_reason=NULL WHERE workspace_id=$1 AND id=$2")
         .bind(workspace)
         .bind(task)
+        .bind(if effects_started {
+            "interrupted"
+        } else {
+            "failed"
+        })
         .execute(&mut *tx)
         .await?;
     release(&mut tx, task).await?;
-    let seq = job::finish_by_harness(
-        &mut tx,
-        job,
-        HarnessEnd::Error {
-            code: ReasonCode::InternalError,
-        },
-    )
-    .await?;
+    let seq = if effects_started {
+        let tenant = tenancy::for_task(&mut *tx, task).await?;
+        job::conclude(
+            &mut tx,
+            &tenant,
+            job,
+            thread,
+            Some(kat),
+            &task.to_string(),
+            &RunFacts::not_run(StopReason::Interrupted),
+        )
+        .await?
+    } else {
+        job::finish_by_harness(
+            &mut tx,
+            job,
+            HarnessEnd::Error {
+                code: ReasonCode::InternalError,
+            },
+        )
+        .await?
+    };
     commit(core, tx, thread, Some(seq)).await
 }
