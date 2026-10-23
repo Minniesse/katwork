@@ -50,6 +50,9 @@ impl Fixture {
         Self::with_timeout(pool, 5000).await
     }
     async fn with_timeout(pool: &PgPool, lock_timeout: u64) -> Self {
+        Self::with_locale(pool, lock_timeout, Locale::En).await
+    }
+    async fn with_locale(pool: &PgPool, lock_timeout: u64, locale: Locale) -> Self {
         let (user, password) = support::user(pool).await;
         let workspace = WorkspaceId::new();
         sqlx::query("INSERT INTO workspaces(id,name) VALUES($1,'Pipeline')")
@@ -75,7 +78,7 @@ impl Fixture {
         .execute(pool)
         .await
         .unwrap();
-        let team = team::create_default(pool, &tenant, space, Locale::En)
+        let team = team::create_default(pool, &tenant, space, locale)
             .await
             .unwrap();
         let kats = team::get(pool, &tenant, team).await.unwrap().members;
@@ -226,7 +229,10 @@ impl Fixture {
         .collect()
     }
     async fn awaiting(&self) -> JobId {
-        let (_, job) = self.submit("@Writer question").await;
+        self.awaiting_kat(&self.kats[2]).await
+    }
+    async fn awaiting_kat(&self, kat: &Kat) -> JobId {
+        let (_, job) = self.submit(&format!("@{} question", kat.name)).await;
         sqlx::query("UPDATE jobs SET status='needs_input',reason='question_pending',decided_by='policy',finished_at=clock_timestamp() WHERE id=$1").bind(job).execute(&self.core.pool).await.unwrap();
         sqlx::query("UPDATE tasks SET state='done' WHERE job_id=$1")
             .bind(job)
@@ -631,7 +637,7 @@ async fn mention_needs_space_names_english_and_thai_kats(pool: PgPool) {
 mod safety;
 
 #[sqlx::test(migrations = "../katwork/migrations")]
-async fn mention_space_warning_respects_parser_and_lead_routing(pool: PgPool) {
+async fn mention_space_warning_respects_parser_and_follow_up_routing(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     for text in [
         "`@Writerplease`",
@@ -649,8 +655,8 @@ async fn mention_space_warning_respects_parser_and_lead_routing(pool: PgPool) {
     f.awaiting().await;
     let (_, job) = f.submit("@Writerplease @Writerplease").await;
     let (kat, input) = f.task(job).await;
-    assert_eq!(kat, f.kats[0].id);
-    assert_eq!(input.routing.rule, katwork::jobs::RouteRule::Lead);
+    assert_eq!(kat, f.kats[2].id);
+    assert_eq!(input.routing.rule, katwork::jobs::RouteRule::FollowUp);
     assert_eq!(
         f.notices()
             .await
@@ -660,3 +666,6 @@ async fn mention_space_warning_respects_parser_and_lead_routing(pool: PgPool) {
         1
     );
 }
+
+#[path = "pipeline/followups.rs"]
+mod followups;

@@ -104,11 +104,34 @@ async fn history_uses_thread_id_index(pool: PgPool) {
 async fn latest_job_in_thread_uses_thread_index(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let mut tx = pool.begin().await.unwrap();
+    sqlx::query("UPDATE jobs SET status='stopped' WHERE id=$1")
+        .bind(f.job)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE runs SET state='finished',ended_at=clock_timestamp() WHERE id=$1")
+        .bind(f.run)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let message = Uuid::now_v7();
+        let job = Uuid::now_v7();
+        sqlx::query("INSERT INTO messages (id,workspace_id,thread_id,author_kind,author_user_id,body) VALUES ($1,$2,$3,'user',$4,'Answer')")
+            .bind(message).bind(f.workspace).bind(f.thread).bind(f.user)
+            .execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO jobs (id,workspace_id,thread_id,request_message_id,requested_by,status) VALUES ($1,$2,$3,$4,$5,'stopped')")
+            .bind(job).bind(f.workspace).bind(f.thread).bind(message).bind(f.user)
+            .execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO tasks (id,workspace_id,job_id,kat_id,kat_policy_version,input,state) VALUES ($1,$2,$3,$4,1,'{}','failed')")
+            .bind(Uuid::now_v7()).bind(f.workspace).bind(job).bind(f.kat)
+            .execute(&mut *tx).await.unwrap();
+    }
     sqlx::query("SET LOCAL enable_seqscan=off")
         .execute(&mut *tx)
         .await
         .unwrap();
-    let plan = QueryBuilder::<Postgres>::new("EXPLAIN ")
+    let plan = QueryBuilder::<Postgres>::new("EXPLAIN (ANALYZE, TIMING OFF) ")
         .push(include_str!("../../src/jobs/latest_in_thread.sql"))
         .build_query_scalar::<String>()
         .bind(f.workspace)
@@ -118,6 +141,17 @@ async fn latest_job_in_thread_uses_thread_index(pool: PgPool) {
         .unwrap()
         .join("\n");
     assert!(plan.contains("jobs_thread_id"), "{plan}");
+    let lines: Vec<_> = plan.lines().collect();
+    assert!(
+        lines.windows(2).any(|pair| {
+            pair[0].contains("runs_job_id")
+                && pair[0].contains("loops=3")
+                && pair[1].contains("Index Cond:")
+                && pair[1].contains("job_id = j.id")
+        }),
+        "{plan}"
+    );
+    assert!(!plan.contains("Seq Scan on runs"), "{plan}");
 }
 #[sqlx::test]
 async fn sender_throttle_uses_requester_and_task_indexes(pool: PgPool) {

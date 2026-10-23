@@ -122,9 +122,10 @@ pub async fn intake(
             ));
         }
     }
-    if chosen.is_none() && missing_spaces.is_empty() {
+    if chosen.is_none() {
         chosen = parent
             .as_ref()
+            .filter(|p| missing_spaces.iter().all(|id| Some(*id) == p.kat_id))
             .and_then(|p| eligible.iter().find(|k| Some(k.id) == p.kat_id))
             .map(|k| (k, RouteRule::FollowUp));
     }
