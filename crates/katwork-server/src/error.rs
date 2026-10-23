@@ -18,7 +18,13 @@ impl IntoResponse for ApiError {
         let status = match &self.0 {
             KatError::NotFound => StatusCode::NOT_FOUND,
             KatError::Forbidden => StatusCode::FORBIDDEN,
-            KatError::SpacePolicyRequired => StatusCode::UNPROCESSABLE_ENTITY,
+            KatError::DotNameConflict
+            | KatError::DefaultSpaceRequired
+            | KatError::GrantInUse
+            | KatError::TeamLeadConflict
+            | KatError::TeamLeadRequired
+            | KatError::DotNotInSpace
+            | KatError::SpacePolicyRequired => StatusCode::UNPROCESSABLE_ENTITY,
             KatError::Unauthenticated => StatusCode::UNAUTHORIZED,
             KatError::ResetTokenInvalid | KatError::PasswordInvalid | KatError::RequestInvalid => {
                 StatusCode::BAD_REQUEST
