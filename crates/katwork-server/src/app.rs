@@ -7,7 +7,7 @@ use axum::{
 use katwork::runtime::Core;
 
 use crate::{
-    routes::{auth, health, kats, teams, threads, workspaces},
+    routes::{auth, events, health, kats, teams, threads, workspaces},
     static_files,
 };
 
@@ -98,6 +98,13 @@ fn router(state: AppState, web_dir: &Path, reset_work: ResetWork) -> Router {
         .layer(Extension(auth::LoginLimiter::default()))
         .layer(Extension(auth::ResetLimiter::default()))
         .layer(Extension(reset_work))
+        .with_state(state.clone());
+    let streams = Router::new()
+        .route(
+            "/api/workspaces/{workspace_id}/threads/{thread_id}/events",
+            get(events::subscribe),
+        )
+        .layer(axum::middleware::from_fn(crate::guards::read_body))
         .with_state(state);
-    crate::guards::apply(router, &config)
+    crate::guards::secure(crate::guards::bounded(router).merge(streams), &config)
 }

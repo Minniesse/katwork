@@ -1,5 +1,11 @@
 #[derive(Debug, thiserror::Error)]
 pub enum KatError {
+    #[error("busy")]
+    Busy,
+    #[error("invalid_cursor")]
+    InvalidCursor,
+    #[error("too_many_streams")]
+    TooManyStreams,
     #[error("message_too_large")]
     MessageTooLarge,
     #[error("message_empty")]
@@ -88,6 +94,9 @@ pub enum KatError {
 
 impl From<sqlx::Error> for KatError {
     fn from(error: sqlx::Error) -> Self {
+        if error.as_database_error().and_then(|e| e.code()).as_deref() == Some("55P03") {
+            return Self::Busy;
+        }
         match error {
             sqlx::Error::PoolTimedOut
             | sqlx::Error::PoolClosed
@@ -101,6 +110,9 @@ impl From<sqlx::Error> for KatError {
 impl KatError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::Busy => "busy",
+            Self::InvalidCursor => "invalid_cursor",
+            Self::TooManyStreams => "too_many_streams",
             Self::MessageTooLarge => "message_too_large",
             Self::MessageEmpty => "message_empty",
             Self::MessageInvalid => "message_invalid",

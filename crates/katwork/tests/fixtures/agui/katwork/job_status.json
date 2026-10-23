@@ -1,0 +1,9 @@
+{
+  "name": "katwork.job_status",
+  "value": {
+    "jobId": "00000000-0000-0000-0000-000000000001",
+    "status": null,
+    "reason": null,
+    "holdReason": "kat_busy"
+  }
+}

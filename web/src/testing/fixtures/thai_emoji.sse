@@ -1,0 +1,19 @@
+retry: 3000
+
+: keep-alive
+
+id: 1
+data: {"type":"RUN_STARTED","threadId":"thread","runId":"run","protocolVersion":"1.0"}
+
+id: 2
+data: {"type":"TEXT_MESSAGE_START","messageId":"reply","role":"assistant"}
+
+id: 3
+data: {"type":"TEXT_MESSAGE_CONTENT","messageId":"reply","delta":"ที่นี่สวัสดีครับ 👋🏽 🇹🇭"}
+
+id: 4
+data: {"type":"TEXT_MESSAGE_END","messageId":"reply"}
+
+id: 5
+data: {"type":"RUN_FINISHED","threadId":"thread","runId":"run"}
+

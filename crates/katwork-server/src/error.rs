@@ -16,6 +16,9 @@ impl From<KatError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.0 {
+            KatError::InvalidCursor => StatusCode::BAD_REQUEST,
+            KatError::TooManyStreams => StatusCode::INTERNAL_SERVER_ERROR,
+            KatError::Busy => StatusCode::SERVICE_UNAVAILABLE,
             KatError::MessageTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             KatError::ClientMsgIdConflict => StatusCode::CONFLICT,
             KatError::MessageEmpty
@@ -64,6 +67,13 @@ impl IntoResponse for ApiError {
             | KatError::Migration(_)
             | KatError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        (status, Json(serde_json::json!({"code": self.0.code()}))).into_response()
+        let mut response =
+            (status, Json(serde_json::json!({"code": self.0.code()}))).into_response();
+        if matches!(self.0, KatError::Busy) {
+            response
+                .headers_mut()
+                .insert("retry-after", axum::http::HeaderValue::from_static("1"));
+        }
+        response
     }
 }
