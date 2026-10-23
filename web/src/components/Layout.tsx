@@ -23,7 +23,7 @@ function Brand() {
         <span />
         <span />
       </span>
-      {t('app.name')}
+      <span className="brand-name">{t('app.name')}</span>
     </p>
   );
 }
@@ -111,7 +111,7 @@ function Picker<T extends { id: string; name: string }>({
   if (items.length < 2 || !current) return null;
   return (
     <label className="picker">
-      <span>{label}</span>
+      <span className="picker-label">{label}</span>
       <select className="select" value={current.id} onChange={(event) => onPick(event.target.value)}>
         {items.map((item) => (
           <option key={item.id} value={item.id}>
@@ -146,8 +146,8 @@ export function AppLayout({
       <SkipLink />
       <header className="shell-header">
         <Brand />
-        <nav className="shell-nav" aria-label={t('nav.main')}>
-          {nav && (
+        {nav && (
+          <nav className="shell-nav" aria-label={t('nav.main')}>
             <ul className="nav-links">
               <li>
                 <NavLink to="/" path={nav.path}>
@@ -172,8 +172,6 @@ export function AppLayout({
                 </li>
               )}
             </ul>
-          )}
-          {nav && (
             <div className="pickers">
               <Picker
                 label={t('nav.workspace')}
@@ -181,14 +179,21 @@ export function AppLayout({
                 current={nav.workspace}
                 onPick={nav.onWorkspace}
               />
-              <Picker label={t('nav.space')} items={nav.spaces} current={nav.space} onPick={nav.onSpace} />
+              <Picker
+                label={t('nav.space')}
+                items={nav.spaces}
+                current={nav.space}
+                onPick={nav.onSpace}
+              />
             </div>
-          )}
+          </nav>
+        )}
+        <div className="shell-tools">
           <Preferences />
           <button type="button" className="button button-quiet" onClick={onSignOut}>
             {t('nav.sign_out')}
           </button>
-        </nav>
+        </div>
       </header>
       <main id="main" className="shell-main">
         {signOutProblem && (
