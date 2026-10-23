@@ -285,6 +285,14 @@ impl Config {
             return Err(KatError::ConfigInvalid);
         }
         let optional = |name: &str| lookup(name).filter(|value| !value.is_empty());
+        for key in ["OPENAI_BASE_URL", "ANTHROPIC_BASE_URL"] {
+            if let Some(value) = optional(key) {
+                let url = Url::parse(&value).map_err(|_| KatError::ConfigInvalid)?;
+                if !matches!(url.scheme(), "http" | "https") || !url.has_host() {
+                    return Err(KatError::ConfigInvalid);
+                }
+            }
+        }
         for name in ["SMTP_PASSWORD", "KATWORK_DEMO_PASSWORD"] {
             if optional(name).is_some_and(|value| value.chars().count() < 8) {
                 return Err(KatError::ConfigInvalid);

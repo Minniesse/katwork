@@ -90,11 +90,13 @@ pub struct Dot {
 
 impl Dot {
     pub fn config_hash(&self) -> String {
-        let config = serde_json::json!({
+        let mut config = serde_json::json!({
             "persona": self.persona, "instructions": self.instructions,
             "tool_allowlist": self.tool_allowlist, "model_tier": self.model_tier,
             "autonomy": self.autonomy, "policy_version": self.policy_version,
         });
+        // Dependency features can enable insertion order; audit hashes require sorted keys.
+        config.sort_all_objects();
         format!("{:x}", Sha256::digest(config.to_string().as_bytes()))
     }
 }
@@ -147,11 +149,11 @@ fn validate_config(
     appearance: &Appearance,
     tools: &mut Vec<String>,
 ) -> Result<(), KatError> {
-    for (text, limit) in [
-        (persona, 4_000),
-        (instructions, 8_000),
-        (appearance.avatar.as_str(), 200),
-        (appearance.accent.as_str(), 200),
+    for (text, limit, multiline) in [
+        (persona, 4_000, true),
+        (instructions, 8_000, true),
+        (appearance.avatar.as_str(), 200, false),
+        (appearance.accent.as_str(), 200, false),
     ] {
         if text.chars().count() > limit
             || text.chars().any(|ch| {
@@ -161,7 +163,7 @@ fn validate_config(
                         | GeneralCategory::Format
                         | GeneralCategory::LineSeparator
                         | GeneralCategory::ParagraphSeparator
-                )
+                ) && !(multiline && matches!(ch, '\n' | '\r' | '\t'))
             })
         {
             return Err(KatError::RequestInvalid);
@@ -210,8 +212,19 @@ pub async fn get(pool: &PgPool, tenant: &Tenant, id: DotId) -> Result<Dot, KatEr
     get_on(pool, tenant, id).await
 }
 
-/// Check current eligibility on the caller's connection, including uncommitted grant changes.
+/// Check the grant independently of status so callers can distinguish a paused Dot from a revoked grant.
 pub async fn is_granted(
+    conn: &mut PgConnection,
+    tenant: &Tenant,
+    id: DotId,
+    space: SpaceId,
+) -> Result<bool, KatError> {
+    Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM dot_spaces WHERE workspace_id=$1 AND dot_id=$2 AND space_id=$3)")
+        .bind(tenant.workspace_id()).bind(id).bind(space).fetch_one(conn).await?)
+}
+
+/// Check both active status and the grant in one snapshot on the caller's connection.
+pub async fn is_eligible(
     conn: &mut PgConnection,
     tenant: &Tenant,
     id: DotId,

@@ -2,6 +2,11 @@ use katwork::{ids::*, types::*};
 use serde_json::{from_value, json, to_value};
 
 #[test]
+fn name_unicode_repertoire_does_not_exceed_case_fold_tables() {
+    assert!(unicode_properties::UNICODE_VERSION <= caseless::UNICODE_VERSION);
+}
+
+#[test]
 fn typed_ids_are_uuid_v7_and_round_trip() {
     macro_rules! check {
         ($($id:ident),+ $(,)?) => {$({

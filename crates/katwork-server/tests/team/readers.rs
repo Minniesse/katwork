@@ -65,7 +65,7 @@ async fn connection_readers_filter_workspace_status_membership_and_grants(pool: 
         eligible.iter().map(|dot| dot.id).collect::<Vec<_>>(),
         ids[..2]
     );
-    for (id, expected) in ids.iter().zip([true, true, false, true, false]) {
+    for (id, expected) in ids.iter().zip([true, true, true, true, false]) {
         assert_eq!(
             dot::is_granted(&mut tx, &tenant, *id, second)
                 .await
@@ -103,7 +103,7 @@ async fn connection_readers_filter_workspace_status_membership_and_grants(pool: 
         "Uncommitted"
     );
     assert!(
-        !dot::is_granted(&mut tx, &tenant, ids[0], second)
+        dot::is_granted(&mut tx, &tenant, ids[0], second)
             .await
             .unwrap()
     );
@@ -157,5 +157,72 @@ async fn connection_readers_filter_workspace_status_membership_and_grants(pool: 
             .unwrap_err()
             .code(),
         "not_found"
+    );
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn paused_dots_keep_grants_but_are_not_eligible(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let hired = f.hire("Writer", json!("writer")).await;
+    let id: DotId = serde_json::from_value(hired["id"].clone()).unwrap();
+    let space = SpaceId(space(&pool, f.workspace).await);
+    let tenant = tenancy::resolve(&pool, UserId(f.user), WorkspaceId(f.workspace))
+        .await
+        .unwrap();
+    dot::grant_space(&pool, &tenant, id, space).await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    assert!(dot::is_granted(&mut tx, &tenant, id, space).await.unwrap());
+    assert!(dot::is_eligible(&mut tx, &tenant, id, space).await.unwrap());
+    sqlx::query("UPDATE dots SET status='paused' WHERE id=$1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    assert!(dot::is_granted(&mut tx, &tenant, id, space).await.unwrap());
+    assert!(!dot::is_eligible(&mut tx, &tenant, id, space).await.unwrap());
+    sqlx::query("DELETE FROM dot_spaces WHERE dot_id=$1 AND space_id=$2")
+        .bind(id)
+        .bind(space)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    assert!(!dot::is_granted(&mut tx, &tenant, id, space).await.unwrap());
+    assert!(!dot::is_eligible(&mut tx, &tenant, id, space).await.unwrap());
+    tx.rollback().await.unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    assert!(
+        dot::is_granted(&mut conn, &tenant, id, space)
+            .await
+            .unwrap()
+    );
+    assert!(
+        dot::is_eligible(&mut conn, &tenant, id, space)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !dot::is_eligible(&mut conn, &tenant, DotId::new(), space)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !dot::is_eligible(&mut conn, &tenant, id, SpaceId::new())
+            .await
+            .unwrap()
+    );
+    let other = workspace(&pool).await;
+    sqlx::query("INSERT INTO memberships (workspace_id,user_id,role) VALUES ($1,$2,'owner')")
+        .bind(other)
+        .bind(f.user)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let foreign = tenancy::resolve(&pool, UserId(f.user), WorkspaceId(other))
+        .await
+        .unwrap();
+    assert!(
+        !dot::is_eligible(&mut conn, &foreign, id, space)
+            .await
+            .unwrap()
     );
 }

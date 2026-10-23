@@ -1,6 +1,114 @@
 use super::*;
 
 #[sqlx::test(migrations = "../katwork/migrations")]
+async fn names_allow_at_most_four_combining_marks_per_base(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let dot = f.hire("Writer", json!("writer")).await;
+    for name in [
+        format!("a{}", "\u{301}".repeat(5)),
+        format!("é{}", "\u{301}".repeat(4)),
+        format!("ก{}", "\u{e49}".repeat(5)),
+    ] {
+        assert_code(
+            f.call(
+                "POST",
+                &format!("spaces/{}/dots", f.space),
+                Some(json!({"name":name,"role":"writer","persona":""})),
+            )
+            .await,
+            400,
+            "request_invalid",
+        )
+        .await;
+        assert_code(
+            f.call(
+                "PATCH",
+                &format!("dots/{}", id(&dot)),
+                Some(json!({"name":name})),
+            )
+            .await,
+            400,
+            "request_invalid",
+        )
+        .await;
+    }
+    for name in [
+        format!("a{}", "\u{301}".repeat(4)),
+        format!("é{}", "\u{301}".repeat(3)),
+        format!("ก{}", "\u{e49}".repeat(4)),
+        format!("a{}b{}", "\u{301}".repeat(4), "\u{301}".repeat(4)),
+    ] {
+        assert_eq!(f.hire(&name, json!("writer")).await["name"], name);
+    }
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn unicode_17_names_are_rejected_in_hire_rename_and_membership_writes(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let lead = f.hire("Lead", json!("lead")).await;
+    let dot = f.hire("Writer", json!("writer")).await;
+    let team = f.team(&lead, &[]).await;
+    for name in ["Writer\u{a7ce}", "Writer\u{a7cf}"] {
+        assert_code(
+            f.call(
+                "POST",
+                &format!("spaces/{}/dots", f.space),
+                Some(json!({"name":name,"role":"writer","persona":""})),
+            )
+            .await,
+            400,
+            "request_invalid",
+        )
+        .await;
+        assert_code(
+            f.call(
+                "PATCH",
+                &format!("dots/{}", id(&dot)),
+                Some(json!({"name":name})),
+            )
+            .await,
+            400,
+            "request_invalid",
+        )
+        .await;
+        // Existing rows from the former Unicode 17 validator must not bypass team-write validation.
+        sqlx::query("UPDATE dots SET name=$2 WHERE id=$1")
+            .bind(Uuid::parse_str(id(&dot)).unwrap())
+            .bind(name)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_code(
+            f.call(
+                "POST",
+                &format!("spaces/{}/teams", f.space),
+                Some(json!({"name":"Team","lead":lead["id"],"members":[dot["id"]]})),
+            )
+            .await,
+            400,
+            "request_invalid",
+        )
+        .await;
+        assert_code(
+            f.call(
+                "PUT",
+                &format!("teams/{}/members/{}", id(&team["team"]), id(&dot)),
+                Some(json!({"is_lead":false})),
+            )
+            .await,
+            400,
+            "request_invalid",
+        )
+        .await;
+        sqlx::query("UPDATE dots SET name='Writer' WHERE id=$1")
+            .bind(Uuid::parse_str(id(&dot)).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
 async fn blank_invisible_and_unassigned_names_are_rejected(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let lead = f.hire("Lead", json!("lead")).await;

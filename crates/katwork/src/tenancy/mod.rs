@@ -3,6 +3,7 @@ pub mod workspace;
 
 use serde::{Deserialize, Serialize};
 use sqlx::{Executor, Postgres};
+use unicode_normalization::UnicodeNormalization;
 use unicode_properties::{GeneralCategory, GeneralCategoryGroup, UnicodeGeneralCategory};
 
 use crate::{
@@ -134,6 +135,17 @@ pub(crate) fn validate_name(name: &str) -> Result<&str, KatError> {
         })
     {
         return Err(KatError::RequestInvalid);
+    }
+    let mut marks = 0;
+    for ch in name.nfd() {
+        if ch.general_category_group() == GeneralCategoryGroup::Mark {
+            marks += 1;
+            if marks > 4 {
+                return Err(KatError::RequestInvalid);
+            }
+        } else {
+            marks = 0;
+        }
     }
     Ok(name)
 }

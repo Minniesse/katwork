@@ -56,7 +56,7 @@ async fn free_text_rejects_nul_controls_bidi_and_oversize(pool: PgPool) {
     let path = format!("dots/{}", id(&hired));
     for (field, cap) in [("persona", 4_000), ("instructions", 8_000)] {
         for value in [
-            "\0", "\n", "\t", "\u{7f}", "\u{85}", "\u{202e}", "\u{200b}", "\u{2028}", "\u{2029}",
+            "\0", "\u{7f}", "\u{85}", "\u{202e}", "\u{200b}", "\u{2028}", "\u{2029}",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -143,6 +143,45 @@ async fn appearance_accepts_only_known_avatars_and_accents(pool: PgPool) {
             assert_eq!(response.status(), 200);
         }
     }
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn multiline_persona_and_instructions_accept_lf_cr_and_tab(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let text = "First line\nSecond line\r\n\tIndented ไทย";
+    f.role(&pool, "member").await;
+    let response = f
+        .call(
+            "POST",
+            &format!("spaces/{}/dots", f.space),
+            Some(json!({"name":"Writer","role":"writer","persona":text})),
+        )
+        .await;
+    assert_eq!(response.status(), 201);
+    let hired = body(response).await;
+    assert_eq!(hired["persona"], text);
+    let path = format!("dots/{}", id(&hired));
+    let response = f.call("PATCH", &path, Some(json!({"persona":text}))).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(body(response).await["persona"], text);
+    f.role(&pool, "owner").await;
+    let response = f
+        .call("PATCH", &path, Some(json!({"instructions":text})))
+        .await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(body(response).await["instructions"], text);
+    let tenant = tenancy::resolve(&pool, UserId(f.user), WorkspaceId(f.workspace))
+        .await
+        .unwrap();
+    let mut new = roles::template(&DotRole::Writer, Locale::En);
+    new.instructions = text.into();
+    let id = dot::hire(&pool, &tenant, SpaceId(f.space), new)
+        .await
+        .unwrap();
+    assert_eq!(
+        dot::get(&pool, &tenant, id).await.unwrap().instructions,
+        text
+    );
 }
 
 #[sqlx::test(migrations = "../katwork/migrations")]

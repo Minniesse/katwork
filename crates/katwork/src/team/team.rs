@@ -113,6 +113,7 @@ async fn create_on(
         if !dot.spaces.contains(&space) {
             return Err(KatError::DotNotInSpace);
         }
+        tenancy::validate_name(&dot.name)?;
         if !names.insert(super::name_key(&dot.name)) {
             return Err(KatError::DotNameConflict);
         }
@@ -209,6 +210,7 @@ pub async fn add_member(
     if !dot.spaces.contains(&team.space_id) {
         return Err(KatError::DotNotInSpace);
     }
+    tenancy::validate_name(&dot.name)?;
     let current: Vec<(DotId, String, bool)> = sqlx::query_as("SELECT d.id, d.name, m.is_lead FROM team_members m JOIN dots d ON d.id=m.dot_id AND d.workspace_id=m.workspace_id WHERE m.workspace_id=$1 AND m.team_id=$2 AND m.active")
         .bind(tenant.workspace_id()).bind(id).fetch_all(&mut *tx).await?;
     if is_lead

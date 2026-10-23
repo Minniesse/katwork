@@ -303,6 +303,7 @@ web/
   - `GET/POST /api/workspaces/{workspace_id}/spaces`. `POST` takes `{name, allow_external}`; without `allow_external` it returns 422 `space_policy_required`, because the admin chooses local-only or hosted-allowed for every Space (spec §11).
   - `PUT /api/workspaces/{workspace_id}/paused` with `{"paused": bool}`
 - `seed-demo` creates the demo Space with `allow_external = true`.
+- Workspace and Space names use the shared name validator documented in Task 5; they require a letter or decimal digit, so emoji-only names are invalid.
 
 - [ ] **Step 1: Write the failing tests** in `crates/katwork-server/tests/tenancy.rs`:
   - `member_lists_own_spaces`
@@ -347,7 +348,7 @@ web/
   - `NewTeam { name: String, lead: DotId, members: Vec<DotId> }`, `team::create(pool, &Tenant, SpaceId, NewTeam) -> Result<TeamId, KatError>` and `team::list(pool, &Tenant, SpaceId) -> Result<Vec<Team>, KatError>`
   - `team::add_member(pool, &Tenant, TeamId, DotId, is_lead: bool) -> Result<(), KatError>`: a second lead is 422 `team_lead_conflict`; a Dot not granted to the team's Space is 422 `dot_not_in_space`
   - `team::remove_member(pool, &Tenant, TeamId, DotId) -> Result<(), KatError>`: removing the lead is 422 `team_lead_required`
-  - Transaction readers: `dot::get_on(executor, &Tenant, DotId)`, `dot::is_granted(&mut PgConnection, &Tenant, DotId, SpaceId) -> Result<bool, KatError>`, and `team::eligible_members(&mut PgConnection, &Tenant, TeamId) -> Result<Vec<Dot>, KatError>`. Eligibility requires an active Dot and a grant; team eligibility also requires active membership. Every reader scopes by the resolved tenant's workspace. Unknown or foreign grants return false; unknown or foreign teams return `not_found`.
+  - Transaction readers: `dot::get_on(executor, &Tenant, DotId)`, `dot::is_granted(&mut PgConnection, &Tenant, DotId, SpaceId) -> Result<bool, KatError>`, `dot::is_eligible(&mut PgConnection, &Tenant, DotId, SpaceId) -> Result<bool, KatError>`, and `team::eligible_members(&mut PgConnection, &Tenant, TeamId) -> Result<Vec<Dot>, KatError>`. `is_granted` checks the grant regardless of status, so Task 8 can distinguish `DotPaused` from `PolicyChanged`. `is_eligible` additionally requires an active Dot; team eligibility also requires active membership. Every reader scopes by the resolved tenant's workspace. Unknown or foreign grants return false; unknown or foreign teams return `not_found`.
 - Routes:
   - Bodies are the serde JSON of the named structs, with snake_case fields.
   - `GET /api/workspaces/{workspace_id}/spaces/{space_id}/dots` → 200 `[Dot]`; `POST` ("hire") with `HireDot` → 201 `Dot`
@@ -359,12 +360,12 @@ web/
 
 **Task 5 validation and policy decisions (PR #24 fix round):**
 - Increment `policy_version` only for effective changes to `tool_allowlist`, `status`, Space grants, `autonomy`, and `model_tier` (residency). Concurrency, budget, persona, instructions, name, and appearance edits leave it unchanged. Persona and instructions still affect the audit `config_hash` for the next run.
-- Free text rejects Cc, Cf (including bidi), Zl, and Zp characters, including NUL, tabs, and newlines. Initial scalar limits: persona 4,000, instructions 8,000, each appearance field 200. Invalid input returns 400 `request_invalid` from both hire and update.
+- Free text rejects Cc, Cf (including bidi), Zl, and Zp characters, except that persona and instructions allow LF, CR, and tab for multiline input. Appearance fields do not allow these exceptions. Initial scalar limits: persona 4,000, instructions 8,000, each appearance field 200. Invalid input returns 400 `request_invalid` from both hire and update.
 - Tool IDs match `^[a-z][a-z0-9_.]{0,63}$`; store at most 32 distinct IDs, sorted and deduplicated. Reordering or repeating IDs is a no-op.
 - Avatars: `compass`, `magnifier`, `pen`, `chart`, `calendar`, `check`, `dot`. Accent palette: `blue`, `yellow`, `red`, `green`, `purple`.
 - Refuse non-default grant revocation with 422 `grant_in_use` while any active team membership uses that Space, including a Lead. Soft-removed memberships do not block revocation; default grants still return `default_space_required`.
-- Name keys use compatibility normalization and full case folding (NFKC_Casefold for accepted names, which exclude default ignorables). Fullwidth letters and no-break spaces collide with their ordinary forms. Reject names without a letter or decimal digit, leading combining marks, invisible fillers, variation selectors, private-use and unassigned code points; preserve accepted display spelling.
-- Canonicalize contiguous Thai combining-mark runs, putting vowels and nikhahit before tone marks. This covers tone/vowel input-order differences and sara am versus nikhahit plus sara aa. This is name matching, not Thai spelling validation.
+- Name keys use compatibility normalization and full case folding (NFKC_Casefold for accepted names, which exclude default ignorables). Fullwidth letters and no-break spaces collide with their ordinary forms, and whitespace runs collapse to one space. Reject names without a letter or decimal digit, leading combining marks, invisible fillers, variation selectors, private-use and unassigned code points, and more than four combining marks per base character after canonical decomposition; preserve accepted display spelling. The validator is pinned to Unicode 16, matching the folding tables; Unicode 17 additions are rejected until both tables can advance together. Team create/add also validates stored Dot names so legacy rows cannot bypass this restriction.
+- Canonicalize contiguous Thai combining-mark runs, putting vowels and nikhahit before tone marks, and remove repeated identical Thai marks from the key. This covers tone/vowel input-order differences and sara am versus nikhahit plus sara aa. This is name matching, not Thai spelling validation.
 - Cross-script confusables such as Latin `Writer` and Cyrillic-i `Wrіter` remain distinct: [UTS #39 skeleton matching](https://www.unicode.org/reports/tr39/#Confusable_Detection) is outside this initial name-key contract. Task 12 must reuse this normalization contract for mentions; it must not assume it prevents every visual impersonation.
 
 - [ ] **Step 1: Write the failing tests** in `crates/katwork-server/tests/team.rs`:
