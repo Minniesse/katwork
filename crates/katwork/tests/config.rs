@@ -16,7 +16,7 @@ fn lock_timeout_must_be_a_positive_integer() {
             std::time::Duration::from_millis(millis)
         );
     }
-    for value in ["0", "x", "", "-1", "+5", "1.5"] {
+    for value in ["0", "x", "-1", "+5", "1.5"] {
         let error = Config::from_lookup(|name| {
             if name == "KATWORK_LOCK_TIMEOUT_MS" {
                 Some(value.into())
@@ -115,11 +115,7 @@ fn config_from_lookup_validates_required_values() {
 #[test]
 fn optional_configuration_requires_host_or_api_key() {
     for empty in [None, Some(String::new())] {
-        let config = Config::from_lookup(|name| match name {
-            "KATWORK_LOCK_TIMEOUT_MS" => None,
-            _ => lookup(name).or_else(|| empty.clone()),
-        })
-        .unwrap();
+        let config = Config::from_lookup(|name| lookup(name).or_else(|| empty.clone())).unwrap();
         assert!(config.public_url.is_none());
         assert!(config.demo_password.is_none());
         assert!(config.smtp.is_none());
@@ -901,4 +897,14 @@ fn error_redaction_scrubs_all_configured_credentials() {
         assert!(!redacted.contains(&secret));
     }
     assert_eq!(redacted.matches("[redacted]").count(), names.len());
+}
+
+#[test]
+fn empty_lock_timeout_uses_default() {
+    let config = Config::from_lookup(|name| match name {
+        "KATWORK_LOCK_TIMEOUT_MS" => Some(String::new()),
+        _ => lookup(name),
+    })
+    .unwrap();
+    assert_eq!(config.lock_timeout, std::time::Duration::from_millis(5000));
 }

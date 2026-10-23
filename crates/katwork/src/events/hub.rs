@@ -1,6 +1,6 @@
 use crate::{
     error::KatError,
-    ids::{EventSeq, ThreadId},
+    ids::{EventSeq, ThreadId, UserId},
 };
 use std::{
     collections::HashMap,
@@ -9,11 +9,13 @@ use std::{
 use tokio::sync::broadcast;
 
 pub const MAX_STREAMS_PER_SESSION: usize = 4;
+pub const MAX_STREAMS_PER_USER: usize = 8;
 
 #[derive(Debug, Default)]
 struct State {
     senders: HashMap<ThreadId, broadcast::Sender<EventSeq>>,
     sessions: HashMap<String, usize>,
+    users: HashMap<UserId, usize>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -52,15 +54,39 @@ impl EventHub {
 
     /// `session` is the SHA-256 token digest, never the cookie token itself.
     pub fn open_stream(&self, session: &str) -> Result<StreamPermit, KatError> {
+        self.reserve_stream(session, None)
+    }
+
+    /// Reserve both budgets atomically for an authenticated HTTP stream.
+    pub fn open_stream_for_user(
+        &self,
+        session: &str,
+        user: UserId,
+    ) -> Result<StreamPermit, KatError> {
+        self.reserve_stream(session, Some(user))
+    }
+
+    fn reserve_stream(
+        &self,
+        session: &str,
+        user: Option<UserId>,
+    ) -> Result<StreamPermit, KatError> {
         let mut state = self.state.lock().unwrap();
-        let count = state.sessions.entry(session.to_owned()).or_default();
-        if *count == MAX_STREAMS_PER_SESSION {
+        if state.sessions.get(session).copied().unwrap_or(0) >= MAX_STREAMS_PER_SESSION
+            || user.is_some_and(|user| {
+                state.users.get(&user).copied().unwrap_or(0) >= MAX_STREAMS_PER_USER
+            })
+        {
             return Err(KatError::TooManyStreams);
         }
-        *count += 1;
+        *state.sessions.entry(session.to_owned()).or_default() += 1;
+        if let Some(user) = user {
+            *state.users.entry(user).or_default() += 1;
+        }
         Ok(StreamPermit {
             hub: self.clone(),
             session: session.to_owned(),
+            user,
         })
     }
 }
@@ -99,6 +125,7 @@ impl Drop for HubSubscription {
 pub struct StreamPermit {
     hub: EventHub,
     session: String,
+    user: Option<UserId>,
 }
 
 impl Drop for StreamPermit {
@@ -108,6 +135,14 @@ impl Drop for StreamPermit {
             *count -= 1;
             if *count == 0 {
                 state.sessions.remove(&self.session);
+            }
+        }
+        if let Some(user) = self.user
+            && let Some(count) = state.users.get_mut(&user)
+        {
+            *count -= 1;
+            if *count == 0 {
+                state.users.remove(&user);
             }
         }
     }

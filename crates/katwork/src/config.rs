@@ -369,10 +369,10 @@ impl Config {
             max_connections_per_ip: positive("KATWORK_MAX_CONNECTIONS_PER_IP", 32)? as usize,
             trusted_proxies,
         };
-        let lock_timeout = match lookup("KATWORK_LOCK_TIMEOUT_MS") {
+        let lock_timeout = match optional("KATWORK_LOCK_TIMEOUT_MS") {
             None => Duration::from_millis(5000),
             Some(value) => {
-                if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                if !value.bytes().all(|b| b.is_ascii_digit()) {
                     return Err(KatError::ConfigInvalid);
                 }
                 let millis: u32 = value.parse().map_err(|_| KatError::ConfigInvalid)?;

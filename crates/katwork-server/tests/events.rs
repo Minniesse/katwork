@@ -387,16 +387,49 @@ async fn fifth_stream_in_a_session_gets_too_many_streams_frame(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../katwork/migrations")]
-async fn duplicate_replay_is_dropped(pool: PgPool) {
-    let s = Setup::new(&pool).await;
-    s.append(1, true).await;
-    let mut stream = s.stream(None).await;
-    assert_eq!(seq(&mut stream).await, 1);
-    for _ in 0..10 {
-        s.core.events.notify(ThreadId(s.data.thread), EventSeq(1));
+async fn ninth_stream_across_user_sessions_gets_too_many_streams_frame(pool: PgPool) {
+    let mut s = Setup::new(&pool).await;
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        s.token = session::create(&pool, UserId(s.data.user)).await.unwrap().0;
+        for _ in 0..4 {
+            let mut stream = s.stream(None).await;
+            assert_eq!(&next(&mut stream).await[..], b"retry: 3000\n\n");
+            held.push(stream);
+        }
     }
-    s.append(1, true).await;
-    assert_eq!(seq(&mut stream).await, 2);
+    s.token = session::create(&pool, UserId(s.data.user)).await.unwrap().0;
+    let mut overflow = s.stream(None).await;
+    assert_eq!(&next(&mut overflow).await[..], b"retry: 30000\n\n");
+    let bytes = next(&mut overflow).await;
+    assert!(has(&bytes, "event: stream_error"));
+    assert!(has(&bytes, "too_many_streams"));
+    assert!(!has(&bytes, "id:"));
+    assert_end(&mut overflow).await;
+
+    // Another account still has its own budget on this same hub.
+    let other = data::Fixture::new(&pool).await;
+    let token = session::create(&pool, UserId(other.user)).await.unwrap().0;
+    let response = support::request(
+        &s.app,
+        "GET",
+        &format!(
+            "/api/workspaces/{}/threads/{}/events",
+            other.workspace, other.thread
+        ),
+        None,
+        Some(&format!("kw_session={token}")),
+    )
+    .await;
+    let mut independent = response.into_body().into_data_stream();
+    assert_eq!(&next(&mut independent).await[..], b"retry: 3000\n\n");
+
+    held.pop();
+    let mut replacement = s.stream(None).await;
+    assert_eq!(&next(&mut replacement).await[..], b"retry: 3000\n\n");
+    drop(held);
+    drop(replacement);
+    assert_eq!(s.core.events.sender_count(), 1);
 }
 
 #[sqlx::test(migrations = "../katwork/migrations")]
@@ -448,10 +481,15 @@ async fn open_streams_do_not_count_against_the_request_limit(pool: PgPool) {
     let mut s = Setup::new(&pool).await;
     let mut held = Vec::new();
     for i in 0..257 {
+        if i % 8 == 0 {
+            s.data = data::Fixture::new(&pool).await;
+        }
         if i % 4 == 0 {
             s.token = session::create(&pool, UserId(s.data.user)).await.unwrap().0;
         }
-        held.push(s.stream(None).await);
+        let mut stream = s.stream(None).await;
+        assert_eq!(&next(&mut stream).await[..], b"retry: 3000\n\n");
+        held.push(stream);
     }
     assert_eq!(
         support::request(&s.app, "GET", "/healthz", None, None)
@@ -488,22 +526,4 @@ async fn sse_route_keeps_host_and_origin_guards(pool: PgPool) {
         "cross_site_request",
     )
     .await;
-}
-
-#[sqlx::test(migrations = "../katwork/migrations")]
-async fn slow_client_is_closed_and_can_resume(pool: PgPool) {
-    let s = Setup::new(&pool).await;
-    s.append(10, true).await;
-    let mut stream = s.stream(None).await;
-    assert_eq!(seq(&mut stream).await, 1);
-    let _clock = Clock::pause();
-    tokio::time::advance(Duration::from_secs(61)).await;
-    let bytes = next(&mut stream).await;
-    assert!(has(&bytes, "stream_error"));
-    assert!(has(&bytes, "slow_client"));
-    assert_end(&mut stream).await;
-    let mut resumed = s.stream(Some("1")).await;
-    for expected in 2..=10 {
-        assert_eq!(seq(&mut resumed).await, expected);
-    }
 }

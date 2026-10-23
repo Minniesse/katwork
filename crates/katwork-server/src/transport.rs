@@ -25,6 +25,7 @@ use tokio::{
 };
 
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub async fn serve(tcp: TcpListener, router: Router) -> io::Result<()> {
     serve_with_shutdown(
@@ -57,6 +58,7 @@ pub async fn serve_with_shutdown(
                     Err(error) if matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted) => continue,
                     Err(error) => break Err(error),
                 };
+                if let Err(error) = configure_socket(&stream) { break Err(error); }
                 // A trusted proxy carries many browsers; its connections still count globally.
                 let permit = if config.trusts_proxy(addr.ip()) {
                     None
@@ -80,6 +82,7 @@ pub async fn serve_with_shutdown(
                         stream,
                         idle: Box::pin(tokio::time::sleep(config.idle_timeout)),
                         idle_timeout: config.idle_timeout,
+                        write_stalled: None,
                     };
                     // Match axum's HTTP/1-only feature set and start the header timer before any bytes arrive.
                     let mut builder = Builder::new(TokioExecutor::new()).http1_only();
@@ -111,18 +114,41 @@ pub async fn serve_with_shutdown(
     result
 }
 
+fn configure_socket(stream: &TcpStream) -> io::Result<()> {
+    let socket = socket2::SockRef::from(stream);
+    socket.set_tcp_keepalive(
+        &socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(30))
+            .with_interval(Duration::from_secs(10))
+            .with_retries(3),
+    )?;
+    #[cfg(target_os = "linux")]
+    socket.set_tcp_user_timeout(Some(WRITE_TIMEOUT))?;
+    Ok(())
+}
+
 struct IdleConnection {
     stream: TcpStream,
     idle: Pin<Box<Sleep>>,
     idle_timeout: Duration,
+    write_stalled: Option<Pin<Box<Sleep>>>,
 }
 
 impl IdleConnection {
-    fn check_idle(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+    fn check_deadlines(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
         if self.idle.as_mut().poll(cx).is_ready() {
             Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "connection idle timeout",
+            ))
+        } else if self
+            .write_stalled
+            .as_mut()
+            .is_some_and(|deadline| deadline.as_mut().poll(cx).is_ready())
+        {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "connection write timeout",
             ))
         } else {
             Ok(())
@@ -140,7 +166,7 @@ impl AsyncRead for IdleConnection {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        self.check_idle(cx)?;
+        self.check_deadlines(cx)?;
         let before = buf.filled().len();
         let result = Pin::new(&mut self.stream).poll_read(cx, buf);
         if buf.filled().len() > before {
@@ -156,10 +182,16 @@ impl AsyncWrite for IdleConnection {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.check_idle(cx)?;
+        self.check_deadlines(cx)?;
         let result = Pin::new(&mut self.stream).poll_write(cx, buf);
         if matches!(result, Poll::Ready(Ok(n)) if n > 0) {
+            self.write_stalled = None;
             self.activity();
+        } else if result.is_pending() {
+            // This timer wakes hyper even when backpressure stops response-body polling.
+            self.write_stalled
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(WRITE_TIMEOUT)));
+            self.check_deadlines(cx)?;
         }
         result
     }
@@ -170,5 +202,36 @@ impl AsyncWrite for IdleConnection {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn accepted_socket_has_keepalive_and_user_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        configure_socket(&stream).unwrap();
+        let socket = socket2::SockRef::from(&stream);
+        assert!(socket.keepalive().unwrap());
+        assert_eq!(
+            socket.tcp_keepalive_time().unwrap(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            socket.tcp_keepalive_interval().unwrap(),
+            Duration::from_secs(10)
+        );
+        assert_eq!(socket.tcp_keepalive_retries().unwrap(), 3);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            socket.tcp_user_timeout().unwrap(),
+            Some(Duration::from_secs(60))
+        );
     }
 }
