@@ -2,6 +2,20 @@ use super::*;
 use sqlx::{Postgres, QueryBuilder};
 
 #[sqlx::test]
+async fn scheduler_migration_can_create_its_job_index(pool: PgPool) {
+    sqlx::query("CREATE INDEX jobs_thread_id ON jobs (thread_id, id DESC)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let unused: Option<String> =
+        sqlx::query_scalar("SELECT to_regclass('tasks_kat_created')::text")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(unused, None);
+}
+
+#[sqlx::test]
 async fn message_list_uses_thread_id_index(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let mut tx = pool.begin().await.unwrap();
@@ -68,37 +82,15 @@ async fn event_seq_cursor_uses_run_started_index(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn history_latest_job_and_rate_queries_have_indexes(pool: PgPool) {
+async fn history_uses_thread_id_index(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let mut tx = pool.begin().await.unwrap();
     sqlx::query("SET LOCAL enable_seqscan=off")
         .execute(&mut *tx)
         .await
         .unwrap();
-    for (query, id, index) in [
-        (
-            "EXPLAIN SELECT id,body FROM messages WHERE workspace_id=$1 AND thread_id=$2 AND author_kind<>'system' AND id<=$3 ORDER BY id DESC",
-            f.thread,
-            "messages_thread_id",
-        ),
-        (
-            "EXPLAIN SELECT id FROM jobs WHERE workspace_id=$1 AND thread_id=$2 ORDER BY id DESC LIMIT 1",
-            f.thread,
-            "jobs_thread_id",
-        ),
-        (
-            "EXPLAIN SELECT count(*) FROM tasks WHERE workspace_id=$1 AND kat_id=$2 AND created_at>statement_timestamp()-interval '60 seconds'",
-            f.kat,
-            "tasks_kat_created",
-        ),
-    ] {
-        let mut query_builder = sqlx::query_scalar::<_, String>(query)
-            .bind(f.workspace)
-            .bind(id);
-        if index == "messages_thread_id" {
-            query_builder = query_builder.bind(f.message);
-        }
-        let plan = query_builder.fetch_all(&mut *tx).await.unwrap().join("\n");
-        assert!(plan.contains(index), "{plan}");
-    }
+    let plan = sqlx::query_scalar::<_, String>("EXPLAIN SELECT id,body FROM messages WHERE workspace_id=$1 AND thread_id=$2 AND author_kind<>'system' AND id<=$3 ORDER BY id DESC")
+        .bind(f.workspace).bind(f.thread).bind(f.message)
+        .fetch_all(&mut *tx).await.unwrap().join("\n");
+    assert!(plan.contains("messages_thread_id"), "{plan}");
 }

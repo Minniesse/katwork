@@ -36,6 +36,7 @@ caseless.workspace = true
 
 unicode-segmentation.workspace = true
 pulldown-cmark.workspace = true
+regex-syntax.workspace = true
 
 [dev-dependencies]
 jsonschema.workspace = true

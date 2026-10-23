@@ -1348,6 +1348,7 @@ dependencies = [
  "percent-encoding",
  "pulldown-cmark",
  "rand_core 0.6.4",
+ "regex-syntax",
  "reqwest",
  "rig-core",
  "rig-reqwest",

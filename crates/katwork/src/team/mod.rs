@@ -13,6 +13,14 @@ use unicode_normalization::UnicodeNormalization;
 use crate::{error::KatError, tenancy::Tenant};
 
 pub(crate) fn name_key(name: &str) -> String {
+    fold_name(name)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+// Preserve edge whitespace so incremental mention matching can collapse it across chunks.
+pub(crate) fn fold_name(name: &str) -> String {
     // Validated names exclude default ignorables; compatibility folding preserves display text.
     let mut key: Vec<_> = name.nfkc().default_case_fold().nfkc().collect();
     // Thai above-vowels have combining class zero; Unicode normalization alone keeps tone-first input distinct.
@@ -20,12 +28,7 @@ pub(crate) fn name_key(name: &str) -> String {
         marks.sort_by_key(|ch| (if *ch == '\u{0e4d}' { '\u{0e47}' } else { *ch }, *ch));
     }
     key.dedup_by(|a, b| a == b && is_thai_mark(*a));
-    key.into_iter()
-        .nfc()
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    key.into_iter().nfc().collect()
 }
 
 fn is_thai_mark(ch: char) -> bool {
