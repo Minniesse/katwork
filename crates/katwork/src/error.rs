@@ -1,5 +1,9 @@
 #[derive(Debug, thiserror::Error)]
 pub enum KatError {
+    #[error("job_already_finished")]
+    JobAlreadyFinished,
+    #[error("job_not_awaiting_input")]
+    JobNotAwaitingInput,
     #[error("busy")]
     Busy,
     #[error("invalid_cursor")]
@@ -110,6 +114,8 @@ impl From<sqlx::Error> for KatError {
 impl KatError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::JobAlreadyFinished => "job_already_finished",
+            Self::JobNotAwaitingInput => "job_not_awaiting_input",
             Self::Busy => "busy",
             Self::InvalidCursor => "invalid_cursor",
             Self::TooManyStreams => "too_many_streams",

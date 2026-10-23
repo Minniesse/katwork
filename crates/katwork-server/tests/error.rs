@@ -98,6 +98,16 @@ async fn api_errors_return_only_stable_codes() {
         ),
         (KatError::LeaseLost, StatusCode::CONFLICT, "lease_lost"),
         (
+            KatError::JobAlreadyFinished,
+            StatusCode::CONFLICT,
+            "job_already_finished",
+        ),
+        (
+            KatError::JobNotAwaitingInput,
+            StatusCode::CONFLICT,
+            "job_not_awaiting_input",
+        ),
+        (
             KatError::AuthBusy,
             StatusCode::SERVICE_UNAVAILABLE,
             "auth_busy",

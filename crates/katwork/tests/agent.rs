@@ -347,6 +347,37 @@ async fn registered_tool_outside_kat_allowlist_is_refused(pool: PgPool) {
     assert!(tool_results(&h.fake)[0].3);
 }
 #[sqlx::test]
+async fn stored_pending_call_is_not_dispatched_by_a_run(pool: PgPool) {
+    let mut h = Harness::new(pool, vec![turn("Please send a new request.", vec![])]).await;
+    let calls = h.add(Probe::new("probe", SideEffect::Read));
+    let pending = PendingCall {
+        record_id: ToolCallRecordId::new(),
+        tool_call_id: "stored-pending".into(),
+        name: "probe".into(),
+        args_canonical: "{}".into(),
+        args_sha256: "digest".into(),
+    };
+    sqlx::query("UPDATE tasks SET pending_tool_call=$2 WHERE id=$1")
+        .bind(h.f.task)
+        .bind(serde_json::to_value(&pending).unwrap())
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    h.input.history.push(ChatMsg::User {
+        content: "Yes, approve it.".into(),
+        name: None,
+    });
+    let facts = h.run().await.unwrap();
+    assert_eq!(
+        facts.final_text.as_deref(),
+        Some("Please send a new request.")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(facts.tool_calls.is_empty());
+    assert!(h.rows().await.is_empty());
+}
+
+#[sqlx::test]
 async fn destructive_and_outward_tools_refused_before_dispatch(pool: PgPool) {
     for effect in [
         SideEffect::Destructive,
@@ -365,6 +396,14 @@ async fn destructive_and_outward_tools_refused_before_dispatch(pool: PgPool) {
         assert_eq!(pending.tool_call_id, "approval");
         assert_eq!(pending.args_canonical, "{\"x\":1}");
         assert_eq!(pending.args_sha256.len(), 64);
+        let rows = h.rows().await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<String, _>("state"), "refused");
+        assert!(
+            rows[0]
+                .get::<Option<chrono::DateTime<chrono::Utc>>, _>("ended_at")
+                .is_some()
+        );
     }
 }
 #[sqlx::test]
