@@ -87,6 +87,7 @@ fn shared_wire_values_match_json() {
         "too_many_requests",
         "workspace_paused_stopped",
         "kat_paused_stopped",
+        "extra_mention_ignored",
     ];
     assert_eq!(ReasonCode::ALL.len(), expected.len());
     for (value, wire) in ReasonCode::ALL.iter().zip(expected) {

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
-use sqlx::{Executor, PgConnection, PgPool, Postgres};
+use sqlx::{Executor, FromRow, PgConnection, PgPool, Postgres, Row};
 
 use super::{Kat, kat};
 use crate::{
@@ -46,9 +46,32 @@ async fn get_team<'e, E: Executor<'e, Database = Postgres>>(
 }
 
 pub async fn get(pool: &PgPool, tenant: &Tenant, id: TeamId) -> Result<TeamView, KatError> {
-    let team = get_team(pool, tenant, id).await?;
-    let members = sqlx::query_as("SELECT d.*, ARRAY(SELECT s.space_id FROM kat_spaces s WHERE s.kat_id = d.id AND s.workspace_id = d.workspace_id ORDER BY s.space_id) AS spaces FROM kats d JOIN team_members m ON m.kat_id=d.id AND m.workspace_id=d.workspace_id WHERE m.workspace_id=$1 AND m.team_id=$2 AND m.active ORDER BY m.is_lead DESC, m.position, d.id")
-        .bind(tenant.workspace_id()).bind(id).fetch_all(pool).await?;
+    get_on(pool, tenant, id).await
+}
+
+pub async fn get_on<'e, E: Executor<'e, Database = Postgres>>(
+    executor: E,
+    tenant: &Tenant,
+    id: TeamId,
+) -> Result<TeamView, KatError> {
+    let rows = sqlx::query("SELECT t.id AS team_id,t.space_id AS team_space_id,t.name AS team_name,k.*,
+        ARRAY(SELECT s.space_id FROM kat_spaces s WHERE s.kat_id=k.id AND s.workspace_id=k.workspace_id ORDER BY s.space_id) AS spaces
+        FROM teams t LEFT JOIN team_members m ON m.team_id=t.id AND m.workspace_id=t.workspace_id AND m.active
+        LEFT JOIN kats k ON k.id=m.kat_id AND k.workspace_id=m.workspace_id
+        WHERE t.workspace_id=$1 AND t.id=$2 ORDER BY m.is_lead DESC,m.position,k.id")
+        .bind(tenant.workspace_id()).bind(id).fetch_all(executor).await?;
+    let first = rows.first().ok_or(KatError::NotFound)?;
+    let team = Team {
+        id: first.try_get("team_id")?,
+        space_id: first.try_get("team_space_id")?,
+        name: first.try_get("team_name")?,
+    };
+    let mut members = Vec::new();
+    for row in rows {
+        if row.try_get::<Option<KatId>, _>("id")?.is_some() {
+            members.push(Kat::from_row(&row)?);
+        }
+    }
     Ok(TeamView { team, members })
 }
 

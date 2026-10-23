@@ -13,6 +13,7 @@ use crate::{
     events::PgEventSink,
     fence::Fence,
     ids::{MessageId, RunId},
+    pipeline,
     runtime::Core,
     team::kat,
     tenancy::{self, space},
@@ -177,12 +178,22 @@ async fn execute(
         let kat = kat::get(&core.pool, &tenant, c.kat_id).await?;
         let thread = thread::get(&core.pool, &tenant, c.thread_id).await?;
         let space = space::get(&core.pool, &tenant, thread.space_id).await?;
-        Ok::<_, crate::error::KatError>((tenant, kat, thread, space))
+        let history = pipeline::load_history(
+            core,
+            &tenant,
+            c.thread_id,
+            c.input.request_message_id,
+            c.kat_id,
+            24_000,
+        )
+        .await?;
+        Ok::<_, crate::error::KatError>((tenant, kat, thread, space, history))
     };
-    let (tenant, kat, thread, space) = prepare.await.map_err(|error| RunAbort::Infrastructure {
-        run_id: None,
-        code: error.code(),
-    })?;
+    let (tenant, kat, thread, space, history) =
+        prepare.await.map_err(|error| RunAbort::Infrastructure {
+            run_id: None,
+            code: error.code(),
+        })?;
     let run_id = RunId::new();
     let sink = PgEventSink::new(
         core.pool.clone(),
@@ -215,8 +226,7 @@ async fn execute(
             lease_epoch: c.lease_epoch,
             kind: c.kind,
             space_policy: space.policy,
-            // Task 12 loads request history here before enabling the pool in serve.
-            history: vec![],
+            history: history.messages,
             reply_message_id: MessageId::new(),
             policy_version: c.policy_version,
             actor: c.input.actor,

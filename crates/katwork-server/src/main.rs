@@ -230,7 +230,13 @@ async fn run() -> Result<(), KatError> {
             let core = Arc::new(Core::new(pool, config));
             core.registry.log_tiers();
             let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
-            katwork_server::transport::serve_with_shutdown(
+            let mut workers = katwork::jobs::worker::spawn_pool(
+                core.clone(),
+                4,
+                std::time::Duration::from_secs(60),
+            );
+            let shutdown = core.shutdown.clone();
+            let served = katwork_server::transport::serve_with_shutdown(
                 listener,
                 build_router(AppState { core: core.clone() }),
                 transport,
@@ -239,7 +245,14 @@ async fn run() -> Result<(), KatError> {
                     core.shutdown.cancel();
                 },
             )
-            .await?;
+            .await;
+            shutdown.cancel();
+            while let Some(result) = workers.join_next().await {
+                if result.is_err() {
+                    tracing::error!("worker_task_failed");
+                }
+            }
+            served?;
             Ok(())
         }
         Command::Migrate => {
