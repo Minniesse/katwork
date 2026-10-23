@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use axum::{
     Extension, Router,
@@ -6,7 +6,10 @@ use axum::{
 };
 use katwork::runtime::Core;
 
-use crate::routes::{auth, dots, health, teams, workspaces};
+use crate::{
+    routes::{auth, dots, health, teams, workspaces},
+    static_files,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -14,6 +17,11 @@ pub struct AppState {
 }
 
 pub fn build_router(state: AppState) -> Router {
+    build_router_with_web_dir(state, Path::new(static_files::DEFAULT_WEB_DIR))
+}
+
+/// `build_router` serving the web app from `web_dir` instead of the default.
+pub fn build_router_with_web_dir(state: AppState, web_dir: &Path) -> Router {
     let config = state.core.config.clone();
     let router = Router::new()
         .route("/healthz", get(health::health))
@@ -58,6 +66,7 @@ pub fn build_router(state: AppState) -> Router {
             "/api/workspaces/{workspace_id}/teams/{team_id}/members/{dot_id}",
             put(teams::add_member).delete(teams::remove_member),
         )
+        .fallback_service(static_files::service(web_dir.to_owned()))
         .layer(Extension(auth::LoginLimiter::default()))
         .layer(Extension(auth::ResetLimiter::default()))
         .layer(Extension(auth::ResetWork::default()))
