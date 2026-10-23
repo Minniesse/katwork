@@ -196,8 +196,20 @@ mod tests {
             .fetch_one(guard.connection())
             .await
             .unwrap();
-        cancellation::poll_once_then_drop(guard.connection().begin()).await;
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(48)")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        // A bare BEGIN can finish in one poll; the barrier guarantees an unfinished future.
+        cancellation::poll_once_then_drop(
+            guard
+                .connection()
+                .begin_with("BEGIN; SELECT pg_advisory_xact_lock(48)"),
+        )
+        .await;
         drop(guard);
+        blocker.rollback().await.unwrap();
         assert_ne!(cancellation::backend_pid(&single).await, pid);
         cancellation::assert_backend_idle(&pool, pid).await;
         single.close().await;
