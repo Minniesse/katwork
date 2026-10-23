@@ -1146,3 +1146,61 @@ async fn a_closed_stdout_fails_cleanly_and_keeps_the_link_off_stderr(pool: sqlx:
         &["reset-link", "--email", "person@example.test"],
     ));
 }
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn create_user_rejects_a_malformed_email(pool: sqlx::PgPool) {
+    sqlx::query("INSERT INTO workspaces (id, name) VALUES ($1, 'Acme')")
+        .bind(uuid::Uuid::now_v7())
+        .execute(&pool)
+        .await
+        .unwrap();
+    // 255 bytes: one over the limit.
+    let long = format!("{}@example.test", "a".repeat(242));
+    assert_eq!(long.len(), 255);
+    for email in [
+        "nobody",
+        "a@b@example.test",
+        "@example.test",
+        "person@",
+        "@",
+        "   ",
+        "",
+        long.as_str(),
+    ] {
+        for args in [
+            &[
+                "create-user",
+                "--email",
+                email,
+                "--workspace",
+                "Acme",
+                "--role",
+                "member",
+            ][..],
+            &["reset-link", "--email", email][..],
+        ] {
+            assert_failed(&operator(&pool, args), "request_invalid\n");
+        }
+    }
+    for sql in [
+        "SELECT count(*) FROM users",
+        "SELECT count(*) FROM memberships",
+        "SELECT count(*) FROM password_resets",
+    ] {
+        assert_eq!(count(&pool, sql).await, 0, "{sql}");
+    }
+    // 254 bytes is still an address.
+    let longest = format!("{}@example.test", "a".repeat(241));
+    printed_link(&operator(
+        &pool,
+        &[
+            "create-user",
+            "--email",
+            &longest,
+            "--workspace",
+            "Acme",
+            "--role",
+            "member",
+        ],
+    ));
+}
