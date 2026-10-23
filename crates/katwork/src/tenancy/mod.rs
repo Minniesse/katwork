@@ -2,7 +2,7 @@ pub mod space;
 pub mod workspace;
 
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{Executor, Postgres};
 use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
 use crate::{
@@ -104,7 +104,7 @@ impl Tenant {
     }
 }
 
-fn validate_name(name: &str) -> Result<&str, KatError> {
+pub(crate) fn validate_name(name: &str) -> Result<&str, KatError> {
     if name.chars().any(|ch| {
         matches!(
             ch.general_category(),
@@ -123,8 +123,8 @@ fn validate_name(name: &str) -> Result<&str, KatError> {
     Ok(name)
 }
 
-pub async fn resolve(
-    pool: &PgPool,
+pub async fn resolve<'e, E: Executor<'e, Database = Postgres>>(
+    pool: E,
     user_id: UserId,
     workspace_id: WorkspaceId,
 ) -> Result<Tenant, KatError> {

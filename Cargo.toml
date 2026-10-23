@@ -28,5 +28,7 @@ base64 = "0.22"
 rand_core = { version = "0.6", features = ["getrandom"] }
 sha2 = "0.10"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls", "aws-lc-rs", "webpki-roots"] }
+unicode-normalization = "0.1"
+caseless = "0.2.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

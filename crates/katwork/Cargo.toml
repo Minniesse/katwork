@@ -24,6 +24,8 @@ rand_core.workspace = true
 sha2.workspace = true
 lettre.workspace = true
 tracing.workspace = true
+unicode-normalization.workspace = true
+caseless.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

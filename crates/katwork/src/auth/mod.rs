@@ -133,6 +133,15 @@ pub async fn seed_demo(
     }
     sqlx::query("INSERT INTO spaces (id, workspace_id, name, allow_external) SELECT $1, $2, 'Demo', true WHERE NOT EXISTS (SELECT 1 FROM spaces WHERE workspace_id = $2 AND name = 'Demo')")
         .bind(SpaceId::new()).bind(workspace_id).execute(&mut *tx).await?;
+    let tenant = crate::tenancy::resolve(&mut *tx, user_id, workspace_id).await?;
+    let space_id = sqlx::query_scalar(
+        "SELECT id FROM spaces WHERE workspace_id=$1 AND name='Demo' ORDER BY id LIMIT 1",
+    )
+    .bind(workspace_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    crate::team::team::create_default_on(&mut tx, &tenant, space_id, crate::types::Locale::En)
+        .await?;
     tx.commit().await?;
     Ok(
         (reset_password || (existing.is_none() && config.demo_password.is_none()))
