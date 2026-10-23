@@ -48,7 +48,7 @@
 - **Roles before bodies.** Every write route that needs an owner or admin calls `Tenant::require_admin()` before it parses the request body, so a member gets 403 `forbidden` whatever the body holds. The Dot `PATCH` (Task 5), whose required role depends on which keys the body sets, checks the role right after reading the keys and before validating any value.
 - **Lock first, then check.** Never decide on time or lease validity inside a locking `SELECT`: lock the row first, then re-read it and check `lease_epoch`, state and `clock_timestamp()` expiry in a separate statement of the same transaction. A locking select evaluates its `WHERE` before it waits for the lock, and Postgres re-checks it after the wait only when the row changed, so a lease that expires during the wait, or one renewed after the snapshot, is misjudged. `fence::check`, `fence::lock` (Task 2) and `lease::claim` (Task 11) follow this rule.
 - **Time windows.** A quota or rate window uses one cutoff for the whole statement, `statement_timestamp() - interval '24 hours'` (or `'60 seconds'`), never a per-row `clock_timestamp()`: Postgres cannot bound an index scan with a volatile expression, so a per-row cutoff visits every historical row. The window's statement runs after the lock it depends on (the Dot row for quotas), so `statement_timestamp()` is sampled after any lock wait. Lease-expiry checks keep `clock_timestamp()`.
-- **Migrations.** A task that changes the schema adds the next numbered file in `crates/katwork/migrations/`: `0002_email_unique.sql` and `0003_email_lowercase.sql` (Task 3), `0004_team_membership.sql` (Task 5), `0005_task_first_claim.sql` (Task 11), `0006_scheduler_indexes.sql` (Task 12), `0007_invite_tokens.sql` (Task 13b). Tasks 3b and 7b add none.
+- **Migrations.** A task that changes the schema adds the next numbered file in `crates/katwork/migrations/`: `0002_email_unique.sql` and `0003_email_lowercase.sql` (Task 3), `0004_team_membership.sql` (Task 5), `0005_invite_tokens.sql` (Task 3b, which merges after PR #24 so its number follows Task 5's), `0006_task_first_claim.sql` (Task 11), `0007_scheduler_indexes.sql` (Task 12). Tasks 7b and 13b add none.
 - **Lock order.** Every transaction that waits for row locks takes them in one global order: workspace row → job row → task row, then its `task_leases`, `runs` and `tool_calls` rows → thread row (the row `log::append` updates for `last_event_seq`) → Dot row, then its `dot_spaces` rows. Within one class, rows are locked in ascending id. A path that needs a later lock takes every lock it needs at its start, in this order, with `SELECT … FOR NO KEY UPDATE` (`FOR SHARE` when it only reads the row), before any write. A transaction that will update a row locks it `FOR NO KEY UPDATE` from the start and never upgrades from `FOR SHARE`; a plain `UPDATE` that leaves the key unchanged takes the same lock. **No path uses `FOR UPDATE`, deletes a workspace, user, job, task, thread, Dot, message or run row, or changes any row's key.** The only deletes are `task_leases` rows and non-default `dot_spaces` grants, which no row references. Foreign-key checks on insert and update take `FOR KEY SHARE` on the parent row, which conflicts only with `FOR UPDATE`, a delete or a key change, so a foreign-key check never waits on a lock any path holds. Inserting a row whose parent sits earlier in the order, such as a follow-up job referencing its parent job or any tenant row referencing its workspace, is therefore safe after later locks. Rows a transaction inserts are invisible to others until commit, unique-index checks run under the thread or job lock that already serializes their writers (Task 12), and a `SKIP LOCKED` select never waits. Every remaining wait is for a lock later in the order than any lock already held, so no cycle of waits, and no deadlock, can form. Tasks 2, 4, 8–12 and 13b name the locks each path takes.
 - Default team roles: Lead, Researcher, Writer, Analyst, Scheduler, Reviewer (spec §2). The Lead's default `max_concurrency` is 3 and each specialist's is 1 (initial defaults; Task 5 follow-up).
 
@@ -59,7 +59,7 @@
 3. **SSE reconnect with `Last-Event-ID`.** The browser drops and reconnects mid-reply, including a Thai reply. Expected: no duplicate and no missing events, no gap when two appenders write to the same thread at once, and text never split inside a grapheme cluster. (Task 9.)
 4. **Password reset and set-password link misuse.**
    - A reset requested for an unknown email gets the same response as a known one.
-   - A reset token used twice, or after 30 minutes, fails, whether it came from a reset mail, `create-user` or `reset-link`. An invite token used twice, or after 72 hours, fails. Neither kind works at the other's route.
+   - A reset token used twice, or after 30 minutes, fails, whether it came from a reset mail or `reset-link`. An invite token used twice, or after 72 hours, fails, whether it came from `create-user` or a Members-page invite. Neither kind works at the other's route.
    - A reset ends all of that user's existing sessions.
    - An admin invites an email that already has an account. Expected: the membership is added and no link is returned or mailed, so an admin of one workspace can never take over an account another workspace created.
    - No reset or set-password token appears in any log.
@@ -99,9 +99,9 @@ crates/katwork/
   migrations/0001_init.sql      all SP1 tables (Task 2)
   migrations/0002_email_unique.sql, 0003_email_lowercase.sql   (Task 3)
   migrations/0004_team_membership.sql                          (Task 5)
-  migrations/0005_task_first_claim.sql                         (Task 11)
-  migrations/0006_scheduler_indexes.sql                        (Task 12)
-  migrations/0007_invite_tokens.sql                            (Task 13b)
+  migrations/0005_invite_tokens.sql                            (Task 3b)
+  migrations/0006_task_first_claim.sql                         (Task 11)
+  migrations/0007_scheduler_indexes.sql                        (Task 12)
   src/lib.rs
   src/config.rs                 Config (Task 1)
   src/error.rs                  KatError + stable codes
@@ -112,7 +112,7 @@ crates/katwork/
   src/db.rs                     pool + migrate
   src/auth/{mod,password,session,reset,mailer}.rs
   src/auth/accounts.rs          operator-created accounts and set-password links (Task 3b)
-  src/auth/invite.rs            invite tokens: issue, link, accept (Task 13b)
+  src/auth/invite.rs            invite tokens: issue, link, accept (Task 3b)
   src/tenancy/{mod,workspace,space}.rs
   src/tenancy/members.rs        member list, invites and role changes (Task 13b)
   src/team/{mod,dot,team,roles}.rs
@@ -146,8 +146,8 @@ web/
   src/main.tsx src/app.tsx src/router.tsx src/api.ts src/sse.ts src/theme.css src/theme.ts
   src/i18n/{index.ts,en.json,th.json}
   src/components/{Layout,Preferences,Announce,Transcript,Composer}.tsx      (Task 13a)
-  src/pages/{Login,ResetRequest,ResetConfirm,Home}.tsx                      (Task 13a)
-  src/pages/{Team,Chat,Members,InviteAccept}.tsx                            (Task 13b)
+  src/pages/{Login,ResetRequest,ResetConfirm,InviteAccept,Home}.tsx         (Task 13a)
+  src/pages/{Team,Chat,Members}.tsx                                         (Task 13b)
   src/**/*.test.ts(x)
 ```
 
@@ -370,10 +370,10 @@ web/
 
 ### Task 3b: Operator accounts and first-run convenience
 
-This task comes after Task 4, can run in parallel with Task 5, and lands as its own PR. It needs Task 4's `Role` and `tenancy::validate_name`, changes Task 3's code, and adds no migration. Accounts then work both ways: with SMTP through mail, and without SMTP through a link the operator prints (ADR-0004). Task 13b builds the admin Members page on it.
+This task comes after Task 4 and lands as its own PR. It can be written in parallel with Task 5 but merges after PR #24, because its migration `0005_invite_tokens.sql` must follow Task 5's `0004`. It needs Task 4's `Role` and `tenancy::validate_name` and changes Task 3's code. Accounts then work both ways: with SMTP through mail, and without SMTP through a link the operator prints (ADR-0004). Task 13b builds the admin Members page on it.
 
 **Files:**
-- Create: `crates/katwork/src/auth/accounts.rs`
+- Create: `crates/katwork/src/auth/{accounts.rs,invite.rs}`, `crates/katwork/migrations/0005_invite_tokens.sql`
 - Modify: `crates/katwork/src/{config.rs,error.rs,auth/mod.rs,auth/reset.rs,auth/mailer.rs}`, `crates/katwork-server/src/{main.rs,error.rs,guards.rs,transport.rs,routes/auth.rs}`, `crates/katwork/tests/config.rs`, `crates/katwork-server/tests/{cli.rs,http_guards.rs,auth.rs,transport.rs,mailer.rs}`, `.env.example`
 
 **Interfaces:**
@@ -381,38 +381,46 @@ This task comes after Task 4, can run in parallel with Task 5, and lands as its 
 - Produces:
   - `KatError::ConfigInvalid { var: &'static str }` replaces the unit variant. `code()` stays `config_invalid`, and the line the CLI prints is `config_invalid (VAR)`. The variable's value never appears in the error, its causes or any log. Every `Config::from_lookup` failure names the variable that failed, and `seed-demo` without demo mode names `KATWORK_DEMO`.
   - `KatError::RateLimited { retry_after_secs: u64 }` replaces the unit variant; `ApiError` sends it as 429 `rate_limited` with a `Retry-After: <retry_after_secs>` header.
-  - New codes `user_exists` (`KatError::UserExists`) and `workspace_ambiguous` (`KatError::WorkspaceAmbiguous`).
-  - `reset::issue(conn: &mut PgConnection, user_id: UserId) -> Result<String, KatError>`: inserts one `password_resets` row with Task 3's mechanics (32 random bytes in URL-safe base64, stored as its SHA-256, `expires_at = clock_timestamp() + interval '30 minutes'`, single use) and returns the raw token. `reset::request` calls it after its three-pending-tokens check; the operator commands call it directly, so that cap applies only to the public request route. Invites use their own token kind (Task 13b).
-  - `reset::link(link_base: &str, token: &str) -> String`: `{link_base without a trailing /}/reset?token={token}`; the reset mail uses it too. An operator's set-password link is a reset link (decision B1: 30 minutes, single use): the person opens it and chooses a password through `POST /api/auth/reset/confirm`, and every reset rule applies (single use, 30 minutes, the account's sessions and other pending tokens ended).
+  - New codes `user_exists` (`KatError::UserExists`), `workspace_ambiguous` (`KatError::WorkspaceAmbiguous`) and `invite_token_invalid` (`KatError::InviteTokenInvalid`, 400).
+  - `reset::issue(conn: &mut PgConnection, user_id: UserId) -> Result<String, KatError>`: inserts one `password_resets` row with Task 3's mechanics (32 random bytes in URL-safe base64, stored as its SHA-256, `expires_at = clock_timestamp() + interval '30 minutes'`, single use) and returns the raw token. `reset::request` calls it after its three-pending-tokens check and `reset-link` calls it directly, so that cap applies only to the public request route.
+  - `reset::link(link_base: &str, token: &str) -> String`: `{link_base without a trailing /}/reset?token={token}`; the reset mail uses it too. `reset-link` prints a reset link: the person opens it and chooses a password through `POST /api/auth/reset/confirm`, and every reset rule applies (single use, 30 minutes, the account's sessions and other pending tokens ended).
   - `reset::confirm(pool, token: &str, new_password: &str) -> Result<String, KatError>`: now returns the account's stored (lowercase) email, so the route can clear that email's login buckets.
+  - Invite tokens are their own kind, so a reset token and an invite token can never stand in for each other:
+    - migration `0005_invite_tokens.sql`: `ALTER TABLE password_resets ADD COLUMN kind TEXT NOT NULL DEFAULT 'reset' CHECK (kind IN ('reset', 'invite'))`; every existing row and every token from Task 3 is `reset`
+    - `reset::request`, `reset::issue` and `reset::confirm` write and accept only `kind = 'reset'`, and the three-pending cap counts only reset tokens
+    - `invite::issue(conn: &mut PgConnection, user_id: UserId) -> Result<String, KatError>`: one `kind = 'invite'` row with the reset token format (32 random bytes in URL-safe base64, stored as its SHA-256), `expires_at = clock_timestamp() + interval '72 hours'`, single use
+    - `invite::link(link_base: &str, token: &str) -> String`: `{link_base without a trailing /}/invite?token={token}`
+    - `invite::accept(pool, token: &str, new_password: &str) -> Result<String, KatError>`: for an unused, unexpired `invite` token only, it sets the password, marks the token used, ends the account's sessions and its other pending tokens of both kinds, and returns the account's email; any other token is 400 `invite_token_invalid`. `reset::confirm` likewise ends pending tokens of both kinds.
+    - route `POST /api/auth/invite/accept` with `{token, new_password}` → 204, under reset confirm's body, password and rate rules; on success it calls `LoginLimiter::clear_email` with the returned email. Task 13a's `InviteAccept.tsx` is its page.
   - `accounts::normalize_email(email: &str) -> Result<String, KatError>`: trims and lowercases; more than 254 bytes, or anything but exactly one `@` with text on both sides, is `request_invalid`.
   - `accounts::EnsuredUser { user_id: UserId, created: bool }` and `accounts::ensure_user(conn: &mut PgConnection, email: &str) -> Result<EnsuredUser, KatError>`: returns the account for the normalized email, or inserts one with `display_name` = the part before `@`, `locale = 'en'` and the Argon2id hash of 32 random bytes that nobody ever sees, so the account has no usable password until its link is used. It runs `INSERT … ON CONFLICT DO NOTHING RETURNING` and then selects the committed row, so concurrent calls for one email create one account.
   - `accounts::WorkspaceRef::{Id(WorkspaceId), Name(String)}` and `WorkspaceRef::parse(s: &str) -> WorkspaceRef`: a string that parses as a UUID is an id; anything else is a name.
   - `accounts::create_user(pool, email: &str, workspace: &WorkspaceRef, role: Role, space_policy: Option<SpacePolicy>, link_base: &str) -> Result<String, KatError>`, in one transaction:
     - an email that already has an account is `user_exists` and nothing changes; `reset-link` serves existing accounts
     - an `Id` must name a workspace, otherwise `not_found`
-    - a `Name` matching exactly one workspace joins it; more than one is `workspace_ambiguous`; none creates a workspace with that validated name when `role` is `Owner`, otherwise `not_found`. A new workspace also gets its first Space, named `General`, with `space_policy`; without one, the command fails with `ConfigInvalid { var: "--space-policy" }` and nothing is created. `space_policy` is ignored when the workspace already exists.
-    - then `ensure_user`, the membership with `role`, and `reset::issue`; it returns `reset::link(link_base, &token)`
+    - a `Name` matching exactly one workspace joins it; more than one is `workspace_ambiguous`; none creates a workspace with that validated name when `role` is `Owner`, otherwise `not_found`. A new workspace also gets its first Space, named `General`, with `space_policy`; without one, the command fails with `ConfigInvalid { var: "--space-policy" }` and nothing is created. `space_policy` is ignored when the workspace already exists. The new `General` Space gets its default team in the Task 5 follow-up (Step 9), once Task 5 is on main; until then it has none.
+    - then `ensure_user`, the membership with `role`, and `invite::issue`; it returns `invite::link(link_base, &token)`, an invite link, because the person it is for often opens it much later
   - `accounts::reset_link(pool, email: &str, link_base: &str) -> Result<String, KatError>`: an unknown email is `not_found`; otherwise `reset::issue` and its link
-  - CLI subcommands `katwork-server create-user --email <e> --workspace <name|id> --role <owner|admin|member> [--space-policy <local|hosted>]` and `katwork-server reset-link --email <e>`. `--space-policy` is required when `create-user` creates the workspace (`local` gives `allow_external = false`, `hosted` gives `true`) and is ignored otherwise. Each flag appears at most once, in any order; a missing required flag other than `--space-policy`, a repeated or unknown flag, any other role and any other space policy are `command_invalid`. They load `Config` like `migrate`, use `public_url_or_default()` as the link base, and need neither SMTP nor demo mode. On success the command writes only the link and a newline to stdout; the link never goes through `tracing`. It is valid for 30 minutes and works once.
+  - CLI subcommands `katwork-server create-user --email <e> --workspace <name|id> --role <owner|admin|member> [--space-policy <local|hosted>]` and `katwork-server reset-link --email <e>`. `--space-policy` is required when `create-user` creates the workspace (`local` gives `allow_external = false`, `hosted` gives `true`) and is ignored otherwise. Each flag appears at most once, in any order; a missing required flag other than `--space-policy`, a repeated or unknown flag, any other role and any other space policy are `command_invalid`. They load `Config` like `migrate`, use `public_url_or_default()` as the link base, and need neither SMTP nor demo mode. On success the command writes only the link and a newline to stdout; the link never goes through `tracing`. `create-user` prints an invite link, valid 72 hours; `reset-link` prints a reset link, valid 30 minutes; each works once.
   - `LoginLimiter::reserve(&self, email: &str, ip: IpAddr) -> Result<LoginAttempt, KatError>`: counts the attempt in all three login buckets, or returns `RateLimited { retry_after_secs }` when one is full, where `retry_after_secs` is the time until the last full bucket's window ends, rounded up and at least 1. `LoginAttempt::succeeded(self)` gives the attempt back to the IP and email buckets and clears the email+IP bucket. A `LoginAttempt` dropped after a failure stays counted, so only failed attempts count, and concurrent attempts can never pass a limit. `LoginLimiter::clear_email(&self, email: &str)` removes every bucket of that email (each email+IP bucket and the backstop) and never an IP bucket.
   - `mailer::reset_mail(to: String, locale: Locale, link: &str) -> Mail`: a bilingual mail in the user's locale order. The subject is `ตั้งรหัสผ่าน KatWork ใหม่ / Reset your KatWork password` for `th`, and the two halves swapped for `en`. The body is the paragraph in the user's locale, then the other one, then the link alone on the last line. Thai: `ใช้ลิงก์นี้ภายใน 30 นาทีเพื่อตั้งรหัสผ่านใหม่ หากคุณไม่ได้ขอเปลี่ยนรหัสผ่าน ให้ละเว้นอีเมลนี้`. English: `Use this link within 30 minutes to set a new password. If you did not ask for this, ignore this email.`
 
 - [ ] **Step 1: Write the failing operator-command tests** in `crates/katwork-server/tests/cli.rs`:
-  - `create_user_prints_a_single_use_set_password_link`: stdout is one link; its token sets a password through `POST /api/auth/reset/confirm`, login then works, and a second confirm is 400 `reset_token_invalid`
+  - `create_user_prints_a_single_use_set_password_link`: stdout is one `/invite` link; its token sets a password through `POST /api/auth/invite/accept`, login then works, and a second accept is 400 `invite_token_invalid`
   - `create_user_creates_a_new_workspace_only_for_an_owner`: an unknown name with `--role owner --space-policy local` creates the workspace with the account as its owner and one Space `General` with `allow_external = false`, and `--space-policy hosted` gives `allow_external = true`; with `--role admin` it is `not_found` and nothing is created
   - `create_user_new_workspace_requires_space_policy`: an unknown name with `--role owner` and no `--space-policy` fails with `config_invalid (--space-policy)`, and no account, workspace or Space is created; joining an existing workspace without the flag succeeds
   - `create_user_joins_an_existing_workspace_by_id_or_name`
   - `create_user_rejects_an_ambiguous_workspace_name`: `workspace_ambiguous`
   - `create_user_rejects_an_existing_email`: `user_exists`; the account and its password are unchanged
-  - `operator_links_expire_after_30_minutes`: the test moves `expires_at` into the past in SQL
+  - `create_user_link_lasts_72_hours_and_reset_link_30_minutes`: the stored `expires_at` values are 72 hours and 30 minutes after issue, and each link fails once the test moves its `expires_at` into the past in SQL
   - `reset_link_prints_a_link_for_an_existing_account`: confirming it sets the new password and ends the account's sessions
   - `reset_link_for_an_unknown_email_is_not_found`
   - `operator_commands_need_no_smtp_or_demo_mode`
   - `operator_commands_reject_bad_arguments`: a missing or repeated flag, an unknown flag and `--role guest` are each `command_invalid`
   - `operator_links_never_reach_logs`: with all tracing output captured, the printed token appears nowhere in it
-- [ ] **Step 2: Run** `cargo test -p katwork-server --test cli`. Expected: FAIL.
-- [ ] **Step 3: Implement** `accounts.rs`, `reset::issue`, `reset::link` and the two subcommands. Run again. Expected: PASS.
+  - in `tests/auth.rs`: `invite_and_reset_tokens_cannot_be_swapped`: an invite token at `POST /api/auth/reset/confirm` is 400 `reset_token_invalid`, and a reset token at `POST /api/auth/invite/accept` is 400 `invite_token_invalid`
+- [ ] **Step 2: Run** `cargo test -p katwork-server --test cli --test auth`. Expected: FAIL.
+- [ ] **Step 3: Implement** `accounts.rs`, `invite.rs` with migration `0005_invite_tokens.sql` and the accept route, the `kind` filter in `reset.rs`, `reset::issue`, `reset::link` and the two subcommands. Run again. Expected: PASS.
 - [ ] **Step 4: Loopback hosts.** Write `loopback_ip_hosts_are_allowed` in `tests/http_guards.rs`: `Host: 127.0.0.1:3000` and `Host: [::1]:3000` pass the Host check, and `Host: 127.0.0.2` is 403 `host_not_allowed`. Run it (FAIL). Make the allowlist accept `localhost`, `127.0.0.1` and `[::1]`, any port, beside the public URL's hostname. Run it (PASS).
 - [ ] **Step 5: `/healthz` skips the Host check.** Write `healthz_skips_the_host_check`: `GET /healthz` with `Host: katwork:3000` (a container health probe) is 200 and still carries the security headers, while `GET /api/auth/me` with that Host is 403 `host_not_allowed`. Run it (FAIL). Exempt only `GET` and `HEAD` on `/healthz`. Run it (PASS).
 - [ ] **Step 6: An Origin that matches the allowed Host.** Write `origin_matching_the_allowed_host_is_accepted`: a `POST` with `Host: 127.0.0.1:3000` and `Origin: http://127.0.0.1:3000` passes the Origin check, while `Origin: http://127.0.0.1:4000` and `Origin: https://127.0.0.1:3000` are 403 `cross_site_request`. Run it (FAIL). Accept an `Origin` that equals the public URL's origin, or equals `<the public URL's scheme>://<the request's Host header>` once that Host has passed the allowlist; `Sec-Fetch-Site: cross-site` stays 403. Run it (PASS).
@@ -439,7 +447,7 @@ This task comes after Task 4, can run in parallel with Task 5, and lands as its 
 
 ### Task 5: Dots, Teams and the default roster
 
-**Status:** in review as PR #24. The interfaces below include its review rulings. A follow-up PR (Steps 6–9) comes after it merges.
+**Status:** in review as PR #24. The interfaces below include its review rulings. A follow-up PR (Steps 6–10) comes after it and Task 3b merge.
 
 **Files:**
 - Create: `crates/katwork/src/team/{mod,dot,team,roles}.rs`, `crates/katwork/migrations/0004_team_membership.sql`, `crates/katwork-server/src/routes/{dots,teams}.rs`, `crates/katwork-server/tests/team.rs`
@@ -510,12 +518,13 @@ This task comes after Task 4, can run in parallel with Task 5, and lands as its 
 - [ ] **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit** with `feat: dots, teams, default roster`.
 
-**Follow-up PR, after PR #24 merges** (no migration):
+**Follow-up PR, after PR #24 and Task 3b merge** (no migration):
 
 - [ ] **Step 6: Lead concurrency default.** Write `lead_defaults_to_three_concurrent_tasks_specialists_to_one` in `tests/team.rs`: the default roster's Lead has `max_concurrency = 3` and each specialist 1, and a hired `Custom` Dot has 1. Run it (FAIL). `NewDot` gains `max_concurrency: u16`; `roles::template` sets 3 for `DotRole::Lead` and 1 for every other role (initial defaults); `dot::hire` and `team::create_default` store it. `HireDot` cannot set it; an admin changes it with `PATCH`. Run it (PASS).
 - [ ] **Step 7: Reply in the person's language.** Write `role_templates_tell_dots_to_reply_in_the_persons_language`: every role template's `instructions`, `Custom` included, end with `Reply in the language of the person's latest message.` for `Locale::En` and `ตอบเป็นภาษาเดียวกับข้อความล่าสุดของคนที่คุยด้วย` for `Locale::Th`. Run it (FAIL), add the line to `roles.rs`, run it (PASS). Existing Dots keep their instructions.
 - [ ] **Step 8: Thai demo seed.** Write `seed_demo_creates_a_thai_workspace_with_the_thai_roster` in `tests/cli.rs`: `seed-demo` also gives the demo user a second workspace `เดโม`, with one Space `พื้นที่ทดลอง` (`allow_external = true`) and the default team from `roles::default_roster(Locale::Th)`, where หัวหน้าทีม comes first and the five specialists have Thai names; a second run creates nothing. Run it (FAIL), implement, run it (PASS).
-- [ ] **Step 9: Commit** with `feat: lead concurrency default, reply-language line, thai demo seed`.
+- [ ] **Step 9: A default team for `create-user`'s new workspace.** Write `create_user_new_workspace_has_default_team` in `tests/cli.rs`: a workspace that `create-user` creates has its `General` Space with a default team, the Lead first and the five specialists from `roles::default_roster(Locale::En)` (the new account's locale), so the owner can start a thread at once; joining an existing workspace creates no team. Run it (FAIL). Add `team::create_default_on(conn: &mut PgConnection, &Tenant, SpaceId, Locale) -> Result<TeamId, KatError>`, the body of `team::create_default` on the caller's transaction, which `team::create_default` now wraps. Let `tenancy::resolve` take any `sqlx::PgExecutor` instead of `&PgPool`, so it can read a membership its own transaction inserted; it stays the only constructor of `Tenant`. `accounts::create_user` then resolves the new owner's `Tenant` on its transaction and calls `team::create_default_on` for `General` before it issues the invite, so the account, workspace, Space and team commit together. Run it (PASS).
+- [ ] **Step 10: Commit** with `feat: lead concurrency default, reply-language line, thai demo seed, default team for new workspaces`.
 
 ### Task 6: Threads and messages (web channel)
 
@@ -937,7 +946,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 ### Task 11: Leases, worker pool and restart recovery
 
 **Files:**
-- Create: `crates/katwork/src/jobs/{lease,worker}.rs`, `crates/katwork/migrations/0005_task_first_claim.sql` (`ALTER TABLE tasks ADD COLUMN first_claimed_at TIMESTAMPTZ NULL`), `crates/katwork/tests/leases.rs`
+- Create: `crates/katwork/src/jobs/{lease,worker}.rs`, `crates/katwork/migrations/0006_task_first_claim.sql` (`ALTER TABLE tasks ADD COLUMN first_claimed_at TIMESTAMPTZ NULL`), `crates/katwork/tests/leases.rs`
 
 **Interfaces:**
 - Consumes: `fence::{Fence, check, lock}` (Task 2); `TaskInput`, `job::{conclude, finish_by_harness}` (Task 10); `run::execute`, `RunAbort`, `RunEnv`, `RunInput`, `RunFacts`, `RunFacts::not_run`, `RunKind`, `Limits`, `StopReason`, `ToolRegistry::builtin` (Task 8); `PgEventSink`, `log::append` (Task 9); `dot::get` (Task 5); `thread::get` (Task 6); `space::get`, `tenancy::resolve` (Task 4); `Core`.
@@ -1008,7 +1017,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 ### Task 12: Message → job pipeline (SP1 routing)
 
 **Files:**
-- Create: `crates/katwork/src/pipeline.rs`, `crates/katwork/src/jobs/quota.rs`, `crates/katwork/migrations/0006_scheduler_indexes.sql`, `crates/katwork-server/src/routes/jobs.rs`, `crates/katwork-server/tests/pipeline.rs`
+- Create: `crates/katwork/src/pipeline.rs`, `crates/katwork/src/jobs/quota.rs`, `crates/katwork/migrations/0007_scheduler_indexes.sql`, `crates/katwork-server/src/routes/jobs.rs`, `crates/katwork-server/tests/pipeline.rs`
 - Modify: `crates/katwork/src/jobs/job.rs` (`job::cancel`, `job::view`), `crates/katwork/tests/schema.rs` (EXPLAIN tests), `crates/katwork-server/src/routes/threads.rs` (`POST` messages calls `pipeline::submit` and returns its `job_id`), `crates/katwork-server/src/main.rs` (`serve` spawns the worker pool)
 
 **Interfaces:**
@@ -1043,7 +1052,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `job::cancel(pool, hub: &EventHub, tenant: &Tenant, job_id: JobId) -> Result<(), KatError>`: another workspace's job is `NotFound`; a finished job is `job_already_finished`. In one transaction it locks the job row (`FOR NO KEY UPDATE`); if the job is already finished it returns `job_already_finished` at once, before taking any other lock. Otherwise it locks, before any write and in the global order, the job's task rows in ascending id, then the thread row, all `FOR NO KEY UPDATE`. Each queued or leased task becomes `cancelled` and its lease row is deleted. For a running run it closes the open calls (`TOOL_CALL_RESULT`, `katwork.tool_status{ok: false}`, ledger state `outcome_unknown`), marks the run `cancelled`, and emits `RUN_ERROR{code: "cancelled"}`, `katwork.run_closed {end: cancelled}` and `katwork.dot_state idle`. It then calls `finish_by_harness(tx, Cancelled)`, commits and notifies the hub. The old worker's next heartbeat or write finds the task no longer leased and gets `lease_lost`.
   - Route `POST /api/workspaces/{workspace_id}/jobs/{job_id}/cancel` returns 202, 404 across tenants, and 409 `job_already_finished`.
   - `JobView { id: JobId, status: Option<JobStatus>, reason: Option<ReasonCode>, hold_reason: Option<HoldReason>, queue_position: Option<u32> }` and `job::view(pool, &Tenant, JobId) -> Result<JobView, KatError>`. `queue_position` is set only while the job's task is `queued`: 1 plus the number of the same Dot's `queued` tasks of running jobs with a smaller `(created_at, id)`, so 1 means next in line (claim follows that order, Task 11). It is null for a leased task or a finished job. Route `GET /api/workspaces/{workspace_id}/jobs/{job_id}` → 200 `JobView`, 404 across tenants; the chat shows the position (Task 13b).
-  - Migration `0006_scheduler_indexes.sql`: `jobs_thread_created ON jobs (thread_id, created_at DESC)` for `job::latest_in_thread`, `jobs_requester_created ON jobs (requested_by, created_at, id)` for the per-sender throttle, and `tasks_job_dot ON tasks (job_id, dot_id)` for the throttle's join, `job::cancel` and `job::view`.
+  - Migration `0007_scheduler_indexes.sql`: `jobs_thread_created ON jobs (thread_id, created_at DESC)` for `job::latest_in_thread`, `jobs_requester_created ON jobs (requested_by, created_at, id)` for the per-sender throttle, and `tasks_job_dot ON tasks (job_id, dot_id)` for the throttle's join, `job::cancel` and `job::view`.
   - `serve` builds `Core` and runs `worker::spawn_pool(core, 4, Duration::from_secs(60))`.
   - Event order for an answered job: `RUN_STARTED`, `katwork.run_started`, `katwork.dot_state working`, `TEXT_MESSAGE_*`, `katwork.decision`, `katwork.message_stored`, `katwork.job_status answered`, `katwork.dot_state idle`, `RUN_FINISHED`, `katwork.run_closed`. `katwork.job_status` is the only success signal; cancelled, needs-input and interrupted outcomes are explicit job statuses, never an omitted one.
 
@@ -1091,13 +1100,14 @@ Task 13 is split in two PRs: 13a, the web shell, starts after Task 6 against moc
 ### Task 13a: Web shell (login, reset, transcript and event folding)
 
 **Files:**
-- Create: `web/` (Vite React TS), `web/index.html` (with a pre-paint theme script), `web/scripts/check-contrast.ts`, `web/src/{main.tsx,app.tsx,router.tsx,api.ts,sse.ts,theme.css,theme.ts}`, `web/src/i18n/{index.ts,en.json,th.json}`, `web/src/components/{Layout,Preferences,Announce,Transcript,Composer}.tsx`, `web/src/pages/{Login,ResetRequest,ResetConfirm,Home}.tsx`, each with its `*.test.ts(x)`, `crates/katwork-server/src/static_files.rs`, `crates/katwork-server/tests/{i18n.rs,static_files.rs}`
+- Create: `web/` (Vite React TS), `web/index.html` (with a pre-paint theme script), `web/scripts/check-contrast.ts`, `web/src/{main.tsx,app.tsx,router.tsx,api.ts,sse.ts,theme.css,theme.ts}`, `web/src/i18n/{index.ts,en.json,th.json}`, `web/src/components/{Layout,Preferences,Announce,Transcript,Composer}.tsx`, `web/src/pages/{Login,ResetRequest,ResetConfirm,InviteAccept,Home}.tsx`, each with its `*.test.ts(x)`, `crates/katwork-server/src/static_files.rs`, `crates/katwork-server/tests/{i18n.rs,static_files.rs}`
 - Modify: `crates/katwork-server/src/app.rs` (serve `web/dist` at `/`, SPA fallback), `Dockerfile` (web stage `node:22-bookworm-slim`), `.github/workflows/ci.yml` (`node-version: 22`, `npm run check:contrast`)
 
 **Interfaces:**
-- Consumes: the auth routes (Task 3), mocked threads, events and jobs routes; `crates/katwork-server/tests/fixtures/sse/thai_emoji.sse` (Task 9); `ReasonCode::ALL` (Task 2, with Task 10's `too_many_requests`).
+- Consumes: the auth routes (Task 3) and the invite accept route (Task 3b), mocked threads, events and jobs routes; `crates/katwork-server/tests/fixtures/sse/thai_emoji.sse` (Task 9); `ReasonCode::ALL` (Task 2, with Task 10's `too_many_requests`).
 - Produces:
   - `Transcript` and `Composer` components, which Task 13b's Chat page uses, and `Home`, the signed-in placeholder that 13b replaces with Team and Chat
+  - `InviteAccept.tsx` at `/invite`: like `ResetConfirm`, it takes the token from the link, hides it from the address bar, and posts to `POST /api/auth/invite/accept` (Task 3b)
   - `sse.ts`: `subscribe(url, onEvent): () => void`, using the browser `EventSource` (no Rust or SDK client) and its native `Last-Event-ID` resume. It keeps the last seq and drops duplicates after a reconnect, and folds text by `messageId` and tool arguments by `toolCallId`, never into "the last message". It follows Task 9's folding rules: `TEXT_MESSAGE_START` resets a message's provisional text, `katwork.message_stored` replaces it with the stored body, `synthetic` flag and any question with its options, and `katwork.run_closed` drops that run's unconfirmed provisional message.
   - `i18n.t(key, vars?)` with locales `en` and `th`; the locale switch persists in `localStorage`, and the locale is read with try/catch
   - `i18n.formatDate(date, { calendar: 'gregory' | 'buddhist' })`: Gregorian in the UI chrome, Buddhist Era where a template asks for it
@@ -1126,6 +1136,7 @@ Task 13 is split in two PRs: 13a, the web shell, starts after Task 6 against moc
   - `format_date_buddhist_era_in_thai`
   - `every_key_exists_in_both_locales`: `en.json` and `th.json` have identical key sets
   - Rust, in `crates/katwork-server/tests/i18n.rs`: `reason_codes_have_en_and_th_messages`
+  - `invite_accept_sets_a_password_and_hides_the_token`
   - Rust, in `crates/katwork-server/tests/static_files.rs`: `spa_routes_fall_back_to_index`, `api_paths_never_fall_back`, `missing_asset_is_404_not_index`, `static_responses_carry_security_headers`
 - [ ] **Step 2: Run** `cd web && npm test`. Expected: FAIL.
 - [ ] **Step 3: Implement** the pages and components, plain CSS with tokens, and keyboard-reachable controls. Serve `dist/` from Axum with SPA fallback; `/api/*` never falls back.
@@ -1134,14 +1145,14 @@ Task 13 is split in two PRs: 13a, the web shell, starts after Task 6 against moc
 
 ### Task 13b: Team, Chat and Members pages
 
-This task comes after Tasks 12 and 3b and builds on Task 13a. It adds migration `0007_invite_tokens.sql`.
+This task comes after Tasks 12 and 3b and builds on Task 13a. It adds no migration.
 
 **Files:**
-- Create: `web/src/pages/{Team,Chat,Members,InviteAccept}.tsx` with their `*.test.tsx`, `crates/katwork/src/tenancy/members.rs`, `crates/katwork/src/auth/invite.rs`, `crates/katwork/migrations/0007_invite_tokens.sql`, `crates/katwork-server/src/routes/members.rs`, `crates/katwork-server/tests/members.rs`
-- Modify: `web/src/{router.tsx,api.ts}`, `web/src/components/Layout.tsx`, `web/src/i18n/{en,th}.json`, `crates/katwork/src/{tenancy/mod.rs,auth/mod.rs,auth/reset.rs,auth/mailer.rs,error.rs}`, `crates/katwork-server/src/{app.rs,error.rs,routes/auth.rs}`
+- Create: `web/src/pages/{Team,Chat,Members}.tsx` with their `*.test.tsx`, `crates/katwork/src/tenancy/members.rs`, `crates/katwork-server/src/routes/members.rs`, `crates/katwork-server/tests/members.rs`
+- Modify: `web/src/{router.tsx,api.ts}`, `web/src/components/Layout.tsx`, `web/src/i18n/{en,th}.json`, `crates/katwork/src/{tenancy/mod.rs,auth/mailer.rs,error.rs}`, `crates/katwork-server/src/{app.rs,error.rs}`
 
 **Interfaces:**
-- Consumes: the workspaces, dots, teams, threads, events and jobs routes (Tasks 4–12); `JobView` and `GET …/jobs/{job_id}` (Task 12); `accounts::normalize_email`, `accounts::ensure_user`, `reset::confirm`, `password`, `Mailer`, `MailKind`, `LoginLimiter::clear_email` (Tasks 3 and 3b); `Tenant`, `Role`, `WorkspaceSummary.role` (Task 4); `Transcript`, `Composer`, `sse.ts`, `api.ts`, `i18n` (Task 13a).
+- Consumes: the workspaces, dots, teams, threads, events and jobs routes (Tasks 4–12); `JobView` and `GET …/jobs/{job_id}` (Task 12); `accounts::normalize_email`, `accounts::ensure_user`, `invite::issue`, `invite::link`, `Mailer`, `MailKind` (Tasks 3 and 3b); `Tenant`, `Role`, `WorkspaceSummary.role` (Task 4); `Transcript`, `Composer`, `sse.ts`, `api.ts`, `i18n` (Task 13a).
 - Produces:
   - `Team.tsx`: the thread's team from `GET …/teams/{team_id}`, lead first, names in the stored script (Thai names shown as stored)
   - `Chat.tsx`: posts with a fresh `client_msg_id`, subscribes to the thread's events through `sse.ts`, and renders `Transcript` and `Composer`. While a job runs it shows a Stop button that calls the cancel route. When a job's latest `katwork.job_status` has `holdReason: "dot_busy"`, it fetches `GET …/jobs/{job_id}` and shows `chat.queue_position` (`Waiting in line: {position}` / `รอคิว ลำดับที่ {position}`), refreshing every 5 s until that job's next `katwork.job_status` or its `RUN_STARTED`.
@@ -1155,15 +1166,7 @@ This task comes after Tasks 12 and 3b and builds on Task 13a. It adds migration 
     - a new account gets the membership and `invite::issue`. `Link` returns `invite::link(config.public_url_or_default(), &token)` in `link`. `Email` returns `link: None` and, after the commit, sends `mailer::invite_mail` without delaying the response; a failed delivery is logged with the mail kind and outcome only, and the invite stands (the person can still use password reset).
   - `members::set_role(pool, &Tenant, UserId, Role) -> Result<(), KatError>`, in one transaction that first locks the workspace row: owner or admin only; only an owner may grant `Owner` or change an owner's role; demoting the workspace's last owner is 422 `last_owner_required`; a user who is not a member is 404 `not_found`. It applies on that user's next request, because `tenancy::resolve` reads the membership every time.
   - `MailKind::Invite` and `mailer::invite_mail(to: String, locale: Locale, link: &str, workspace: &str) -> Mail`: bilingual in the invitee's locale order, like the reset mail. Subject `คำเชิญเข้าร่วม KatWork / You're invited to KatWork` (halves swapped for `en`). Thai: `คุณได้รับเชิญเข้าร่วม {workspace} บน KatWork ใช้ลิงก์นี้ภายใน 72 ชั่วโมงเพื่อตั้งรหัสผ่าน`. English: `You have been invited to {workspace} on KatWork. Use this link within 72 hours to set your password.` The link stands alone on the last line.
-  - Invite tokens are their own kind, so a reset token and an invite token can never stand in for each other:
-    - migration `0007_invite_tokens.sql`: `ALTER TABLE password_resets ADD COLUMN kind TEXT NOT NULL DEFAULT 'reset' CHECK (kind IN ('reset', 'invite'))`; every existing row and every token from Tasks 3 and 3b is `reset`
-    - `reset::request`, `reset::issue` and `reset::confirm` now write and accept only `kind = 'reset'`, and the three-pending cap counts only reset tokens
-    - `invite::issue(conn: &mut PgConnection, user_id: UserId) -> Result<String, KatError>`: one `kind = 'invite'` row with the reset token format (32 random bytes in URL-safe base64, stored as its SHA-256), `expires_at = clock_timestamp() + interval '72 hours'`, single use
-    - `invite::link(link_base: &str, token: &str) -> String`: `{link_base without a trailing /}/invite?token={token}`
-    - `invite::accept(pool, token: &str, new_password: &str) -> Result<String, KatError>`: for an unused, unexpired `invite` token only, it sets the password, marks the token used, ends the account's sessions and its other pending tokens of both kinds, and returns the account's email; any other token is 400 `invite_token_invalid`. `reset::confirm` likewise ends pending tokens of both kinds.
-    - route `POST /api/auth/invite/accept` with `{token, new_password}` → 204, under reset confirm's body, password and rate rules; on success it calls `LoginLimiter::clear_email` with the returned email
-    - `InviteAccept.tsx` at `/invite`: like `ResetConfirm`, it takes the token from the link, hides it from the address bar, and posts to the accept route
-  - New codes: `member_exists` (409), `last_owner_required` (422), `smtp_unconfigured` (422) and `invite_token_invalid` (400), each with an `error.<code>` message in both locales
+  - New codes: `member_exists` (409), `last_owner_required` (422) and `smtp_unconfigured` (422), each with an `error.<code>` message in both locales
   - Routes, each calling `require_admin()` before parsing any body:
     - `GET /api/workspaces/{workspace_id}/members` → 200 `[Member]`
     - `POST /api/workspaces/{workspace_id}/members` with `Invite` → 201 `InviteResult`
@@ -1181,8 +1184,6 @@ This task comes after Tasks 12 and 3b and builds on Task 13a. It adds migration 
   - in `crates/katwork-server/tests/members.rs`:
     - `member_cannot_list_invite_or_change_roles`: 403, with a valid and with an invalid body
     - `invite_new_email_by_link_returns_a_single_use_link`: the `/invite` link sets a password once through `POST /api/auth/invite/accept`, and a second accept is 400 `invite_token_invalid`; the new account then lists the workspace with the invited role
-    - `invite_tokens_last_72_hours`: the token's `expires_at` is 72 hours after issue, and accepting fails once the test moves it into the past in SQL
-    - `invite_and_reset_tokens_cannot_be_swapped`: an invite token at `POST /api/auth/reset/confirm` is 400 `reset_token_invalid`, and a reset token at `POST /api/auth/invite/accept` is 400 `invite_token_invalid`
     - `invite_by_email_sends_a_bilingual_invite_mail`: with `CapturingMailer`; the response has no link
     - `invite_by_email_without_smtp_is_422_and_writes_nothing`
     - `invite_of_an_existing_account_adds_membership_without_a_link`: Review Focus 4; `link` is null, no mail is sent, and the account's password and sessions are unchanged
@@ -1193,9 +1194,9 @@ This task comes after Tasks 12 and 3b and builds on Task 13a. It adds migration 
     - `concurrent_invites_for_one_email_create_one_account`
     - `members_routes_hide_other_workspaces`: 404
     - `invite_tokens_never_reach_logs`
-  - in `web/src/pages/Members.test.tsx`: `members_page_is_offered_only_to_owners_and_admins`, `members_page_invites_by_link_and_shows_it_once`, `members_page_explains_email_invites_without_smtp`, `members_page_changes_a_role`; in `web/src/pages/InviteAccept.test.tsx`: `invite_accept_sets_a_password_and_hides_the_token`
+  - in `web/src/pages/Members.test.tsx`: `members_page_is_offered_only_to_owners_and_admins`, `members_page_invites_by_link_and_shows_it_once`, `members_page_explains_email_invites_without_smtp`, `members_page_changes_a_role`
 
-  Run `cargo test -p katwork-server --test members && (cd web && npm test)`. Expected: FAIL. Implement `tenancy/members.rs`, `routes/members.rs`, `auth/invite.rs` with migration `0007_invite_tokens.sql` and the accept route, the `kind` filter in `reset.rs`, `MailKind::Invite` with `mailer::invite_mail`, the new codes, `Members.tsx` and `InviteAccept.tsx`. Run again. Expected: PASS.
+  Run `cargo test -p katwork-server --test members && (cd web && npm test)`. Expected: FAIL. Implement `tenancy/members.rs`, `routes/members.rs`, `MailKind::Invite` with `mailer::invite_mail`, the new codes and `Members.tsx`. Run again. Expected: PASS.
 - [ ] **Step 5: Run** `npm test && npm run check:contrast && npm run build && cargo test --workspace --locked`. Expected: PASS.
 - [ ] **Step 6: Commit** with `feat: team, chat and members pages`.
 
@@ -1258,8 +1259,8 @@ This task comes after Tasks 12 and 3b and builds on Task 13a. It adds migration 
 
 - Task 7 (model gateway) depends only on Task 2: it takes `ModelTier` and `SpacePolicy` from `crate::types` and `Config` from Task 1. It can run in parallel with Tasks 3–6 and 9. Tasks 7 and 9 each add one field to `Core` in `runtime.rs`; whichever merges second rebases.
 - Task 7b (local model provider) is a small PR after PR #21 merges, and must merge before Task 8, which reads `ModelEntry.timeouts`.
-- Task 3b (operator accounts and first-run convenience) comes after Task 4, runs in parallel with Task 5, lands as its own PR, and must merge before Task 13b, whose Members page uses its account functions. Tasks 3b and 7b both edit `config.rs`; whichever merges second adopts `ConfigInvalid { var }`.
-- Task 5's follow-up PR (Steps 6–9: Lead concurrency default, reply-language line, Thai demo seed) merges after PR #24 and before Task 11, whose `lead_runs_three_tasks_at_once_specialists_one` uses the Lead default.
+- Task 3b (operator accounts and first-run convenience) comes after Task 4, can be written in parallel with Task 5 but merges after PR #24 (its migration 0005 follows Task 5's 0004), lands as its own PR, and must merge before Task 13b, whose Members page uses its account functions. Tasks 3b and 7b both edit `config.rs`; whichever merges second adopts `ConfigInvalid { var }`.
+- Task 5's follow-up PR (Steps 6–10: Lead concurrency default, reply-language line, Thai demo seed, default team for `create-user`'s new workspace) merges after PR #24 and Task 3b and before Task 11, whose `lead_runs_three_tasks_at_once_specialists_one` uses the Lead default.
 - Task 9 comes before Task 8 because the agent loop emits through `EventSink`.
 - Task 13a starts against mocked APIs after Task 6. Task 13b needs Tasks 12, 3b and 13a.
-- Migration numbers follow this order (Global Constraints): 0004 (Task 5), 0005 (Task 11), 0006 (Task 12).
+- Migration numbers follow this order (Global Constraints): 0004 (Task 5), 0005 (Task 3b), 0006 (Task 11), 0007 (Task 12).
