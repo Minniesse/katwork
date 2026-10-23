@@ -44,15 +44,19 @@ In Claude Code, every command run inside a worktree of this repo gets that workt
 
 ## Blocked commands
 
-`guard.py` runs before every shell command in both tools. It blocks:
+`guard.py` runs before every shell command in both tools. It parses the command the way the shell would, through `&&`/`;`/`|` chains, `sh -c`, `eval`, heredocs fed to a shell, `$(...)`, wrappers such as `env`, `sudo`, `xargs` and `find -exec`, and git and gh aliases. It blocks:
 
-- `git push` that updates or deletes `main` or `master`, in any spelling, including a bare `git push` from `main`
+- `git push` that updates or deletes `main` or `master`. That covers explicit refspecs, `HEAD` or a bare push from `main`, push config (`remote.<name>.push`, `push.default=upstream`), `--all`/`--mirror`, and a refspec computed at run time (write the branch name, or `HEAD`)
 - deleting a remote branch, by `git push --delete` or `gh pr merge --delete-branch`, while open PRs use it as their base
-- `git reset --hard`, and `git clean` with `--force`
-- `git commit` when `user.email` isn't a GitHub noreply address
-- `gh pr merge` with `--admin`, `--squash` or `--rebase`, or without a review on the PR's head commit
+- `git reset --hard`, and `git clean` that would delete files (dry runs pass)
+- commits and merges whose author or committer email isn't a GitHub noreply address
+- `gh pr merge` with `--admin`, `--auto`, `--squash` or `--rebase`, or when no review covers the code being merged, and `gh api` or `curl` writes that merge PRs or move refs
+
+A review covers the head when it was posted on the head commit, or on an earlier commit followed only by merges of the base branch that leave the PR's own diff unchanged. Merging `main` into a reviewed PR keeps the review valid; resolving a conflict or adding a commit needs a new review. The guard doesn't read what a review says; the maintainer weighs that.
 
 The blocking message says what to do instead. Run `.claude/hooks/guard.py --self-test` after changing it.
+
+The guard is a guardrail for agents, not a security boundary: anything that runs code it can't see (a compiled program, a script in another language, a fresh login) gets past it. Server-side branch protection or a ruleset on `main` is what actually refuses a direct push or an unreviewed merge.
 
 ## Codex setup
 

@@ -5,7 +5,7 @@ description: Cross-review a KatWork pull request and post the review. Use when a
 
 # Cross-review a PR
 
-The model that didn't write a PR reviews it. A Codex-written PR gets two reviews: one from Claude and a separate one from a fresh Codex session. The maintainer merges once a review on the PR's current head says it's ready; `gh pr merge` refuses otherwise.
+The model that didn't write a PR reviews it. A Codex-written PR gets two reviews: one from Claude and a separate one from a fresh Codex session. The maintainer merges once a review says it's ready. `gh pr merge` refuses unless a review covers the head: one posted on it, or on an earlier commit followed only by clean merges of the base branch.
 
 ## Steps
 

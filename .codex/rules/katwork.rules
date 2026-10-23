@@ -21,6 +21,21 @@ prefix_rule(
 )
 
 prefix_rule(
+    pattern = ["git", "push", ["--repo=origin", "--repo=upstream"], ["main", "master", "HEAD:main", "HEAD:master", "HEAD:refs/heads/main", ":main", "+main"]],
+    decision = "forbidden",
+    justification = "Never push to main. Push your branch (git push -u origin HEAD) and open a PR.",
+    match = ["git push --repo=origin HEAD:main"],
+    not_match = ["git push --repo=origin HEAD:feature"],
+)
+
+prefix_rule(
+    pattern = ["git", "push", "--repo", ["origin", "upstream"], ["main", "master", "HEAD:main", "HEAD:master", "HEAD:refs/heads/main", ":main", "+main"]],
+    decision = "forbidden",
+    justification = "Never push to main. Push your branch (git push -u origin HEAD) and open a PR.",
+    match = ["git push --repo origin HEAD:main"],
+)
+
+prefix_rule(
     pattern = ["git", "reset", "--hard"],
     decision = "forbidden",
     justification = "git reset --hard discards work. Use git stash, or git restore <path> for specific files.",

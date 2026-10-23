@@ -67,5 +67,5 @@ Fix each finding with a test that would have caught it, run step 5 again, and pu
 ## Keeping the stack healthy
 
 - Before the PR opens, rebase onto `origin/<base>` freely.
-- Once it's open, bring base changes in with `git merge origin/<base>` rather than rebasing, so reviewed commits stay valid and PRs stacked on yours keep their history. Merges into `main` are merge commits for the same reason.
+- Once it's open, bring base changes in with `git merge origin/<base>` rather than rebasing, so reviewed commits stay valid and PRs stacked on yours keep their history. A clean merge keeps the last review valid for `gh pr merge`; a merge that resolves conflicts needs a review of the merge. Merges into `main` are merge commits for the same reason.
 - When your base PR merges, GitHub may retarget your PR to `main`; check it with `gh pr view <n> --json baseRefName`. Before anyone deletes a base branch, every PR based on it is retargeted with `gh pr edit <n> --base <new-base>`; deleting it first closes them.
