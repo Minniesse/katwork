@@ -349,6 +349,12 @@ fn first_run_and_profile_configuration() {
     assert!(!missing.status.success());
     let error = String::from_utf8_lossy(&missing.stderr);
     assert!(error.contains("KATWORK_SECRET") && error.contains("scripts/init-env.sh"));
+    for variable in ["DATABASE_URL", "POSTGRES_PASSWORD", "KATWORK_SECRET"] {
+        let missing = output(stack.compose().env(variable, "").args(["config", "-q"]));
+        assert!(!missing.status.success());
+        let error = String::from_utf8_lossy(&missing.stderr);
+        assert!(error.contains(variable) && error.contains("scripts/init-env.sh"));
+    }
     for overrides in [
         vec![],
         vec!["smoke"],
@@ -393,6 +399,7 @@ fn first_run_and_profile_configuration() {
         );
         assert!(config["services"]["postgres"]["ports"].is_null());
         if overrides.contains(&"https") {
+            assert_eq!(app["networks"]["edge"]["ipv4_address"], "172.31.250.3");
             assert_eq!(
                 app["environment"]["KATWORK_TRUSTED_PROXIES"],
                 "172.31.250.2"
@@ -414,6 +421,10 @@ fn first_run_and_profile_configuration() {
         }
         if overrides.contains(&"demo") {
             assert_eq!(app["environment"]["KATWORK_DEMO"], "1");
+            assert_eq!(
+                config["services"]["migrate"]["environment"]["KATWORK_DEMO"],
+                "1"
+            );
             for name in [
                 "OPENAI_API_KEY",
                 "ANTHROPIC_API_KEY",
@@ -451,8 +462,13 @@ async fn thai_demo_stream_is_synthetic_and_dependency_logs_are_blocked() {
 
 #[tokio::test]
 #[ignore = "Docker daemon; run scripts/smoke.sh"]
-async fn offline_demo_uses_synthetic_provider_without_egress() {
+async fn offline_demo_uses_synthetic_provider_with_host_keys_cleared() {
     let mut stack = Stack::new(false);
+    let settings = stack.dir.join(".env");
+    let mut env = fs::read_to_string(&settings).unwrap();
+    env.push_str(&format!("\nOPENAI_API_KEY={}\nANTHROPIC_API_KEY={}\nKATWORK_LOCAL_BASE_URL=http://model.invalid/v1\nKATWORK_LOCAL_MODEL=fixture\nSMTP_HOST=mail.invalid\n", Uuid::now_v7(), Uuid::now_v7()));
+    fs::write(settings, env).unwrap();
+
     let override_path = format!(":{}", stack.dir.join("test.yml").display());
     stack.files = stack.files.replace(
         &override_path,
@@ -465,24 +481,19 @@ async fn offline_demo_uses_synthetic_provider_without_egress() {
         Command::new("docker").args(["inspect", id.trim()]),
     ))
     .unwrap();
-    let networks = inspect[0]["NetworkSettings"]["Networks"]
-        .as_object()
-        .unwrap();
-    assert_eq!(networks.len(), 1);
-    let network = networks.values().next().unwrap()["NetworkID"]
-        .as_str()
-        .unwrap();
-    assert_eq!(
-        checked(Command::new("docker").args([
-            "network",
-            "inspect",
-            "--format",
-            "{{.Internal}}",
-            network
-        ]))
-        .trim(),
-        "true"
-    );
+    let env = inspect[0]["Config"]["Env"].as_array().unwrap();
+    for setting in [
+        "OPENAI_API_KEY=",
+        "ANTHROPIC_API_KEY=",
+        "KATWORK_LOCAL_BASE_URL=",
+        "KATWORK_LOCAL_MODEL=",
+        "SMTP_HOST=",
+    ] {
+        assert!(
+            env.iter().any(|value| value == setting),
+            "demo must clear {setting}"
+        );
+    }
     let thread = stack.thread().await;
     let job = stack.post(&thread).await;
     stack.answered(&thread, &job).await;

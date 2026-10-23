@@ -3,6 +3,7 @@ services:
     networks: !override
       backend:
       edge:
+        ipv4_address: 172.31.250.3
     ports: !reset []
     environment:
       KATWORK_TRUSTED_PROXIES: 172.31.250.2

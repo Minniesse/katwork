@@ -3,7 +3,7 @@ set -eu
 umask 077
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
-if [ ! -e .env ]; then scripts/init-env.sh; fi
+if [ ! -e .env ]; then KATWORK_ENV_FILE="$root/.env" scripts/init-env.sh; fi
 compose() { docker compose -f docker-compose.yml -f docker-compose.demo.yml "$@"; }
 compose up -d
 attempt=0

@@ -26,7 +26,7 @@ cat > "$tmp/bin/curl" <<'SCRIPT'
 exit 0
 SCRIPT
 chmod +x "$tmp/bin/docker" "$tmp/bin/curl"
-"$tmp/scripts/demo.sh" > "$tmp/out" 2>&1
+KATWORK_ENV_FILE="$tmp/elsewhere" "$tmp/scripts/demo.sh" > "$tmp/out" 2>&1
 [ -f "$tmp/.env" ]
 [ "$(cat "$tmp/.demo-credentials")" = "$DEMO_TEST_PASSWORD" ]
 mode=$(stat -c %a "$tmp/.demo-credentials" 2>/dev/null || stat -f %Lp "$tmp/.demo-credentials")

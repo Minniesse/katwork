@@ -1,9 +1,7 @@
 services:
   katwork:
-    networks: !override
-      backend:
     ports: !override ["127.0.0.1:3000:3000"]
-    environment:
+    environment: &demo-environment
       KATWORK_DEMO: "1"
       KATWORK_PUBLIC_URL: http://localhost:3000
       KATWORK_BIND: 127.0.0.1
@@ -16,3 +14,5 @@ services:
       SMTP_HOST: ""
       SMTP_USERNAME: ""
       SMTP_PASSWORD: ""
+  migrate:
+    environment: *demo-environment

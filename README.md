@@ -43,8 +43,9 @@ Rerunning the script preserves an existing account's password.
 
 The demo includes English `Demo` and Thai `เดโม` workspaces, each with a team of
 six Kats. Replies are synthetic and marked as such; no model or mail service is
-called. The demo override clears provider and mail settings and gives the app
-only the internal network. It is available only from this host. It exercises the
+called. The demo override clears provider and mail settings. It is available
+only from this host. Docker keeps a normal app network to publish the local port;
+the demo configuration disables external services, rather than acting as a firewall. It exercises the
 API and streaming pipeline; available web pages depend on your checkout.
 
 ### First account
@@ -119,6 +120,7 @@ published port in this configuration. Caddy's certificate state lives in the
 `caddy_data` and `caddy_config` volumes; keep both across upgrades.
 
 The override trusts only Caddy at `172.31.250.2`, on subnet `172.31.250.0/29`.
+The app uses `172.31.250.3`, so it cannot take Caddy's address during startup.
 That subnet must be free on your host. Keep `KATWORK_TRUSTED_PROXIES` limited to
 proxies you operate. Caddy keeps event streams uncompressed and flushes them
 immediately. It bounds header and idle waits and enables TCP keepalive on the
@@ -148,7 +150,8 @@ running. Every startup waits for the backup to succeed before it runs migrations
 or starts the app. Do not run migrations by hand around that gate.
 
 Existing databases are saved under `backups/katwork-<UTC timestamp>-<suffix>.dump`.
-The script writes a private `.partial` file and renames it only after `pg_dump`
+On Linux, these private files belong to the container's root user; use operator
+privileges to copy or restore them. The script writes a private `.partial` file and renames it only after `pg_dump`
 succeeds. A failed backup stops startup. Check free disk space and file permissions,
 fix the cause, then start again. No retention policy deletes old backups; copy them
 to secure storage and remove old files yourself after checking a restore.
