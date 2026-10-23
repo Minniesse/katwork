@@ -118,7 +118,7 @@ async fn default_team_has_one_lead_and_five_specialists(pool: PgPool) {
     config.demo = true;
     auth::seed_demo(&pool, &config, false).await.unwrap();
     auth::seed_demo(&pool, &config, false).await.unwrap();
-    let rows: Vec<(String, bool)> = sqlx::query_as("SELECT d.name, m.is_lead FROM team_members m JOIN kats d ON d.id = m.kat_id ORDER BY m.position")
+    let rows: Vec<(String, bool)> = sqlx::query_as("SELECT d.name, m.is_lead FROM team_members m JOIN kats d ON d.id = m.kat_id JOIN workspaces w ON w.id = m.workspace_id WHERE w.name = 'Demo' ORDER BY m.position")
         .fetch_all(&pool).await.unwrap();
     assert_eq!(
         rows,
@@ -131,10 +131,12 @@ async fn default_team_has_one_lead_and_five_specialists(pool: PgPool) {
             ("Reviewer".into(), false)
         ]
     );
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM teams")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM teams t JOIN workspaces w ON w.id = t.workspace_id WHERE w.name = 'Demo'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(count, 1);
 }
 
@@ -148,6 +150,75 @@ async fn default_roster_avatars_are_distinct(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(count, 6);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn lead_defaults_to_three_concurrent_tasks_specialists_to_one(pool: PgPool) {
+    use katwork::{
+        ids::{SpaceId, UserId, WorkspaceId},
+        team::team,
+        tenancy,
+        types::Locale,
+    };
+    let f = Fixture::new(&pool).await;
+    let tenant = tenancy::resolve(&pool, UserId(f.user), WorkspaceId(f.workspace))
+        .await
+        .unwrap();
+    for locale in [Locale::En, Locale::Th] {
+        let space = space(&pool, f.workspace).await;
+        let id = team::create_default(&pool, &tenant, SpaceId(space), locale)
+            .await
+            .unwrap();
+        let view = body(f.call("GET", &format!("teams/{id}"), None).await).await;
+        let limits: Vec<_> = view["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|kat| (kat["role"].clone(), kat["max_concurrency"].clone()))
+            .collect();
+        assert_eq!(
+            limits,
+            [
+                (json!("lead"), json!(3)),
+                (json!("researcher"), json!(1)),
+                (json!("writer"), json!(1)),
+                (json!("analyst"), json!(1)),
+                (json!("scheduler"), json!(1)),
+                (json!("reviewer"), json!(1)),
+            ],
+            "{locale:?}"
+        );
+    }
+    f.role(&pool, "member").await;
+    assert_eq!(
+        f.hire("HR", json!({"custom": "HR"})).await["max_concurrency"],
+        1
+    );
+    let lead = f.hire("Chief", json!("lead")).await;
+    assert_eq!(lead["max_concurrency"], 3);
+    assert_code(
+        f.call(
+            "POST",
+            &format!("spaces/{}/kats", f.space),
+            Some(json!({"name": "Fast", "role": "writer", "persona": "", "max_concurrency": 3})),
+        )
+        .await,
+        400,
+        "request_invalid",
+    )
+    .await;
+    let path = format!("kats/{}", id(&lead));
+    let patch = json!({"max_concurrency": 5});
+    assert_code(
+        f.call("PATCH", &path, Some(patch.clone())).await,
+        403,
+        "forbidden",
+    )
+    .await;
+    f.role(&pool, "admin").await;
+    let patched = body(f.call("PATCH", &path, Some(patch)).await).await;
+    assert_eq!(patched["max_concurrency"], 5);
+    assert_eq!(patched["policy_version"], lead["policy_version"]);
 }
 
 #[sqlx::test(migrations = "../katwork/migrations")]

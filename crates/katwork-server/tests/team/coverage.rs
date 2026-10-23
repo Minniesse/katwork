@@ -348,11 +348,15 @@ fn every_role_template_has_safe_defaults() {
             "Help with the user's task and ask when clarification is needed.",
         ),
     ] {
-        for (locale, name) in [(Locale::En, en), (Locale::Th, th)] {
+        for (locale, name, reply) in [(Locale::En, en, REPLY_EN), (Locale::Th, th, REPLY_TH)] {
             let new = roles::template(&role, locale);
             assert_eq!(new.name, name);
             assert_eq!(new.role, role);
-            assert_eq!(new.instructions, instruction);
+            assert_eq!(new.instructions, format!("{instruction} {reply}"));
+            assert_eq!(
+                new.max_concurrency,
+                if role == KatRole::Lead { 3 } else { 1 }
+            );
             assert!(new.persona.is_empty());
             assert_eq!(new.tool_allowlist, ["ask_user", "read_thread"]);
             assert_eq!(new.model_tier, ModelTier::Standard);
@@ -361,4 +365,122 @@ fn every_role_template_has_safe_defaults() {
             assert_eq!(new.appearance.accent, "blue");
         }
     }
+}
+
+const REPLY_EN: &str = "Reply in the language of the person's latest message.";
+const REPLY_TH: &str = "ตอบเป็นภาษาเดียวกับข้อความล่าสุดของคนที่คุยด้วย";
+
+fn every_role() -> [KatRole; 7] {
+    [
+        KatRole::Lead,
+        KatRole::Researcher,
+        KatRole::Writer,
+        KatRole::Analyst,
+        KatRole::Scheduler,
+        KatRole::Reviewer,
+        KatRole::Custom("HR".into()),
+    ]
+}
+
+#[test]
+fn role_templates_tell_kats_to_reply_in_the_persons_language() {
+    for role in every_role() {
+        for (locale, line) in [(Locale::En, REPLY_EN), (Locale::Th, REPLY_TH)] {
+            let instructions = roles::template(&role, locale).instructions;
+            assert!(instructions.ends_with(line), "{role:?} {locale:?}");
+            assert_eq!(instructions.matches(line).count(), 1, "{role:?} {locale:?}");
+        }
+    }
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn member_can_hire_from_either_locales_template_but_not_change_it(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    f.role(&pool, "member").await;
+    let member = tenancy::resolve(&pool, UserId(f.user), WorkspaceId(f.workspace))
+        .await
+        .unwrap();
+    let space = SpaceId(f.space);
+    // Hiring proves each template, reply line included, passes the free-text checks.
+    for role in every_role() {
+        for locale in [Locale::En, Locale::Th] {
+            let template = roles::template(&role, locale);
+            let id = kat::hire(&pool, &member, space, template.clone())
+                .await
+                .unwrap();
+            let kat = kat::get(&pool, &member, id).await.unwrap();
+            assert_eq!(kat.instructions, template.instructions);
+            assert_eq!(kat.max_concurrency, template.max_concurrency);
+        }
+    }
+    let mut changed = roles::template(&KatRole::Writer, Locale::Th);
+    changed.instructions.push_str(" Skip the review.");
+    let mut lead = roles::template(&KatRole::Lead, Locale::En);
+    lead.max_concurrency = 1;
+    let mut writer = roles::template(&KatRole::Writer, Locale::En);
+    writer.max_concurrency = 3;
+    for new in [changed, lead, writer] {
+        assert_eq!(
+            kat::hire(&pool, &member, space, new.clone())
+                .await
+                .unwrap_err()
+                .code(),
+            "forbidden",
+            "{new:?}"
+        );
+    }
+    let kats: i64 = sqlx::query_scalar("SELECT count(*) FROM kats")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(kats, 14);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn admin_may_hire_with_any_positive_max_concurrency(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let admin = tenancy::resolve(&pool, UserId(f.user), WorkspaceId(f.workspace))
+        .await
+        .unwrap();
+    let mut writer = roles::template(&KatRole::Writer, Locale::En);
+    writer.max_concurrency = 2;
+    let id = kat::hire(&pool, &admin, SpaceId(f.space), writer.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        kat::get(&pool, &admin, id).await.unwrap().max_concurrency,
+        2
+    );
+    writer.max_concurrency = 0;
+    assert_eq!(
+        kat::hire(&pool, &admin, SpaceId(f.space), writer)
+            .await
+            .unwrap_err()
+            .code(),
+        "request_invalid"
+    );
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn member_can_create_the_thai_default_team(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    f.role(&pool, "member").await;
+    let member = tenancy::resolve(&pool, UserId(f.user), WorkspaceId(f.workspace))
+        .await
+        .unwrap();
+    let id = team::create_default(&pool, &member, SpaceId(f.space), Locale::Th)
+        .await
+        .unwrap();
+    let view = team::get(&pool, &member, id).await.unwrap();
+    assert_eq!(view.team.name, "ทีมเริ่มต้น");
+    let names: Vec<_> = view.members.iter().map(|kat| kat.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["หัวหน้าทีม", "นักวิจัย", "นักเขียน", "นักวิเคราะห์", "เลขา", "ผู้ตรวจ"]
+    );
+    assert!(
+        view.members
+            .iter()
+            .all(|kat| kat.instructions.ends_with(REPLY_TH))
+    );
 }

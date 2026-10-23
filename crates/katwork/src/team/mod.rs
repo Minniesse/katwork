@@ -91,7 +91,33 @@ fn validate_name(name: &str) -> Result<&str, KatError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fold_name, validate_name};
+    use super::{fold_name, roles::default_roster, team, validate_name};
+    use crate::types::Locale;
+
+    #[test]
+    fn default_names_pass_validate_name_and_fold_to_fixed_points() {
+        for locale in [Locale::En, Locale::Th] {
+            let mut names: Vec<_> = default_roster(locale)
+                .into_iter()
+                .map(|new| new.name)
+                .collect();
+            names.push(team::default_name(locale).to_owned());
+            for name in &names {
+                assert_eq!(validate_name(name).ok(), Some(name.as_str()), "{name:?}");
+                let key = fold_name(name);
+                assert_eq!(fold_name(&key), key, "{name:?}");
+                assert!(!key.contains('@'), "{name:?}");
+                if locale == Locale::Th {
+                    assert_eq!(key, *name, "{name:?}");
+                }
+            }
+        }
+        for (workspace, space, _) in crate::auth::DEMO_WORKSPACES {
+            for name in [workspace, space] {
+                assert_eq!(crate::tenancy::validate_name(name).ok(), Some(name));
+            }
+        }
+    }
 
     #[test]
     fn fold_name_is_idempotent_with_mixed_thai_marks() {

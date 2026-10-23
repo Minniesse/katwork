@@ -13,7 +13,7 @@ use katwork::{
     error::KatError,
     runtime::Core,
     tenancy::Role,
-    types::SpacePolicy,
+    types::{Locale, SpacePolicy},
 };
 use katwork_server::{
     app::{AppState, build_router},
@@ -89,7 +89,7 @@ const USAGE: &str = "\
 usage: katwork-server [serve]
        katwork-server migrate
        katwork-server seed-demo [--reset-password]
-       katwork-server create-user --email <email> --workspace <name|id> --role <owner|admin|member> [--space-policy <local|hosted>]
+       katwork-server create-user --email <email> --workspace <name|id> --role <owner|admin|member> [--space-policy <local|hosted>] [--locale <en|th>]
        katwork-server reset-link --email <email>
 ";
 
@@ -125,6 +125,7 @@ enum Command {
         workspace: WorkspaceRef,
         role: Role,
         space_policy: Option<SpacePolicy>,
+        locale: Locale,
     },
     ResetLink {
         email: String,
@@ -156,7 +157,13 @@ fn parse(args: &[String]) -> Result<Command, KatError> {
         ("create-user", _) => {
             let mut flags = flags(
                 &args[1..],
-                &["--email", "--workspace", "--role", "--space-policy"],
+                &[
+                    "--email",
+                    "--workspace",
+                    "--role",
+                    "--space-policy",
+                    "--locale",
+                ],
             )?;
             let mut required = |name| flags.remove(name).ok_or(KatError::CommandInvalid);
             let email = required("--email")?;
@@ -177,11 +184,17 @@ fn parse(args: &[String]) -> Result<Command, KatError> {
                 }),
                 Some(_) => return Err(KatError::CommandInvalid),
             };
+            let locale = match flags.remove("--locale").as_deref() {
+                None | Some("en") => Locale::En,
+                Some("th") => Locale::Th,
+                Some(_) => return Err(KatError::CommandInvalid),
+            };
             Command::CreateUser {
                 email,
                 workspace,
                 role,
                 space_policy,
+                locale,
             }
         }
         ("reset-link", _) => Command::ResetLink {
@@ -250,6 +263,7 @@ async fn run() -> Result<(), KatError> {
             workspace,
             role,
             space_policy,
+            locale,
         } => {
             let config = Config::from_env()?;
             let pool = db::connect(&config.database_url).await?;
@@ -260,6 +274,7 @@ async fn run() -> Result<(), KatError> {
                 &workspace,
                 role,
                 space_policy,
+                locale,
                 config.public_url_or_default(),
             )
             .await?;

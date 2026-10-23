@@ -201,13 +201,13 @@ async fn concurrent_seed_demo_creates_exactly_one_roster(pool: PgPool) {
     );
     for (table, expected) in [
         ("SELECT count(*) FROM users", 1),
-        ("SELECT count(*) FROM workspaces", 1),
-        ("SELECT count(*) FROM memberships", 1),
-        ("SELECT count(*) FROM spaces", 1),
-        ("SELECT count(*) FROM kats", 6),
-        ("SELECT count(*) FROM kat_spaces", 6),
-        ("SELECT count(*) FROM teams", 1),
-        ("SELECT count(*) FROM team_members", 6),
+        ("SELECT count(*) FROM workspaces", 2),
+        ("SELECT count(*) FROM memberships", 2),
+        ("SELECT count(*) FROM spaces", 2),
+        ("SELECT count(*) FROM kats", 12),
+        ("SELECT count(*) FROM kat_spaces", 12),
+        ("SELECT count(*) FROM teams", 2),
+        ("SELECT count(*) FROM team_members", 12),
     ] {
         let count: i64 = sqlx::query_scalar(table).fetch_one(&pool).await.unwrap();
         assert_eq!(count, expected, "{table}");
@@ -217,5 +217,5 @@ async fn concurrent_seed_demo_creates_exactly_one_roster(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(leads, 1);
+    assert_eq!(leads, 2);
 }

@@ -229,7 +229,7 @@ async fn seed_demo_creates_demo_user_and_workspace(pool: sqlx::PgPool) {
         assert!(!String::from_utf8_lossy(&output.stdout).contains(&password));
         assert!(!String::from_utf8_lossy(&output.stderr).contains(&password));
     }
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM memberships m JOIN users u ON u.id = m.user_id JOIN workspaces w ON w.id = m.workspace_id WHERE u.email = 'demo@katwork.local' AND m.role = 'owner'")
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM memberships m JOIN users u ON u.id = m.user_id JOIN workspaces w ON w.id = m.workspace_id WHERE u.email = 'demo@katwork.local' AND m.role = 'owner' AND w.name = 'Demo'")
         .fetch_one(&pool).await.unwrap();
     assert_eq!(count, 1);
     let app = support::app(&pool, None);
@@ -267,6 +267,7 @@ async fn seed_demo_reset_password_allows_login(pool: sqlx::PgPool) {
         .unwrap();
     assert!(reset.status.success());
     assert_eq!(String::from_utf8(reset.stdout).unwrap().trim(), password);
+    assert_eq!(row_counts(&pool).await, [1, 2, 2, 2, 12, 12, 2, 12]);
     assert_eq!(demo_login(&app, &password).await.status(), 200);
     support::assert_code(
         demo_login(&app, &first_password).await,
@@ -280,6 +281,153 @@ async fn seed_demo_reset_password_allows_login(pool: sqlx::PgPool) {
         "unauthenticated",
     )
     .await;
+}
+
+fn seed_demo(pool: &sqlx::PgPool) {
+    let output = server()
+        .arg("seed-demo")
+        .env("KATWORK_DEMO", "1")
+        .env("DATABASE_URL", database_url(pool))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const ROW_COUNTS: [&str; 8] = [
+    "SELECT count(*) FROM users",
+    "SELECT count(*) FROM workspaces",
+    "SELECT count(*) FROM memberships",
+    "SELECT count(*) FROM spaces",
+    "SELECT count(*) FROM kats",
+    "SELECT count(*) FROM kat_spaces",
+    "SELECT count(*) FROM teams",
+    "SELECT count(*) FROM team_members",
+];
+
+async fn row_counts(pool: &sqlx::PgPool) -> Vec<i64> {
+    let mut counts = Vec::new();
+    for sql in ROW_COUNTS {
+        counts.push(count(pool, sql).await);
+    }
+    counts
+}
+
+/// The Space and active members, in order, of the named workspace's default team.
+async fn default_team(
+    pool: &sqlx::PgPool,
+    workspace: &str,
+) -> (String, String, Vec<(String, bool, i32)>) {
+    let (team, space): (String, String) = sqlx::query_as("SELECT t.name, s.name FROM teams t JOIN spaces s ON s.id = t.space_id JOIN workspaces w ON w.id = t.workspace_id WHERE w.name = $1 AND t.is_default")
+        .bind(workspace).fetch_one(pool).await.unwrap();
+    let members = sqlx::query_as("SELECT d.name, m.is_lead, d.max_concurrency FROM team_members m JOIN teams t ON t.id = m.team_id JOIN kats d ON d.id = m.kat_id JOIN workspaces w ON w.id = t.workspace_id WHERE w.name = $1 AND t.is_default AND m.active ORDER BY m.position")
+        .bind(workspace).fetch_all(pool).await.unwrap();
+    (team, space, members)
+}
+
+fn roster(names: [&str; 6]) -> Vec<(String, bool, i32)> {
+    names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| ((*name).to_owned(), i == 0, if i == 0 { 3 } else { 1 }))
+        .collect()
+}
+
+const EN_ROSTER: [&str; 6] = [
+    "Lead",
+    "Researcher",
+    "Writer",
+    "Analyst",
+    "Scheduler",
+    "Reviewer",
+];
+const TH_ROSTER: [&str; 6] = ["หัวหน้าทีม", "นักวิจัย", "นักเขียน", "นักวิเคราะห์", "เลขา", "ผู้ตรวจ"];
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn seed_demo_creates_a_thai_workspace_with_the_thai_roster(pool: sqlx::PgPool) {
+    seed_demo(&pool);
+    assert_eq!(row_counts(&pool).await, [1, 2, 2, 2, 12, 12, 2, 12]);
+    let workspaces: Vec<(String, String)> = sqlx::query_as("SELECT w.name, m.role FROM memberships m JOIN users u ON u.id = m.user_id JOIN workspaces w ON w.id = m.workspace_id WHERE u.email = 'demo@katwork.local' ORDER BY w.name = 'Demo' DESC")
+        .fetch_all(&pool).await.unwrap();
+    assert_eq!(
+        workspaces,
+        [
+            ("Demo".to_owned(), "owner".to_owned()),
+            ("เดโม".to_owned(), "owner".to_owned())
+        ]
+    );
+    let spaces: Vec<(String, bool)> = sqlx::query_as("SELECT s.name, s.allow_external FROM spaces s JOIN workspaces w ON w.id = s.workspace_id WHERE w.name = 'เดโม'")
+        .fetch_all(&pool).await.unwrap();
+    assert_eq!(spaces, [("พื้นที่ทดลอง".to_owned(), true)]);
+    assert_eq!(
+        default_team(&pool, "เดโม").await,
+        (
+            "ทีมเริ่มต้น".to_owned(),
+            "พื้นที่ทดลอง".to_owned(),
+            roster(TH_ROSTER)
+        )
+    );
+    assert_eq!(
+        default_team(&pool, "Demo").await,
+        (
+            "Default team".to_owned(),
+            "Demo".to_owned(),
+            roster(EN_ROSTER)
+        )
+    );
+    let kats: Vec<(String, String)> =
+        sqlx::query_as("SELECT name, instructions FROM kats ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    seed_demo(&pool);
+    assert_eq!(row_counts(&pool).await, [1, 2, 2, 2, 12, 12, 2, 12]);
+    let again: Vec<(String, String)> =
+        sqlx::query_as("SELECT name, instructions FROM kats ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(again, kats);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn seed_demo_adds_only_the_thai_workspace_to_an_older_seed(pool: sqlx::PgPool) {
+    seed_demo(&pool);
+    let thai: uuid::Uuid = sqlx::query_scalar("SELECT id FROM workspaces WHERE name = 'เดโม'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    // Roll the install back to a seed from before the Thai workspace and the new defaults.
+    for sql in [
+        "DELETE FROM team_members WHERE workspace_id = $1",
+        "DELETE FROM teams WHERE workspace_id = $1",
+        // A Kat and its default grant reference each other, so they go in one statement.
+        "WITH grants AS (DELETE FROM kat_spaces WHERE workspace_id = $1) DELETE FROM kats WHERE workspace_id = $1",
+        "DELETE FROM spaces WHERE workspace_id = $1",
+        "DELETE FROM memberships WHERE workspace_id = $1",
+        "DELETE FROM workspaces WHERE id = $1",
+    ] {
+        sqlx::query(sql).bind(thai).execute(&pool).await.unwrap();
+    }
+    sqlx::query("UPDATE kats SET instructions = 'Older instructions.', max_concurrency = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let english: Vec<(uuid::Uuid, String, i32)> =
+        sqlx::query_as("SELECT id, instructions, max_concurrency FROM kats ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    seed_demo(&pool);
+    assert_eq!(row_counts(&pool).await, [1, 2, 2, 2, 12, 12, 2, 12]);
+    let kept: Vec<(uuid::Uuid, String, i32)> = sqlx::query_as("SELECT d.id, d.instructions, d.max_concurrency FROM kats d JOIN workspaces w ON w.id = d.workspace_id WHERE w.name = 'Demo' ORDER BY d.id")
+        .fetch_all(&pool).await.unwrap();
+    // Existing Kats keep their stored settings; only new Kats get the new defaults.
+    assert_eq!(kept, english);
+    assert_eq!(default_team(&pool, "เดโม").await.2, roster(TH_ROSTER));
 }
 
 #[test]
@@ -469,6 +617,178 @@ async fn create_user_creates_a_new_workspace_only_for_an_owner(pool: sqlx::PgPoo
             "SELECT count(*) FROM workspaces WHERE name = 'New Co'"
         )
         .await,
+        0
+    );
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn create_user_new_workspace_has_default_team(pool: sqlx::PgPool) {
+    let link = printed_link(&operator(
+        &pool,
+        &[
+            "create-user",
+            "--email",
+            "person@example.test",
+            "--workspace",
+            "Acme",
+            "--role",
+            "owner",
+            "--space-policy",
+            "local",
+        ],
+    ));
+    assert_eq!(
+        default_team(&pool, "Acme").await,
+        (
+            "Default team".to_owned(),
+            "General".to_owned(),
+            roster(EN_ROSTER)
+        )
+    );
+    let locale: String = sqlx::query_scalar("SELECT locale FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(locale, "en");
+    // The new owner can start a thread with that team straight away.
+    let app = support::app(&pool, None);
+    let password = uuid::Uuid::now_v7().to_string();
+    let accepted = accept_invite(&app, &link_token(&link), &password).await;
+    assert_eq!(accepted.status(), 204);
+    let cookie = support::cookie(&support::login(&app, &password).await);
+    let (workspace, space): (uuid::Uuid, uuid::Uuid) =
+        sqlx::query_as("SELECT workspace_id, id FROM spaces")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let teams = support::body(
+        support::request(
+            &app,
+            "GET",
+            &format!("/api/workspaces/{workspace}/spaces/{space}/teams"),
+            None,
+            Some(&cookie),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(teams.as_array().unwrap().len(), 1, "{teams}");
+    let thread = support::request(
+        &app,
+        "POST",
+        &format!("/api/workspaces/{workspace}/threads"),
+        Some(serde_json::json!({"space_id": space, "team_id": teams[0]["id"]})),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(thread.status(), 201);
+    // Joining an existing workspace, by name or id, adds no team.
+    let id = workspace.to_string();
+    for (email, reference, role) in [
+        ("member@example.test", "Acme", "member"),
+        ("other-owner@example.test", id.as_str(), "owner"),
+    ] {
+        printed_link(&operator(
+            &pool,
+            &[
+                "create-user",
+                "--email",
+                email,
+                "--workspace",
+                reference,
+                "--role",
+                role,
+                "--space-policy",
+                "hosted",
+                "--locale",
+                "th",
+            ],
+        ));
+    }
+    assert_eq!(row_counts(&pool).await, [3, 1, 3, 1, 6, 6, 1, 6]);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn create_user_locale_sets_the_account_and_new_roster_language(pool: sqlx::PgPool) {
+    for (email, workspace, locale) in [
+        ("thai@example.test", "บริษัทไทย", Some("th")),
+        ("english@example.test", "English Co", Some("en")),
+        ("joiner@example.test", "บริษัทไทย", Some("th")),
+        ("default@example.test", "บริษัทไทย", None),
+    ] {
+        let mut args = vec![
+            "create-user",
+            "--email",
+            email,
+            "--workspace",
+            workspace,
+            "--role",
+            "owner",
+            "--space-policy",
+            "hosted",
+        ];
+        args.extend(
+            locale
+                .map(|locale| ["--locale", locale])
+                .into_iter()
+                .flatten(),
+        );
+        printed_link(&operator(&pool, &args));
+    }
+    let accounts: Vec<(String, String)> =
+        sqlx::query_as("SELECT email, locale FROM users ORDER BY email")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        accounts,
+        [
+            ("default@example.test".to_owned(), "en".to_owned()),
+            ("english@example.test".to_owned(), "en".to_owned()),
+            ("joiner@example.test".to_owned(), "th".to_owned()),
+            ("thai@example.test".to_owned(), "th".to_owned()),
+        ]
+    );
+    assert_eq!(
+        default_team(&pool, "บริษัทไทย").await,
+        (
+            "ทีมเริ่มต้น".to_owned(),
+            "General".to_owned(),
+            roster(TH_ROSTER)
+        )
+    );
+    assert_eq!(default_team(&pool, "English Co").await.2, roster(EN_ROSTER));
+    assert_eq!(count(&pool, "SELECT count(*) FROM teams").await, 2);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn create_user_roster_failure_rolls_back_the_account_and_workspace(pool: sqlx::PgPool) {
+    sqlx::raw_sql("CREATE FUNCTION fail_kat() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected roster failure'; END $$; CREATE TRIGGER fail_roster BEFORE INSERT ON kats FOR EACH ROW EXECUTE FUNCTION fail_kat();")
+        .execute(&pool).await.unwrap();
+    let output = operator(
+        &pool,
+        &[
+            "create-user",
+            "--email",
+            "owner@example.test",
+            "--workspace",
+            "Acme",
+            "--role",
+            "owner",
+            "--space-policy",
+            "local",
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).starts_with("database_error\n"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(row_counts(&pool).await, [0; 8]);
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM password_resets").await,
         0
     );
 }
@@ -885,6 +1205,38 @@ fn operator_commands_reject_bad_arguments() {
             "--space-policy",
             "cloud",
         ]),
+        create(&[
+            "--email",
+            "a@example.test",
+            "--workspace",
+            "Acme",
+            "--role",
+            "owner",
+            "--locale",
+            "fr",
+        ]),
+        create(&[
+            "--email",
+            "a@example.test",
+            "--workspace",
+            "Acme",
+            "--role",
+            "owner",
+            "--locale",
+            "TH",
+        ]),
+        create(&[
+            "--email",
+            "a@example.test",
+            "--workspace",
+            "Acme",
+            "--role",
+            "owner",
+            "--locale",
+            "th",
+            "--locale",
+            "th",
+        ]),
         create(&["--email", "a@example.test", "--workspace", "Acme", "--role"]),
         create(&[
             "--email",
@@ -1010,7 +1362,7 @@ const USAGE: &str = "\
 usage: katwork-server [serve]
        katwork-server migrate
        katwork-server seed-demo [--reset-password]
-       katwork-server create-user --email <email> --workspace <name|id> --role <owner|admin|member> [--space-policy <local|hosted>]
+       katwork-server create-user --email <email> --workspace <name|id> --role <owner|admin|member> [--space-policy <local|hosted>] [--locale <en|th>]
        katwork-server reset-link --email <email>
 ";
 

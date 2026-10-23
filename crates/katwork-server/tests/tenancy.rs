@@ -257,9 +257,15 @@ async fn seed_demo_space_allows_external(pool: PgPool) {
     config.demo = true;
     auth::seed_demo(&pool, &config, false).await.unwrap();
     auth::seed_demo(&pool, &config, false).await.unwrap();
-    let spaces: Vec<(String, bool)> = sqlx::query_as("SELECT s.name, s.allow_external FROM spaces s JOIN memberships m ON m.workspace_id = s.workspace_id JOIN users u ON u.id = m.user_id WHERE u.email = 'demo@katwork.local'")
+    let spaces: Vec<(String, String, bool)> = sqlx::query_as("SELECT w.name, s.name, s.allow_external FROM spaces s JOIN workspaces w ON w.id = s.workspace_id JOIN memberships m ON m.workspace_id = s.workspace_id JOIN users u ON u.id = m.user_id WHERE u.email = 'demo@katwork.local' ORDER BY w.name = 'Demo' DESC")
         .fetch_all(&pool).await.unwrap();
-    assert_eq!(spaces, vec![("Demo".into(), true)]);
+    assert_eq!(
+        spaces,
+        vec![
+            ("Demo".into(), "Demo".into(), true),
+            ("เดโม".into(), "พื้นที่ทดลอง".into(), true)
+        ]
+    );
 }
 
 #[sqlx::test(migrations = "../katwork/migrations")]

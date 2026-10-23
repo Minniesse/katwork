@@ -698,6 +698,7 @@ async fn concurrent_create_user_creates_one_new_workspace(pool: PgPool) {
     use katwork::{
         auth::accounts::{WorkspaceRef, create_user},
         tenancy::Role,
+        types::Locale,
     };
     let acme = WorkspaceRef::parse("Acme");
     let (first, second) = tokio::join!(
@@ -707,6 +708,7 @@ async fn concurrent_create_user_creates_one_new_workspace(pool: PgPool) {
             &acme,
             Role::Owner,
             local_space(),
+            Locale::En,
             LINK_BASE
         ),
         create_user(
@@ -715,6 +717,7 @@ async fn concurrent_create_user_creates_one_new_workspace(pool: PgPool) {
             &acme,
             Role::Owner,
             local_space(),
+            Locale::En,
             LINK_BASE
         ),
     );
@@ -724,6 +727,8 @@ async fn concurrent_create_user_creates_one_new_workspace(pool: PgPool) {
     // The second command waits for the first and joins the workspace it created.
     assert_eq!(count("SELECT count(*) FROM workspaces").await.unwrap(), 1);
     assert_eq!(count("SELECT count(*) FROM spaces").await.unwrap(), 1);
+    assert_eq!(count("SELECT count(*) FROM teams").await.unwrap(), 1);
+    assert_eq!(count("SELECT count(*) FROM kats").await.unwrap(), 6);
     assert_eq!(
         count("SELECT count(*) FROM memberships WHERE role = 'owner'")
             .await
@@ -737,6 +742,7 @@ async fn concurrent_create_user_for_one_email_creates_one_account(pool: PgPool) 
     use katwork::{
         auth::accounts::{WorkspaceRef, create_user},
         tenancy::Role,
+        types::Locale,
     };
     let workspace = Uuid::now_v7();
     sqlx::query("INSERT INTO workspaces (id, name) VALUES ($1, 'Acme')")
@@ -753,8 +759,24 @@ async fn concurrent_create_user_for_one_email_creates_one_account(pool: PgPool) 
     ] {
         let shouted = format!(" {} ", email.to_uppercase());
         let (first, second) = tokio::join!(
-            create_user(&pool, email, &reference, Role::Member, None, LINK_BASE),
-            create_user(&pool, &shouted, &reference, Role::Admin, None, LINK_BASE),
+            create_user(
+                &pool,
+                email,
+                &reference,
+                Role::Member,
+                None,
+                Locale::En,
+                LINK_BASE
+            ),
+            create_user(
+                &pool,
+                &shouted,
+                &reference,
+                Role::Admin,
+                None,
+                Locale::Th,
+                LINK_BASE
+            ),
         );
         let mut codes: Vec<_> = [first, second]
             .into_iter()
