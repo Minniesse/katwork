@@ -170,3 +170,18 @@ test('mention_picker_is_localized', async () => {
   await user.type(screen.getByRole('textbox', { name: th['chat.composer_label'] }), '@');
   expect(screen.getByRole('listbox', { name: th['chat.mention_list'] })).toBeInTheDocument();
 });
+
+test('mention_picker_announces_the_current_choice', async () => {
+  const user = userEvent.setup({ delay: null });
+  const { box } = setup({ mentions: KATS });
+  const status = () => screen.getByRole('status');
+  expect(status()).toHaveTextContent('');
+  // A textarea may not carry aria-expanded; the picker is announced instead.
+  expect(box).not.toHaveAttribute('aria-expanded');
+  await user.type(box, '@');
+  expect(status()).toHaveTextContent('หัวหน้าทีม, 1 of 3. Enter inserts the name.');
+  await user.keyboard('{ArrowDown}');
+  expect(status()).toHaveTextContent('Writer, 2 of 3. Enter inserts the name.');
+  await user.keyboard('{Escape}');
+  expect(status()).toHaveTextContent('');
+});

@@ -117,7 +117,11 @@ test('chat_lists_threads_newest_first_and_reopens_one_after_reload', async () =>
   expect(await screen.findByRole('heading', { level: 1, name: en['chat.title'] })).toBeVisible();
   const list = await screen.findByRole('list', { name: en['chat.title'] });
   const links = within(list).getAllByRole('link');
-  expect(links.map((link) => link.textContent)).toEqual([en['chat.untitled'], 'งบประมาณ']);
+  // An untitled thread shows when it started, from its UUIDv7 id.
+  expect(links.map((link) => link.textContent)).toEqual([
+    expect.stringMatching(/^Untitled conversation from /),
+    'งบประมาณ',
+  ]);
 
   await user.click(links[1]!);
   expect(window.location.pathname).toBe(`/chat/${older.id}`);

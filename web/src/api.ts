@@ -142,6 +142,14 @@ export interface Member {
 
 export type InviteDelivery = 'email' | 'link';
 
+/** Whether this server can mail invites (SMTP configured). */
+export interface InviteOptions {
+  email: boolean;
+}
+
+/** Messages per page, Task 6's default; a shorter page means the thread has no older ones. */
+export const MESSAGE_PAGE = 50;
+
 export interface InviteResult {
   user_id: string;
   created: boolean;
@@ -182,8 +190,16 @@ export const api = {
     apiFetch<Thread>(`${workspacePath(workspaceId)}/threads`, { method: 'POST', body: thread }),
   thread: (workspaceId: string, threadId: string) =>
     apiFetch<Thread>(`${workspacePath(workspaceId)}/threads/${segment(threadId)}`),
-  messages: (workspaceId: string, threadId: string) =>
-    apiFetch<MessagePage>(`${workspacePath(workspaceId)}/threads/${segment(threadId)}/messages`),
+  /** The newest `MESSAGE_PAGE` messages, or those just before the message id `before`. */
+  messages: (workspaceId: string, threadId: string, before?: string) => {
+    const query = new URLSearchParams({ limit: String(MESSAGE_PAGE) });
+    if (before) query.set('before', before);
+    return apiFetch<MessagePage>(
+      `${workspacePath(workspaceId)}/threads/${segment(threadId)}/messages?${query}`,
+    );
+  },
+  inviteOptions: (workspaceId: string) =>
+    apiFetch<InviteOptions>(`${workspacePath(workspaceId)}/members/invite-options`),
   postMessage: (workspaceId: string, threadId: string, body: string, clientMsgId: string) =>
     apiFetch<Posted>(`${workspacePath(workspaceId)}/threads/${segment(threadId)}/messages`, {
       method: 'POST',

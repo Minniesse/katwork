@@ -83,6 +83,19 @@ export function formatTime(date: Date | string | number, options: { timeZone?: s
   }).format(new Date(date));
 }
 
+/** A date and time for the UI chrome, such as when an untitled conversation started. */
+export function formatDateTime(
+  date: Date | string | number,
+  options: { timeZone?: string } = {},
+): string {
+  const tag = current === 'th' ? 'th-TH' : 'en-GB';
+  return new Intl.DateTimeFormat(`${tag}-u-ca-gregory`, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+    timeZone: options.timeZone,
+  }).format(new Date(date));
+}
+
 function subscribe(listener: () => void): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);

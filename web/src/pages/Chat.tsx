@@ -1,15 +1,18 @@
 import { useEffect, useReducer, useRef, useState, type FormEvent } from 'react';
-import { api, ApiError, errorMessage, type MessagePage, type Thread } from '../api';
+import { api, ApiError, errorMessage, MESSAGE_PAGE, type MessagePage, type Thread } from '../api';
+import { newClientMsgId } from '../client-msg-id';
 import { Composer } from '../components/Composer';
 import { PageTitle } from '../components/Layout';
-import { Transcript, type PendingMessage } from '../components/Transcript';
-import { hasMessage, t, useLocale } from '../i18n';
+import { Transcript, type Earlier, type PendingMessage } from '../components/Transcript';
+import { formatDateTime, hasMessage, t, useLocale } from '../i18n';
 import { Link, navigate } from '../router';
 import {
   emptyTranscript,
   foldEvent,
+  mergeEarlier,
   mergeMessages,
   putPosted,
+  replyingKats,
   runningJobs,
   subscribe,
   transcriptFromSnapshot,
@@ -39,6 +42,20 @@ function runEndCopy(code: string): string {
 }
 
 const isUnauthenticated = (error: unknown) => error instanceof ApiError && error.status === 401;
+
+/** The creation time a UUIDv7 id carries in its first 48 bits, or null for any other id. */
+export function uuidv7Time(id: string): Date | null {
+  const hex = id.replace(/-/g, '');
+  if (!/^[0-9a-f]{32}$/i.test(hex) || hex[12] !== '7') return null;
+  return new Date(parseInt(hex.slice(0, 12), 16));
+}
+
+/** A thread's title, or for an untitled one the time it started, so several can be told apart. */
+export function threadLabel(thread: Thread): string {
+  if (thread.title) return thread.title;
+  const started = uuidv7Time(thread.id);
+  return started ? t('chat.untitled_at', { time: formatDateTime(started) }) : t('chat.untitled');
+}
 
 interface Props {
   workspaceId: string;
@@ -132,7 +149,7 @@ export function Conversations({
           {shown.map((thread) => (
             <li key={thread.id}>
               <Link to={`/chat/${thread.id}`} className="thread-link">
-                {thread.title || t('chat.untitled')}
+                {threadLabel(thread)}
               </Link>
             </li>
           ))}
@@ -213,7 +230,9 @@ function NewConversation({
 type Action =
   | { type: 'snapshot'; page: MessagePage }
   | { type: 'event'; event: SeqEvent }
-  | { type: 'merge'; messages: ApiMessage[] }
+  /** A polled page, read when the transcript was at seq `issuedAt`. */
+  | { type: 'merge'; messages: ApiMessage[]; issuedAt: number }
+  | { type: 'earlier'; messages: ApiMessage[] }
   | { type: 'posted'; posted: Parameters<typeof putPosted>[1] };
 
 function reduce(state: TranscriptState, action: Action): TranscriptState {
@@ -223,7 +242,10 @@ function reduce(state: TranscriptState, action: Action): TranscriptState {
     case 'event':
       return foldEvent(state, action.event);
     case 'merge':
-      return mergeMessages(state, action.messages);
+      // An event folded since the page was read is newer than the page.
+      return state.lastSeq > action.issuedAt ? state : mergeMessages(state, action.messages);
+    case 'earlier':
+      return mergeEarlier(state, action.messages);
     case 'posted':
       return putPosted(state, action.posted);
   }
@@ -261,6 +283,8 @@ function Conversation({
   const [finished, setFinished] = useState<ReadonlySet<string>>(new Set());
   const [stopFailure, setStopFailure] = useState<unknown>(null);
   const [answered, setAnswered] = useState<string | null>(null);
+  const [earlier, setEarlier] = useState<Earlier>('none');
+  const composerInput = useRef<HTMLTextAreaElement>(null);
   const cancelling = useRef(new Set<string>());
   const [, setCancels] = useState(0);
   const lastSeq = useRef(0);
@@ -276,6 +300,7 @@ function Conversation({
         if (!live) return;
         setThread(loaded);
         dispatch({ type: 'snapshot', page });
+        setEarlier(page.messages.length >= MESSAGE_PAGE ? 'more' : 'none');
         setSnapshots((n) => n + 1);
       },
       (error: unknown) => {
@@ -291,8 +316,10 @@ function Conversation({
 
   // One stream per open page: opened from the snapshot, closed on unmount or a minute hidden.
   useEffect(() => {
-    if (snapshots === 0 || !streaming) return;
+    if (snapshots === 0) return;
+    // Hidden for a minute: no stream, and so no polling either, until the page is visible.
     setStatus(null);
+    if (!streaming) return;
     return subscribe(
       api.eventsPath(workspaceId, threadId),
       (event) => dispatch({ type: 'event', event }),
@@ -308,16 +335,29 @@ function Conversation({
     if (status === 'unauthenticated') signedOut.current();
   }, [status]);
 
-  // Over the session's stream budget: stored messages, job statuses and Stop stay current.
+  // Over the session's stream budget: stored messages, job statuses and Stop stay current. A
+  // page answered after polling ended, or after a later poll's page, is dropped.
   useEffect(() => {
     if (status !== 'polling') return;
+    let live = true;
+    let sent = 0;
+    let applied = 0;
     const timer = setInterval(() => {
+      const poll = (sent += 1);
+      const issuedAt = lastSeq.current;
       api.messages(workspaceId, threadId).then(
-        (page) => dispatch({ type: 'merge', messages: page.messages }),
+        (page) => {
+          if (!live || poll < applied) return;
+          applied = poll;
+          dispatch({ type: 'merge', messages: page.messages, issuedAt });
+        },
         () => {},
       );
     }, POLL_MS);
-    return () => clearInterval(timer);
+    return () => {
+      live = false;
+      clearInterval(timer);
+    };
   }, [status, workspaceId, threadId]);
 
   useEffect(() => {
@@ -328,6 +368,8 @@ function Conversation({
         timer = setTimeout(() => setStreaming(false), HIDDEN_CLOSE_MS);
       else setStreaming(true);
     };
+    // A chat opened in a background tab gets no visibility change until it is shown.
+    onChange();
     document.addEventListener('visibilitychange', onChange);
     return () => {
       clearTimeout(timer);
@@ -388,7 +430,7 @@ function Conversation({
   };
   // A fresh UUID v4 per composed message, reused by every retry of that message.
   const send = (body: string) => {
-    const post = { clientMsgId: crypto.randomUUID(), body, failure: null };
+    const post = { clientMsgId: newClientMsgId(), body, failure: null };
     setPosts((list) => [...list, post]);
     deliver(post);
   };
@@ -432,9 +474,37 @@ function Conversation({
     if (!activeQuestion || answered === activeQuestion) return;
     setAnswered(activeQuestion);
     send(option);
+    // The options turn disabled; the composer is where the conversation goes on.
+    composerInput.current?.focus();
   };
 
-  const running = runningJobs(transcript).filter((job) => !finished.has(job));
+  const loadEarlier = async () => {
+    const oldest = messages.find((message) => !message.provisional);
+    if (!oldest || earlier !== 'more') return;
+    setEarlier('loading');
+    try {
+      const page = await api.messages(workspaceId, threadId, oldest.id);
+      dispatch({ type: 'earlier', messages: page.messages });
+      setEarlier(page.messages.length >= MESSAGE_PAGE ? 'more' : 'start');
+    } catch (error) {
+      if (isUnauthenticated(error)) signedOut.current();
+      setEarlier('more');
+    }
+  };
+
+  // Stop cancels only this person's requests (coordinator ruling for PR #46); a colleague's work
+  // in a shared thread shows as work in progress. Task 12 enforces who may cancel.
+  const requester = new Map<string, string>();
+  for (const message of messages) {
+    if (message.author?.kind === 'user' && message.jobId)
+      requester.set(message.jobId, message.author.id);
+  }
+  const unfinished = runningJobs(transcript).filter((job) => !finished.has(job));
+  const running = unfinished.filter((job) => requester.get(job) === me);
+  const othersWorking = unfinished.some((job) => {
+    const by = requester.get(job);
+    return by !== undefined && by !== me;
+  });
   const stopping = running.length > 0 && running.every((job) => cancelling.current.has(job));
   const stop = () => {
     setStopFailure(null);
@@ -457,9 +527,8 @@ function Conversation({
     setCancels((n) => n + 1);
   };
 
-  const replying = Object.entries(transcript.katStates)
-    .filter(([, state]) => state === 'working' || state === 'researching')
-    .map(([katId]) => katId);
+  // A Kat replies while any of its runs is open: the Lead runs several at once.
+  const replying = replyingKats(transcript);
   const queued = Object.entries(transcript.jobs)
     .filter(([, job]) => job.status === null && job.holdReason === 'kat_busy' && !job.started)
     .map(([jobId]) => jobId);
@@ -472,7 +541,7 @@ function Conversation({
             {t('chat.back')}
           </Link>
         </p>
-        <PageTitle>{thread.title || t('chat.untitled')}</PageTitle>
+        <PageTitle>{threadLabel(thread)}</PageTitle>
         {team.state === 'ready' && (
           <p className="chat-team">
             <Link to={`/team/${thread.team_id}`} className="link">
@@ -490,6 +559,8 @@ function Conversation({
         optionsDisabled={answered !== null && answered === activeQuestion}
         onOption={answer}
         onRetry={retry}
+        earlier={earlier}
+        onEarlier={loadEarlier}
       />
       <div className="chat-status">
         <div className="kat-status" role="status" data-testid="kat-status">
@@ -498,6 +569,7 @@ function Conversation({
               {t('chat.replying', { kat: nameOf(katId) })}
             </p>
           ))}
+          {othersWorking && <p className="kat-status-line">{t('chat.others_working')}</p>}
           {Object.entries(transcript.errors).map(([katId, code]) => (
             <p key={`error-${katId}`} className="kat-status-line kat-status-error">
               {t('chat.kat_error', { kat: nameOf(katId), message: runEndCopy(code) })}
@@ -526,7 +598,11 @@ function Conversation({
             {stopping ? t('chat.stopping') : t('chat.stop')}
           </button>
         )}
-        <Composer onSend={send} mentions={members.map(({ id, name }) => ({ id, name }))} />
+        <Composer
+          onSend={send}
+          inputRef={composerInput}
+          mentions={members.map(({ id, name }) => ({ id, name }))}
+        />
       </div>
     </div>
   );

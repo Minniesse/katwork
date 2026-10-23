@@ -425,6 +425,23 @@ export function mergeMessages(state: Transcript, messages: ApiMessage[]): Transc
 }
 
 /**
+ * An older page of the thread ("Show earlier messages"). It only adds what the transcript does
+ * not hold yet: anything already here, a message or a job's status, came later and is newer.
+ */
+export function mergeEarlier(state: Transcript, messages: ApiMessage[]): Transcript {
+  const unseen = messages.filter((message) => !Object.hasOwn(state.messages, message.id));
+  const merged = mergeMessages(state, unseen);
+  return { ...merged, jobs: { ...merged.jobs, ...state.jobs } };
+}
+
+/** The Kats with a run that started and has not closed yet: those still replying. */
+export function replyingKats(state: Transcript): string[] {
+  const kats = new Set<string>();
+  for (const run of Object.values(state.runs)) if (!run.closed) kats.add(run.katId);
+  return [...kats];
+}
+
+/**
  * Starts from the messages API's snapshot at `lastSeq` (its `event_seq`). Events up to and
  * including `lastSeq` are skipped, except that their `katwork.run_started` and
  * `katwork.run_closed` still record which runs are open.

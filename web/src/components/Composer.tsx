@@ -5,6 +5,7 @@ import {
   useState,
   type FormEvent,
   type KeyboardEvent,
+  type RefObject,
 } from 'react';
 import { t, useLocale } from '../i18n';
 
@@ -18,6 +19,8 @@ interface Props {
   disabled?: boolean;
   /** The Kats the `@` picker offers, in team order. */
   mentions?: Mentionable[];
+  /** The text box, for a page that moves focus to it. */
+  inputRef?: RefObject<HTMLTextAreaElement | null>;
 }
 
 // An `@` at the start or after whitespace, then the name typed so far, right before the caret.
@@ -37,14 +40,14 @@ const fold = (text: string) => text.normalize('NFKC').toLocaleLowerCase();
  * sends. Typing `@` offers the team's Kats; choosing one inserts the name and a space, because
  * a Thai name followed directly by Thai text would not resolve as a mention.
  */
-export function Composer({ onSend, disabled = false, mentions = [] }: Props) {
+export function Composer({ onSend, disabled = false, mentions = [], inputRef }: Props) {
   useLocale();
   const [text, setText] = useState('');
   const [caret, setCaret] = useState(0);
   const [active, setActive] = useState(0);
   const [dismissed, setDismissed] = useState<number | null>(null);
   const composing = useRef(false);
-  const box = useRef<HTMLTextAreaElement>(null);
+  const box = useRef<HTMLTextAreaElement | null>(null);
   const nextCaret = useRef<number | null>(null);
   const id = useId();
 
@@ -126,7 +129,10 @@ export function Composer({ onSend, disabled = false, mentions = [] }: Props) {
       <div className="composer-row">
         <div className="composer-field">
           <textarea
-            ref={box}
+            ref={(node) => {
+              box.current = node;
+              if (inputRef) inputRef.current = node;
+            }}
             id={`${id}-text`}
             className="composer-input"
             rows={2}
@@ -175,6 +181,16 @@ export function Composer({ onSend, disabled = false, mentions = [] }: Props) {
       </div>
       <p id={`${id}-hint`} className="hint">
         {t('chat.composer_hint')}
+      </p>
+      {/* A textarea cannot carry aria-expanded (ARIA in HTML), so the open picker and its
+          current choice are announced here instead (coordinator ruling for PR #46). */}
+      <p className="sr-only" role="status">
+        {open &&
+          t('chat.mention_status', {
+            name: options[current]!.name,
+            position: current + 1,
+            count: options.length,
+          })}
       </p>
     </form>
   );

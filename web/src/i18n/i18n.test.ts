@@ -104,6 +104,24 @@ describe('catalogues', () => {
     expect(th['reason.kat_paused_stopped']).toBe('งานหยุดแล้ว เพราะ Kat ที่รับงานนี้ถูกหยุดไว้ชั่วคราว โปรดส่งคำขออีกครั้งเมื่อเปิดใช้แล้ว หรือขอให้ Kat อื่นช่วยแทน');
   });
 
+  test('thai_copy_names_a_space_one_way_and_asks_politely', () => {
+    // The nav calls a Space พื้นที่, so no Thai copy says "Space".
+    for (const [key, value] of Object.entries(th)) expect(value, key).not.toMatch(/\bSpace\b/);
+    for (const key of [
+      'workspace.none',
+      'workspace.no_space',
+      'team.none',
+      'members.invite.link_hint',
+      'reason.message_empty',
+      'reason.thread_title_invalid',
+      'reason.too_many_streams',
+    ]) {
+      expect((th as Record<string, string>)[key], key).toContain('โปรด');
+    }
+    expect(th['reason.thread_title_invalid']).not.toContain('อักขระควบคุม');
+    expect(en['reason.thread_title_invalid']).not.toMatch(/control character/i);
+  });
+
   test('copy_calls_coworkers_kats_and_thai_never_says_ai_employee', () => {
     const enText = Object.values(en).join('\n');
     const thText = Object.values(th).join('\n');

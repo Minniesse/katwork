@@ -219,8 +219,32 @@ describe('posting and streaming', () => {
     const [theirs, mine] = within(log()).getAllByRole('listitem');
     expect(within(theirs!).getByText('สมชาย')).toBeVisible();
     expect(within(mine!).getByText(en['chat.author.you'])).toBeVisible();
-    // Another member's job still offers Stop.
-    expect(screen.getByRole('button', { name: en['chat.stop'] })).toBeVisible();
+    // Another member's job is shown as work in progress, without Stop.
+    expect(screen.queryByRole('button', { name: en['chat.stop'] })).toBeNull();
+    expect(katStatus()).toHaveTextContent(en['chat.others_working']);
+  });
+
+  test('send_works_without_crypto_random_uuid', async () => {
+    // A plain-HTTP LAN address is not a secure context, so randomUUID is missing there.
+    Object.defineProperty(crypto, 'randomUUID', { value: undefined, configurable: true });
+    try {
+      const calls = api({ [POST]: [201, { message_id: ASK, job_id: 'job-1' }] });
+      const user = userEvent.setup({ delay: null });
+      await openThread();
+      await user.type(
+        screen.getByRole('textbox', { name: en['chat.composer_label'] }),
+        'hello from the LAN{Enter}',
+      );
+      const [post] = calls.callsTo(POST);
+      expect(post!.body).toEqual({
+        body: 'hello from the LAN',
+        client_msg_id: expect.stringMatching(UUID_V4),
+      });
+      await waitFor(() => expect(bodies()).toEqual(['hello from the LAN']));
+    } finally {
+      delete (crypto as { randomUUID?: unknown }).randomUUID;
+    }
+    expect(typeof crypto.randomUUID).toBe('function');
   });
 
   test('message_posted_during_run_orders_same_live_and_after_reload', async () => {
@@ -349,6 +373,105 @@ describe('the event stream', () => {
     expect(screen.queryByText(en['chat.polling'])).toBeNull();
     const polled = calls.callsTo(MESSAGES).length;
     await act(() => vi.advanceTimersByTimeAsync(15_000));
+    expect(calls.callsTo(MESSAGES)).toHaveLength(polled);
+  });
+
+  test('a_poll_answered_after_the_stream_resumes_never_rolls_back_state', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const held = deferred<Reply>();
+    const running = page(
+      [apiMessage(ASK, 'Write it', { author: { kind: 'user', id: ME }, job_id: 'job-1' })],
+      2,
+    );
+    const calls = api();
+    let reads = 0;
+    calls.route(MESSAGES, () => (reads++ === 0 ? running : held.promise));
+    const { source } = await openThread();
+    expect(screen.getByRole('button', { name: en['chat.stop'] })).toBeVisible();
+    act(() => source.named('stream_error', { code: 'too_many_streams' }));
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(calls.callsTo(MESSAGES)).toHaveLength(2);
+
+    // The stream comes back and the job finishes before the old poll answers.
+    act(() => source.ping(2));
+    stream(source, 3, [ev.jobStatus('job-1', 'answered')]);
+    expect(screen.queryByRole('button', { name: en['chat.stop'] })).toBeNull();
+    await act(async () => held.resolve(running));
+    expect(screen.queryByRole('button', { name: en['chat.stop'] })).toBeNull();
+  });
+
+  test('an_older_poll_never_replaces_a_newer_one', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const held = deferred<Reply>();
+    const asked = apiMessage(ASK, 'Write it', {
+      author: { kind: 'user', id: ME },
+      job_id: 'job-1',
+    });
+    const replies: (Reply | Promise<Reply>)[] = [
+      page([asked], 2),
+      held.promise,
+      page(
+        [
+          { ...asked, job_status: 'answered' },
+          apiMessage(REPLY, 'Done', { job_id: 'job-1', job_status: 'answered' }),
+        ],
+        9,
+      ),
+    ];
+    const calls = api();
+    calls.route(MESSAGES, () => replies.shift()!);
+    const { source } = await openThread();
+    act(() => source.named('stream_error', { code: 'too_many_streams' }));
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    await waitFor(() => expect(bodies()).toEqual(['Write it', 'Done']));
+    expect(screen.queryByRole('button', { name: en['chat.stop'] })).toBeNull();
+    // The first poll, sent earlier, answers last with the job still running.
+    await act(async () => held.resolve(page([asked], 2)));
+    expect(screen.queryByRole('button', { name: en['chat.stop'] })).toBeNull();
+    expect(bodies()).toEqual(['Write it', 'Done']);
+  });
+
+  test('chat_opened_in_a_hidden_tab_gives_its_stream_back_and_starts_when_visible', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true });
+    api({ [MESSAGES]: page([], 6) });
+    const { source } = await openThread();
+    await pingFor(source, 59_000);
+    expect(FakeEventSource.live()).toHaveLength(1);
+    await act(() => vi.advanceTimersByTimeAsync(1_000));
+    expect(FakeEventSource.live()).toHaveLength(0);
+    act(() => {
+      Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await waitFor(() => expect(FakeEventSource.live()).toHaveLength(1));
+    expect(FakeEventSource.latest().url).toBe(`${EVENTS}?after=6`);
+  });
+
+  test('a_hidden_tab_stops_polling_and_resumes_when_visible', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const calls = api({ [MESSAGES]: page([], 2) });
+    const { source } = await openThread();
+    act(() => source.named('stream_error', { code: 'too_many_streams' }));
+    act(() => {
+      Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(FakeEventSource.live()).toHaveLength(0);
+    expect(screen.queryByText(en['chat.polling'])).toBeNull();
+    const polled = calls.callsTo(MESSAGES).length;
+    await act(() => vi.advanceTimersByTimeAsync(30_000));
+    expect(calls.callsTo(MESSAGES)).toHaveLength(polled);
+
+    act(() => {
+      Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await waitFor(() => expect(FakeEventSource.live()).toHaveLength(1));
+    act(() => FakeEventSource.latest().ping(2));
+    await act(() => vi.advanceTimersByTimeAsync(10_000));
     expect(calls.callsTo(MESSAGES)).toHaveLength(polled);
   });
 
@@ -523,6 +646,27 @@ describe('Stop', () => {
     expect(calls.callsTo(cancelRoute('job-1'))).toHaveLength(1);
   });
 
+  test('stop_cancels_only_the_signed_in_persons_jobs', async () => {
+    const calls = api({ [cancelRoute('job-mine')]: [202], [cancelRoute('job-theirs')]: [202] });
+    const user = userEvent.setup({ delay: null });
+    const { source } = await openThread();
+    stream(source, 1, [
+      ev.userStored(ASK, '@นักเขียน draft the memo', { userId: 'user-2', jobId: 'job-theirs' }),
+      ev.jobStatus('job-theirs', null),
+      ev.kwRunStarted('run-theirs', WRITER, REPLY, { jobId: 'job-theirs' }),
+      ev.userStored(SECOND, 'Summarise the budget', { userId: ME, jobId: 'job-mine' }),
+      ev.jobStatus('job-mine', null),
+    ]);
+    await user.click(screen.getByRole('button', { name: en['chat.stop'] }));
+    expect(calls.callsTo(cancelRoute('job-mine'))).toHaveLength(1);
+    expect(calls.callsTo(cancelRoute('job-theirs'))).toHaveLength(0);
+
+    // Once mine is done, the colleague's work stays visible, read-only.
+    stream(source, 6, [ev.jobStatus('job-mine', 'cancelled', 'cancelled')]);
+    expect(screen.queryByRole('button', { name: en['chat.stop'] })).toBeNull();
+    expect(katStatus()).toHaveTextContent(en['chat.others_working']);
+  });
+
   test('stop_enabled_after_reload_from_job_status_null', async () => {
     const calls = api({
       [MESSAGES]: page(
@@ -675,6 +819,8 @@ describe('questions', () => {
     const group = screen.getByRole('group', { name: en['chat.question_options'] });
     const word = within(group).getByRole('button', { name: 'Word' });
     await user.click(word);
+    // Focus leaves the now disabled options for the composer, not the page body.
+    expect(screen.getByRole('textbox', { name: en['chat.composer_label'] })).toHaveFocus();
     await user.click(word);
     const posts = calls.callsTo(POST);
     expect(posts).toHaveLength(1);
@@ -907,14 +1053,41 @@ describe('Kat status', () => {
     const { source } = await openThread();
     const status = katStatus();
     expect(status).toHaveAttribute('role', 'status');
-    stream(source, 1, [ev.katState(LEAD, 'working'), ev.katState(WRITER, 'researching')]);
+    stream(source, 1, [
+      ev.kwRunStarted('run-1', LEAD, REPLY),
+      ev.katState(LEAD, 'working'),
+      ev.kwRunStarted('run-2', WRITER, SECOND),
+      ev.katState(WRITER, 'researching'),
+    ]);
     expect(status).toHaveTextContent(en['chat.replying'].replace('{kat}', 'หัวหน้าทีม'));
     expect(status).toHaveTextContent(en['chat.replying'].replace('{kat}', 'นักเขียน'));
     act(() => setLocale('th'));
     expect(status).toHaveTextContent(th['chat.replying'].replace('{kat}', 'หัวหน้าทีม'));
     act(() => setLocale('en'));
-    stream(source, 3, [ev.katState(LEAD, 'idle')]);
+    stream(source, 5, [ev.katState(LEAD, 'idle'), ev.kwRunClosed('run-1', 'finished')]);
     expect(status).not.toHaveTextContent('หัวหน้าทีม');
+  });
+
+  test('replying_stays_while_any_run_of_the_kat_streams', async () => {
+    // The Lead runs up to three jobs at once; its kat_state goes idle when the first ends.
+    api();
+    const { source } = await openThread();
+    const replying = en['chat.replying'].replace('{kat}', 'หัวหน้าทีม');
+    stream(source, 1, [
+      ev.kwRunStarted('run-1', LEAD, REPLY),
+      ev.kwRunStarted('run-2', LEAD, SECOND),
+      ev.katState(LEAD, 'working'),
+    ]);
+    expect(katStatus()).toHaveTextContent(replying);
+    stream(source, 4, [
+      ev.stored(REPLY, 'First answer', { author: { kind: 'kat', id: LEAD } }),
+      ev.katState(LEAD, 'idle'),
+      ev.kwRunClosed('run-1', 'finished'),
+    ]);
+    expect(katStatus()).toHaveTextContent(replying);
+    expect(katStatus().textContent!.split(replying)).toHaveLength(2);
+    stream(source, 7, [ev.kwRunClosed('run-2', 'finished')]);
+    expect(katStatus()).not.toHaveTextContent(replying);
   });
 });
 
@@ -928,4 +1101,84 @@ test('composer_offers_the_team_for_mentions', async () => {
       .getAllByRole('option')
       .map((o) => o.textContent),
   ).toEqual(THAI_TEAM.members.map((member) => member.name));
+});
+
+describe('history', () => {
+  const id = (n: number) => `0000-${String(n).padStart(4, '0')}`;
+  const messages = (from: number, to: number) =>
+    Array.from({ length: to - from + 1 }, (_, i) =>
+      apiMessage(id(from + i), `message ${from + i}`, { author: { kind: 'user', id: ME } }),
+    );
+
+  test('show_earlier_messages_loads_older_pages_and_keeps_the_scroll_position', async () => {
+    const calls = api();
+    calls.route(MESSAGES, ({ path }) => {
+      const before = new URL(path, 'http://localhost').searchParams.get('before');
+      if (before === null) return page(messages(51, 100), 3);
+      if (before === id(51)) return page(messages(1, 50), 3);
+      return page([], 3);
+    });
+    const user = userEvent.setup({ delay: null });
+    await openThread();
+    expect(bodies()).toHaveLength(50);
+
+    // jsdom has no layout: give the scroller a height that grows with its messages.
+    const scroller = log().closest('.transcript-content')!.parentElement!;
+    let top = 120;
+    Object.defineProperty(scroller, 'scrollHeight', {
+      configurable: true,
+      get: () => scroller.querySelectorAll('.message').length * 20,
+    });
+    Object.defineProperty(scroller, 'scrollTop', {
+      configurable: true,
+      get: () => top,
+      set: (value: number) => {
+        top = value;
+      },
+    });
+
+    await user.click(screen.getByRole('button', { name: en['chat.earlier'] }));
+    await waitFor(() => expect(bodies()).toHaveLength(100));
+    expect(calls.callsTo(MESSAGES).at(-1)!.path).toContain(`before=${id(51)}`);
+    expect(bodies()[0]).toBe('message 1');
+    // The message that was in view stays in view: 880 px from the bottom, before and after.
+    expect(top).toBe(100 * 20 - (50 * 20 - 120));
+
+    await user.click(screen.getByRole('button', { name: en['chat.earlier'] }));
+    const start = await screen.findByText(en['chat.start']);
+    expect(screen.queryByRole('button', { name: en['chat.earlier'] })).toBeNull();
+    expect(start).toHaveFocus();
+    expect(bodies()).toHaveLength(100);
+  });
+
+  test('a_short_conversation_offers_no_earlier_messages', async () => {
+    api({ [MESSAGES]: page(messages(1, 12), 3) });
+    await openThread();
+    expect(bodies()).toHaveLength(12);
+    expect(screen.queryByRole('button', { name: en['chat.earlier'] })).toBeNull();
+  });
+});
+
+test('untitled_conversations_are_told_apart_by_their_start_time', async () => {
+  const earlier = {
+    id: '0192b3c4-d5e6-7000-8000-000000000001',
+    space_id: 'space-1',
+    team_id: TEAM,
+    title: '',
+  };
+  const later = {
+    id: '0192b4c4-d5e6-7000-8000-000000000002',
+    space_id: 'space-1',
+    team_id: TEAM,
+    title: '',
+  };
+  api({ [`GET ${BASE}/spaces/space-1/threads`]: [200, [later, earlier]] });
+  renderChat({ threadId: null });
+  const list = await screen.findByRole('list', { name: en['chat.title'] });
+  const labels = within(list)
+    .getAllByRole('link')
+    .map((link) => link.textContent);
+  expect(labels).toHaveLength(2);
+  expect(new Set(labels).size).toBe(2);
+  for (const label of labels) expect(label).toMatch(/^Untitled conversation from /);
 });

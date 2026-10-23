@@ -2,9 +2,11 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import {
   emptyTranscript,
   foldEvent,
+  mergeEarlier,
   mergeMessages,
   parseAuthor,
   putPosted,
+  replyingKats,
   runningJobs,
   STALE_AFTER_MS,
   subscribe,
@@ -718,4 +720,34 @@ test('parse_author_reads_the_task_6_shape', () => {
   expect(parseAuthor({ Kat: 'd1' })).toBeNull();
   expect(parseAuthor({ kind: 'kat' })).toBeNull();
   expect(parseAuthor(42)).toBeNull();
+});
+
+test('earlier_page_adds_only_what_the_transcript_lacks', () => {
+  const live = fold(
+    numbered([ev.userStored('05-ask', 'Latest', { jobId: 'j2' }), ev.jobStatus('j2', 'answered')]),
+  );
+  const merged = mergeEarlier(live, [
+    apiMessage('01-old', 'Older', {
+      author: { kind: 'user', id: 'user-1' },
+      job_id: 'j1',
+      job_status: 'answered',
+    }),
+    apiMessage('05-ask', 'Stale copy', { author: { kind: 'user', id: 'user-1' }, job_id: 'j2' }),
+  ]);
+  expect(shown(merged)).toEqual(stored(['01-old', 'Older'], ['05-ask', 'Latest']));
+  expect(merged.jobs['j2']).toMatchObject({ status: 'answered' });
+  expect(merged.jobs['j1']).toMatchObject({ status: 'answered' });
+});
+
+test('replying_kats_follow_open_runs', () => {
+  const state = fold(
+    numbered([
+      ev.kwRunStarted('r1', 'kat-a', '01-a'),
+      ev.kwRunStarted('r2', 'kat-a', '02-a'),
+      ev.kwRunStarted('r3', 'kat-b', '03-b'),
+      ev.kwRunClosed('r1', 'finished'),
+      ev.kwRunClosed('r3', 'finished'),
+    ]),
+  );
+  expect(replyingKats(state)).toEqual(['kat-a']);
 });
