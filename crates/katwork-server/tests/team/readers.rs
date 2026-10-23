@@ -1,7 +1,7 @@
 use super::*;
 use katwork::{
-    ids::{DotId, SpaceId, TeamId, UserId, WorkspaceId},
-    team::{dot, team},
+    ids::{KatId, SpaceId, TeamId, UserId, WorkspaceId},
+    team::{kat, team},
     tenancy,
 };
 
@@ -17,12 +17,12 @@ async fn connection_readers_filter_workspace_status_membership_and_grants(pool: 
     let tenant = tenancy::resolve(&pool, UserId(f.user), WorkspaceId(f.workspace))
         .await
         .unwrap();
-    let ids: Vec<DotId> = [&lead, &valid, &paused, &removed, &revoked]
+    let ids: Vec<KatId> = [&lead, &valid, &paused, &removed, &revoked]
         .into_iter()
-        .map(|dot| serde_json::from_value(dot["id"].clone()).unwrap())
+        .map(|kat| serde_json::from_value(kat["id"].clone()).unwrap())
         .collect();
     for id in &ids {
-        dot::grant_space(&pool, &tenant, *id, second).await.unwrap();
+        kat::grant_space(&pool, &tenant, *id, second).await.unwrap();
     }
     let team_id = team::create(
         &pool,
@@ -39,7 +39,7 @@ async fn connection_readers_filter_workspace_status_membership_and_grants(pool: 
     assert_eq!(
         f.call(
             "PATCH",
-            &format!("dots/{}", ids[2]),
+            &format!("kats/{}", ids[2]),
             Some(json!({"status":"paused"}))
         )
         .await
@@ -50,7 +50,7 @@ async fn connection_readers_filter_workspace_status_membership_and_grants(pool: 
         .await
         .unwrap();
     // Simulate a legacy membership whose grant was revoked before the grant-in-use guard existed.
-    sqlx::query("DELETE FROM dot_spaces WHERE workspace_id=$1 AND dot_id=$2 AND space_id=$3")
+    sqlx::query("DELETE FROM kat_spaces WHERE workspace_id=$1 AND kat_id=$2 AND space_id=$3")
         .bind(f.workspace)
         .bind(ids[4])
         .bind(second)
@@ -62,24 +62,24 @@ async fn connection_readers_filter_workspace_status_membership_and_grants(pool: 
         .await
         .unwrap();
     assert_eq!(
-        eligible.iter().map(|dot| dot.id).collect::<Vec<_>>(),
+        eligible.iter().map(|kat| kat.id).collect::<Vec<_>>(),
         ids[..2]
     );
     for (id, expected) in ids.iter().zip([true, true, true, true, false]) {
         assert_eq!(
-            dot::is_granted(&mut tx, &tenant, *id, second)
+            kat::is_granted(&mut tx, &tenant, *id, second)
                 .await
                 .unwrap(),
             expected
         );
     }
     assert!(
-        !dot::is_granted(&mut tx, &tenant, DotId::new(), second)
+        !kat::is_granted(&mut tx, &tenant, KatId::new(), second)
             .await
             .unwrap()
     );
     assert!(
-        !dot::is_granted(&mut tx, &tenant, ids[0], SpaceId::new())
+        !kat::is_granted(&mut tx, &tenant, ids[0], SpaceId::new())
             .await
             .unwrap()
     );
@@ -90,20 +90,20 @@ async fn connection_readers_filter_workspace_status_membership_and_grants(pool: 
             .code(),
         "not_found"
     );
-    sqlx::query("UPDATE dots SET persona='Uncommitted', status='paused' WHERE id=$1")
+    sqlx::query("UPDATE kats SET persona='Uncommitted', status='paused' WHERE id=$1")
         .bind(ids[0])
         .execute(&mut *tx)
         .await
         .unwrap();
     assert_eq!(
-        dot::get_on(&mut *tx, &tenant, ids[0])
+        kat::get_on(&mut *tx, &tenant, ids[0])
             .await
             .unwrap()
             .persona,
         "Uncommitted"
     );
     assert!(
-        dot::is_granted(&mut tx, &tenant, ids[0], second)
+        kat::is_granted(&mut tx, &tenant, ids[0], second)
             .await
             .unwrap()
     );
@@ -112,13 +112,13 @@ async fn connection_readers_filter_workspace_status_membership_and_grants(pool: 
             .await
             .unwrap()
             .iter()
-            .map(|dot| dot.id)
+            .map(|kat| kat.id)
             .collect::<Vec<_>>(),
         [ids[1]]
     );
     tx.rollback().await.unwrap();
     assert_eq!(
-        dot::get(&pool, &tenant, ids[0]).await.unwrap().persona,
+        kat::get(&pool, &tenant, ids[0]).await.unwrap().persona,
         "Careful"
     );
 
@@ -135,19 +135,19 @@ async fn connection_readers_filter_workspace_status_membership_and_grants(pool: 
         .unwrap();
     let mut conn = pool.acquire().await.unwrap();
     assert_eq!(
-        dot::get_on(&mut *conn, &foreign, ids[0])
+        kat::get_on(&mut *conn, &foreign, ids[0])
             .await
             .unwrap_err()
             .code(),
         "not_found"
     );
     assert!(
-        !dot::is_granted(&mut conn, &foreign, ids[0], second)
+        !kat::is_granted(&mut conn, &foreign, ids[0], second)
             .await
             .unwrap()
     );
     assert!(
-        !dot::is_granted(&mut conn, &tenant, ids[0], foreign_space)
+        !kat::is_granted(&mut conn, &tenant, ids[0], foreign_space)
             .await
             .unwrap()
     );
@@ -161,52 +161,52 @@ async fn connection_readers_filter_workspace_status_membership_and_grants(pool: 
 }
 
 #[sqlx::test(migrations = "../katwork/migrations")]
-async fn paused_dots_keep_grants_but_are_not_eligible(pool: PgPool) {
+async fn paused_kats_keep_grants_but_are_not_eligible(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let hired = f.hire("Writer", json!("writer")).await;
-    let id: DotId = serde_json::from_value(hired["id"].clone()).unwrap();
+    let id: KatId = serde_json::from_value(hired["id"].clone()).unwrap();
     let space = SpaceId(space(&pool, f.workspace).await);
     let tenant = tenancy::resolve(&pool, UserId(f.user), WorkspaceId(f.workspace))
         .await
         .unwrap();
-    dot::grant_space(&pool, &tenant, id, space).await.unwrap();
+    kat::grant_space(&pool, &tenant, id, space).await.unwrap();
     let mut tx = pool.begin().await.unwrap();
-    assert!(dot::is_granted(&mut tx, &tenant, id, space).await.unwrap());
-    assert!(dot::is_eligible(&mut tx, &tenant, id, space).await.unwrap());
-    sqlx::query("UPDATE dots SET status='paused' WHERE id=$1")
+    assert!(kat::is_granted(&mut tx, &tenant, id, space).await.unwrap());
+    assert!(kat::is_eligible(&mut tx, &tenant, id, space).await.unwrap());
+    sqlx::query("UPDATE kats SET status='paused' WHERE id=$1")
         .bind(id)
         .execute(&mut *tx)
         .await
         .unwrap();
-    assert!(dot::is_granted(&mut tx, &tenant, id, space).await.unwrap());
-    assert!(!dot::is_eligible(&mut tx, &tenant, id, space).await.unwrap());
-    sqlx::query("DELETE FROM dot_spaces WHERE dot_id=$1 AND space_id=$2")
+    assert!(kat::is_granted(&mut tx, &tenant, id, space).await.unwrap());
+    assert!(!kat::is_eligible(&mut tx, &tenant, id, space).await.unwrap());
+    sqlx::query("DELETE FROM kat_spaces WHERE kat_id=$1 AND space_id=$2")
         .bind(id)
         .bind(space)
         .execute(&mut *tx)
         .await
         .unwrap();
-    assert!(!dot::is_granted(&mut tx, &tenant, id, space).await.unwrap());
-    assert!(!dot::is_eligible(&mut tx, &tenant, id, space).await.unwrap());
+    assert!(!kat::is_granted(&mut tx, &tenant, id, space).await.unwrap());
+    assert!(!kat::is_eligible(&mut tx, &tenant, id, space).await.unwrap());
     tx.rollback().await.unwrap();
     let mut conn = pool.acquire().await.unwrap();
     assert!(
-        dot::is_granted(&mut conn, &tenant, id, space)
+        kat::is_granted(&mut conn, &tenant, id, space)
             .await
             .unwrap()
     );
     assert!(
-        dot::is_eligible(&mut conn, &tenant, id, space)
+        kat::is_eligible(&mut conn, &tenant, id, space)
             .await
             .unwrap()
     );
     assert!(
-        !dot::is_eligible(&mut conn, &tenant, DotId::new(), space)
+        !kat::is_eligible(&mut conn, &tenant, KatId::new(), space)
             .await
             .unwrap()
     );
     assert!(
-        !dot::is_eligible(&mut conn, &tenant, id, SpaceId::new())
+        !kat::is_eligible(&mut conn, &tenant, id, SpaceId::new())
             .await
             .unwrap()
     );
@@ -221,7 +221,7 @@ async fn paused_dots_keep_grants_but_are_not_eligible(pool: PgPool) {
         .await
         .unwrap();
     assert!(
-        !dot::is_eligible(&mut conn, &foreign, id, space)
+        !kat::is_eligible(&mut conn, &foreign, id, space)
             .await
             .unwrap()
     );

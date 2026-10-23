@@ -1,7 +1,7 @@
 use super::*;
 use katwork::{
     ids::{SpaceId, UserId, WorkspaceId},
-    team::{Dot, DotRole, dot, roles},
+    team::{Kat, KatRole, kat, roles},
     tenancy,
     types::Locale,
 };
@@ -10,7 +10,7 @@ use katwork::{
 async fn only_policy_fields_bump_version(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let hired = f.hire("Lead", json!("lead")).await;
-    let path = format!("dots/{}", id(&hired));
+    let path = format!("kats/{}", id(&hired));
     let mut version = 1;
     for patch in [
         json!({"tool_allowlist":["read_thread"]}),
@@ -33,7 +33,7 @@ async fn only_policy_fields_bump_version(pool: PgPool) {
 async fn next_run_settings_do_not_bump_policy_version(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let hired = f.hire("Lead", json!("lead")).await;
-    let path = format!("dots/{}", id(&hired));
+    let path = format!("kats/{}", id(&hired));
     for patch in [
         json!({"max_concurrency":2}),
         json!({"daily_token_budget":100}),
@@ -53,7 +53,7 @@ async fn next_run_settings_do_not_bump_policy_version(pool: PgPool) {
 async fn free_text_rejects_nul_controls_bidi_and_oversize(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let hired = f.hire("Lead", json!("lead")).await;
-    let path = format!("dots/{}", id(&hired));
+    let path = format!("kats/{}", id(&hired));
     for (field, cap) in [("persona", 4_000), ("instructions", 8_000)] {
         for value in [
             "\0", "\u{7f}", "\u{85}", "\u{202e}", "\u{200b}", "\u{2028}", "\u{2029}",
@@ -73,7 +73,7 @@ async fn free_text_rejects_nul_controls_bidi_and_oversize(pool: PgPool) {
                 assert_code(
                     f.call(
                         "POST",
-                        &format!("spaces/{}/dots", f.space),
+                        &format!("spaces/{}/kats", f.space),
                         Some(json!({"name":"Writer", "role":"writer", "persona":value})),
                     )
                     .await,
@@ -102,7 +102,7 @@ async fn free_text_rejects_nul_controls_bidi_and_oversize(pool: PgPool) {
 async fn appearance_accepts_only_known_avatars_and_accents(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let hired = f.hire("Lead", json!("lead")).await;
-    let path = format!("dots/{}", id(&hired));
+    let path = format!("kats/{}", id(&hired));
     f.role(&pool, "member").await;
     for field in ["avatar", "accent"] {
         for invalid in [
@@ -130,7 +130,7 @@ async fn appearance_accepts_only_known_avatars_and_accents(pool: PgPool) {
         "chart",
         "calendar",
         "check",
-        "dot",
+        "kat",
     ] {
         for accent in ["blue", "yellow", "red", "green", "purple"] {
             let response = f
@@ -153,14 +153,14 @@ async fn multiline_persona_and_instructions_accept_lf_cr_and_tab(pool: PgPool) {
     let response = f
         .call(
             "POST",
-            &format!("spaces/{}/dots", f.space),
+            &format!("spaces/{}/kats", f.space),
             Some(json!({"name":"Writer","role":"writer","persona":text})),
         )
         .await;
     assert_eq!(response.status(), 201);
     let hired = body(response).await;
     assert_eq!(hired["persona"], text);
-    let path = format!("dots/{}", id(&hired));
+    let path = format!("kats/{}", id(&hired));
     let response = f.call("PATCH", &path, Some(json!({"persona":text}))).await;
     assert_eq!(response.status(), 200);
     assert_eq!(body(response).await["persona"], text);
@@ -173,13 +173,13 @@ async fn multiline_persona_and_instructions_accept_lf_cr_and_tab(pool: PgPool) {
     let tenant = tenancy::resolve(&pool, UserId(f.user), WorkspaceId(f.workspace))
         .await
         .unwrap();
-    let mut new = roles::template(&DotRole::Writer, Locale::En);
+    let mut new = roles::template(&KatRole::Writer, Locale::En);
     new.instructions = text.into();
-    let id = dot::hire(&pool, &tenant, SpaceId(f.space), new)
+    let id = kat::hire(&pool, &tenant, SpaceId(f.space), new)
         .await
         .unwrap();
     assert_eq!(
-        dot::get(&pool, &tenant, id).await.unwrap().instructions,
+        kat::get(&pool, &tenant, id).await.unwrap().instructions,
         text
     );
 }
@@ -189,7 +189,7 @@ async fn tool_allowlist_validates_ids_and_canonicalizes_order_and_dupes(pool: Pg
     let f = Fixture::new(&pool).await;
     let hired = f.hire("Lead", json!("lead")).await;
     assert_eq!(hired["tool_allowlist"], json!(["ask_user", "read_thread"]));
-    let path = format!("dots/{}", id(&hired));
+    let path = format!("kats/{}", id(&hired));
     for invalid in [
         "".into(),
         "1tool".into(),
@@ -225,8 +225,8 @@ async fn tool_allowlist_validates_ids_and_canonicalizes_order_and_dupes(pool: Pg
             .call("PATCH", &path, Some(json!({"tool_allowlist":tools})))
             .await;
         assert_eq!(response.status(), 200);
-        let changed: Dot = serde_json::from_value(body(response).await).unwrap();
-        let original: Dot = serde_json::from_value(hired.clone()).unwrap();
+        let changed: Kat = serde_json::from_value(body(response).await).unwrap();
+        let original: Kat = serde_json::from_value(hired.clone()).unwrap();
         assert_eq!(changed.tool_allowlist, ["ask_user", "read_thread"]);
         assert_eq!(changed.policy_version, 1);
         assert_eq!(changed.config_hash(), original.config_hash());
@@ -245,7 +245,7 @@ async fn repository_hire_validates_all_free_text_and_allowlist(pool: PgPool) {
     let tenant = tenancy::resolve(&pool, UserId(f.user), WorkspaceId(f.workspace))
         .await
         .unwrap();
-    let template = roles::template(&DotRole::Writer, Locale::En);
+    let template = roles::template(&KatRole::Writer, Locale::En);
     for field in [
         "persona",
         "instructions",
@@ -263,7 +263,7 @@ async fn repository_hire_validates_all_free_text_and_allowlist(pool: PgPool) {
                 _ => new.tool_allowlist = vec![invalid],
             }
             assert_eq!(
-                dot::hire(&pool, &tenant, SpaceId(f.space), new)
+                kat::hire(&pool, &tenant, SpaceId(f.space), new)
                     .await
                     .unwrap_err()
                     .code(),
@@ -278,11 +278,11 @@ async fn repository_hire_validates_all_free_text_and_allowlist(pool: PgPool) {
         .unwrap();
     let mut new = template;
     new.tool_allowlist = vec!["ask_user".into(), "read_thread".into(), "ask_user".into()];
-    let hired = dot::hire(&pool, &tenant, SpaceId(f.space), new)
+    let hired = kat::hire(&pool, &tenant, SpaceId(f.space), new)
         .await
         .unwrap();
     assert_eq!(
-        dot::get(&pool, &tenant, hired)
+        kat::get(&pool, &tenant, hired)
             .await
             .unwrap()
             .tool_allowlist,

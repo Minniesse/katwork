@@ -3,6 +3,8 @@
 **Planned: the self-hosted AI team office.**
 **อยู่ในแผนพัฒนา: ห้องทำงานทีมผู้ช่วย AI บนเซิร์ฟเวอร์ขององค์กร**
 
+The AI coworkers are called **Kats** in English and Thai. See [ADR-0006](docs/adr/0006-rename-dots-to-kats.md).
+
 Pre-alpha planning status. Public-alpha target: week of 2027-01-25.
 No capability is verified “in alpha” in this README.
 

@@ -25,7 +25,7 @@ export interface SeqEvent {
   event: AgUiEvent;
 }
 
-export type Author = { kind: 'user'; id: string } | { kind: 'dot'; id: string } | { kind: 'system' };
+export type Author = { kind: 'user'; id: string } | { kind: 'kat'; id: string } | { kind: 'system' };
 
 export interface Question {
   question: string;
@@ -63,7 +63,7 @@ export interface ToolCall {
 }
 
 export interface RunInfo {
-  dotId: string;
+  katId: string;
   replyMessageId: string;
   closed: boolean;
 }
@@ -85,7 +85,7 @@ export interface Transcript {
   messages: Record<string, ChatMessage>;
   runs: Record<string, RunInfo>;
   toolCalls: Record<string, ToolCall>;
-  dotStates: Record<string, string>;
+  katStates: Record<string, string>;
   jobs: Record<string, JobInfo>;
   /** The code of the latest `RUN_ERROR`, until a later job succeeds. */
   runError: string | null;
@@ -131,16 +131,16 @@ export function parseEvent(raw: unknown): AgUiEvent | null {
 }
 
 // TODO(13b): pin to Task 6's serde shape for `Author` once it lands; until then both the
-// adjacently tagged `{kind, id}` and serde's default `{"Dot": id}` / `"System"` are read.
+// adjacently tagged `{kind, id}` and serde's default `{"Kat": id}` / `"System"` are read.
 export function parseAuthor(raw: unknown): Author | null {
   if (raw === 'System' || raw === 'system') return { kind: 'system' };
   const author = fields(raw);
   if (!author) return null;
   const kind = isString(author.kind) ? author.kind.toLowerCase() : null;
   if (kind === 'system') return { kind: 'system' };
-  if ((kind === 'user' || kind === 'dot') && isString(author.id)) return { kind, id: author.id };
+  if ((kind === 'user' || kind === 'kat') && isString(author.id)) return { kind, id: author.id };
   if (isString(author.User)) return { kind: 'user', id: author.User };
-  if (isString(author.Dot)) return { kind: 'dot', id: author.Dot };
+  if (isString(author.Kat)) return { kind: 'kat', id: author.Kat };
   return null;
 }
 
@@ -208,7 +208,7 @@ export function emptyTranscript(): Transcript {
     messages: {},
     runs: {},
     toolCalls: {},
-    dotStates: {},
+    katStates: {},
     jobs: {},
     runError: null,
   };
@@ -292,12 +292,12 @@ function apply(state: Transcript, event: AgUiEvent): Transcript {
 function applyCustom(state: Transcript, name: string, value: Fields): Transcript {
   switch (name) {
     case 'katwork.run_started': {
-      const { runId, dotId, replyMessageId } = value;
-      if (!isString(runId) || !isString(dotId) || !isString(replyMessageId)) return state;
-      const next = { ...state, runs: { ...state.runs, [runId]: { dotId, replyMessageId, closed: false } } };
+      const { runId, katId, replyMessageId } = value;
+      if (!isString(runId) || !isString(katId) || !isString(replyMessageId)) return state;
+      const next = { ...state, runs: { ...state.runs, [runId]: { katId, replyMessageId, closed: false } } };
       const reply = own(state.messages, replyMessageId);
       return reply?.provisional
-        ? putMessage(next, { ...reply, runId, author: { kind: 'dot', id: dotId } })
+        ? putMessage(next, { ...reply, runId, author: { kind: 'kat', id: katId } })
         : next;
     }
     case 'katwork.run_closed': {
@@ -339,10 +339,10 @@ function applyCustom(state: Transcript, name: string, value: Fields): Transcript
         runError: job.status !== null && SUCCESS.has(job.status) ? null : state.runError,
       };
     }
-    case 'katwork.dot_state': {
-      const { dotId, state: dotState } = value;
-      if (!isString(dotId) || !isString(dotState)) return state;
-      return { ...state, dotStates: { ...state.dotStates, [dotId]: dotState } };
+    case 'katwork.kat_state': {
+      const { katId, state: katState } = value;
+      if (!isString(katId) || !isString(katState)) return state;
+      return { ...state, katStates: { ...state.katStates, [katId]: katState } };
     }
     case 'katwork.tool_status': {
       const { toolCallId, ok } = value;
@@ -365,7 +365,7 @@ function streamText(state: Transcript, messageId: string, delta: string, restart
   const run = openRunFor(state, messageId);
   return putMessage(state, {
     id: messageId,
-    author: existing?.author ?? (run ? { kind: 'dot', id: run.info.dotId } : null),
+    author: existing?.author ?? (run ? { kind: 'kat', id: run.info.katId } : null),
     body: (restart || !existing ? '' : existing.body) + delta,
     provisional: true,
     synthetic: false,

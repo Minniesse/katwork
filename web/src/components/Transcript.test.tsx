@@ -16,7 +16,7 @@ test('transcript_is_live_region', () => {
   const streaming = messagesFrom([
     ev.userStored('u1', 'Hello'),
     ev.runStarted('r1'),
-    ev.kwRunStarted('r1', 'dot-a', 'm1'),
+    ev.kwRunStarted('r1', 'kat-a', 'm1'),
     ev.textStart('m1'),
     ev.text('m1', 'Hi'),
   ]);
@@ -58,9 +58,9 @@ test('system_notice_shows_localized_reason', () => {
   expect(screen.queryByText('provider_unavailable')).toBeNull();
 });
 
-test('dot_messages_use_the_given_dot_name', () => {
-  const messages = messagesFrom([ev.stored('m1', 'Done.', { author: { kind: 'dot', id: 'dot-a' } })]);
-  render(<Transcript messages={messages} dotName={(id) => (id === 'dot-a' ? 'Mali' : undefined)} />);
+test('kat_messages_use_the_given_kat_name', () => {
+  const messages = messagesFrom([ev.stored('m1', 'Done.', { author: { kind: 'kat', id: 'kat-a' } })]);
+  render(<Transcript messages={messages} katName={(id) => (id === 'kat-a' ? 'Mali' : undefined)} />);
   expect(screen.getByText('Mali')).toBeInTheDocument();
 });
 

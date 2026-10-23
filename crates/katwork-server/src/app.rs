@@ -7,7 +7,7 @@ use axum::{
 use katwork::runtime::Core;
 
 use crate::{
-    routes::{auth, dots, health, teams, workspaces},
+    routes::{auth, health, kats, teams, workspaces},
     static_files,
 };
 
@@ -43,16 +43,16 @@ pub fn build_router_with_web_dir(state: AppState, web_dir: &Path) -> Router {
             put(workspaces::set_paused),
         )
         .route(
-            "/api/workspaces/{workspace_id}/spaces/{space_id}/dots",
-            get(dots::list).post(dots::hire),
+            "/api/workspaces/{workspace_id}/spaces/{space_id}/kats",
+            get(kats::list).post(kats::hire),
         )
         .route(
-            "/api/workspaces/{workspace_id}/dots/{dot_id}",
-            get(dots::get).patch(dots::update),
+            "/api/workspaces/{workspace_id}/kats/{kat_id}",
+            get(kats::get).patch(kats::update),
         )
         .route(
-            "/api/workspaces/{workspace_id}/dots/{dot_id}/spaces/{space_id}",
-            put(dots::grant).delete(dots::revoke),
+            "/api/workspaces/{workspace_id}/kats/{kat_id}/spaces/{space_id}",
+            put(kats::grant).delete(kats::revoke),
         )
         .route(
             "/api/workspaces/{workspace_id}/spaces/{space_id}/teams",
@@ -63,7 +63,7 @@ pub fn build_router_with_web_dir(state: AppState, web_dir: &Path) -> Router {
             get(teams::get),
         )
         .route(
-            "/api/workspaces/{workspace_id}/teams/{team_id}/members/{dot_id}",
+            "/api/workspaces/{workspace_id}/teams/{team_id}/members/{kat_id}",
             put(teams::add_member).delete(teams::remove_member),
         )
         .fallback_service(static_files::service(web_dir.to_owned()))

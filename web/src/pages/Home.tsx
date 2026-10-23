@@ -1,4 +1,4 @@
-import { AppLayout, DotCluster, PageTitle } from '../components/Layout';
+import { AppLayout, KatCluster, PageTitle } from '../components/Layout';
 import { formatDate, t, useLocale } from '../i18n';
 
 /** The signed-in landing page. Team and Chat arrive in Task 13b. */
@@ -22,7 +22,7 @@ export function Home({
             route, Lead first, with Thai names (`team_page_lists_lead_first_with_thai_names`). */}
         <section className="panel panel-team" aria-labelledby="home-team-title">
           <h2 id="home-team-title">{t('home.team.title')}</h2>
-          <DotCluster size="small" />
+          <KatCluster size="small" />
           <p>{t('home.team.empty')}</p>
           <p className="tag">{t('home.coming_soon')}</p>
         </section>

@@ -1,9 +1,9 @@
-pub mod dot;
+pub mod kat;
 pub mod roles;
 #[expect(clippy::module_inception)]
 pub mod team;
 
-pub use dot::{Appearance, Autonomy, Dot, DotPatch, DotRole, HireDot, NewDot};
+pub use kat::{Appearance, Autonomy, HireKat, Kat, KatPatch, KatRole, NewKat};
 pub use team::{NewTeam, Team, TeamView};
 
 use caseless::Caseless;
@@ -36,7 +36,7 @@ pub(crate) async fn lock_workspace(
     conn: &mut PgConnection,
     tenant: &Tenant,
 ) -> Result<(), KatError> {
-    // Serialize roster edits, including renames racing membership changes, before any Dot lock.
+    // Serialize roster edits, including renames racing membership changes, before any Kat lock.
     sqlx::query("SELECT id FROM workspaces WHERE id = $1 FOR NO KEY UPDATE")
         .bind(tenant.workspace_id())
         .fetch_optional(conn)

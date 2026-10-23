@@ -21,7 +21,7 @@ fn typed_ids_are_uuid_v7_and_round_trip() {
         WorkspaceId,
         SpaceId,
         UserId,
-        DotId,
+        KatId,
         TeamId,
         ThreadId,
         MessageId,
@@ -52,7 +52,7 @@ fn shared_wire_values_match_json() {
         assert_eq!(to_value(value).unwrap(), json!(wire));
     }
     for (value, wire) in [
-        (HoldReason::DotBusy, "dot_busy"),
+        (HoldReason::KatBusy, "kat_busy"),
         (HoldReason::ProviderQuota, "provider_quota"),
         (HoldReason::WorkspacePaused, "workspace_paused"),
     ] {
@@ -77,12 +77,12 @@ fn shared_wire_values_match_json() {
         "approval_pending",
         "question_pending",
         "interrupted_review_required",
-        "dot_paused",
+        "kat_paused",
         "retries_exhausted",
         "cancelled",
         "outcome_unknown",
-        "no_eligible_dot",
-        "dot_not_in_space",
+        "no_eligible_kat",
+        "kat_not_in_space",
         "lease_lost",
     ];
     assert_eq!(ReasonCode::ALL.len(), expected.len());
@@ -93,7 +93,7 @@ fn shared_wire_values_match_json() {
     }
     assert_eq!(to_value(ModelTier::Standard).unwrap(), json!("standard"));
     assert_eq!(to_value(Locale::Th).unwrap(), json!("th"));
-    assert_eq!(to_value(DotStatus::Paused).unwrap(), json!("paused"));
+    assert_eq!(to_value(KatStatus::Paused).unwrap(), json!("paused"));
 }
 
 #[test]

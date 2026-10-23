@@ -34,7 +34,7 @@ typed_id!(
     WorkspaceId,
     SpaceId,
     UserId,
-    DotId,
+    KatId,
     TeamId,
     ThreadId,
     MessageId,

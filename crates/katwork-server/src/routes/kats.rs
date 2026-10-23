@@ -12,8 +12,8 @@ use axum::{
     http::StatusCode,
 };
 use katwork::{
-    ids::{DotId, SpaceId},
-    team::{Dot, DotPatch, HireDot, dot, roles},
+    ids::{KatId, SpaceId},
+    team::{HireKat, Kat, KatPatch, kat, roles},
     tenancy::Tenant,
     types::Locale,
 };
@@ -24,12 +24,12 @@ pub(crate) struct SpacePath {
     space_id: SpaceId,
 }
 #[derive(Deserialize)]
-pub(crate) struct DotPath {
-    dot_id: DotId,
+pub(crate) struct KatPath {
+    kat_id: KatId,
 }
 #[derive(Deserialize)]
 pub(crate) struct GrantPath {
-    dot_id: DotId,
+    kat_id: KatId,
     space_id: SpaceId,
 }
 
@@ -37,45 +37,45 @@ pub(crate) async fn list(
     State(state): State<AppState>,
     tenant: Tenant,
     path: Result<Path<SpacePath>, PathRejection>,
-) -> Result<Json<Vec<Dot>>, ApiError> {
+) -> Result<Json<Vec<Kat>>, ApiError> {
     let path = route_path(path)?;
     Ok(Json(
-        dot::list(&state.core.pool, &tenant, path.space_id).await?,
+        kat::list(&state.core.pool, &tenant, path.space_id).await?,
     ))
 }
 pub(crate) async fn hire(
     State(state): State<AppState>,
     tenant: Tenant,
     path: Result<Path<SpacePath>, PathRejection>,
-    body: Result<Json<HireDot>, JsonRejection>,
-) -> Result<(StatusCode, Json<Dot>), ApiError> {
+    body: Result<Json<HireKat>, JsonRejection>,
+) -> Result<(StatusCode, Json<Kat>), ApiError> {
     let path = route_path(path)?;
     let body = payload(body)?;
     let mut new = roles::template(&body.role, Locale::En);
     new.name = body.name;
     new.persona = body.persona;
-    let id = dot::hire(&state.core.pool, &tenant, path.space_id, new).await?;
+    let id = kat::hire(&state.core.pool, &tenant, path.space_id, new).await?;
     Ok((
         StatusCode::CREATED,
-        Json(dot::get(&state.core.pool, &tenant, id).await?),
+        Json(kat::get(&state.core.pool, &tenant, id).await?),
     ))
 }
 pub(crate) async fn get(
     State(state): State<AppState>,
     tenant: Tenant,
-    path: Result<Path<DotPath>, PathRejection>,
-) -> Result<Json<Dot>, ApiError> {
+    path: Result<Path<KatPath>, PathRejection>,
+) -> Result<Json<Kat>, ApiError> {
     let path = route_path(path)?;
     Ok(Json(
-        dot::get(&state.core.pool, &tenant, path.dot_id).await?,
+        kat::get(&state.core.pool, &tenant, path.kat_id).await?,
     ))
 }
 pub(crate) async fn update(
     State(state): State<AppState>,
     tenant: Tenant,
-    path: Result<Path<DotPath>, PathRejection>,
+    path: Result<Path<KatPath>, PathRejection>,
     body: Result<Json<serde_json::Value>, JsonRejection>,
-) -> Result<Json<Dot>, ApiError> {
+) -> Result<Json<Kat>, ApiError> {
     let body = payload(body)?;
     if [
         "instructions",
@@ -92,10 +92,10 @@ pub(crate) async fn update(
         tenant.require_admin()?;
     }
     let path = route_path(path)?;
-    let patch: DotPatch =
+    let patch: KatPatch =
         serde_json::from_value(body).map_err(|_| katwork::error::KatError::RequestInvalid)?;
     Ok(Json(
-        dot::update(&state.core.pool, &tenant, path.dot_id, patch).await?,
+        kat::update(&state.core.pool, &tenant, path.kat_id, patch).await?,
     ))
 }
 pub(crate) async fn grant(
@@ -105,7 +105,7 @@ pub(crate) async fn grant(
 ) -> Result<StatusCode, ApiError> {
     tenant.require_admin()?;
     let path = route_path(path)?;
-    dot::grant_space(&state.core.pool, &tenant, path.dot_id, path.space_id).await?;
+    kat::grant_space(&state.core.pool, &tenant, path.kat_id, path.space_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 pub(crate) async fn revoke(
@@ -115,6 +115,6 @@ pub(crate) async fn revoke(
 ) -> Result<StatusCode, ApiError> {
     tenant.require_admin()?;
     let path = route_path(path)?;
-    dot::revoke_space(&state.core.pool, &tenant, path.dot_id, path.space_id).await?;
+    kat::revoke_space(&state.core.pool, &tenant, path.kat_id, path.space_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

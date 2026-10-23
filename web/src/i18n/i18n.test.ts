@@ -23,12 +23,12 @@ const REASON_CODES = [
   'approval_pending',
   'question_pending',
   'interrupted_review_required',
-  'dot_paused',
+  'kat_paused',
   'retries_exhausted',
   'cancelled',
   'outcome_unknown',
-  'no_eligible_dot',
-  'dot_not_in_space',
+  'no_eligible_kat',
+  'kat_not_in_space',
   'lease_lost',
 ];
 
@@ -82,11 +82,11 @@ describe('catalogues', () => {
     }
   });
 
-  test('copy_calls_coworkers_dots_and_thai_never_says_ai_employee', () => {
+  test('copy_calls_coworkers_kats_and_thai_never_says_ai_employee', () => {
     const enText = Object.values(en).join('\n');
     const thText = Object.values(th).join('\n');
-    expect(enText).toMatch(/\bDots?\b/);
-    expect(thText).toMatch(/\bDots?\b/);
+    expect(enText).toMatch(/\bKats?\b/);
+    expect(thText).toMatch(/\bKats?\b/);
     expect(thText).toContain('ผู้ช่วย AI');
     expect(thText).not.toMatch(/พนักงาน\s*AI/);
     expect(enText).not.toMatch(/\bAI (employee|worker|staff)/i);
