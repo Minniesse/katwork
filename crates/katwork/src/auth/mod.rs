@@ -15,6 +15,7 @@ use crate::{
     config::Config,
     error::KatError,
     ids::{SpaceId, UserId, WorkspaceId},
+    types::Locale,
 };
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -80,6 +81,13 @@ pub async fn login(
     Ok((AuthUser { user_id }, token))
 }
 
+/// The demo user's workspaces, each with one Space that allows hosted providers and that
+/// Space's default team in the workspace's language.
+pub(crate) const DEMO_WORKSPACES: [(&str, &str, Locale); 2] = [
+    ("Demo", "Demo", Locale::En),
+    ("เดโม", "พื้นที่ทดลอง", Locale::Th),
+];
+
 pub async fn seed_demo(
     pool: &PgPool,
     config: &Config,
@@ -128,33 +136,49 @@ pub async fn seed_demo(
             .await?;
         reset::revoke_credentials(&mut tx, user_id).await?;
     }
-    let workspace: Option<WorkspaceId> = sqlx::query_scalar("SELECT w.id FROM workspaces w JOIN memberships m ON m.workspace_id = w.id WHERE m.user_id = $1 AND w.name = 'Demo' ORDER BY w.id LIMIT 1")
-        .bind(user_id).fetch_optional(&mut *tx).await?;
-    let workspace_id = workspace.unwrap_or_default();
-    if workspace.is_none() {
-        sqlx::query("INSERT INTO workspaces (id, name) VALUES ($1, 'Demo')")
+    let mut seeded = Vec::new();
+    for (name, space, locale) in DEMO_WORKSPACES {
+        let workspace: Option<WorkspaceId> = sqlx::query_scalar("SELECT w.id FROM workspaces w JOIN memberships m ON m.workspace_id = w.id WHERE m.user_id = $1 AND w.name = $2 ORDER BY w.id LIMIT 1")
+            .bind(user_id).bind(name).fetch_optional(&mut *tx).await?;
+        let workspace_id = workspace.unwrap_or_default();
+        if workspace.is_none() {
+            sqlx::query("INSERT INTO workspaces (id, name) VALUES ($1, $2)")
+                .bind(workspace_id)
+                .bind(name)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "INSERT INTO memberships (workspace_id, user_id, role) VALUES ($1, $2, 'owner')",
+            )
             .bind(workspace_id)
+            .bind(user_id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query(
-            "INSERT INTO memberships (workspace_id, user_id, role) VALUES ($1, $2, 'owner')",
+        }
+        sqlx::query("INSERT INTO spaces (id, workspace_id, name, allow_external) SELECT $1, $2, $3, true WHERE NOT EXISTS (SELECT 1 FROM spaces WHERE workspace_id = $2 AND name = $3)")
+            .bind(SpaceId::new()).bind(workspace_id).bind(space).execute(&mut *tx).await?;
+        seeded.push((workspace_id, space, locale));
+    }
+    // Lock order: both workspace rows, in ascending id, before either roster is written.
+    let mut locked: Vec<_> = seeded.iter().map(|(id, ..)| id.0).collect();
+    locked.sort();
+    for id in locked {
+        sqlx::query("SELECT id FROM workspaces WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    for (workspace_id, space, locale) in seeded {
+        let tenant = crate::tenancy::resolve(&mut *tx, user_id, workspace_id).await?;
+        let space_id = sqlx::query_scalar(
+            "SELECT id FROM spaces WHERE workspace_id=$1 AND name=$2 ORDER BY id LIMIT 1",
         )
         .bind(workspace_id)
-        .bind(user_id)
-        .execute(&mut *tx)
+        .bind(space)
+        .fetch_one(&mut *tx)
         .await?;
+        crate::team::team::create_default_on(&mut tx, &tenant, space_id, locale).await?;
     }
-    sqlx::query("INSERT INTO spaces (id, workspace_id, name, allow_external) SELECT $1, $2, 'Demo', true WHERE NOT EXISTS (SELECT 1 FROM spaces WHERE workspace_id = $2 AND name = 'Demo')")
-        .bind(SpaceId::new()).bind(workspace_id).execute(&mut *tx).await?;
-    let tenant = crate::tenancy::resolve(&mut *tx, user_id, workspace_id).await?;
-    let space_id = sqlx::query_scalar(
-        "SELECT id FROM spaces WHERE workspace_id=$1 AND name='Demo' ORDER BY id LIMIT 1",
-    )
-    .bind(workspace_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    crate::team::team::create_default_on(&mut tx, &tenant, space_id, crate::types::Locale::En)
-        .await?;
     tx.commit().await?;
     Ok(
         (reset_password || (existing.is_none() && config.demo_password.is_none()))

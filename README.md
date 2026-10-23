@@ -70,6 +70,11 @@ Run them on the Docker host, from a fresh checkout of this repository:
      --email you@example.com --workspace "My team" --role owner --space-policy local
    ```
 
+   The workspace's first Space, `General`, comes with a default team of six
+   Kats, a Lead and five specialists, so it has a team to chat with from the
+   start. Add `--locale th` to make Thai the account's language and give the
+   Kats Thai names; the default is `--locale en`.
+
 5. The command prints one link. Open it in a browser within 72 hours, choose a
    password, then sign in with your email and that password. The link works once.
 

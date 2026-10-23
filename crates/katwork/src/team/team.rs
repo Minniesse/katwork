@@ -149,6 +149,13 @@ pub async fn create_default(
     Ok(id)
 }
 
+pub(super) fn default_name(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Default team",
+        Locale::Th => "ทีมเริ่มต้น",
+    }
+}
+
 pub(crate) async fn create_default_on(
     conn: &mut PgConnection,
     tenant: &Tenant,
@@ -177,11 +184,7 @@ pub(crate) async fn create_default_on(
         tenant,
         space,
         NewTeam {
-            name: match locale {
-                Locale::En => "Default team",
-                Locale::Th => "ทีมเริ่มต้น",
-            }
-            .into(),
+            name: default_name(locale).into(),
             lead,
             members,
         },

@@ -111,6 +111,7 @@ pub struct NewKat {
     pub model_tier: ModelTier,
     pub autonomy: Autonomy,
     pub appearance: Appearance,
+    pub max_concurrency: u16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -270,19 +271,26 @@ pub(super) async fn hire_on(
         &new.appearance,
         &mut new.tool_allowlist,
     )?;
-    let template = super::roles::template(&new.role, Locale::En);
-    if new.instructions != template.instructions
-        || new.tool_allowlist != template.tool_allowlist
-        || new.model_tier != template.model_tier
-        || new.autonomy != template.autonomy
-    {
+    if new.max_concurrency == 0 {
+        return Err(KatError::RequestInvalid);
+    }
+    // A template in either language is a default hire; anything else is an execution setting.
+    let is_template = [Locale::En, Locale::Th].into_iter().any(|locale| {
+        let template = super::roles::template(&new.role, locale);
+        new.instructions == template.instructions
+            && new.tool_allowlist == template.tool_allowlist
+            && new.model_tier == template.model_tier
+            && new.autonomy == template.autonomy
+            && new.max_concurrency == template.max_concurrency
+    });
+    if !is_template {
         tenant.require_admin()?;
     }
     let id = KatId::new();
-    sqlx::query("INSERT INTO kats (id, workspace_id, default_space_id, name, role, persona, instructions, tool_allowlist, model_tier, autonomy, appearance) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)")
+    sqlx::query("INSERT INTO kats (id, workspace_id, default_space_id, name, role, persona, instructions, tool_allowlist, model_tier, autonomy, appearance, max_concurrency) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)")
         .bind(id).bind(tenant.workspace_id()).bind(space).bind(new.name).bind(new.role.stored())
         .bind(new.persona).bind(new.instructions).bind(new.tool_allowlist).bind(new.model_tier).bind(new.autonomy)
-        .bind(sqlx::types::Json(new.appearance)).execute(&mut *conn).await?;
+        .bind(sqlx::types::Json(new.appearance)).bind(i32::from(new.max_concurrency)).execute(&mut *conn).await?;
     sqlx::query("INSERT INTO kat_spaces (workspace_id, kat_id, space_id) VALUES ($1,$2,$3)")
         .bind(tenant.workspace_id())
         .bind(id)

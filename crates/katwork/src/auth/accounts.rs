@@ -5,8 +5,9 @@ use super::{invite, password, random_token, reset};
 use crate::{
     error::KatError,
     ids::{SpaceId, UserId, WorkspaceId},
+    team::team,
     tenancy::{self, Role},
-    types::SpacePolicy,
+    types::{Locale, SpacePolicy},
 };
 
 /// Trims and lowercases; more than 254 bytes, or anything but exactly one `@` with text on
@@ -28,20 +29,29 @@ pub struct EnsuredUser {
     pub created: bool,
 }
 
-/// The account for `email`, created when there is none. A new account's password is the hash
-/// of 32 random bytes nobody ever sees, so it has no usable password until its link is used.
-pub async fn ensure_user(conn: &mut PgConnection, email: &str) -> Result<EnsuredUser, KatError> {
+/// The account for `email`, created with `locale` when there is none. A new account's password
+/// is the hash of 32 random bytes nobody ever sees, so it has no usable password until its link
+/// is used.
+pub async fn ensure_user(
+    conn: &mut PgConnection,
+    email: &str,
+    locale: Locale,
+) -> Result<EnsuredUser, KatError> {
     let email = normalize_email(email)?;
     let display_name = email.split('@').next().unwrap_or_default().to_owned();
     let unknown = random_token()?;
     let hash = password::run(move || password::hash(&unknown)).await??;
     // A concurrent insert of the same email makes this one wait, then do nothing; the select
     // that follows is a new statement and sees the committed row.
-    let inserted: Option<UserId> = sqlx::query_scalar("INSERT INTO users (id, email, password_hash, display_name, locale) VALUES ($1, $2, $3, $4, 'en') ON CONFLICT DO NOTHING RETURNING id")
+    let inserted: Option<UserId> = sqlx::query_scalar("INSERT INTO users (id, email, password_hash, display_name, locale) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING RETURNING id")
         .bind(UserId::new())
         .bind(&email)
         .bind(hash)
         .bind(display_name)
+        .bind(match locale {
+            Locale::En => "en",
+            Locale::Th => "th",
+        })
         .fetch_optional(&mut *conn)
         .await?;
     if let Some(user_id) = inserted {
@@ -76,15 +86,17 @@ impl WorkspaceRef {
     }
 }
 
-/// Creates an account in `workspace` with `role` and returns its invite link. An unknown
-/// workspace name is created, with a first Space `General`, only for an owner and only with a
-/// `space_policy`. Everything happens in one transaction, so a refusal changes nothing.
+/// Creates an account in `workspace` with `role` and `locale` and returns its invite link. An
+/// unknown workspace name is created, with a first Space `General` and its default team in
+/// `locale`, only for an owner and only with a `space_policy`. Everything happens in one
+/// transaction, so a refusal changes nothing.
 pub async fn create_user(
     pool: &PgPool,
     email: &str,
     workspace: &WorkspaceRef,
     role: Role,
     space_policy: Option<SpacePolicy>,
+    locale: Locale,
     link_base: &str,
 ) -> Result<String, KatError> {
     let email = normalize_email(email)?;
@@ -97,12 +109,15 @@ pub async fn create_user(
     if exists {
         return Err(KatError::UserExists);
     }
-    let workspace_id = match workspace {
-        WorkspaceRef::Id(id) => sqlx::query_scalar("SELECT id FROM workspaces WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(KatError::NotFound)?,
+    let (workspace_id, general) = match workspace {
+        WorkspaceRef::Id(id) => (
+            sqlx::query_scalar("SELECT id FROM workspaces WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(KatError::NotFound)?,
+            None,
+        ),
         WorkspaceRef::Name(name) => {
             // Serializes name-based commands, so two of them never create one name twice.
             sqlx::query("SELECT pg_advisory_xact_lock(3000004)")
@@ -114,7 +129,7 @@ pub async fn create_user(
                     .fetch_all(&mut *tx)
                     .await?;
             match found[..] {
-                [id] => id,
+                [id] => (id, None),
                 [_, _, ..] => return Err(KatError::WorkspaceAmbiguous),
                 [] if role != Role::Owner => return Err(KatError::NotFound),
                 [] => {
@@ -128,18 +143,19 @@ pub async fn create_user(
                         .bind(name)
                         .execute(&mut *tx)
                         .await?;
+                    let space = SpaceId::new();
                     sqlx::query("INSERT INTO spaces (id, workspace_id, name, allow_external) VALUES ($1, $2, 'General', $3)")
-                        .bind(SpaceId::new())
+                        .bind(space)
                         .bind(id)
                         .bind(policy.allow_external)
                         .execute(&mut *tx)
                         .await?;
-                    id
+                    (id, Some(space))
                 }
             }
         }
     };
-    let user = ensure_user(&mut tx, &email).await?;
+    let user = ensure_user(&mut tx, &email, locale).await?;
     if !user.created {
         return Err(KatError::UserExists);
     }
@@ -149,6 +165,11 @@ pub async fn create_user(
         .bind(role)
         .execute(&mut *tx)
         .await?;
+    if let Some(space) = general {
+        // Resolved on this transaction, which can see the membership it just inserted.
+        let tenant = tenancy::resolve(&mut *tx, user.user_id, workspace_id).await?;
+        team::create_default_on(&mut tx, &tenant, space, locale).await?;
+    }
     let token = invite::issue(&mut tx, user.user_id).await?;
     tx.commit().await?;
     Ok(invite::link(link_base, &token))
