@@ -2,8 +2,9 @@ pub mod space;
 pub mod workspace;
 
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
-use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
+use sqlx::{Executor, Postgres};
+use unicode_normalization::UnicodeNormalization;
+use unicode_properties::{GeneralCategory, GeneralCategoryGroup, UnicodeGeneralCategory};
 
 use crate::{
     error::KatError,
@@ -104,7 +105,7 @@ impl Tenant {
     }
 }
 
-fn validate_name(name: &str) -> Result<&str, KatError> {
+pub(crate) fn validate_name(name: &str) -> Result<&str, KatError> {
     if name.chars().any(|ch| {
         matches!(
             ch.general_category(),
@@ -112,19 +113,45 @@ fn validate_name(name: &str) -> Result<&str, KatError> {
                 | GeneralCategory::Format
                 | GeneralCategory::LineSeparator
                 | GeneralCategory::ParagraphSeparator
+                | GeneralCategory::PrivateUse
+                | GeneralCategory::Unassigned
         )
+        // Default ignorables outside Cc/Cf/Cn, plus the visually blank Braille cell.
+        || matches!(ch, '\u{034f}' | '\u{115f}'..='\u{1160}' | '\u{17b4}'..='\u{17b5}'
+            | '\u{180b}'..='\u{180f}' | '\u{2800}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}'
+            | '\u{ffa0}' | '\u{e0100}'..='\u{e01ef}')
     }) {
         return Err(KatError::RequestInvalid);
     }
     let name = name.trim();
-    if name.is_empty() || name.chars().count() > 120 {
+    if name.chars().count() > 120
+        || name
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.general_category_group() == GeneralCategoryGroup::Mark)
+        || !name.chars().any(|ch| {
+            ch.general_category_group() == GeneralCategoryGroup::Letter
+                || ch.general_category() == GeneralCategory::DecimalNumber
+        })
+    {
         return Err(KatError::RequestInvalid);
+    }
+    let mut marks = 0;
+    for ch in name.nfd() {
+        if ch.general_category_group() == GeneralCategoryGroup::Mark {
+            marks += 1;
+            if marks > 4 {
+                return Err(KatError::RequestInvalid);
+            }
+        } else {
+            marks = 0;
+        }
     }
     Ok(name)
 }
 
-pub async fn resolve(
-    pool: &PgPool,
+pub async fn resolve<'e, E: Executor<'e, Database = Postgres>>(
+    pool: E,
     user_id: UserId,
     workspace_id: WorkspaceId,
 ) -> Result<Tenant, KatError> {

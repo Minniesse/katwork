@@ -6,5 +6,6 @@ pub mod fence;
 pub mod ids;
 pub mod models;
 pub mod runtime;
+pub mod team;
 pub mod tenancy;
 pub mod types;
