@@ -41,13 +41,15 @@ pub fn resolve(body: &str, names: &[(KatId, &str)]) -> Vec<KatId> {
                     for (start, cluster) in rest.grapheme_indices(true) {
                         let end = start + cluster.len();
                         let candidate = &rest[..end];
+                        // Trailing whitespace cannot match and leaves the trimmed key unchanged.
+                        if candidate.ends_with(char::is_whitespace) {
+                            continue;
+                        }
                         let key = name_key(candidate);
                         if key.graphemes(true).count() > max {
                             break;
                         }
-                        if candidate.ends_with(char::is_whitespace)
-                            || !ends_mention(candidate, &rest[end..])
-                        {
+                        if !ends_mention(candidate, &rest[end..]) {
                             continue;
                         }
                         if let Some((id, _)) = keys.iter().find(|(_, name)| *name == key) {

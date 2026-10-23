@@ -115,3 +115,10 @@ fn mentions_preserve_emoji_graphemes_and_require_a_boundary() {
     check("@Writer 👩‍💻", &["Writer", "Writer 👩‍💻"], &[1]);
     check("@Writer", &[], &[]);
 }
+
+#[test]
+fn mentions_resolve_long_whitespace_runs_within_normalized_bound() {
+    let body = format!("@AI{}Writer", " ".repeat(30_000));
+    check(&body, &["AI", "AI Writer"], &[1]);
+    check(&format!("@Writer{}", " ".repeat(30_000)), &["Writer"], &[0]);
+}
