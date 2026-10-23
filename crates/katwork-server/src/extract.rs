@@ -1,6 +1,9 @@
 use axum::{
     Json,
-    extract::{FromRequestParts, Path, rejection::JsonRejection},
+    extract::{
+        FromRequestParts, Path,
+        rejection::{JsonRejection, PathRejection},
+    },
     http::{HeaderMap, StatusCode, request::Parts},
 };
 use katwork::{
@@ -67,4 +70,9 @@ pub(crate) fn payload<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, ApiE
             KatError::RequestInvalid
         })
     })
+}
+
+pub(crate) fn path<T>(path: Result<Path<T>, PathRejection>) -> Result<T, ApiError> {
+    path.map(|Path(value)| value)
+        .map_err(|_| ApiError(KatError::RequestInvalid))
 }

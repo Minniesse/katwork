@@ -1,5 +1,18 @@
 #[derive(Debug, thiserror::Error)]
 pub enum KatError {
+    #[error("dot_name_conflict")]
+    DotNameConflict,
+    #[error("default_space_required")]
+    DefaultSpaceRequired,
+    #[error("grant_in_use")]
+    GrantInUse,
+    #[error("team_lead_conflict")]
+    TeamLeadConflict,
+    #[error("team_lead_required")]
+    TeamLeadRequired,
+    #[error("dot_not_in_space")]
+    DotNotInSpace,
+
     #[error("not_found")]
     NotFound,
     #[error("forbidden")]
@@ -62,6 +75,13 @@ impl From<sqlx::Error> for KatError {
 impl KatError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::DotNameConflict => "dot_name_conflict",
+            Self::DefaultSpaceRequired => "default_space_required",
+            Self::GrantInUse => "grant_in_use",
+            Self::TeamLeadConflict => "team_lead_conflict",
+            Self::TeamLeadRequired => "team_lead_required",
+            Self::DotNotInSpace => "dot_not_in_space",
+
             Self::NotFound => "not_found",
             Self::Forbidden => "forbidden",
             Self::SpacePolicyRequired => "space_policy_required",

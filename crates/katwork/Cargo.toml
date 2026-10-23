@@ -30,6 +30,8 @@ base64.workspace = true
 rand_core.workspace = true
 sha2.workspace = true
 lettre.workspace = true
+unicode-normalization.workspace = true
+caseless.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "io-util"] }
