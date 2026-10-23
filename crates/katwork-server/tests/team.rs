@@ -936,37 +936,39 @@ async fn foreign_members_and_leads_are_hidden_and_role_is_workspace_scoped(pool:
 async fn kat_and_team_names_reject_at_sign(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let kat = f.hire("Writer", json!("writer")).await;
-    assert_code(
-        f.call(
-            "POST",
-            &format!("spaces/{}/kats", f.space),
-            Some(json!({"name":"@Writer", "role":"writer", "persona":""})),
+    for at in ["@", "＠", "﹫"] {
+        assert_code(
+            f.call(
+                "POST",
+                &format!("spaces/{}/kats", f.space),
+                Some(json!({"name":format!("{at}Writer"), "role":"writer", "persona":""})),
+            )
+            .await,
+            400,
+            "request_invalid",
         )
-        .await,
-        400,
-        "request_invalid",
-    )
-    .await;
-    assert_code(
-        f.call(
-            "PATCH",
-            &format!("kats/{}", id(&kat)),
-            Some(json!({"name":"AI@Writer"})),
+        .await;
+        assert_code(
+            f.call(
+                "PATCH",
+                &format!("kats/{}", id(&kat)),
+                Some(json!({"name":format!("AI{at}Writer")})),
+            )
+            .await,
+            400,
+            "request_invalid",
         )
-        .await,
-        400,
-        "request_invalid",
-    )
-    .await;
-    assert_code(
-        f.call(
-            "POST",
-            &format!("spaces/{}/teams", f.space),
-            Some(json!({"name":"@Team", "lead":kat["id"], "members":[]})),
+        .await;
+        assert_code(
+            f.call(
+                "POST",
+                &format!("spaces/{}/teams", f.space),
+                Some(json!({"name":format!("{at}Team"), "lead":kat["id"], "members":[]})),
+            )
+            .await,
+            400,
+            "request_invalid",
         )
-        .await,
-        400,
-        "request_invalid",
-    )
-    .await;
+        .await;
+    }
 }
