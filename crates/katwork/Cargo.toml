@@ -9,6 +9,7 @@ license.workspace = true
 percent-encoding.workspace = true
 thiserror.workspace = true
 url.workspace = true
+unicode-properties.workspace = true
 sqlx.workspace = true
 uuid.workspace = true
 chrono.workspace = true
