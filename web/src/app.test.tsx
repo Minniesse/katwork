@@ -369,3 +369,28 @@ test('theme_toggle_sets_data_theme_and_persists', async () => {
   expect(toggle).toHaveAttribute('aria-pressed', 'true');
   expect(localStorage.getItem('kw-theme')).toBe('dark');
 });
+
+test('demoting_yourself_takes_the_members_page_away', async () => {
+  window.history.replaceState(null, '', '/members');
+  const admin = { ...WORKSPACES[0]!, role: 'admin' as const };
+  signedIn({
+    'GET /api/workspaces': [
+      [200, [admin]],
+      [200, [{ ...admin, role: 'member' }]],
+    ],
+    [`GET ${BASE}/members`]: [
+      200,
+      [{ user_id: ME, email: 'pat@example.test', display_name: 'Pat', role: 'admin' }],
+    ],
+    [`PUT ${BASE}/members/${ME}/role`]: [204],
+  });
+  const user = userEvent.setup({ delay: null });
+  render(<App />);
+  const mine = await screen.findByRole('combobox', {
+    name: en['members.role_for'].replace('{name}', 'Pat'),
+  });
+  await user.selectOptions(mine, 'member');
+  await user.click(screen.getByRole('button', { name: en['members.self_role_yes'] }));
+  expect(await screen.findByText(en['reason.forbidden'])).toBeVisible();
+  expect(screen.queryByRole('link', { name: en['nav.members'] })).toBeNull();
+});

@@ -6,7 +6,7 @@ import type { Member } from '../api';
 import { setLocale } from '../i18n';
 import en from '../i18n/en.json';
 import th from '../i18n/th.json';
-import { mockApi } from '../testing/api-mock';
+import { deferred, mockApi, type Reply } from '../testing/api-mock';
 import { installFakeEventSource } from '../testing/fake-event-source';
 import { ME, SPACE, TEAM, THAI_TEAM, WORKSPACE } from '../testing/fixtures';
 import { Members } from './Members';
@@ -15,6 +15,7 @@ const BASE = `/api/workspaces/${WORKSPACE}`;
 const LIST = `GET ${BASE}/members`;
 const INVITE = `POST ${BASE}/members`;
 const role = (user: string) => `PUT ${BASE}/members/${user}/role`;
+const OPTIONS = `GET ${BASE}/members/invite-options`;
 
 const PEOPLE: Member[] = [
   { user_id: 'user-2', email: 'malee@example.test', display_name: 'มาลี', role: 'member' },
@@ -31,8 +32,17 @@ afterEach(() => {
   act(() => setLocale('en'));
 });
 
-function renderMembers(myRole: Member['role'] = 'owner') {
-  render(<Members workspaceId={WORKSPACE} workspaceName="เดโม" me={ME} myRole={myRole} />);
+function renderMembers(myRole: Member['role'] = 'owner', onOwnRoleChanged = vi.fn()) {
+  render(
+    <Members
+      workspaceId={WORKSPACE}
+      workspaceName="เดโม"
+      me={ME}
+      myRole={myRole}
+      onOwnRoleChanged={onOwnRoleChanged}
+    />,
+  );
+  return onOwnRoleChanged;
 }
 
 test.each(['member', 'admin', 'owner'] as const)(
@@ -152,12 +162,21 @@ test('members_page_says_an_existing_account_was_added_without_a_link', async () 
 });
 
 test('members_page_explains_email_invites_without_smtp', async () => {
-  const calls = mockApi({ [LIST]: [200, PEOPLE], [INVITE]: [422, { code: 'smtp_unconfigured' }] });
+  const calls = mockApi({
+    [LIST]: [200, PEOPLE],
+    [OPTIONS]: [200, { email: false }],
+    [INVITE]: [422, { code: 'smtp_unconfigured' }],
+  });
   const user = userEvent.setup({ delay: null });
   renderMembers();
   const form = await screen.findByRole('form', { name: en['members.invite.title'] });
+  // Without SMTP the form starts on the link, and says why.
+  await waitFor(() =>
+    expect(within(form).getByRole('radio', { name: en['members.invite.by_link'] })).toBeChecked(),
+  );
+  expect(within(form).getByText(en['members.invite.email_unavailable'])).toBeVisible();
   await user.type(within(form).getByLabelText(en['members.invite.email']), 'somchai@example.test');
-  expect(within(form).getByRole('radio', { name: en['members.invite.by_email'] })).toBeChecked();
+  await user.click(within(form).getByRole('radio', { name: en['members.invite.by_email'] }));
   await user.click(within(form).getByRole('button', { name: en['members.invite.submit'] }));
   expect(calls.callsTo(INVITE)[0]!.body).toMatchObject({ delivery: 'email' });
   const alert = await screen.findByRole('alert');
@@ -196,6 +215,8 @@ test('members_page_changes_a_role', async () => {
     name: en['members.role_for'].replace('{name}', 'Pat'),
   });
   await user.selectOptions(pat, 'member');
+  // Lowering your own role is confirmed first.
+  await user.click(screen.getByRole('button', { name: en['members.self_role_yes'] }));
   expect(await screen.findByRole('alert')).toHaveTextContent(en['reason.last_owner_required']);
   await waitFor(() => expect(pat).toHaveValue('owner'));
 });
@@ -229,4 +250,129 @@ test('members_page_removes_a_member_after_confirming', async () => {
   expect(
     screen.queryByRole('button', { name: en['members.remove_label'].replace('{name}', 'Pat') }),
   ).toBeNull();
+});
+
+test('invite_form_starts_on_email_when_the_server_can_mail', async () => {
+  mockApi({ [LIST]: [200, PEOPLE], [OPTIONS]: [200, { email: true }] });
+  renderMembers();
+  const form = await screen.findByRole('form', { name: en['members.invite.title'] });
+  await waitFor(() =>
+    expect(within(form).getByRole('radio', { name: en['members.invite.by_email'] })).toBeChecked(),
+  );
+  expect(within(form).queryByText(en['members.invite.email_unavailable'])).toBeNull();
+});
+
+test('a_shown_invite_link_says_how_to_get_a_new_one', async () => {
+  mockApi({
+    [LIST]: [200, PEOPLE],
+    [OPTIONS]: [200, { email: false }],
+    [INVITE]: [
+      201,
+      { user_id: 'user-3', created: true, link: 'http://localhost:3000/invite?token=t' },
+    ],
+  });
+  const user = userEvent.setup({ delay: null });
+  renderMembers();
+  const form = await screen.findByRole('form', { name: en['members.invite.title'] });
+  await user.type(within(form).getByLabelText(en['members.invite.email']), 'new@example.test');
+  await user.click(within(form).getByRole('button', { name: en['members.invite.submit'] }));
+  expect(await screen.findByText(en['members.invite.link_lost'])).toBeVisible();
+});
+
+test('overlapping_role_changes_send_one_at_a_time_and_the_latest_wins', async () => {
+  const first = deferred<Reply>();
+  const sent: unknown[] = [];
+  const calls = mockApi({ [LIST]: [200, PEOPLE] });
+  calls.route(role('user-2'), ({ body }) => {
+    sent.push(body);
+    return sent.length === 1 ? first.promise : [204];
+  });
+  const user = userEvent.setup({ delay: null });
+  renderMembers();
+  const malee = await screen.findByRole('combobox', {
+    name: en['members.role_for'].replace('{name}', 'มาลี'),
+  });
+  await user.selectOptions(malee, 'admin');
+  await user.selectOptions(malee, 'owner');
+  // The second change waits for the first instead of racing it.
+  expect(sent).toEqual([{ role: 'admin' }]);
+  expect(malee).toHaveValue('owner');
+
+  // The first fails, but a newer choice is queued: it is sent, and it is what the page shows.
+  await act(async () => first.resolve([503, { code: 'busy' }]));
+  await waitFor(() => expect(sent).toEqual([{ role: 'admin' }, { role: 'owner' }]));
+  await waitFor(() => expect(malee).toHaveValue('owner'));
+  expect(screen.queryByRole('alert')).toBeNull();
+});
+
+test('a_failed_latest_role_change_shows_the_role_the_server_kept', async () => {
+  const first = deferred<Reply>();
+  const sent: unknown[] = [];
+  const calls = mockApi({ [LIST]: [200, PEOPLE] });
+  calls.route(role('user-2'), ({ body }) => {
+    sent.push(body);
+    return sent.length === 1 ? first.promise : [422, { code: 'last_owner_required' }];
+  });
+  const user = userEvent.setup({ delay: null });
+  renderMembers();
+  const malee = await screen.findByRole('combobox', {
+    name: en['members.role_for'].replace('{name}', 'มาลี'),
+  });
+  await user.selectOptions(malee, 'admin');
+  await user.selectOptions(malee, 'owner');
+  await act(async () => first.resolve([204]));
+  await waitFor(() => expect(sent).toHaveLength(2));
+  expect(await screen.findByRole('alert')).toHaveTextContent(en['reason.last_owner_required']);
+  await waitFor(() => expect(malee).toHaveValue('admin'));
+});
+
+test('demoting_yourself_asks_first_then_refreshes_the_page', async () => {
+  const admins: Member[] = [
+    { user_id: 'user-2', email: 'malee@example.test', display_name: 'มาลี', role: 'owner' },
+    { user_id: ME, email: 'pat@example.test', display_name: 'Pat', role: 'admin' },
+  ];
+  const calls = mockApi({ [LIST]: [200, admins], [role(ME)]: [204] });
+  const user = userEvent.setup({ delay: null });
+  const onOwnRoleChanged = renderMembers('admin');
+  const mine = await screen.findByRole('combobox', {
+    name: en['members.role_for'].replace('{name}', 'Pat'),
+  });
+  await user.selectOptions(mine, 'member');
+  const confirm = screen.getByRole('group', { name: en['members.self_role'] });
+  expect(confirm).toHaveTextContent(
+    en['members.self_role_confirm'].replace('{role}', en['members.role.member']),
+  );
+  expect(within(confirm).getByRole('button', { name: en['members.cancel'] })).toHaveFocus();
+  expect(calls.callsTo(role(ME))).toHaveLength(0);
+  expect(mine).toHaveValue('admin');
+
+  await user.click(within(confirm).getByRole('button', { name: en['members.cancel'] }));
+  expect(screen.queryByRole('group', { name: en['members.self_role'] })).toBeNull();
+  expect(mine).toHaveValue('admin');
+  expect(mine).toHaveFocus();
+
+  await user.selectOptions(mine, 'member');
+  await user.click(screen.getByRole('button', { name: en['members.self_role_yes'] }));
+  expect(calls.callsTo(role(ME))[0]!.body).toEqual({ role: 'member' });
+  await waitFor(() => expect(onOwnRoleChanged).toHaveBeenCalledOnce());
+});
+
+test('focus_lands_on_the_outcome_after_removing_a_member', async () => {
+  mockApi({
+    [LIST]: [
+      [200, PEOPLE],
+      [200, PEOPLE.slice(1)],
+    ],
+    [`DELETE ${BASE}/members/user-2`]: [204],
+  });
+  const user = userEvent.setup({ delay: null });
+  renderMembers();
+  await user.click(
+    await screen.findByRole('button', {
+      name: en['members.remove_label'].replace('{name}', 'มาลี'),
+    }),
+  );
+  await user.click(screen.getByRole('button', { name: en['members.remove_yes'] }));
+  const outcome = await screen.findByText(en['members.removed'].replace('{name}', 'มาลี'));
+  await waitFor(() => expect(outcome).toHaveFocus());
 });

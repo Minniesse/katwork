@@ -41,7 +41,7 @@ export function App() {
   // The token from an emailed or printed `/reset?token=…` link, held in memory only: see useLinkToken.
   const token = useLinkToken('/reset');
   const linkPage = location.pathname === '/reset' || location.pathname === '/invite';
-  const [workspace, chooseWorkspace, chooseSpace] = useWorkspace(
+  const [workspace, chooseWorkspace, chooseSpace, reloadWorkspace] = useWorkspace(
     session.state === 'signed_in' && !linkPage,
   );
 
@@ -131,7 +131,13 @@ export function App() {
       : null;
   return (
     <AppLayout onSignOut={signOut} signOutProblem={signOutProblem} nav={nav}>
-      <SignedInPage page={page} workspace={workspace} me={session.user.user_id} onSessionEnded={sessionEnded} />
+      <SignedInPage
+        page={page}
+        workspace={workspace}
+        me={session.user.user_id}
+        onSessionEnded={sessionEnded}
+        onRolesChanged={reloadWorkspace}
+      />
     </AppLayout>
   );
 }
@@ -141,11 +147,13 @@ function SignedInPage({
   workspace,
   me,
   onSessionEnded,
+  onRolesChanged,
 }: {
   page: Page;
   workspace: WorkspaceContext;
   me: string;
   onSessionEnded: () => void;
+  onRolesChanged: () => void;
 }): ReactNode {
   useLocale();
   const failed = workspace.state === 'failed';
@@ -175,7 +183,14 @@ function SignedInPage({
   const { workspace: current, space, teamId } = workspace;
   if (page.page === 'members') {
     return (
-      <Members key={current.id} workspaceId={current.id} workspaceName={current.name} me={me} myRole={current.role} />
+      <Members
+        key={current.id}
+        workspaceId={current.id}
+        workspaceName={current.name}
+        me={me}
+        myRole={current.role}
+        onOwnRoleChanged={onRolesChanged}
+      />
     );
   }
   if (page.page === 'team') {

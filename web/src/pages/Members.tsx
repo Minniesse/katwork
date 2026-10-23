@@ -16,30 +16,50 @@ interface Props {
   me: string;
   /** The signed-in user's role here (`WorkspaceSummary.role`). */
   myRole: Role;
+  /** The signed-in user changed their own role: the page's controls must follow it. */
+  onOwnRoleChanged?: () => void;
 }
 
 type Message = { key: string; vars?: Vars };
 
 /** Owners and admins: who is in the workspace, their roles, and invites. */
-export function Members({ workspaceId, workspaceName, me, myRole }: Props) {
+export function Members({ workspaceId, workspaceName, me, myRole, onOwnRoleChanged }: Props) {
   useLocale();
   const [members, setMembers] = useState<Member[] | null>(null);
   const [failure, setFailure] = useState<unknown>(null);
   const [saved, setSaved] = useState<Message | null>(null);
   const [reloads, setReloads] = useState(0);
+  const notice = useRef<HTMLParagraphElement>(null);
+  const [focusNotice, setFocusNotice] = useState(false);
+  // Role changes go one at a time per member; a change made meanwhile waits, and only the
+  // latest waiting one is sent. `kept` is the role the server last confirmed.
+  const kept = useRef(new Map<string, Role>());
+  const sending = useRef(new Set<string>());
+  const waiting = useRef(new Map<string, Role>());
   const allowed = myRole !== 'member';
 
   useEffect(() => {
     if (!allowed) return;
     let live = true;
     api.members(workspaceId).then(
-      (list) => live && setMembers(list),
+      (list) => {
+        if (!live) return;
+        for (const member of list) kept.current.set(member.user_id, member.role);
+        setMembers(list);
+      },
       (error: unknown) => live && setFailure(error),
     );
     return () => {
       live = false;
     };
   }, [workspaceId, reloads, allowed]);
+
+  useEffect(() => {
+    // A removed member's row and its buttons are gone; focus goes to what happened.
+    if (!focusNotice) return;
+    setFocusNotice(false);
+    notice.current?.focus();
+  }, [focusNotice]);
 
   if (!allowed) {
     return (
@@ -52,27 +72,50 @@ export function Members({ workspaceId, workspaceName, me, myRole }: Props) {
     );
   }
 
-  const changeRole = async (member: Member, role: Role) => {
-    setFailure(null);
-    setSaved(null);
+  const show = (userId: string, role: Role) =>
     setMembers(
       (list) =>
-        list?.map((other) => (other.user_id === member.user_id ? { ...other, role } : other)) ??
-        list,
+        list?.map((other) => (other.user_id === userId ? { ...other, role } : other)) ?? list,
     );
+
+  const sendRole = async (member: Member, role: Role) => {
+    const id = member.user_id;
+    sending.current.add(id);
+    let outcome: { ok: true } | { ok: false; error: unknown };
     try {
-      await api.setRole(workspaceId, member.user_id, role);
-      setSaved({
-        key: 'members.role_saved',
-        vars: { name: member.display_name, role: `members.role.${role}` },
-      });
+      await api.setRole(workspaceId, id, role);
+      kept.current.set(id, role);
+      outcome = { ok: true };
     } catch (error) {
-      setFailure(error);
-      // The server kept the old role; show it.
-      setMembers(
-        (list) => list?.map((other) => (other.user_id === member.user_id ? member : other)) ?? list,
-      );
+      outcome = { ok: false, error };
     }
+    sending.current.delete(id);
+    const next = waiting.current.get(id);
+    waiting.current.delete(id);
+    if (next !== undefined && next !== kept.current.get(id)) {
+      // A newer choice was made meanwhile: it wins, whatever this one's outcome.
+      void sendRole(member, next);
+      return;
+    }
+    const current = kept.current.get(id) ?? role;
+    show(id, current);
+    if (!outcome.ok) {
+      setFailure(outcome.error);
+      return;
+    }
+    setSaved({
+      key: 'members.role_saved',
+      vars: { name: member.display_name, role: `members.role.${current}` },
+    });
+    if (id === me) onOwnRoleChanged?.();
+  };
+
+  const changeRole = (member: Member, role: Role) => {
+    setFailure(null);
+    setSaved(null);
+    show(member.user_id, role);
+    if (sending.current.has(member.user_id)) waiting.current.set(member.user_id, role);
+    else void sendRole(member, role);
   };
 
   const remove = async (member: Member) => {
@@ -81,6 +124,7 @@ export function Members({ workspaceId, workspaceName, me, myRole }: Props) {
     try {
       await api.removeMember(workspaceId, member.user_id);
       setSaved({ key: 'members.removed', vars: { name: member.display_name } });
+      setFocusNotice(true);
       setReloads((n) => n + 1);
     } catch (error) {
       setFailure(error);
@@ -93,7 +137,7 @@ export function Members({ workspaceId, workspaceName, me, myRole }: Props) {
         <PageTitle>{t('members.title')}</PageTitle>
         <p className="lede">{t('members.lede')}</p>
       </div>
-      <p className="notice-line" role="status">
+      <p ref={notice} tabIndex={-1} className="notice-line" role="status">
         {saved && t(saved.key, translatedVars(saved.vars))}
       </p>
       {failure !== null && (
@@ -133,6 +177,8 @@ function translatedVars(vars: Vars | undefined): Vars | undefined {
   );
 }
 
+const RANK: Record<Role, number> = { member: 0, admin: 1, owner: 2 };
+
 function roleOptions(myRole: Role, current: Role): Role[] {
   // Only an owner may make someone an owner; an owner's row still shows its role.
   return myRole === 'owner' || current === 'owner'
@@ -157,6 +203,13 @@ function MemberTable({
 }) {
   useLocale();
   const [confirming, setConfirming] = useState<string | null>(null);
+  // Lowering your own role can take this page away, so it is confirmed first.
+  const [selfRole, setSelfRole] = useState<Role | null>(null);
+  const ownSelect = useRef<HTMLSelectElement>(null);
+  const pick = (member: Member, role: Role) => {
+    if (member.user_id === me && RANK[role] < RANK[member.role]) setSelfRole(role);
+    else onRole(member, role);
+  };
   return (
     <table className="members-table">
       <caption>{t('members.list', { workspace: workspaceName })}</caption>
@@ -180,11 +233,12 @@ function MemberTable({
               <td>{member.email}</td>
               <td>
                 <select
+                  ref={self ? ownSelect : undefined}
                   className="select"
                   aria-label={t('members.role_for', { name: member.display_name })}
                   value={member.role}
                   disabled={ownerOnly}
-                  onChange={(event) => onRole(member, event.target.value as Role)}
+                  onChange={(event) => pick(member, event.target.value as Role)}
                 >
                   {roleOptions(myRole, member.role).map((role) => (
                     <option key={role} value={role}>
@@ -192,6 +246,19 @@ function MemberTable({
                     </option>
                   ))}
                 </select>
+                {self && selfRole !== null && (
+                  <ConfirmOwnRole
+                    role={selfRole}
+                    onConfirm={() => {
+                      setSelfRole(null);
+                      onRole(member, selfRole);
+                    }}
+                    onCancel={() => {
+                      setSelfRole(null);
+                      ownSelect.current?.focus();
+                    }}
+                  />
+                )}
               </td>
               <td>
                 {!self &&
@@ -221,6 +288,32 @@ function MemberTable({
         })}
       </tbody>
     </table>
+  );
+}
+
+function ConfirmOwnRole({
+  role,
+  onConfirm,
+  onCancel,
+}: {
+  role: Role;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const cancel = useRef<HTMLButtonElement>(null);
+  useEffect(() => cancel.current?.focus(), []);
+  return (
+    <div className="confirm" role="group" aria-label={t('members.self_role')}>
+      <p>{t('members.self_role_confirm', { role: t(`members.role.${role}`) })}</p>
+      <div className="form-actions">
+        <button type="button" className="button button-danger" onClick={onConfirm}>
+          {t('members.self_role_yes')}
+        </button>
+        <button ref={cancel} type="button" className="button button-quiet" onClick={onCancel}>
+          {t('members.cancel')}
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -270,11 +363,29 @@ function InviteForm({
   const id = useId();
   const [email, setEmail] = useState('');
   const [role, setRole] = useState<Role>('member');
-  const [delivery, setDelivery] = useState<InviteDelivery>('email');
+  // A link always works; email only once the server says SMTP is set up.
+  const [delivery, setDelivery] = useState<InviteDelivery>('link');
+  const [emailWorks, setEmailWorks] = useState<boolean | null>(null);
+  const chosen = useRef(false);
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<unknown>(null);
   // Held in memory only: a returned link is shown once and is gone when the page unmounts.
   const [outcome, setOutcome] = useState<Outcome | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    api.inviteOptions(workspaceId).then(
+      (options) => {
+        if (!live) return;
+        setEmailWorks(options.email);
+        if (!chosen.current) setDelivery(options.email ? 'email' : 'link');
+      },
+      () => live && setEmailWorks(false),
+    );
+    return () => {
+      live = false;
+    };
+  }, [workspaceId]);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -333,11 +444,22 @@ function InviteForm({
                 name={`${id}-delivery`}
                 value={option}
                 checked={delivery === option}
-                onChange={() => setDelivery(option)}
+                aria-describedby={
+                  option === 'email' && emailWorks === false ? `${id}-no-email` : undefined
+                }
+                onChange={() => {
+                  chosen.current = true;
+                  setDelivery(option);
+                }}
               />
               {t(option === 'email' ? 'members.invite.by_email' : 'members.invite.by_link')}
             </label>
           ))}
+          {emailWorks === false && (
+            <p id={`${id}-no-email`} className="hint">
+              {t('members.invite.email_unavailable')}
+            </p>
+          )}
         </fieldset>
         {failure !== null && (
           <div className="alert" role="alert">
@@ -389,6 +511,7 @@ function InviteOutcome({ outcome }: { outcome: Outcome }) {
     <section className="invite-link" aria-labelledby={`${id}-title`}>
       <h3 id={`${id}-title`}>{t('members.invite.link_title', { email })}</h3>
       <p className="hint">{t('members.invite.link_hint')}</p>
+      <p className="hint">{t('members.invite.link_lost')}</p>
       <div className="invite-link-row">
         <input
           ref={field}

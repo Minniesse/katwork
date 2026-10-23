@@ -36,12 +36,17 @@ function save(id: string): void {
 }
 
 /** Loads the signed-in person's workspaces, the chosen one's Spaces, and that Space's team. */
-export function useWorkspace(
-  enabled: boolean,
-): [WorkspaceContext, (workspaceId: string) => void, (spaceId: string) => void] {
+export function useWorkspace(enabled: boolean): [
+  WorkspaceContext,
+  (workspaceId: string) => void,
+  (spaceId: string) => void,
+  /** Reads the workspaces again, for a role that changed. */
+  () => void,
+] {
   const [context, setContext] = useState<WorkspaceContext>({ state: 'loading' });
   const [workspaceId, setWorkspaceId] = useState<string | null>(saved);
   const [spaceId, setSpaceId] = useState<string | null>(null);
+  const [reloads, setReloads] = useState(0);
 
   useEffect(() => {
     if (!enabled) return;
@@ -62,7 +67,7 @@ export function useWorkspace(
     return () => {
       live = false;
     };
-  }, [enabled, workspaceId, spaceId]);
+  }, [enabled, workspaceId, spaceId, reloads]);
 
   const chooseWorkspace = (id: string) => {
     save(id);
@@ -70,5 +75,5 @@ export function useWorkspace(
     setSpaceId(null);
     setWorkspaceId(id);
   };
-  return [context, chooseWorkspace, setSpaceId];
+  return [context, chooseWorkspace, setSpaceId, () => setReloads((n) => n + 1)];
 }
