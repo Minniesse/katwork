@@ -252,10 +252,12 @@ async fn held_busy_queue_does_not_starve_another_workspace(pool: PgPool) {
     let core = core(&pool);
     let active = claim(&core, "active").await.unwrap();
     let oldest = enqueue(&pool, &f, KatId(f.kat)).await;
-    for _ in 1..16 {
+    for _ in 1..300 {
         enqueue(&pool, &f, KatId(f.kat)).await;
     }
-    assert!(claim(&core, "holds").await.is_none());
+    for _ in 0..2 {
+        assert!(claim(&core, "holds").await.is_none());
+    }
     let other = setup(&pool).await;
     assert_eq!(
         claim(&core, "other").await.unwrap().task_id,
@@ -269,10 +271,12 @@ async fn held_paused_workspace_does_not_starve_another_workspace(pool: PgPool) {
     let f = setup(&pool).await;
     let core = core(&pool);
     paused(&pool, &f, true).await;
-    for _ in 1..16 {
+    for _ in 1..300 {
         enqueue(&pool, &f, KatId(f.kat)).await;
     }
-    assert!(claim(&core, "holds").await.is_none());
+    for _ in 0..2 {
+        assert!(claim(&core, "holds").await.is_none());
+    }
     let other = setup(&pool).await;
     assert_eq!(
         claim(&core, "other").await.unwrap().task_id,
@@ -284,7 +288,7 @@ async fn held_paused_workspace_does_not_starve_another_workspace(pool: PgPool) {
             .iter()
             .filter(|e| e["name"] == "katwork.job_status")
             .count(),
-        16
+        300
     );
     paused(&pool, &f, false).await;
     assert_eq!(

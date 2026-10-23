@@ -45,6 +45,10 @@ pub fn spawn_pool(core: Arc<Core>, n: usize, ttl: Duration) -> JoinSet<()> {
                 // A cancelled BEGIN can poison the pool; always drain admission SQL.
                 match lease::claim(&core, &worker_id, ttl, &limits).await {
                     Ok(Some(c)) => {
+                        if core.shutdown.is_cancelled() {
+                            abandon(&core, &c, &worker_id).await;
+                            break;
+                        }
                         let claimed_at = Instant::now();
                         work(
                             &core,
@@ -247,7 +251,7 @@ async fn execute(
         }),
     );
     let tools = ToolRegistry::builtin();
-    run::execute(
+    run::execute_with_shutdown(
         &RunEnv {
             pool: &core.pool,
             models: &core.registry,
@@ -275,6 +279,7 @@ async fn execute(
             cancel,
         },
         limits,
+        Some(&core.shutdown),
     )
     .await
 }
