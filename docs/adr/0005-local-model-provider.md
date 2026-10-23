@@ -12,7 +12,7 @@ Every Space declares whether hosted providers may see its data. The gateway knew
 - An operator configures one local server with `KATWORK_LOCAL_BASE_URL` and `KATWORK_LOCAL_MODEL`, plus an optional `KATWORK_LOCAL_API_KEY`. Without a key, requests carry no `Authorization` header.
 - The local provider uses the same Rig adapter (`OpenAiApi::Chat`), the same bounded HTTP client and the same adapter rules as the hosted providers (ADR-0001).
 - It is registered as `Residency::Local` for every tier, after the hosted providers. A Space that allows hosted providers gets a hosted entry when one is configured; a local-only Space gets the local entry. A configured local provider turns off the demo fallback.
-- Each model entry carries its own stream timeouts. Local entries get 120 s to the first content chunk and 60 s between content chunks (initial defaults); hosted entries keep 30 s and 30 s. Every attempt is still capped by the run's remaining time.
+- Each model entry carries its own timeouts: the first content chunk, the gap between content chunks, and the run's wall clock. Local entries get 120 s, 60 s and 300 s; hosted and demo entries get 30 s, 30 s and 90 s (all initial defaults). A run takes its wall clock from the entry its first attempt selects, and the task and job deadlines still bound it.
 - At startup the server logs one line per tier, naming the entry a hosted-allowed Space gets and the one a local-only Space gets, with no key or URL.
 
 ## Consequences
@@ -20,6 +20,6 @@ Every Space declares whether hosted providers may see its data. The gateway knew
 - A local-only Space runs real work outside demo mode.
 - Residency comes from the variable the operator set, never from the URL. KatWork does not check that the endpoint is inside the install's network, so pointing `KATWORK_LOCAL_BASE_URL` at a remote service sends local-only data there. The README states it.
 - One local model serves every tier, so the tiers differ only in their output-token caps until per-tier local models are needed.
-- With the 90 s run wall clock, a local model's wait for first content is at most 90 s; a slow local model may need that limit raised.
+- A local run may take up to 300 s, which is close to the 5-minute task deadline, so a slow local model leaves little room for a recovery run within one task.
 - The conservative input charge for a missing usage count assumes a tokenizer that emits at most one token per UTF-8 byte. KatWork cannot verify that for an operator's model.
 - The operator chooses the model. KatWork still recommends a local model only after it is qualified on Thai office tasks (§11).
