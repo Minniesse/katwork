@@ -69,6 +69,36 @@ test('invite_token_is_not_kept_for_a_reload', async () => {
   expect(fetchMock).not.toHaveBeenCalled();
 });
 
+// A full-document navigation can keep the whole page, token included, in the back-forward
+// cache, and restore it without a popstate. Leaving or coming back that way drops the token.
+test.each([
+  ['the_page_is_hidden', 'pagehide', false],
+  ['the_page_returns_from_the_back_forward_cache', 'pageshow', true],
+] as const)('invite_token_is_dropped_when_%s', async (_, type, persisted) => {
+  window.history.replaceState(null, '', '/invite?token=token-from-link');
+  const fetchMock = stubFetch([204]);
+  render(<InviteAccept />);
+  expect(await screen.findByLabelText(en['invite.password'])).toBeVisible();
+  act(() => {
+    window.dispatchEvent(new PageTransitionEvent(type, { persisted }));
+  });
+  expect(await screen.findByRole('alert')).toHaveTextContent(en['invite.no_token']);
+  expect(screen.queryByLabelText(en['invite.password'])).toBeNull();
+  expect(fetchMock).not.toHaveBeenCalled();
+});
+
+test('a_first_pageshow_keeps_the_invite_token', async () => {
+  window.history.replaceState(null, '', '/invite?token=token-from-link');
+  stubFetch([204]);
+  render(<InviteAccept />);
+  await screen.findByLabelText(en['invite.password']);
+  act(() => {
+    window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: false }));
+  });
+  expect(screen.getByLabelText(en['invite.password'])).toBeVisible();
+  expect(screen.queryByRole('alert')).toBeNull();
+});
+
 test.each(['en', 'th'] as const)(
   'invite_accept_explains_an_invalid_or_used_link (%s)',
   async (locale) => {

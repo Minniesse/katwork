@@ -203,6 +203,23 @@ test('reset_token_is_gone_after_leaving_and_coming_back', async () => {
   ).toBeVisible();
 });
 
+test.each([
+  ['pagehide', false],
+  ['pageshow', true],
+] as const)('reset_token_is_dropped_on_%s', async (type, persisted) => {
+  window.history.replaceState(null, '', '/reset?token=reset-token');
+  stubFetch([401, { code: 'unauthenticated' }]);
+  render(<App />);
+  await screen.findByRole('heading', { level: 1, name: en['reset.confirm.title'] });
+  act(() => {
+    window.dispatchEvent(new PageTransitionEvent(type, { persisted }));
+  });
+  expect(
+    await screen.findByRole('heading', { level: 1, name: en['reset.request.title'] }),
+  ).toBeVisible();
+  expect(screen.queryByLabelText(en['reset.confirm.password'])).toBeNull();
+});
+
 test('reset_without_token_opens_the_request_form', async () => {
   window.history.replaceState(null, '', '/reset');
   stubFetch([401, { code: 'unauthenticated' }]);
