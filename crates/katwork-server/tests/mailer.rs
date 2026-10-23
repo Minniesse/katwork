@@ -54,6 +54,7 @@ impl Logs {
 async fn reset_token_never_appears_in_logs(pool: PgPool) {
     let (user_id, password) = support::user(&pool).await;
     let capture = Arc::new(CapturingMailer::default());
+    let _idle = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let logs = Logs::default();
     let mut core = Core::new(pool.clone(), Arc::new(support::config(None)));
     core.mailer = capture.clone();
@@ -126,6 +127,7 @@ async fn reset_token_never_appears_in_logs(pool: PgPool) {
 #[sqlx::test(migrations = "../katwork/migrations")]
 async fn reset_without_smtp_returns_202_and_sends_nothing(pool: PgPool) {
     support::user(&pool).await;
+    let _idle = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let logs = Logs::default();
     let app = support::app(&pool, None);
     let response = support::request(
@@ -164,6 +166,7 @@ async fn only_demo_console_backend_logs_mail_content() {
     for demo in [false, true] {
         let mut config = support::config(None);
         config.demo = demo;
+        let _idle = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let logs = Logs::default();
         mailer::from_config(&config)
             .send(&mail)
@@ -196,6 +199,7 @@ async fn smtp_errors_never_log_mail_or_credentials_and_override_demo() {
         subject: token.clone(),
         body: format!("https://katwork.example/reset?token={token}"),
     };
+    let _idle = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let logs = Logs::default();
     let error = mailer::from_config(&config)
         .send(&mail)
@@ -221,6 +225,7 @@ async fn demo_console_never_logs_non_demo_reset_links() {
         subject: "Reset password".into(),
         body: "http://localhost:3000/reset?token=private".into(),
     };
+    let _idle = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let logs = Logs::default();
     mailer::from_config(&config)
         .send(&mail)
@@ -298,6 +303,7 @@ async fn smtp_timeout_logs_failed_without_reset_content() {
         subject: "Reset".into(),
         body: "private-reset-token".into(),
     };
+    let _idle = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let logs = Logs::default();
     let send =
         tokio::spawn(async move { mailer.send(&mail).await }.with_subscriber(subscriber(&logs)));

@@ -1,5 +1,55 @@
 use katwork::config::Config;
 
+#[test]
+fn lock_timeout_must_be_a_positive_integer() {
+    for (value, millis) in [(None, 5000), (Some("250"), 250)] {
+        let config = Config::from_lookup(|name| {
+            if name == "KATWORK_LOCK_TIMEOUT_MS" {
+                value.map(str::to_owned)
+            } else {
+                lookup(name)
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            config.lock_timeout,
+            std::time::Duration::from_millis(millis)
+        );
+    }
+    for value in ["0", "x", "-1", "+5", "1.5"] {
+        let error = Config::from_lookup(|name| {
+            if name == "KATWORK_LOCK_TIMEOUT_MS" {
+                Some(value.into())
+            } else {
+                lookup(name)
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), "config_invalid");
+    }
+}
+
+#[test]
+fn lock_timeout_errors_name_the_variable_not_its_value() {
+    for value in ["abc", "0", "-5", "99999999999"] {
+        let error = Config::from_lookup(|name| {
+            if name == "KATWORK_LOCK_TIMEOUT_MS" {
+                Some(value.into())
+            } else {
+                lookup(name)
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            katwork::error::KatError::ConfigInvalid {
+                var: "KATWORK_LOCK_TIMEOUT_MS"
+            }
+        ));
+        assert!(!format!("{error:?}").contains(value));
+    }
+}
+
 fn lookup(name: &str) -> Option<String> {
     match name {
         "DATABASE_URL" => Some("postgres://localhost/katwork".into()),
@@ -1158,4 +1208,14 @@ fn config_invalid_names_variable_without_value() {
         );
         assert_eq!(error.to_string(), format!("config_invalid ({var})"));
     }
+}
+
+#[test]
+fn empty_lock_timeout_uses_default() {
+    let config = Config::from_lookup(|name| match name {
+        "KATWORK_LOCK_TIMEOUT_MS" => Some(String::new()),
+        _ => lookup(name),
+    })
+    .unwrap();
+    assert_eq!(config.lock_timeout, std::time::Duration::from_millis(5000));
 }

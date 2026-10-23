@@ -4,6 +4,19 @@ use sqlx::{Connection, PgConnection, PgPool, migrate::Migrator, postgres::PgPool
 
 use crate::error::KatError;
 
+pub async fn set_lock_timeout(conn: &mut PgConnection, timeout: Duration) -> Result<(), KatError> {
+    sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+        .bind(format!("{}ms", timeout.as_millis().max(1)))
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn set_configured_lock_timeout(conn: &mut PgConnection) -> Result<(), KatError> {
+    let timeout = crate::config::lock_timeout(std::env::var("KATWORK_LOCK_TIMEOUT_MS").ok())?;
+    set_lock_timeout(conn, timeout).await
+}
+
 pub async fn connect(url: &str) -> Result<PgPool, KatError> {
     match PgPoolOptions::new().connect(url).await {
         Ok(pool) => Ok(pool),

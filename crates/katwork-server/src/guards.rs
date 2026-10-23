@@ -44,6 +44,26 @@ const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "[::1]"];
 const LOGGED_VALUE_BYTES: usize = 256;
 
 pub fn apply(router: Router, config: &Config) -> Router {
+    secure(bounded(router), config)
+}
+
+pub(crate) fn bounded(router: Router) -> Router {
+    router.layer(middleware::from_fn(read_body)).layer(
+        tower::ServiceBuilder::new()
+            .layer(HandleErrorLayer::new(|error: axum::BoxError| async move {
+                if error.is::<tower::timeout::error::Elapsed>() {
+                    StatusCode::REQUEST_TIMEOUT
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }))
+            .timeout(Duration::from_secs(30))
+            .load_shed()
+            .layer(tower::limit::GlobalConcurrencyLimitLayer::new(256)),
+    )
+}
+
+pub(crate) fn secure(router: Router, config: &Config) -> Router {
     let url = Url::parse(config.public_url_or_default()).ok();
     let config = GuardConfig {
         host: url
@@ -54,21 +74,6 @@ pub fn apply(router: Router, config: &Config) -> Router {
         rejections: Arc::default(),
     };
     router
-        .layer(middleware::from_fn(read_body))
-        // Task 9: SSE must bypass these timeout/concurrency layers, keeping the security guards.
-        .layer(
-            tower::ServiceBuilder::new()
-                .layer(HandleErrorLayer::new(|error: axum::BoxError| async move {
-                    if error.is::<tower::timeout::error::Elapsed>() {
-                        StatusCode::REQUEST_TIMEOUT
-                    } else {
-                        StatusCode::SERVICE_UNAVAILABLE
-                    }
-                }))
-                .timeout(Duration::from_secs(30))
-                .load_shed()
-                .layer(tower::limit::GlobalConcurrencyLimitLayer::new(256)),
-        )
         .layer(DefaultBodyLimit::max(1_048_576))
         .layer(middleware::from_fn_with_state(config, guard))
 }
@@ -215,7 +220,7 @@ async fn guard(State(config): State<GuardConfig>, request: Request, next: Next) 
     response
 }
 
-async fn read_body(request: Request, next: Next) -> Response {
+pub(crate) async fn read_body(request: Request, next: Next) -> Response {
     let (parts, body) = request.into_parts();
     let bytes = tokio::time::timeout(
         Duration::from_secs(10),

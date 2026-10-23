@@ -3,6 +3,20 @@ use katwork::error::KatError;
 use katwork_server::error::ApiError;
 
 #[tokio::test]
+async fn lock_timeout_returns_busy_with_retry_after() {
+    let response = ApiError(KatError::Busy).into_response();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["retry-after"], "1");
+    let bytes = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        serde_json::json!({"code":"busy"})
+    );
+}
+
+#[tokio::test]
 async fn pool_and_connection_errors_during_request_return_503() {
     for error in [
         sqlx::Error::PoolTimedOut,
@@ -83,6 +97,16 @@ async fn api_errors_return_only_stable_codes() {
             "io_error",
         ),
         (KatError::LeaseLost, StatusCode::CONFLICT, "lease_lost"),
+        (
+            KatError::JobAlreadyFinished,
+            StatusCode::CONFLICT,
+            "job_already_finished",
+        ),
+        (
+            KatError::JobNotAwaitingInput,
+            StatusCode::CONFLICT,
+            "job_not_awaiting_input",
+        ),
         (
             KatError::AuthBusy,
             StatusCode::SERVICE_UNAVAILABLE,

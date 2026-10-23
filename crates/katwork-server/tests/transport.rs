@@ -187,6 +187,8 @@ async fn graceful_shutdown_drains_in_flight_response_and_closes_idle_connections
         .unwrap();
     assert!(TcpStream::connect(addr).await.is_err());
 }
+#[path = "transport/events.rs"]
+mod events;
 
 async fn served(stream: &mut TcpStream) {
     stream

@@ -232,9 +232,12 @@ async fn run() -> Result<(), KatError> {
             let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
             katwork_server::transport::serve_with_shutdown(
                 listener,
-                build_router(AppState { core }),
+                build_router(AppState { core: core.clone() }),
                 transport,
-                shutdown_signal(),
+                async move {
+                    shutdown_signal().await;
+                    core.shutdown.cancel();
+                },
             )
             .await?;
             Ok(())
@@ -398,6 +401,7 @@ mod tests {
                         move || Capture(output.clone())
                     }),
             );
+            let _idle = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
             let _guard = subscriber.set_default();
             let registry = Registry::from_config(&cfg);
             for tier in [ModelTier::Fast, ModelTier::Standard, ModelTier::Strong] {
@@ -483,6 +487,7 @@ mod tests {
                         move || Capture(output.clone())
                     }),
             );
+        let _idle = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let _guard = subscriber.set_default();
         tracing::trace!(target: "rig::completions", "private prompt");
         tracing::debug!(target: "rig_core::completions", "private response");
@@ -555,6 +560,7 @@ mod tests {
                                 move || Capture(output.clone())
                             }),
                     );
+                let _idle = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
                 let _guard = subscriber.set_default();
                 let provider = RigProvider::openai(
                     &ProviderEnv {

@@ -3,3 +3,7 @@ Copyright 2026 The KatWork authors
 
 This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 Third-party notices for bundled dependencies, fonts and assets will be listed here as they are added.
+
+AG-UI Protocol 1.0 JSON Schema and valid event fixtures (test data only)
+https://github.com/ag-ui-protocol/ag-ui, commit 8aa86867fb2918001dca1c64db3976cd37f50703
+MIT License; copyright and full licence text: crates/katwork/tests/fixtures/agui/LICENSE.

@@ -6,6 +6,7 @@ use url::Url;
 use crate::error::KatError;
 
 pub struct Config {
+    pub lock_timeout: Duration,
     pub database_url: String,
     pub secret: String,
     pub demo: bool,
@@ -403,6 +404,7 @@ impl Config {
             max_connections_per_ip: positive("KATWORK_MAX_CONNECTIONS_PER_IP", 32)? as usize,
             trusted_proxies,
         };
+        let lock_timeout = lock_timeout(optional("KATWORK_LOCK_TIMEOUT_MS"))?;
         let smtp = if let Some(host) = optional("SMTP_HOST") {
             if host.contains('@') {
                 return Err(invalid("SMTP_HOST"));
@@ -441,6 +443,7 @@ impl Config {
             }),
         };
         Ok(Self {
+            lock_timeout,
             local,
             database_url,
             secret,
@@ -512,5 +515,27 @@ impl fmt::Debug for LocalEnv {
             .field("model", &self.model)
             .field("api_key", &"[redacted]")
             .finish()
+    }
+}
+
+pub(crate) fn lock_timeout(value: Option<String>) -> Result<Duration, KatError> {
+    match value.filter(|value| !value.is_empty()) {
+        None => Ok(Duration::from_millis(5000)),
+        Some(value) => {
+            if !value.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(KatError::ConfigInvalid {
+                    var: "KATWORK_LOCK_TIMEOUT_MS",
+                });
+            }
+            let millis: u32 = value.parse().map_err(|_| KatError::ConfigInvalid {
+                var: "KATWORK_LOCK_TIMEOUT_MS",
+            })?;
+            if millis == 0 || millis > i32::MAX as u32 {
+                return Err(KatError::ConfigInvalid {
+                    var: "KATWORK_LOCK_TIMEOUT_MS",
+                });
+            }
+            Ok(Duration::from_millis(millis.into()))
+        }
     }
 }

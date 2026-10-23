@@ -22,6 +22,42 @@ fn app() -> Router {
     })
 }
 
+#[tokio::test]
+async fn pending_request_bodies_count_against_the_concurrency_limit() {
+    let app = app();
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..256 {
+        let signal = started.clone();
+        let body = Body::from_stream(async_stream::stream! {
+            signal.add_permits(1);
+            std::future::pending::<()>().await;
+            yield Ok::<_, std::io::Error>("{}");
+        });
+        tasks.spawn(
+            app.clone().oneshot(
+                Request::post("/api/auth/login")
+                    .header("host", "localhost")
+                    .header("origin", "https://katwork.example:8443")
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .unwrap(),
+            ),
+        );
+    }
+    let _entered = started.acquire_many(256).await.unwrap();
+    let response = app
+        .oneshot(
+            Request::get("/healthz")
+                .header("host", "localhost")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+}
+
 async fn code(response: Response, status: u16, code: &str) {
     assert_eq!(response.status(), status);
     let body = axum::body::to_bytes(response.into_body(), 1024)

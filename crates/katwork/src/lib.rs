@@ -1,11 +1,15 @@
+pub mod agent;
 pub mod auth;
 pub mod chat;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod events;
 pub mod fence;
 pub mod ids;
+pub mod jobs;
 pub mod models;
+pub mod policy;
 pub mod runtime;
 pub mod team;
 pub mod tenancy;
