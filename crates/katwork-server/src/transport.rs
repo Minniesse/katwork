@@ -42,6 +42,7 @@ pub async fn serve_with_shutdown(
 ) -> io::Result<()> {
     let mut connections = JoinSet::new();
     let mut peers: HashMap<IpAddr, Weak<Semaphore>> = HashMap::new();
+    let mut drops = DropLog::default();
     let (stop, _) = watch::channel(());
     tokio::pin!(shutdown);
     let result = loop {
@@ -55,15 +56,26 @@ pub async fn serve_with_shutdown(
                     Err(error) if matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted) => continue,
                     Err(error) => break Err(error),
                 };
-                // Headers do not exist at accept time; proxies share this socket-peer budget.
-                let ip = crate::peer::ip_bucket(addr.ip());
-                peers.retain(|_, slots| slots.strong_count() > 0);
-                let slots = peers.get(&ip).and_then(Weak::upgrade).unwrap_or_else(|| {
-                    let slots = Arc::new(Semaphore::new(config.max_connections_per_ip));
-                    peers.insert(ip, Arc::downgrade(&slots));
-                    slots
-                });
-                let Ok(permit) = slots.try_acquire_owned() else { continue; };
+                // Headers do not exist at accept time. A trusted proxy carries every client behind
+                // it, so it skips the per-peer cap; it still counts toward the global one.
+                let permit = if config.trusts_proxy(addr.ip()) {
+                    None
+                } else {
+                    let ip = crate::peer::ip_bucket(addr.ip());
+                    peers.retain(|_, slots| slots.strong_count() > 0);
+                    let slots = peers.get(&ip).and_then(Weak::upgrade).unwrap_or_else(|| {
+                        let slots = Arc::new(Semaphore::new(config.max_connections_per_ip));
+                        peers.insert(ip, Arc::downgrade(&slots));
+                        slots
+                    });
+                    let Ok(permit) = slots.try_acquire_owned() else {
+                        if drops.should_log(ip, Instant::now()) {
+                            tracing::warn!(reason = "per_peer_cap", peer = %ip, "connection_dropped");
+                        }
+                        continue;
+                    };
+                    Some(permit)
+                };
                 let app = router.clone().layer(Extension(ConnectInfo(addr)));
                 let config = config.clone();
                 let mut stopping = stop.subscribe();
@@ -94,6 +106,26 @@ pub async fn serve_with_shutdown(
     drop(stop);
     while connections.join_next().await.is_some() {}
     result
+}
+
+/// Logs at most one dropped connection per peer bucket per window, so a flood cannot flood the log.
+#[derive(Default)]
+struct DropLog {
+    logged: HashMap<IpAddr, Instant>,
+}
+
+impl DropLog {
+    const WINDOW: Duration = Duration::from_secs(60);
+
+    fn should_log(&mut self, bucket: IpAddr, now: Instant) -> bool {
+        self.logged
+            .retain(|_, at| now.duration_since(*at) < Self::WINDOW);
+        if self.logged.contains_key(&bucket) {
+            return false;
+        }
+        self.logged.insert(bucket, now);
+        true
+    }
 }
 
 struct IdleConnection {
@@ -155,5 +187,28 @@ impl AsyncWrite for IdleConnection {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drops_are_logged_once_per_bucket_per_minute() {
+        let mut drops = DropLog::default();
+        let start = Instant::now();
+        let first: IpAddr = "192.0.2.1".parse().unwrap();
+        let second: IpAddr = "192.0.2.2".parse().unwrap();
+        assert!(drops.should_log(first, start));
+        assert!(!drops.should_log(first, start + Duration::from_secs(1)));
+        assert!(drops.should_log(second, start + Duration::from_secs(1)));
+        assert!(!drops.should_log(first, start + Duration::from_millis(59_999)));
+        assert!(drops.should_log(first, start + Duration::from_secs(60)));
+        assert!(!drops.should_log(second, start + Duration::from_secs(60)));
+        assert!(drops.should_log(second, start + Duration::from_secs(61)));
+        // Entries older than the window are forgotten, so the map stays bounded by recent drops.
+        assert!(drops.should_log(first, start + Duration::from_secs(600)));
+        assert_eq!(drops.logged.len(), 1);
     }
 }

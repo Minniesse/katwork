@@ -129,6 +129,29 @@ test('reset_while_signed_in_rechecks_the_session_before_sign_in', async () => {
   ]);
 });
 
+test('invite_link_opens_accept_page_and_hides_token_from_address_bar', async () => {
+  window.history.replaceState(null, '', '/invite?token=invite-token');
+  const fetchMock = stubFetch([401, { code: 'unauthenticated' }], [204], [401, { code: 'unauthenticated' }]);
+  const user = userEvent.setup({ delay: null });
+  render(<App />);
+  expect(
+    await screen.findByRole('heading', { level: 1, name: en['invite.title'] }),
+  ).toBeVisible();
+  // Signed out, the invite page stays: it is not sent to sign in.
+  expect(window.location.pathname).toBe('/invite');
+  expect(window.location.search).toBe('');
+  await user.type(screen.getByLabelText(en['invite.password']), 'a new long password');
+  await user.type(screen.getByLabelText(en['invite.again']), 'a new long password');
+  await user.click(screen.getByRole('button', { name: en['invite.submit'] }));
+  await user.click(await screen.findByRole('link', { name: en['reset.back_to_login'] }));
+  expect(await screen.findByRole('heading', { level: 1, name: en['login.title'] })).toBeVisible();
+  expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+    '/api/auth/me',
+    '/api/auth/invite/accept',
+    '/api/auth/me',
+  ]);
+});
+
 test('reset_without_token_opens_the_request_form', async () => {
   window.history.replaceState(null, '', '/reset');
   stubFetch([401, { code: 'unauthenticated' }]);

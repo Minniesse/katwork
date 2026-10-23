@@ -13,6 +13,7 @@ use lettre::{
 use crate::{
     config::{Config, SmtpConfig},
     error::KatError,
+    types::Locale,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -33,6 +34,31 @@ impl fmt::Debug for Mail {
         f.debug_struct("Mail")
             .field("kind", &self.kind)
             .finish_non_exhaustive()
+    }
+}
+
+const RESET_SUBJECT_TH: &str = "ตั้งรหัสผ่าน KatWork ใหม่";
+const RESET_SUBJECT_EN: &str = "Reset your KatWork password";
+const RESET_BODY_TH: &str = "ใช้ลิงก์นี้ภายใน 30 นาทีเพื่อตั้งรหัสผ่านใหม่ หากคุณไม่ได้ขอเปลี่ยนรหัสผ่าน ให้ละเว้นอีเมลนี้";
+const RESET_BODY_EN: &str = "Use this link within 30 minutes to set a new password. If you did not ask for this, ignore this email.";
+
+/// A reset mail in both languages, the user's own first, with the link alone on the last line.
+pub fn reset_mail(to: String, locale: Locale, link: &str) -> Mail {
+    let (subjects, bodies) = match locale {
+        Locale::Th => (
+            [RESET_SUBJECT_TH, RESET_SUBJECT_EN],
+            [RESET_BODY_TH, RESET_BODY_EN],
+        ),
+        Locale::En => (
+            [RESET_SUBJECT_EN, RESET_SUBJECT_TH],
+            [RESET_BODY_EN, RESET_BODY_TH],
+        ),
+    };
+    Mail {
+        kind: MailKind::PasswordReset,
+        to,
+        subject: subjects.join(" / "),
+        body: format!("{}\n\n{}\n\n{link}", bodies[0], bodies[1]),
     }
 }
 

@@ -77,7 +77,12 @@ fn config_from_lookup_validates_required_values() {
             }
             Err(error) => {
                 assert_eq!(error.code(), expected);
-                assert_eq!(error.to_string(), expected);
+                let variable = if database.is_none_or(|url| url.trim().is_empty()) {
+                    "DATABASE_URL"
+                } else {
+                    "KATWORK_SECRET"
+                };
+                assert_eq!(error.to_string(), format!("{expected} ({variable})"));
             }
         }
     }
@@ -158,6 +163,7 @@ fn smtp_port_is_optional_and_must_be_a_valid_port_when_set() {
         Some("0"),
     ] {
         let result = Config::from_lookup(|name| match name {
+            "KATWORK_PUBLIC_URL" => Some("https://katwork.example.test".into()),
             "SMTP_HOST" => Some("smtp.example.test".into()),
             "SMTP_PORT" => port.map(str::to_owned),
             _ => lookup(name),
@@ -185,6 +191,7 @@ fn config_debug_redacts_secrets() {
     let config = Config::from_lookup(|name| match name {
         "DATABASE_URL" => Some("postgres://katwork:db-test-password@localhost/katwork".into()),
         "KATWORK_DEMO_PASSWORD" => Some("demo-test-password".into()),
+        "KATWORK_PUBLIC_URL" => Some("https://katwork.example.test".into()),
         "SMTP_HOST" => Some("smtp.example.test".into()),
         "SMTP_PASSWORD" => Some("smtp-test-password".into()),
         "OPENAI_API_KEY" => Some("openai-test-key".into()),
@@ -336,6 +343,7 @@ fn smtp_debug_redacts_url_credentials() {
         ("smtp.test", "smtp.test"),
     ] {
         let mut config = Config::from_lookup(|name| match name {
+            "KATWORK_PUBLIC_URL" => Some("https://katwork.example.test".into()),
             "SMTP_HOST" => Some("smtp.test".into()),
             _ => lookup(name),
         })
@@ -629,6 +637,7 @@ fn rejects_smtp_host_with_embedded_credentials() {
         format!("smtps://mailer:{password}@smtp.test:465"),
     ] {
         let result = Config::from_lookup(|name| match name {
+            "KATWORK_PUBLIC_URL" => Some("https://katwork.example.test".into()),
             "SMTP_HOST" => Some(host.clone()),
             _ => lookup(name),
         });
@@ -721,13 +730,7 @@ fn demo_on_https_requires_explicit_override() {
 
 #[test]
 fn trusted_proxy_config_rejects_invalid_cidrs() {
-    for value in [
-        "127.0.0.1",
-        "127.0.0.1/33",
-        "::1/129",
-        "evil/8",
-        "10.0.0.0/8,,::1/128",
-    ] {
+    for value in ["127.0.0.1/33", "::1/129", "evil/8", "10.0.0.0/8,,::1/128"] {
         let result = Config::from_lookup(|name| match name {
             "KATWORK_TRUSTED_PROXIES" => Some(value.into()),
             _ => lookup(name),
@@ -818,6 +821,7 @@ fn transport_defaults_and_overrides() {
 fn smtp_and_enclosing_config_debug_redact_username_tokens() {
     let token = uuid::Uuid::now_v7().to_string();
     let config = Config::from_lookup(|name| match name {
+        "KATWORK_PUBLIC_URL" => Some("https://katwork.example.test".into()),
         "SMTP_HOST" => Some("smtp.example.test".into()),
         "SMTP_USERNAME" | "SMTP_PASSWORD" => Some(token.clone()),
         _ => lookup(name),
@@ -855,6 +859,7 @@ fn error_redaction_scrubs_all_configured_credentials() {
             .position(|key| *key == name)
             .map(|i| secrets[i].clone())
             .or_else(|| match name {
+                "KATWORK_PUBLIC_URL" => Some("https://katwork.example.test".into()),
                 "SMTP_HOST" => Some("smtp.example.invalid".into()),
                 _ => lookup(name),
             })
@@ -868,4 +873,144 @@ fn error_redaction_scrubs_all_configured_credentials() {
         assert!(!redacted.contains(&secret));
     }
     assert_eq!(redacted.matches("[redacted]").count(), names.len());
+}
+
+fn invalid_variable(result: Result<Config, katwork::error::KatError>) -> &'static str {
+    match result {
+        Err(katwork::error::KatError::ConfigInvalid { var }) => var,
+        Err(other) => panic!("expected config_invalid, got {}", other.code()),
+        Ok(_) => panic!("expected config_invalid, got a config"),
+    }
+}
+
+#[test]
+fn trusted_proxies_accept_bare_ips_and_cidrs() {
+    let config = Config::from_lookup(|name| match name {
+        "KATWORK_TRUSTED_PROXIES" => Some("10.0.0.2, fd00::2 ,192.168.0.0/16".into()),
+        _ => lookup(name),
+    })
+    .unwrap();
+    assert_eq!(
+        config.transport.trusted_proxies,
+        vec![
+            ("10.0.0.2".parse().unwrap(), 32),
+            ("fd00::2".parse().unwrap(), 128),
+            ("192.168.0.0".parse().unwrap(), 16),
+        ]
+    );
+    for (ip, trusted) in [
+        ("10.0.0.2", true),
+        ("10.0.0.3", false),
+        ("fd00::2", true),
+        ("fd00::3", false),
+        ("192.168.255.1", true),
+        ("10.0.0.1", false),
+    ] {
+        assert_eq!(config.trusts_proxy(ip.parse().unwrap()), trusted, "{ip}");
+    }
+    let config = Config::from_lookup(|name| match name {
+        "KATWORK_TRUSTED_PROXIES" => Some("10.0.0.0/8".into()),
+        _ => lookup(name),
+    })
+    .unwrap();
+    assert!(config.trusts_proxy("10.255.0.1".parse().unwrap()));
+    for value in [
+        "10.0.0.2/33",
+        "fd00::2/129",
+        "10.0.0.2/",
+        "10.0.0.2/x",
+        "/8",
+        "host",
+    ] {
+        let result = Config::from_lookup(|name| match name {
+            "KATWORK_TRUSTED_PROXIES" => Some(value.into()),
+            _ => lookup(name),
+        });
+        assert_eq!(
+            invalid_variable(result),
+            "KATWORK_TRUSTED_PROXIES",
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn smtp_without_public_url_is_config_invalid() {
+    let result = Config::from_lookup(|name| match name {
+        "SMTP_HOST" => Some("smtp.example.test".into()),
+        _ => lookup(name),
+    });
+    assert_eq!(invalid_variable(result), "KATWORK_PUBLIC_URL");
+    let config = Config::from_lookup(|name| match name {
+        "SMTP_HOST" => Some("smtp.example.test".into()),
+        "KATWORK_PUBLIC_URL" => Some("https://katwork.example.test".into()),
+        _ => lookup(name),
+    })
+    .unwrap();
+    assert_eq!(
+        config.public_url_or_default(),
+        "https://katwork.example.test"
+    );
+    assert!(config.smtp.is_some());
+}
+
+#[test]
+fn config_errors_name_the_variable_not_its_value() {
+    let marker = uuid::Uuid::now_v7().to_string();
+    for (variable, value) in [
+        ("DATABASE_URL", None),
+        ("DATABASE_URL", Some(" ".to_owned())),
+        ("KATWORK_SECRET", None),
+        ("KATWORK_SECRET", Some("short".to_owned())),
+        ("OPENAI_BASE_URL", Some(format!("ftp://{marker}.example"))),
+        ("ANTHROPIC_BASE_URL", Some(format!("not a url {marker}"))),
+        ("SMTP_PASSWORD", Some("short".to_owned())),
+        ("KATWORK_DEMO_PASSWORD", Some("short".to_owned())),
+        (
+            "KATWORK_PUBLIC_URL",
+            Some(format!("ftp://{marker}.example")),
+        ),
+        (
+            "KATWORK_PUBLIC_URL",
+            Some(format!("https://{marker}.example/path")),
+        ),
+        ("KATWORK_TRUSTED_PROXIES", Some(format!("{marker}/8"))),
+        ("KATWORK_HEADER_TIMEOUT_SECONDS", Some("0".to_owned())),
+        ("KATWORK_IDLE_TIMEOUT_SECONDS", Some("x".to_owned())),
+        ("KATWORK_MAX_CONNECTIONS", Some("-1".to_owned())),
+        ("KATWORK_MAX_CONNECTIONS_PER_IP", Some("0".to_owned())),
+        ("SMTP_HOST", Some(format!("mailer:{marker}@smtp.test"))),
+        ("SMTP_PORT", Some("0".to_owned())),
+    ] {
+        let error = Config::from_lookup(|name| match name {
+            "SMTP_HOST" if variable == "SMTP_PORT" => Some("smtp.example.test".into()),
+            "KATWORK_PUBLIC_URL" if variable.starts_with("SMTP_") => {
+                Some("https://katwork.example.test".into())
+            }
+            name if name == variable => value.clone(),
+            _ => lookup(name),
+        });
+        let Err(error) = error else {
+            panic!("{variable} accepted {value:?}")
+        };
+        assert_eq!(error.code(), "config_invalid");
+        assert_eq!(error.to_string(), format!("config_invalid ({variable})"));
+        assert!(
+            matches!(error, katwork::error::KatError::ConfigInvalid { var } if var == variable),
+            "{variable}"
+        );
+        let mut chain = format!("{error:?}");
+        let mut source = std::error::Error::source(&error);
+        while let Some(cause) = source {
+            chain.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        assert!(!chain.contains(&marker), "{chain}");
+    }
+    let result = Config::from_lookup(|name| match name {
+        "KATWORK_DEMO" => Some("1".into()),
+        "KATWORK_PUBLIC_URL" => Some("https://katwork.example".into()),
+        _ => lookup(name),
+    });
+    assert_eq!(invalid_variable(result), "KATWORK_ALLOW_DEMO_ON_HTTPS");
 }

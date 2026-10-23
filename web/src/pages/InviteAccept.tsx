@@ -1,0 +1,156 @@
+import { useEffect, useId, useState, type FormEvent } from 'react';
+import { ApiError, api, errorMessage } from '../api';
+import { Announce } from '../components/Announce';
+import { AuthLayout, PageTitle } from '../components/Layout';
+import { t, useLocale } from '../i18n';
+import { Link, navigate, useLocation } from '../router';
+
+// Matches katwork::auth::password: at least 8 characters, at most 1024 bytes.
+const MIN_CHARS = 8;
+const MAX_BYTES = 1024;
+
+type Problem = { kind: 'api'; error: unknown } | { kind: 'mismatch' };
+
+/**
+ * The token from a `/invite?token=…` link. Once read it moves from the URL into the history
+ * entry's state, as a reset token does, so it stays out of the address bar and any later
+ * Referer, survives a reload, and is gone as soon as the person navigates anywhere else.
+ */
+function inviteToken(location: URL): string | null {
+  const fromLink = location.searchParams.get('token');
+  if (fromLink) return fromLink;
+  const state: unknown = window.history.state;
+  const saved = (state as { inviteToken?: unknown } | null)?.inviteToken;
+  return typeof saved === 'string' && saved ? saved : null;
+}
+
+/** Where an invite link lands: the invited person chooses their first password. */
+export function InviteAccept({ onAccepted }: { onAccepted?: () => void }) {
+  useLocale();
+  const location = useLocation();
+  const token = inviteToken(location);
+  const id = useId();
+  const [password, setPassword] = useState('');
+  const [again, setAgain] = useState('');
+  const [problem, setProblem] = useState<Problem | null>(null);
+  const [done, setDone] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const tokenInUrl = location.searchParams.has('token');
+  useEffect(() => {
+    if (tokenInUrl) navigate('/invite', { replace: true, state: { inviteToken: token } });
+  }, [tokenInUrl, token]);
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (busy || !token) return;
+    if ([...password].length < MIN_CHARS || new TextEncoder().encode(password).length > MAX_BYTES) {
+      setProblem({ kind: 'api', error: new ApiError(0, 'password_invalid') });
+      return;
+    }
+    if (password !== again) {
+      setProblem({ kind: 'mismatch' });
+      return;
+    }
+    setBusy(true);
+    setProblem(null);
+    try {
+      await api.acceptInvite(token, password);
+      setDone(true);
+      onAccepted?.();
+    } catch (failure) {
+      setProblem({ kind: 'api', error: failure });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (done) {
+    return (
+      <AuthLayout>
+        <PageTitle>{t('invite.title')}</PageTitle>
+        <Announce>
+          <p>{t('invite.done')}</p>
+          <p>
+            <Link to="/login" className="link">
+              {t('reset.back_to_login')}
+            </Link>
+          </p>
+        </Announce>
+      </AuthLayout>
+    );
+  }
+
+  // A link without a token can never work: say so instead of showing a form.
+  const tokenRejected =
+    !token ||
+    (problem?.kind === 'api' &&
+      problem.error instanceof ApiError &&
+      problem.error.code === 'invite_token_invalid');
+  const errorId = `${id}-error`;
+  const alert = (problem || !token) && (
+    <div id={errorId} className="alert" role="alert">
+      <p>
+        {!token
+          ? t('reason.invite_token_invalid')
+          : problem?.kind === 'mismatch'
+            ? t('invite.mismatch')
+            : errorMessage(problem?.error)}
+      </p>
+      {tokenRejected && (
+        <p>
+          <Link to="/reset" className="link">
+            {t('invite.use_reset')}
+          </Link>
+        </p>
+      )}
+    </div>
+  );
+  return (
+    <AuthLayout>
+      <PageTitle>{t('invite.title')}</PageTitle>
+      <p className="lede">{t('invite.lede')}</p>
+      {!token ? (
+        alert
+      ) : (
+        <form className="form" onSubmit={submit} noValidate>
+          {alert}
+          <div className="field">
+            <label htmlFor={`${id}-password`}>{t('invite.password')}</label>
+            <input
+              id={`${id}-password`}
+              type="password"
+              autoComplete="new-password"
+              required
+              minLength={MIN_CHARS}
+              value={password}
+              aria-invalid={problem !== null || undefined}
+              aria-describedby={[`${id}-hint`, problem ? errorId : ''].join(' ').trim()}
+              onChange={(event) => setPassword(event.target.value)}
+            />
+            <p id={`${id}-hint`} className="hint">
+              {t('invite.hint')}
+            </p>
+          </div>
+          <div className="field">
+            <label htmlFor={`${id}-again`}>{t('invite.again')}</label>
+            <input
+              id={`${id}-again`}
+              type="password"
+              autoComplete="new-password"
+              required
+              value={again}
+              aria-invalid={problem?.kind === 'mismatch' || undefined}
+              onChange={(event) => setAgain(event.target.value)}
+            />
+          </div>
+          <div className="form-actions">
+            <button type="submit" className="button button-primary" aria-disabled={busy}>
+              {busy ? t('invite.saving') : t('invite.submit')}
+            </button>
+          </div>
+        </form>
+      )}
+    </AuthLayout>
+  );
+}

@@ -23,10 +23,16 @@ pub enum KatError {
     Unauthenticated,
     #[error("reset_token_invalid")]
     ResetTokenInvalid,
+    #[error("invite_token_invalid")]
+    InviteTokenInvalid,
+    #[error("user_exists")]
+    UserExists,
+    #[error("workspace_ambiguous")]
+    WorkspaceAmbiguous,
     #[error("password_invalid")]
     PasswordInvalid,
     #[error("rate_limited")]
-    RateLimited,
+    RateLimited { retry_after_secs: u64 },
     #[error("request_invalid")]
     RequestInvalid,
     #[error("body_too_large")]
@@ -44,8 +50,9 @@ pub enum KatError {
     CrossSiteRequest,
     #[error("json_required")]
     JsonRequired,
-    #[error("config_invalid")]
-    ConfigInvalid,
+    /// Names the variable (or flag) that failed, never its value.
+    #[error("config_invalid ({var})")]
+    ConfigInvalid { var: &'static str },
     #[error("command_invalid")]
     CommandInvalid,
     #[error("database_unavailable")]
@@ -87,8 +94,11 @@ impl KatError {
             Self::SpacePolicyRequired => "space_policy_required",
             Self::Unauthenticated => "unauthenticated",
             Self::ResetTokenInvalid => "reset_token_invalid",
+            Self::InviteTokenInvalid => "invite_token_invalid",
+            Self::UserExists => "user_exists",
+            Self::WorkspaceAmbiguous => "workspace_ambiguous",
             Self::PasswordInvalid => "password_invalid",
-            Self::RateLimited => "rate_limited",
+            Self::RateLimited { .. } => "rate_limited",
             Self::RequestInvalid => "request_invalid",
             Self::BodyTooLarge => "body_too_large",
             Self::AuthBusy => "auth_busy",
@@ -98,7 +108,7 @@ impl KatError {
             Self::HostNotAllowed => "host_not_allowed",
             Self::CrossSiteRequest => "cross_site_request",
             Self::JsonRequired => "json_required",
-            Self::ConfigInvalid => "config_invalid",
+            Self::ConfigInvalid { .. } => "config_invalid",
             Self::CommandInvalid => "command_invalid",
             Self::DatabaseUnavailable(_) => "database_unavailable",
             Self::Database(_) => "database_error",

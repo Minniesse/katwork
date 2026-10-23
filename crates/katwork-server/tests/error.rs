@@ -28,9 +28,22 @@ async fn pool_and_connection_errors_during_request_return_503() {
 async fn api_errors_return_only_stable_codes() {
     for (error, status, code) in [
         (
-            KatError::ConfigInvalid,
+            KatError::ConfigInvalid {
+                var: "KATWORK_PUBLIC_URL",
+            },
             StatusCode::INTERNAL_SERVER_ERROR,
             "config_invalid",
+        ),
+        (KatError::UserExists, StatusCode::CONFLICT, "user_exists"),
+        (
+            KatError::WorkspaceAmbiguous,
+            StatusCode::CONFLICT,
+            "workspace_ambiguous",
+        ),
+        (
+            KatError::InviteTokenInvalid,
+            StatusCode::BAD_REQUEST,
+            "invite_token_invalid",
         ),
         (
             KatError::CommandInvalid,
@@ -74,6 +87,25 @@ async fn api_errors_return_only_stable_codes() {
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
             serde_json::json!({"code": code})
+        );
+    }
+}
+
+#[tokio::test]
+async fn rate_limited_sends_retry_after() {
+    for seconds in [1, 900, 3600] {
+        let response = ApiError::from(KatError::RateLimited {
+            retry_after_secs: seconds,
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["retry-after"], seconds.to_string());
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"code": "rate_limited"})
         );
     }
 }

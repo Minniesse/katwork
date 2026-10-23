@@ -10,7 +10,6 @@ pub struct Config {
     pub secret: String,
     pub demo: bool,
     pub transport: TransportConfig,
-    pub trusted_proxies: Vec<(IpAddr, u8)>,
     pub public_url: Option<String>,
     pub demo_password: Option<String>,
     pub smtp: Option<SmtpConfig>,
@@ -24,6 +23,9 @@ pub struct TransportConfig {
     pub idle_timeout: Duration,
     pub max_connections: usize,
     pub max_connections_per_ip: usize,
+    /// `KATWORK_TRUSTED_PROXIES` as (network, prefix) pairs. A trusted proxy may supply
+    /// `X-Forwarded-For` and is exempt from the per-peer connection cap.
+    pub trusted_proxies: Vec<(IpAddr, u8)>,
 }
 
 impl Default for TransportConfig {
@@ -33,7 +35,26 @@ impl Default for TransportConfig {
             idle_timeout: Duration::from_secs(60),
             max_connections: 256,
             max_connections_per_ip: 32,
+            trusted_proxies: Vec::new(),
         }
+    }
+}
+
+impl TransportConfig {
+    pub fn trusts_proxy(&self, ip: IpAddr) -> bool {
+        self.trusted_proxies
+            .iter()
+            .any(|(network, prefix)| match (network, ip) {
+                (IpAddr::V4(network), IpAddr::V4(ip)) => {
+                    let shift = 32 - u32::from(*prefix);
+                    u32::from(*network).checked_shr(shift) == u32::from(ip).checked_shr(shift)
+                }
+                (IpAddr::V6(network), IpAddr::V6(ip)) => {
+                    let shift = 128 - u32::from(*prefix);
+                    u128::from(*network).checked_shr(shift) == u128::from(ip).checked_shr(shift)
+                }
+                _ => false,
+            })
     }
 }
 
@@ -232,19 +253,7 @@ impl Config {
     }
 
     pub fn trusts_proxy(&self, ip: IpAddr) -> bool {
-        self.trusted_proxies
-            .iter()
-            .any(|(network, prefix)| match (network, ip) {
-                (IpAddr::V4(network), IpAddr::V4(ip)) => {
-                    let shift = 32 - u32::from(*prefix);
-                    u32::from(*network).checked_shr(shift) == u32::from(ip).checked_shr(shift)
-                }
-                (IpAddr::V6(network), IpAddr::V6(ip)) => {
-                    let shift = 128 - u32::from(*prefix);
-                    u128::from(*network).checked_shr(shift) == u128::from(ip).checked_shr(shift)
-                }
-                _ => false,
-            })
+        self.transport.trusts_proxy(ip)
     }
 
     pub fn cookie_secure(&self) -> bool {
@@ -279,28 +288,31 @@ impl Config {
     }
 
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, KatError> {
-        let database_url = lookup("DATABASE_URL").ok_or(KatError::ConfigInvalid)?;
-        let secret = lookup("KATWORK_SECRET").ok_or(KatError::ConfigInvalid)?;
-        if database_url.trim().is_empty() || secret.len() < 32 {
-            return Err(KatError::ConfigInvalid);
-        }
+        // Every failure names its variable and drops the parse error, which may quote the value.
+        let invalid = |var: &'static str| KatError::ConfigInvalid { var };
+        let database_url = lookup("DATABASE_URL")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(invalid("DATABASE_URL"))?;
+        let secret = lookup("KATWORK_SECRET")
+            .filter(|value| value.len() >= 32)
+            .ok_or(invalid("KATWORK_SECRET"))?;
         let optional = |name: &str| lookup(name).filter(|value| !value.is_empty());
         for key in ["OPENAI_BASE_URL", "ANTHROPIC_BASE_URL"] {
             if let Some(value) = optional(key) {
-                let url = Url::parse(&value).map_err(|_| KatError::ConfigInvalid)?;
+                let url = Url::parse(&value).map_err(|_| invalid(key))?;
                 if !matches!(url.scheme(), "http" | "https") || !url.has_host() {
-                    return Err(KatError::ConfigInvalid);
+                    return Err(invalid(key));
                 }
             }
         }
         for name in ["SMTP_PASSWORD", "KATWORK_DEMO_PASSWORD"] {
             if optional(name).is_some_and(|value| value.chars().count() < 8) {
-                return Err(KatError::ConfigInvalid);
+                return Err(invalid(name));
             }
         }
         let mut public_url = optional("KATWORK_PUBLIC_URL");
         if let Some(value) = &public_url {
-            let url = Url::parse(value).map_err(|_| KatError::ConfigInvalid)?;
+            let url = Url::parse(value).map_err(|_| invalid("KATWORK_PUBLIC_URL"))?;
             if !matches!(url.scheme(), "http" | "https")
                 || !url.has_host()
                 || !url.username().is_empty()
@@ -309,7 +321,7 @@ impl Config {
                 || url.query().is_some()
                 || url.fragment().is_some()
             {
-                return Err(KatError::ConfigInvalid);
+                return Err(invalid("KATWORK_PUBLIC_URL"));
             }
             public_url = Some(url.origin().ascii_serialization());
         }
@@ -320,19 +332,28 @@ impl Config {
                 .is_some_and(|url| url.starts_with("https://"))
             && lookup("KATWORK_ALLOW_DEMO_ON_HTTPS").as_deref() != Some("1")
         {
-            return Err(KatError::ConfigInvalid);
+            return Err(invalid("KATWORK_ALLOW_DEMO_ON_HTTPS"));
         }
+        // Each entry is a CIDR or a bare IP, which means that one address.
         let trusted_proxies = optional("KATWORK_TRUSTED_PROXIES")
             .map(|value| {
                 value
                     .split(',')
-                    .map(|cidr| {
-                        let (ip, prefix) =
-                            cidr.trim().split_once('/').ok_or(KatError::ConfigInvalid)?;
-                        let ip: IpAddr = ip.parse().map_err(|_| KatError::ConfigInvalid)?;
-                        let prefix: u8 = prefix.parse().map_err(|_| KatError::ConfigInvalid)?;
-                        if prefix > if ip.is_ipv4() { 32 } else { 128 } {
-                            return Err(KatError::ConfigInvalid);
+                    .map(|entry| {
+                        let (ip, prefix) = match entry.trim().split_once('/') {
+                            Some((ip, prefix)) => (ip, Some(prefix)),
+                            None => (entry.trim(), None),
+                        };
+                        let ip: IpAddr =
+                            ip.parse().map_err(|_| invalid("KATWORK_TRUSTED_PROXIES"))?;
+                        let bits = if ip.is_ipv4() { 32 } else { 128 };
+                        let prefix: u8 = prefix
+                            .map(str::parse)
+                            .transpose()
+                            .map_err(|_| invalid("KATWORK_TRUSTED_PROXIES"))?
+                            .unwrap_or(bits);
+                        if prefix > bits {
+                            return Err(invalid("KATWORK_TRUSTED_PROXIES"));
                         }
                         Ok((ip, prefix))
                     })
@@ -340,14 +361,14 @@ impl Config {
             })
             .transpose()?
             .unwrap_or_default();
-        let positive = |name: &str, default: u32| -> Result<u32, KatError> {
+        let positive = |name: &'static str, default: u32| -> Result<u32, KatError> {
             let value = optional(name)
                 .map(|value| value.parse::<u32>())
                 .transpose()
-                .map_err(|_| KatError::ConfigInvalid)?
+                .map_err(|_| invalid(name))?
                 .unwrap_or(default);
             if value == 0 {
-                return Err(KatError::ConfigInvalid);
+                return Err(invalid(name));
             }
             Ok(value)
         };
@@ -358,16 +379,21 @@ impl Config {
             idle_timeout: Duration::from_secs(positive("KATWORK_IDLE_TIMEOUT_SECONDS", 60)?.into()),
             max_connections: positive("KATWORK_MAX_CONNECTIONS", 256)? as usize,
             max_connections_per_ip: positive("KATWORK_MAX_CONNECTIONS_PER_IP", 32)? as usize,
+            trusted_proxies,
         };
         let smtp = if let Some(host) = optional("SMTP_HOST") {
             if host.contains('@') {
-                return Err(KatError::ConfigInvalid);
+                return Err(invalid("SMTP_HOST"));
             }
             let port = optional("SMTP_PORT")
-                .map(|value| value.parse::<u16>().map_err(|_| KatError::ConfigInvalid))
+                .map(|value| value.parse::<u16>().map_err(|_| invalid("SMTP_PORT")))
                 .transpose()?;
             if port == Some(0) {
-                return Err(KatError::ConfigInvalid);
+                return Err(invalid("SMTP_PORT"));
+            }
+            // A mailed link must never point at the localhost default.
+            if public_url.is_none() {
+                return Err(invalid("KATWORK_PUBLIC_URL"));
             }
             Some(SmtpConfig {
                 host,
@@ -384,7 +410,6 @@ impl Config {
             secret,
             demo,
             transport,
-            trusted_proxies,
             public_url,
             demo_password: optional("KATWORK_DEMO_PASSWORD"),
             smtp,

@@ -1,3 +1,5 @@
+pub mod accounts;
+pub mod invite;
 pub mod mailer;
 pub mod password;
 pub mod reset;
@@ -84,7 +86,9 @@ pub async fn seed_demo(
     reset_password: bool,
 ) -> Result<Option<String>, KatError> {
     if !config.demo {
-        return Err(KatError::ConfigInvalid);
+        return Err(KatError::ConfigInvalid {
+            var: "KATWORK_DEMO",
+        });
     }
     let password = config
         .demo_password
@@ -98,16 +102,25 @@ pub async fn seed_demo(
     sqlx::query("SELECT pg_advisory_xact_lock(3000003)")
         .execute(&mut *tx)
         .await?;
-    let existing: Option<UserId> = sqlx::query_scalar(
-        "SELECT id FROM users WHERE email = 'demo@katwork.local' FOR NO KEY UPDATE",
+    let existing: Option<(UserId, String)> = sqlx::query_as(
+        "SELECT id, password_hash FROM users WHERE email = 'demo@katwork.local' FOR NO KEY UPDATE",
     )
     .fetch_optional(&mut *tx)
     .await?;
-    let user_id = existing.unwrap_or_default();
+    let user_id = existing.as_ref().map(|(id, _)| *id).unwrap_or_default();
+    let changed = match (&existing, &config.demo_password) {
+        (Some(_), _) if reset_password => true,
+        // The operator changed KATWORK_DEMO_PASSWORD: apply it, as a reset would.
+        (Some((_, stored)), Some(chosen)) => {
+            let (chosen, stored) = (chosen.clone(), stored.clone());
+            !password::run(move || password::verify(&chosen, &stored)).await?
+        }
+        _ => false,
+    };
     if existing.is_none() {
         sqlx::query("INSERT INTO users (id, email, password_hash, display_name, locale) VALUES ($1, 'demo@katwork.local', $2, 'Demo', 'en')")
             .bind(user_id).bind(&hash).execute(&mut *tx).await?;
-    } else if reset_password {
+    } else if changed {
         sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
             .bind(user_id)
             .bind(&hash)

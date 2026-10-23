@@ -3,6 +3,7 @@ import { api, type AuthUser } from './api';
 import { AuthLayout, PageTitle } from './components/Layout';
 import { t, useLocale } from './i18n';
 import { Home } from './pages/Home';
+import { InviteAccept } from './pages/InviteAccept';
 import { Login } from './pages/Login';
 import { ResetConfirm } from './pages/ResetConfirm';
 import { ResetRequest } from './pages/ResetRequest';
@@ -54,7 +55,7 @@ export function App() {
   const signedOut = session.state === 'signed_out';
 
   useEffect(() => {
-    if (path === '/reset') return;
+    if (path === '/reset' || path === '/invite') return;
     if (signedOut && path !== '/login') navigate('/login', { replace: true });
     if (signedIn && path === '/login') navigate('/', { replace: true });
   }, [path, signedIn, signedOut]);
@@ -86,6 +87,8 @@ export function App() {
       <ResetRequest />
     );
   }
+  // An invite link works signed in or out; accepting it ends every session of that account.
+  if (path === '/invite') return <InviteAccept onAccepted={recheckSession} />;
   if (session.state === 'checking') {
     return <div className="loading" aria-busy="true" />;
   }
