@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+jsonschema.workspace = true
 async-trait.workspace = true
 async-stream.workspace = true
 bytes.workspace = true
@@ -38,6 +39,5 @@ unicode-segmentation.workspace = true
 pulldown-cmark.workspace = true
 
 [dev-dependencies]
-jsonschema.workspace = true
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util", "io-util"] }

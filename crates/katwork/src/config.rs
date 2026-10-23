@@ -415,11 +415,17 @@ impl Config {
             None => Duration::from_millis(5000),
             Some(value) => {
                 if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-                    return Err(KatError::ConfigInvalid);
+                    return Err(KatError::ConfigInvalid {
+                        var: "KATWORK_LOCK_TIMEOUT_MS",
+                    });
                 }
-                let millis: u32 = value.parse().map_err(|_| KatError::ConfigInvalid)?;
+                let millis: u32 = value.parse().map_err(|_| KatError::ConfigInvalid {
+                    var: "KATWORK_LOCK_TIMEOUT_MS",
+                })?;
                 if millis == 0 || millis > i32::MAX as u32 {
-                    return Err(KatError::ConfigInvalid);
+                    return Err(KatError::ConfigInvalid {
+                        var: "KATWORK_LOCK_TIMEOUT_MS",
+                    });
                 }
                 Duration::from_millis(millis.into())
             }
