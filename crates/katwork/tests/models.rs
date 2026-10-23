@@ -53,6 +53,7 @@ fn registry_refuses_external_provider_for_local_only_space() {
         max_output_tokens: 2048,
         temperature: None,
         price: None,
+        timeouts: ModelTimeouts::HOSTED,
     };
     let registry = Registry::from_entries(vec![(entry, provider)]);
     assert!(matches!(
@@ -538,6 +539,7 @@ fn registry_selects_local_entry_after_denied_external_entry() {
         max_output_tokens: 2048,
         temperature: None,
         price: None,
+        timeouts: ModelTimeouts::HOSTED,
     };
     let local = ModelEntry {
         provider_id: "local".into(),
@@ -640,5 +642,203 @@ async fn demo_reply_follows_latest_user_language() {
         );
         assert!(provider.capabilities().synthetic);
         assert!(provider.received().is_empty());
+    }
+}
+
+fn local_config(demo: bool, hosted: bool) -> Config {
+    Config::from_lookup(|name| match name {
+        "DATABASE_URL" => Some("postgres://localhost/katwork".into()),
+        "KATWORK_SECRET" => Some(uuid::Uuid::now_v7().to_string()),
+        "KATWORK_LOCAL_BASE_URL" => Some("http://localhost:8000/v1".into()),
+        "KATWORK_LOCAL_MODEL" => Some("local-model".into()),
+        "KATWORK_DEMO" if demo => Some("1".into()),
+        "OPENAI_API_KEY" if hosted => Some(uuid::Uuid::now_v7().to_string()),
+        _ => None,
+    })
+    .unwrap()
+}
+
+#[test]
+fn local_only_space_uses_local_provider_without_demo() {
+    let registry = Registry::from_config(&local_config(false, false));
+    for (tier, cap) in [
+        (ModelTier::Fast, 2048),
+        (ModelTier::Standard, 4096),
+        (ModelTier::Strong, 8192),
+    ] {
+        let selected = registry
+            .for_tier(
+                tier,
+                &SpacePolicy {
+                    allow_external: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(selected.provider.id(), "local");
+        assert_eq!(selected.entry.provider_id, "local");
+        assert_eq!(selected.entry.model, "local-model");
+        assert_eq!(selected.entry.capabilities.residency, Residency::Local);
+        assert_eq!(selected.provider.capabilities().residency, Residency::Local);
+        assert!(!selected.entry.capabilities.synthetic);
+        assert!(selected.entry.capabilities.tools);
+        assert_eq!(selected.entry.max_output_tokens, cap);
+        assert_eq!(selected.entry.price, None);
+        assert_eq!(selected.entry.temperature, None);
+    }
+}
+
+#[test]
+fn hosted_allowed_space_prefers_hosted_entry_over_local() {
+    let registry = Registry::from_config(&local_config(false, true));
+    for tier in [ModelTier::Fast, ModelTier::Standard, ModelTier::Strong] {
+        assert_eq!(
+            registry
+                .for_tier(
+                    tier,
+                    &SpacePolicy {
+                        allow_external: true
+                    }
+                )
+                .unwrap()
+                .provider
+                .id(),
+            "openai:chat"
+        );
+        assert_eq!(
+            registry
+                .for_tier(
+                    tier,
+                    &SpacePolicy {
+                        allow_external: false
+                    }
+                )
+                .unwrap()
+                .provider
+                .id(),
+            "local"
+        );
+    }
+}
+
+#[test]
+fn local_provider_disables_demo_fallback() {
+    let registry = Registry::from_config(&local_config(true, false));
+    for tier in [ModelTier::Fast, ModelTier::Standard, ModelTier::Strong] {
+        for allow_external in [false, true] {
+            let selected = registry
+                .for_tier(tier, &SpacePolicy { allow_external })
+                .unwrap();
+            assert_eq!(selected.provider.id(), "local");
+            assert!(!selected.entry.capabilities.synthetic);
+        }
+    }
+}
+
+#[test]
+fn local_entries_carry_local_timeouts() {
+    for (cfg, allow_external, expected) in [
+        (local_config(false, true), false, (120, 60, 300)),
+        (local_config(false, true), true, (30, 30, 90)),
+        (config(true), false, (30, 30, 90)),
+    ] {
+        let registry = Registry::from_config(&cfg);
+        for tier in [ModelTier::Fast, ModelTier::Standard, ModelTier::Strong] {
+            let t = registry
+                .for_tier(tier, &SpacePolicy { allow_external })
+                .unwrap()
+                .entry
+                .timeouts;
+            assert_eq!(t.first_chunk.as_secs(), expected.0);
+            assert_eq!(t.idle.as_secs(), expected.1);
+            assert_eq!(t.run_wall_clock.as_secs(), expected.2);
+            assert_eq!(t.stream().first_chunk, t.first_chunk);
+            assert_eq!(t.stream().idle, t.idle);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn local_run_wall_clock_is_300s() {
+    let selected = Registry::from_config(&local_config(false, false))
+        .for_tier(
+            ModelTier::Strong,
+            &SpacePolicy {
+                allow_external: false,
+            },
+        )
+        .unwrap();
+    let started = tokio::time::Instant::now();
+    let stream = Box::pin(async_stream::stream! {
+        loop {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            yield Ok(ChatChunk::TextDelta("still running".into()));
+        }
+    });
+    let result = tokio::time::timeout(
+        selected.entry.timeouts.run_wall_clock,
+        guard_stream(stream, selected.entry.timeouts.stream()).collect::<Vec<_>>(),
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(started.elapsed(), Duration::from_secs(300));
+}
+
+#[test]
+fn local_init_failure_resolves_to_provider_unavailable() {
+    let mut cfg = local_config(true, false);
+    cfg.local.as_mut().unwrap().api_key = Some(format!("{}\n", uuid::Uuid::now_v7()));
+    let registry = Registry::from_config(&cfg);
+    for tier in [ModelTier::Fast, ModelTier::Standard, ModelTier::Strong] {
+        assert!(matches!(
+            registry.for_tier(
+                tier,
+                &SpacePolicy {
+                    allow_external: false
+                }
+            ),
+            Err(ModelError::ProviderUnavailable)
+        ));
+    }
+}
+
+#[derive(Clone, Default)]
+struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for LogCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn startup_logs_one_line_per_tier() {
+    let mut cfg = local_config(false, true);
+    let secret = uuid::Uuid::now_v7().to_string();
+    cfg.local.as_mut().unwrap().base_url =
+        format!("http://user:{secret}@localhost:8000/v1?key={secret}");
+    cfg.local.as_mut().unwrap().api_key = Some(secret.clone());
+    let output = LogCapture::default();
+    let writer = output.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || Registry::from_config(&cfg).log_tiers());
+    let logged = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(logged.lines().count(), 3, "{logged}");
+    for tier in ["Fast", "Standard", "Strong"] {
+        assert!(logged.contains(tier), "{logged}");
+    }
+    for line in logged.lines() {
+        assert!(line.contains("model_tier"));
+        assert!(line.contains("hosted_allowed=openai:chat/gpt-4.1"));
+        assert!(line.contains("local_only=local/local-model"));
+    }
+    for forbidden in [&secret, "http://", "localhost:8000", "user:", "?key="] {
+        assert!(!logged.contains(forbidden), "secret leaked");
     }
 }

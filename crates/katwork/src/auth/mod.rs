@@ -84,7 +84,9 @@ pub async fn seed_demo(
     reset_password: bool,
 ) -> Result<Option<String>, KatError> {
     if !config.demo {
-        return Err(KatError::ConfigInvalid);
+        return Err(KatError::ConfigInvalid {
+            var: "KATWORK_DEMO",
+        });
     }
     let password = config
         .demo_password
