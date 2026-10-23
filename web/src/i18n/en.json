@@ -62,6 +62,7 @@
   "reason.provider_auth_failed": "The AI model service rejected KatWork's key. Ask your admin to check the model settings.",
   "reason.model_protocol_error": "The AI model sent a reply KatWork couldn't read. Try again.",
   "reason.time_limit": "The Kat ran out of time before finishing. Try a smaller request.",
+  "reason.too_many_requests": "You sent too many requests to this Kat. Try again in a minute.",
   "reason.quota_exceeded": "This workspace has reached its usage limit for today. Try again tomorrow or ask your admin.",
   "reason.workspace_paused": "Your admin has paused the Kats in this workspace. The work waits until they're resumed.",
   "reason.step_limit": "The Kat took too many steps without finishing. Try splitting the request into smaller parts.",

@@ -16,6 +16,7 @@ impl From<KatError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.0 {
+            KatError::JobAlreadyFinished | KatError::JobNotAwaitingInput => StatusCode::CONFLICT,
             KatError::InvalidCursor => StatusCode::BAD_REQUEST,
             KatError::TooManyStreams => StatusCode::INTERNAL_SERVER_ERROR,
             KatError::Busy => StatusCode::SERVICE_UNAVAILABLE,

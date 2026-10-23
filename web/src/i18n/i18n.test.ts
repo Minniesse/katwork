@@ -30,6 +30,7 @@ const REASON_CODES = [
   'no_eligible_kat',
   'kat_not_in_space',
   'lease_lost',
+  'too_many_requests',
 ];
 
 // API error codes the auth routes and guards can return (KatError::code).

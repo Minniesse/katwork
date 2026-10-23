@@ -84,6 +84,7 @@ fn shared_wire_values_match_json() {
         "no_eligible_kat",
         "kat_not_in_space",
         "lease_lost",
+        "too_many_requests",
     ];
     assert_eq!(ReasonCode::ALL.len(), expected.len());
     for (value, wire) in ReasonCode::ALL.iter().zip(expected) {

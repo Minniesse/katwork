@@ -166,10 +166,11 @@ wire_enum!(ReasonCode {
     NoEligibleKat => "no_eligible_kat",
     KatNotInSpace => "kat_not_in_space",
     LeaseLost => "lease_lost",
+    TooManyRequests => "too_many_requests",
 });
 
 impl ReasonCode {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::ProviderUnavailable,
         Self::ProviderRateLimited,
         Self::ProviderQuota,
@@ -194,5 +195,6 @@ impl ReasonCode {
         Self::NoEligibleKat,
         Self::KatNotInSpace,
         Self::LeaseLost,
+        Self::TooManyRequests,
     ];
 }
