@@ -51,6 +51,16 @@ async fn api_errors_return_only_stable_codes() {
             "command_invalid",
         ),
         (
+            KatError::MigrationRequired,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "migration_required",
+        ),
+        (
+            KatError::LinkNotPrinted,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "link_not_printed",
+        ),
+        (
             KatError::DatabaseUnavailable(Box::new(std::io::Error::other(
                 uuid::Uuid::now_v7().to_string(),
             ))),

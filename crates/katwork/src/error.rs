@@ -55,6 +55,10 @@ pub enum KatError {
     ConfigInvalid { var: &'static str },
     #[error("command_invalid")]
     CommandInvalid,
+    #[error("migration_required")]
+    MigrationRequired,
+    #[error("link_not_printed")]
+    LinkNotPrinted,
     #[error("database_unavailable")]
     DatabaseUnavailable(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("database_error")]
@@ -110,6 +114,8 @@ impl KatError {
             Self::JsonRequired => "json_required",
             Self::ConfigInvalid { .. } => "config_invalid",
             Self::CommandInvalid => "command_invalid",
+            Self::MigrationRequired => "migration_required",
+            Self::LinkNotPrinted => "link_not_printed",
             Self::DatabaseUnavailable(_) => "database_unavailable",
             Self::Database(_) => "database_error",
             Self::Migration(_) => "migration_failed",

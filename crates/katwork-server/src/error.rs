@@ -51,6 +51,8 @@ impl IntoResponse for ApiError {
             KatError::LeaseLost => StatusCode::CONFLICT,
             KatError::ConfigInvalid { .. }
             | KatError::CommandInvalid
+            | KatError::MigrationRequired
+            | KatError::LinkNotPrinted
             | KatError::Database(_)
             | KatError::Migration(_)
             | KatError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use sqlx::{Connection, PgConnection, PgPool, postgres::PgPoolOptions};
+use sqlx::{Connection, PgConnection, PgPool, migrate::Migrator, postgres::PgPoolOptions};
 
 use crate::error::KatError;
 
@@ -21,7 +21,33 @@ pub async fn connect(url: &str) -> Result<PgPool, KatError> {
     }
 }
 
+static MIGRATOR: Migrator = sqlx::migrate!();
+
 pub async fn migrate(pool: &PgPool) -> Result<(), KatError> {
-    sqlx::migrate!().run(pool).await?;
+    MIGRATOR.run(pool).await?;
+    Ok(())
+}
+
+/// `migration_required` unless every migration this binary carries has been applied, so an
+/// operator command on a new or older database says to run `migrate` instead of failing midway.
+pub async fn require_migrated(pool: &PgPool) -> Result<(), KatError> {
+    let applied: Vec<i64> =
+        match sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success")
+            .fetch_all(pool)
+            .await
+        {
+            Ok(applied) => applied,
+            // undefined_table: nothing was ever migrated.
+            Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42P01") => {
+                Vec::new()
+            }
+            Err(error) => return Err(error.into()),
+        };
+    if MIGRATOR
+        .iter()
+        .any(|migration| !applied.contains(&migration.version))
+    {
+        return Err(KatError::MigrationRequired);
+    }
     Ok(())
 }

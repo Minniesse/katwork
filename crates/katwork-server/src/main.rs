@@ -1,5 +1,8 @@
-use std::{collections::HashMap, error::Error, process::ExitCode, sync::Arc};
+use std::{
+    collections::HashMap, error::Error, io::Write, net::IpAddr, process::ExitCode, sync::Arc,
+};
 use tracing_subscriber::prelude::*;
+use url::Url;
 
 use katwork::{
     auth::{
@@ -52,6 +55,18 @@ fn error_report(error: &KatError, config: Option<&Config>, database_url: Option<
         KatError::ConfigInvalid { .. } => error.to_string(),
         _ => error.code().to_owned(),
     }];
+    // What the operator does next; none of these lines carries a value or a link.
+    match error {
+        KatError::CommandInvalid => lines.push(USAGE.trim_end().to_owned()),
+        KatError::MigrationRequired => {
+            lines.push("  run `katwork-server migrate` first, then try again".into())
+        }
+        KatError::LinkNotPrinted => lines.extend([
+            "  the account change was saved, but its link could not be written to stdout".into(),
+            "  run `katwork-server reset-link --email <email>` for a new link".into(),
+        ]),
+        _ => {}
+    }
     let mut source = error.source();
     while let Some(cause) = source {
         let message = cause.to_string();
@@ -69,6 +84,14 @@ fn dependency_log_allowed(metadata: &tracing::Metadata<'_>) -> bool {
     // SQLx logs secret options and Rig logs provider messages, even at WARN.
     !metadata.target().starts_with("sqlx") && !metadata.target().starts_with("rig")
 }
+
+const USAGE: &str = "\
+usage: katwork-server [serve]
+       katwork-server migrate
+       katwork-server seed-demo [--reset-password]
+       katwork-server create-user --email <email> --workspace <name|id> --role <owner|admin|member> [--space-policy <local|hosted>]
+       katwork-server reset-link --email <email>
+";
 
 /// `--name value` pairs, each name from `allowed` and given at most once.
 fn flags(
@@ -91,6 +114,7 @@ fn flags(
 }
 
 enum Command {
+    Help,
     Serve,
     Migrate,
     SeedDemo {
@@ -112,6 +136,13 @@ fn parse(args: &[String]) -> Result<Command, KatError> {
         Some((command, rest)) => (command.as_str(), rest),
         None => ("serve", &[][..]),
     };
+    if command == "help"
+        || args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        return Ok(Command::Help);
+    }
     let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
     Ok(match (command, rest.as_slice()) {
         ("serve", []) => Command::Serve,
@@ -165,10 +196,21 @@ fn parse(args: &[String]) -> Result<Command, KatError> {
 async fn run() -> Result<(), KatError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse(&args)? {
+        Command::Help => {
+            // Nothing to recover if stdout is gone.
+            let _ = std::io::stdout().lock().write_all(USAGE.as_bytes());
+            Ok(())
+        }
         Command::Serve => {
             let config = Arc::new(Config::from_env()?);
             if !config.cookie_secure() {
                 tracing::warn!("session cookie is not Secure on an HTTP public URL");
+            }
+            let bind = std::env::var("KATWORK_BIND").ok();
+            if lan_bind_without_public_url(bind.as_deref(), &config) {
+                tracing::warn!(
+                    "KATWORK_BIND exposes KatWork beyond this host, but KATWORK_PUBLIC_URL is unset or names this machine: other machines get host_not_allowed and printed links point at it; set KATWORK_PUBLIC_URL to the address people open"
+                );
             }
             let pool = db::connect(&config.database_url).await?;
             let transport = config.transport.clone();
@@ -211,6 +253,7 @@ async fn run() -> Result<(), KatError> {
         } => {
             let config = Config::from_env()?;
             let pool = db::connect(&config.database_url).await?;
+            db::require_migrated(&pool).await?;
             let link = accounts::create_user(
                 &pool,
                 &email,
@@ -220,17 +263,47 @@ async fn run() -> Result<(), KatError> {
                 config.public_url_or_default(),
             )
             .await?;
-            println!("{link}");
-            Ok(())
+            print_link(&link)
         }
         Command::ResetLink { email } => {
             let config = Config::from_env()?;
             let pool = db::connect(&config.database_url).await?;
+            db::require_migrated(&pool).await?;
             let link = accounts::reset_link(&pool, &email, config.public_url_or_default()).await?;
-            println!("{link}");
-            Ok(())
+            print_link(&link)
         }
     }
+}
+
+/// Writes an operator command's link, the only thing it prints. A closed or failing stdout is
+/// `link_not_printed`, never a panic, and the link never goes to stderr.
+fn print_link(link: &str) -> Result<(), KatError> {
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{link}")
+        .and_then(|()| stdout.flush())
+        .map_err(|_| KatError::LinkNotPrinted)
+}
+
+/// Compose publishes port 3000 on `KATWORK_BIND`. Past loopback, people on other machines open
+/// KatWork by this host's address, which a localhost public URL neither allows as a Host nor
+/// puts in printed links.
+fn lan_bind_without_public_url(bind: Option<&str>, config: &Config) -> bool {
+    let local = |host: &str| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    };
+    let exposed = bind
+        .map(str::trim)
+        .is_some_and(|bind| !bind.is_empty() && !local(bind));
+    let public_is_local = Url::parse(config.public_url_or_default())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_none_or(|host| local(&host));
+    exposed && public_is_local
 }
 
 async fn shutdown_signal() {

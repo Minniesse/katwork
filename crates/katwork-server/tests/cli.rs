@@ -913,7 +913,7 @@ fn operator_commands_reject_bad_arguments() {
         assert!(output.stdout.is_empty(), "{args:?}");
         assert_eq!(
             String::from_utf8_lossy(&output.stderr),
-            "command_invalid\n",
+            format!("command_invalid\n{USAGE}"),
             "{args:?}"
         );
     }
@@ -1004,4 +1004,145 @@ async fn seed_demo_applies_changed_demo_password(pool: sqlx::PgPool) {
         "unauthenticated",
     )
     .await;
+}
+
+const USAGE: &str = "\
+usage: katwork-server [serve]
+       katwork-server migrate
+       katwork-server seed-demo [--reset-password]
+       katwork-server create-user --email <email> --workspace <name|id> --role <owner|admin|member> [--space-policy <local|hosted>]
+       katwork-server reset-link --email <email>
+";
+
+#[test]
+fn help_prints_usage() {
+    for args in [
+        vec!["--help"],
+        vec!["-h"],
+        vec!["help"],
+        vec!["create-user", "--help"],
+        vec!["reset-link", "--email", "a@example.test", "-h"],
+    ] {
+        let output = server().args(&args).output().unwrap();
+        assert!(output.status.success(), "{args:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), USAGE, "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn operator_commands_ask_for_migrate_on_an_unmigrated_database(pool: sqlx::PgPool) {
+    let expected = "migration_required\n  run `katwork-server migrate` first, then try again\n";
+    let create = [
+        "create-user",
+        "--email",
+        "person@example.test",
+        "--workspace",
+        "Acme",
+        "--role",
+        "owner",
+        "--space-policy",
+        "local",
+    ];
+    let reset = ["reset-link", "--email", "person@example.test"];
+    for args in [&create[..], &reset[..]] {
+        assert_failed(&operator(&pool, args), expected);
+    }
+    // Part of the schema is no better: every migration this binary carries must be applied.
+    let mut old = sqlx::migrate!("../katwork/migrations");
+    old.migrations = old
+        .iter()
+        .filter(|migration| migration.version <= 5)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into();
+    old.run(&pool).await.unwrap();
+    for args in [&create[..], &reset[..]] {
+        assert_failed(&operator(&pool, args), expected);
+    }
+    assert_eq!(count(&pool, "SELECT count(*) FROM users").await, 0);
+    assert_eq!(count(&pool, "SELECT count(*) FROM workspaces").await, 0);
+}
+
+#[test]
+fn serve_warns_when_a_lan_bind_has_no_public_url() {
+    let warning = "KATWORK_BIND exposes KatWork beyond this host";
+    for (bind, public_url, warns) in [
+        (Some("0.0.0.0"), None, true),
+        (Some("192.168.1.20"), Some("http://localhost:3000"), true),
+        (Some("0.0.0.0"), Some("http://127.0.0.1:3000"), true),
+        (Some("0.0.0.0"), Some("http://192.168.1.20:3000"), false),
+        (Some("127.0.0.1"), None, false),
+        (Some("::1"), None, false),
+        (None, None, false),
+    ] {
+        let mut command = server();
+        // An unparsable sslmode stops serve right after its startup checks, without a wait.
+        command.arg("serve").env(
+            "DATABASE_URL",
+            "postgres://localhost/katwork?sslmode=unparsable",
+        );
+        if let Some(bind) = bind {
+            command.env("KATWORK_BIND", bind);
+        }
+        if let Some(url) = public_url {
+            command.env("KATWORK_PUBLIC_URL", url);
+        }
+        let output = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success());
+        assert_eq!(
+            stderr.contains(warning),
+            warns,
+            "{bind:?} {public_url:?}: {stderr}"
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn a_closed_stdout_fails_cleanly_and_keeps_the_link_off_stderr(pool: sqlx::PgPool) {
+    for args in [
+        &[
+            "create-user",
+            "--email",
+            "person@example.test",
+            "--workspace",
+            "Acme",
+            "--role",
+            "owner",
+            "--space-policy",
+            "local",
+        ][..],
+        &["reset-link", "--email", "person@example.test"][..],
+    ] {
+        let mut child = server()
+            .args(args)
+            .env("DATABASE_URL", database_url(&pool))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Close the reading end before the command gets to print.
+        drop(child.stdout.take());
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{stderr}");
+        assert_eq!(
+            stderr,
+            "link_not_printed\n  the account change was saved, but its link could not be written to stdout\n  run `katwork-server reset-link --email <email>` for a new link\n"
+        );
+    }
+    // The account was created before the print failed; reset-link recovers it.
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM users WHERE email = 'person@example.test'"
+        )
+        .await,
+        1
+    );
+    printed_link(&operator(
+        &pool,
+        &["reset-link", "--email", "person@example.test"],
+    ));
 }
