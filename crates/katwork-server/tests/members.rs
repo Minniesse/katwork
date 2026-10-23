@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
 #[allow(dead_code)]
 #[path = "support/mod.rs"]
 mod support;
@@ -1053,9 +1057,10 @@ async fn stale_admin_tenant_is_refused_behind_the_lock(pool: PgPool) {
         };
         let invited = members::invite(&pool, &config, mailer.clone(), &stale, new_invite()).await;
         assert_eq!(invited.unwrap_err().code(), expected);
-        let promoted = members::set_role(&pool, &stale, member.id, Role::Admin).await;
+        let promoted =
+            members::set_role(&pool, &stale, member.id, Role::Admin, config.lock_timeout).await;
         assert_eq!(promoted.unwrap_err().code(), expected);
-        let removed = members::remove(&pool, &stale, member.id).await;
+        let removed = members::remove(&pool, &stale, member.id, config.lock_timeout).await;
         assert_eq!(removed.unwrap_err().code(), expected);
 
         assert_eq!(users_with_email(&pool, "new@example.test").await, 0);

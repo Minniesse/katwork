@@ -76,7 +76,14 @@ pub(crate) async fn set_role(
     tenant.require_admin()?;
     let user_id = route_path(path)?.user_id;
     let body = payload(Json::<NewRole>::from_bytes(&body))?;
-    members::set_role(&state.core.pool, &tenant, user_id, body.role).await?;
+    members::set_role(
+        &state.core.pool,
+        &tenant,
+        user_id,
+        body.role,
+        state.core.config.lock_timeout,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -87,6 +94,12 @@ pub(crate) async fn remove(
 ) -> Result<StatusCode, ApiError> {
     tenant.require_admin()?;
     let user_id = route_path(path)?.user_id;
-    members::remove(&state.core.pool, &tenant, user_id).await?;
+    members::remove(
+        &state.core.pool,
+        &tenant,
+        user_id,
+        state.core.config.lock_timeout,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }

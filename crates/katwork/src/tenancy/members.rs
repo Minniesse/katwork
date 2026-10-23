@@ -1,7 +1,7 @@
 use std::{fmt, sync::Arc};
 
 use serde::{Deserialize, Serialize};
-use sqlx::{PgConnection, PgPool};
+use sqlx::{Connection, PgConnection, PgPool};
 use tracing::instrument::WithSubscriber;
 
 use super::{Role, Tenant};
@@ -154,37 +154,42 @@ pub async fn invite(
     // Hashed before any lock: Argon2 can wait for a slot, and every tool call of a running Kat
     // takes this workspace row (`guards::authorize`). Unused when the account already exists.
     let hash = accounts::unusable_password_hash().await?;
-    let mut tx = pool.begin().await?;
-    let (actor, workspace) = lock_workspace(&mut tx, tenant).await?;
-    if invite.role == Role::Owner && actor.role() != Role::Owner {
-        return Err(KatError::Forbidden);
-    }
-    // A new account starts in the inviter's language, which also orders the mail.
-    let locale = match sqlx::query_scalar::<_, String>("SELECT locale FROM users WHERE id = $1")
-        .bind(actor.user_id())
-        .fetch_one(&mut *tx)
-        .await?
-        .as_str()
-    {
-        "th" => Locale::Th,
-        _ => Locale::En,
-    };
-    let user = accounts::ensure_user_with_hash(&mut tx, &email, locale, hash).await?;
-    if role_of(&mut tx, &actor, user.user_id).await?.is_some() {
-        return Err(KatError::MemberExists);
-    }
-    sqlx::query("INSERT INTO memberships (workspace_id, user_id, role) VALUES ($1, $2, $3)")
-        .bind(actor.workspace_id())
-        .bind(user.user_id)
-        .bind(invite.role)
-        .execute(&mut *tx)
-        .await?;
-    let token = if user.created {
-        Some(invite_token::issue(&mut tx, user.user_id).await?)
-    } else {
-        None
-    };
-    tx.commit().await?;
+    let (user, token, locale, workspace) = crate::db::guarded(pool, async |conn| {
+        let mut tx = conn.begin().await?;
+        crate::db::set_lock_timeout(&mut tx, config.lock_timeout).await?;
+        let (actor, workspace) = lock_workspace(&mut tx, tenant).await?;
+        if invite.role == Role::Owner && actor.role() != Role::Owner {
+            return Err(KatError::Forbidden);
+        }
+        // A new account starts in the inviter's language, which also orders the mail.
+        let locale = match sqlx::query_scalar::<_, String>("SELECT locale FROM users WHERE id = $1")
+            .bind(actor.user_id())
+            .fetch_one(&mut *tx)
+            .await?
+            .as_str()
+        {
+            "th" => Locale::Th,
+            _ => Locale::En,
+        };
+        let user = accounts::ensure_user_with_hash(&mut tx, &email, locale, hash).await?;
+        if role_of(&mut tx, &actor, user.user_id).await?.is_some() {
+            return Err(KatError::MemberExists);
+        }
+        sqlx::query("INSERT INTO memberships (workspace_id, user_id, role) VALUES ($1, $2, $3)")
+            .bind(actor.workspace_id())
+            .bind(user.user_id)
+            .bind(invite.role)
+            .execute(&mut *tx)
+            .await?;
+        let token = if user.created {
+            Some(invite_token::issue(&mut tx, user.user_id).await?)
+        } else {
+            None
+        };
+        tx.commit().await?;
+        Ok((user, token, locale, workspace))
+    })
+    .await?;
     let link = token.map(|token| invite_token::link(config.public_url_or_default(), &token));
     let link = match (invite.delivery, link) {
         (InviteDelivery::Link, link) => link,
@@ -217,50 +222,64 @@ pub async fn set_role(
     tenant: &Tenant,
     user_id: UserId,
     role: Role,
+    lock_timeout: std::time::Duration,
 ) -> Result<(), KatError> {
     tenant.require_admin()?;
-    let mut tx = pool.begin().await?;
-    let (actor, _) = lock_workspace(&mut tx, tenant).await?;
-    let current = role_of(&mut tx, &actor, user_id)
-        .await?
-        .ok_or(KatError::NotFound)?;
-    if (role == Role::Owner || current == Role::Owner) && actor.role() != Role::Owner {
-        return Err(KatError::Forbidden);
-    }
-    if current == Role::Owner && role != Role::Owner {
-        keep_an_owner(&mut tx, &actor).await?;
-    }
-    sqlx::query("UPDATE memberships SET role = $3 WHERE workspace_id = $1 AND user_id = $2")
-        .bind(actor.workspace_id())
-        .bind(user_id)
-        .bind(role)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(())
+    crate::db::guarded(pool, async |conn| {
+        let mut tx = conn.begin().await?;
+        crate::db::set_lock_timeout(&mut tx, lock_timeout).await?;
+        let (actor, _) = lock_workspace(&mut tx, tenant).await?;
+        let current = role_of(&mut tx, &actor, user_id)
+            .await?
+            .ok_or(KatError::NotFound)?;
+        if (role == Role::Owner || current == Role::Owner) && actor.role() != Role::Owner {
+            return Err(KatError::Forbidden);
+        }
+        if current == Role::Owner && role != Role::Owner {
+            keep_an_owner(&mut tx, &actor).await?;
+        }
+        sqlx::query("UPDATE memberships SET role = $3 WHERE workspace_id = $1 AND user_id = $2")
+            .bind(actor.workspace_id())
+            .bind(user_id)
+            .bind(role)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    })
+    .await
 }
 
 /// Removes a member from the workspace. Only the membership row goes: messages and jobs
 /// reference the user, so their history stays. Only an owner removes an owner, and the last
 /// owner stays.
-pub async fn remove(pool: &PgPool, tenant: &Tenant, user_id: UserId) -> Result<(), KatError> {
+pub async fn remove(
+    pool: &PgPool,
+    tenant: &Tenant,
+    user_id: UserId,
+    lock_timeout: std::time::Duration,
+) -> Result<(), KatError> {
     tenant.require_admin()?;
-    let mut tx = pool.begin().await?;
-    let (actor, _) = lock_workspace(&mut tx, tenant).await?;
-    let current = role_of(&mut tx, &actor, user_id)
-        .await?
-        .ok_or(KatError::NotFound)?;
-    if current == Role::Owner {
-        if actor.role() != Role::Owner {
-            return Err(KatError::Forbidden);
+    crate::db::guarded(pool, async |conn| {
+        let mut tx = conn.begin().await?;
+        crate::db::set_lock_timeout(&mut tx, lock_timeout).await?;
+        let (actor, _) = lock_workspace(&mut tx, tenant).await?;
+        let current = role_of(&mut tx, &actor, user_id)
+            .await?
+            .ok_or(KatError::NotFound)?;
+        if current == Role::Owner {
+            if actor.role() != Role::Owner {
+                return Err(KatError::Forbidden);
+            }
+            keep_an_owner(&mut tx, &actor).await?;
         }
-        keep_an_owner(&mut tx, &actor).await?;
-    }
-    sqlx::query("DELETE FROM memberships WHERE workspace_id = $1 AND user_id = $2")
-        .bind(actor.workspace_id())
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(())
+        sqlx::query("DELETE FROM memberships WHERE workspace_id = $1 AND user_id = $2")
+            .bind(actor.workspace_id())
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    })
+    .await
 }

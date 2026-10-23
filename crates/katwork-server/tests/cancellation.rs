@@ -231,3 +231,85 @@ async fn normal_busy_reuses_connection(pool: PgPool) {
     blocker.rollback().await.unwrap();
     single.close().await;
 }
+
+fn member_change(
+    workspace: &str,
+    operation: &str,
+) -> (&'static str, String, Option<serde_json::Value>) {
+    let path = format!("/api/workspaces/{workspace}/members");
+    let user = uuid::Uuid::now_v7();
+    match operation {
+        "invite" => (
+            "POST",
+            path,
+            Some(json!({"email":"cancelled@example.test","role":"member","delivery":"link"})),
+        ),
+        "role" => (
+            "PUT",
+            format!("{path}/{user}/role"),
+            Some(json!({"role":"admin"})),
+        ),
+        "remove" => ("DELETE", format!("{path}/{user}"), None),
+        _ => unreachable!(),
+    }
+}
+
+async fn cancelled_member_change(pool: PgPool, operation: &str) {
+    let (single, app, cookie, workspace, pid) = fixture(&pool).await;
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM workspaces WHERE id::text=$1 FOR NO KEY UPDATE")
+        .bind(&workspace)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let (method, path, body) = member_change(&workspace, operation);
+    drop_waiting(
+        &pool,
+        pid,
+        request(&app, method, &path, body, Some(&cookie)),
+    )
+    .await;
+    blocker.rollback().await.unwrap();
+    assert_closed(&pool, &single, pid).await;
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn cancelled_member_invite_closes_connection(pool: PgPool) {
+    cancelled_member_change(pool, "invite").await;
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn cancelled_member_role_closes_connection(pool: PgPool) {
+    cancelled_member_change(pool, "role").await;
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn cancelled_member_remove_closes_connection(pool: PgPool) {
+    cancelled_member_change(pool, "remove").await;
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn normal_member_busy_reuses_connection(pool: PgPool) {
+    let (single, app, cookie, workspace, pid) = fixture(&pool).await;
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM workspaces WHERE id::text=$1 FOR NO KEY UPDATE")
+        .bind(&workspace)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    for operation in ["invite", "role", "remove"] {
+        let (method, path, body) = member_change(&workspace, operation);
+        let response = tokio::time::timeout(
+            cancel::DEADLINE,
+            request(&app, method, &path, body, Some(&cookie)),
+        )
+        .await
+        .expect("unbounded membership lock");
+        assert_eq!(response.headers().get("retry-after").unwrap(), "1");
+        assert_code(response, 503, "busy").await;
+        assert_eq!(cancel::backend_pid(&single).await, pid);
+        cancel::assert_backend_idle(&pool, pid).await;
+    }
+    blocker.rollback().await.unwrap();
+    single.close().await;
+}
