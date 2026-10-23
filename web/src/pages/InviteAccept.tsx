@@ -63,13 +63,10 @@ export function InviteAccept({ onAccepted }: { onAccepted?: () => void }) {
     );
   }
 
-  // A link without a token can never work: say so instead of showing a form.
-  const tokenRejected =
-    !token ||
-    (problem?.kind === 'api' &&
-      problem.error instanceof ApiError &&
-      problem.error.code === 'invite_token_invalid');
   const errorId = `${id}-error`;
+  // A link without a token can never work: say so instead of showing a form. Neither message
+  // links to password reset, which is a dead end on an install without SMTP; both point at
+  // the person who manages KatWork instead.
   const alert = (problem || !token) && (
     <div id={errorId} className="alert" role="alert">
       <p>
@@ -79,13 +76,6 @@ export function InviteAccept({ onAccepted }: { onAccepted?: () => void }) {
             ? t('invite.mismatch')
             : errorMessage(problem?.error)}
       </p>
-      {tokenRejected && (
-        <p>
-          <Link to="/reset" className="link">
-            {t('invite.use_reset')}
-          </Link>
-        </p>
-      )}
     </div>
   );
   return (

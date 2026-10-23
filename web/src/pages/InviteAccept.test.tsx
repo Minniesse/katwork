@@ -1,4 +1,4 @@
-import { act, render, screen } from '@testing-library/react';
+import { act, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { setLocale } from '../i18n';
@@ -113,10 +113,8 @@ test.each(['en', 'th'] as const)(
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent(messages['reason.invite_token_invalid']!);
     expect(onAccepted).not.toHaveBeenCalled();
-    expect(screen.getByRole('link', { name: messages['invite.use_reset'] })).toHaveAttribute(
-      'href',
-      '/reset',
-    );
+    // Without SMTP a reset form is a dead end, so the page only points at the operator.
+    expect(within(alert).queryByRole('link')).toBeNull();
     expect(window.location.href).not.toContain('used-token');
   },
 );
@@ -125,12 +123,10 @@ test('invite_without_token_explains_the_link_is_incomplete', async () => {
   window.history.replaceState(null, '', '/invite');
   const fetchMock = stubFetch([204]);
   render(<InviteAccept />);
-  expect(await screen.findByRole('alert')).toHaveTextContent(en['invite.no_token']);
+  const alert = await screen.findByRole('alert');
+  expect(alert).toHaveTextContent(en['invite.no_token']);
+  expect(within(alert).queryByRole('link')).toBeNull();
   expect(screen.queryByRole('button', { name: en['invite.submit'] })).toBeNull();
-  expect(screen.getByRole('link', { name: en['invite.use_reset'] })).toHaveAttribute(
-    'href',
-    '/reset',
-  );
   expect(fetchMock).not.toHaveBeenCalled();
 });
 
