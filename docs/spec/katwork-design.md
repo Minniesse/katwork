@@ -148,7 +148,7 @@ Vendor picks (one primary pick per role):
 - **Documents:** docx-rs · umya-spreadsheet · pdf-extract · lopdf · Typst · OAR-OCR.
 - **Search and Thai text:** Tantivy with nlpO3 · Qdrant · ICU4X.
 - **Inference:** ort (Laya) · mistral.rs (optional local LLM).
-- **Front end:** AG-UI protocol 1.0 events as KatWork serde types with conformance fixtures; the community Rust crates are not used (`docs/adr/0003-own-ag-ui-event-types.md`). Our own React UI, not CopilotKit Intelligence.
+- **Front end:** AG-UI protocol 1.0 events as KatWork serde types, each validated against the protocol's JSON Schema; the community Rust crates are not used. A thread's stream carries overlapping runs and KatWork events, so it is KatWork's own stream built from AG-UI shapes, read by KatWork's web client, not by stock AG-UI clients (`docs/adr/0003-own-ag-ui-event-types.md`). Our own React UI, not CopilotKit Intelligence.
 - **Shells and art:** Tauri · Capacitor · react-three-fiber with drei · Kenney Furniture Kit · Quaternius Universal Base Characters.
 
 ### 5.3 What must stay in-house

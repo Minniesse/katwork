@@ -1,6 +1,6 @@
 # 0002. `needs_input` is final in sub-project 1; resume comes in sub-project 3
 
-- Status: Accepted (2026-10-22)
+- Status: Accepted (2026-10-22); amended 2026-10-23
 - Spec: §4 (job statuses), §6.2, §6.4 (clarifying), §19
 
 ## Context
@@ -21,3 +21,8 @@ Resuming the same job needs a parked task, a rule for who may answer, and a chan
 - Sub-project 1 needs no parked-task state and no answer-authorization rule.
 - Sub-project 3 carries one migration: resumable `needs_input`, and the copy of plan and evidence that team jobs will need by then.
 - The spec's job-status table and Stage 0 state both phases: a follow-up job in sub-project 1, and resume from sub-project 3, before the alpha ships.
+
+## Amendment (2026-10-23): approval is not executable in sub-project 1
+
+- In sub-project 1 nothing can approve a pending call: there is no approval route or tool, the stored `pending_tool_call` is never dispatched, and the person's next message starts a follow-up job.
+- Sub-project 3's approval host binds each approval to the pending call's `args_sha256` and records the approver, who must be the requester or a Space admin, with a receipt keyed by the call. The call is dispatched only once its receipt validates. Repeating the same approval returns the stored receipt and result; a different decision for the same call is rejected with 409.
