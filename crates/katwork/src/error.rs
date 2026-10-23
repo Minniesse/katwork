@@ -1,5 +1,20 @@
 #[derive(Debug, thiserror::Error)]
 pub enum KatError {
+    #[error("message_too_large")]
+    MessageTooLarge,
+    #[error("message_empty")]
+    MessageEmpty,
+    #[error("message_invalid")]
+    MessageInvalid,
+    #[error("client_msg_id_invalid")]
+    ClientMsgIdInvalid,
+    #[error("client_msg_id_too_long")]
+    ClientMsgIdTooLong,
+    #[error("client_msg_id_conflict")]
+    ClientMsgIdConflict,
+    #[error("thread_title_invalid")]
+    ThreadTitleInvalid,
+
     #[error("kat_name_conflict")]
     KatNameConflict,
     #[error("default_space_required")]
@@ -75,6 +90,14 @@ impl From<sqlx::Error> for KatError {
 impl KatError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::MessageTooLarge => "message_too_large",
+            Self::MessageEmpty => "message_empty",
+            Self::MessageInvalid => "message_invalid",
+            Self::ClientMsgIdInvalid => "client_msg_id_invalid",
+            Self::ClientMsgIdTooLong => "client_msg_id_too_long",
+            Self::ClientMsgIdConflict => "client_msg_id_conflict",
+            Self::ThreadTitleInvalid => "thread_title_invalid",
+
             Self::KatNameConflict => "kat_name_conflict",
             Self::DefaultSpaceRequired => "default_space_required",
             Self::GrantInUse => "grant_in_use",

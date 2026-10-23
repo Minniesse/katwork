@@ -260,7 +260,7 @@ pub(super) async fn hire_on(
     mut new: NewKat,
 ) -> Result<KatId, KatError> {
     super::check_space(conn, tenant, space).await?;
-    new.name = tenancy::validate_name(&new.name)?.to_owned();
+    new.name = super::validate_name(&new.name)?.to_owned();
     if let KatRole::Custom(name) = &mut new.role {
         *name = tenancy::validate_name(name)?.to_owned();
     }
@@ -323,7 +323,7 @@ pub async fn update(
     lock_kat(&mut tx, tenant, id).await?;
     let mut kat = get_on(&mut *tx, tenant, id).await?;
     if let Some(name) = patch.name {
-        let name = tenancy::validate_name(&name)?;
+        let name = super::validate_name(&name)?;
         let others: Vec<String> = sqlx::query_scalar("SELECT d.name FROM team_members mine JOIN team_members peer ON peer.team_id = mine.team_id AND peer.workspace_id = mine.workspace_id JOIN kats d ON d.id = peer.kat_id AND d.workspace_id = peer.workspace_id WHERE mine.workspace_id = $1 AND mine.kat_id = $2 AND mine.active AND peer.active AND peer.kat_id <> $2")
             .bind(tenant.workspace_id()).bind(id).fetch_all(&mut *tx).await?;
         if others

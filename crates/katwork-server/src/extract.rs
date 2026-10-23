@@ -76,3 +76,20 @@ pub(crate) fn path<T>(path: Result<Path<T>, PathRejection>) -> Result<T, ApiErro
     path.map(|Path(value)| value)
         .map_err(|_| ApiError(KatError::RequestInvalid))
 }
+
+/// JSON bodies with the same stable error envelope as role-gated `payload` routes.
+pub struct ApiJson<T>(pub T);
+
+impl<T> axum::extract::FromRequest<AppState> for ApiJson<T>
+where
+    T: serde::de::DeserializeOwned + Send,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(
+        request: axum::extract::Request,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        payload(Json::<T>::from_request(request, state).await).map(Self)
+    }
+}

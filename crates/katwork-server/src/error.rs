@@ -16,6 +16,13 @@ impl From<KatError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.0 {
+            KatError::MessageTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            KatError::ClientMsgIdConflict => StatusCode::CONFLICT,
+            KatError::MessageEmpty
+            | KatError::MessageInvalid
+            | KatError::ClientMsgIdInvalid
+            | KatError::ClientMsgIdTooLong
+            | KatError::ThreadTitleInvalid => StatusCode::UNPROCESSABLE_ENTITY,
             KatError::NotFound => StatusCode::NOT_FOUND,
             KatError::Forbidden => StatusCode::FORBIDDEN,
             KatError::KatNameConflict

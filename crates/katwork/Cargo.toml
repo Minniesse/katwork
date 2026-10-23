@@ -33,6 +33,10 @@ lettre.workspace = true
 unicode-normalization.workspace = true
 caseless.workspace = true
 
+unicode-segmentation.workspace = true
+pulldown-cmark.workspace = true
+regex-syntax.workspace = true
+
 [dev-dependencies]
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util", "io-util"] }
