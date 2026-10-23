@@ -288,7 +288,7 @@ web/
 **Interfaces:**
 - Consumes: `AuthUser`, `types::SpacePolicy`.
 - Produces:
-  - `katwork::tenancy::Tenant { workspace_id: WorkspaceId, user_id: UserId, role: Role }` and `Role::{Owner, Admin, Member}`
+  - `katwork::tenancy::Tenant` with private fields and accessors `workspace_id() -> WorkspaceId`, `user_id() -> UserId`, `role() -> Role` and `require_admin()`; `Role::{Owner, Admin, Member}`
   - `tenancy::resolve(pool, user_id: UserId, workspace_id: WorkspaceId) -> Result<Tenant, KatError>`: a non-member gets `NotFound`. The extractor uses it for the signed-in user, and the worker (Task 11) for a job's requester.
   - `impl FromRequestParts<AppState> for Tenant` in `extract.rs`: reads `{workspace_id}`, requires `AuthUser`, calls `resolve`; a non-member gets 404 `not_found`
   - `workspace::create(pool, name: &str, owner: UserId) -> Result<WorkspaceId, KatError>`
