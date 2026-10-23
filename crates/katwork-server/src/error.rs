@@ -40,7 +40,7 @@ impl IntoResponse for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             KatError::LeaseLost => StatusCode::CONFLICT,
-            KatError::ConfigInvalid
+            KatError::ConfigInvalid { .. }
             | KatError::CommandInvalid
             | KatError::Database(_)
             | KatError::Migration(_)

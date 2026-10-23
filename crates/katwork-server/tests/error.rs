@@ -28,7 +28,9 @@ async fn pool_and_connection_errors_during_request_return_503() {
 async fn api_errors_return_only_stable_codes() {
     for (error, status, code) in [
         (
-            KatError::ConfigInvalid,
+            KatError::ConfigInvalid {
+                var: "KATWORK_SECRET",
+            },
             StatusCode::INTERNAL_SERVER_ERROR,
             "config_invalid",
         ),

@@ -45,7 +45,7 @@ pub enum KatError {
     #[error("json_required")]
     JsonRequired,
     #[error("config_invalid")]
-    ConfigInvalid,
+    ConfigInvalid { var: &'static str },
     #[error("command_invalid")]
     CommandInvalid,
     #[error("database_unavailable")]
@@ -98,7 +98,7 @@ impl KatError {
             Self::HostNotAllowed => "host_not_allowed",
             Self::CrossSiteRequest => "cross_site_request",
             Self::JsonRequired => "json_required",
-            Self::ConfigInvalid => "config_invalid",
+            Self::ConfigInvalid { .. } => "config_invalid",
             Self::CommandInvalid => "command_invalid",
             Self::DatabaseUnavailable(_) => "database_unavailable",
             Self::Database(_) => "database_error",

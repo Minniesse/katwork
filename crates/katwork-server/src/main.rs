@@ -38,6 +38,9 @@ async fn main() -> ExitCode {
 
 fn error_report(error: &KatError, config: Option<&Config>, database_url: Option<&str>) -> String {
     let mut lines = vec![error.code().to_owned()];
+    if let KatError::ConfigInvalid { var } = error {
+        lines[0] = format!("config_invalid {{ var: {var} }}");
+    }
     let mut source = error.source();
     while let Some(cause) = source {
         let message = cause.to_string();
@@ -76,6 +79,7 @@ async fn run() -> Result<(), KatError> {
             let pool = db::connect(&config.database_url).await?;
             let transport = config.transport.clone();
             let core = Arc::new(Core::new(pool, config));
+            core.registry.log_tiers();
             let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
             katwork_server::transport::serve_with_shutdown(
                 listener,
@@ -94,7 +98,9 @@ async fn run() -> Result<(), KatError> {
         "seed-demo" => {
             let config = Config::from_env()?;
             if !config.demo {
-                return Err(KatError::ConfigInvalid);
+                return Err(KatError::ConfigInvalid {
+                    var: "KATWORK_DEMO",
+                });
             }
             let pool = db::connect(&config.database_url).await?;
             if let Some(password) = auth::seed_demo(&pool, &config, reset_password).await? {
@@ -147,7 +153,7 @@ mod tests {
             types::{ModelTier, SpacePolicy},
         };
         use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-        for id in ["openai", "anthropic"] {
+        for id in ["openai", "anthropic", "local"] {
             let key = uuid::Uuid::now_v7().to_string();
             let url = format!("file:///{}", uuid::Uuid::now_v7());
             let mut cfg = Config::from_lookup(|name| match name {
@@ -163,8 +169,14 @@ mod tests {
             };
             if id == "openai" {
                 cfg.openai = Some(env);
-            } else {
+            } else if id == "anthropic" {
                 cfg.anthropic = Some(env);
+            } else {
+                cfg.local = Some(katwork::config::LocalEnv {
+                    base_url: url.clone(),
+                    model: "fixture".into(),
+                    api_key: Some(key.clone()),
+                });
             }
             let output = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
             let subscriber = tracing_subscriber::registry().with(
@@ -342,6 +354,7 @@ mod tests {
                     },
                     "fixture",
                     OpenAiApi::Chat,
+                    HttpLimits::default(),
                 )
                 .unwrap();
                 let mut stream = provider
@@ -370,6 +383,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn config_error_report_names_only_the_variable() {
+        let error = KatError::ConfigInvalid {
+            var: "KATWORK_LOCAL_BASE_URL",
+        };
+        assert_eq!(
+            error_report(&error, None, None),
+            "config_invalid { var: KATWORK_LOCAL_BASE_URL }"
+        );
     }
 
     #[test]
