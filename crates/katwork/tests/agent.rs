@@ -1858,3 +1858,6 @@ async fn rejected_turns_emit_no_tool_events(pool: PgPool) {
 
 #[path = "agent/review.rs"]
 mod review;
+
+#[path = "agent/rereview.rs"]
+mod rereview;
