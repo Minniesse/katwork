@@ -137,6 +137,15 @@ fn mentions_emoji_and_symbols_end_names() {
 }
 
 #[test]
+fn mentions_digit_emoji_presentation_ends_names() {
+    for digit in '0'..='9' {
+        check(&format!("@Writer{digit}\u{fe0f}"), &["Writer"], &[0]);
+        check(&format!("@Writer{digit}\u{fe0e}"), &["Writer"], &[]);
+        check(&format!("@Writer{digit}"), &["Writer"], &[]);
+    }
+}
+
+#[test]
 fn mentions_whitespace_after_at_is_not_a_mention() {
     for body in [
         "@ Writer",
