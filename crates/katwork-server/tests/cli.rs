@@ -18,7 +18,11 @@ fn server() -> Command {
 
 #[test]
 fn rejects_unknown_commands_and_extra_arguments() {
-    for args in [vec!["unknown"], vec!["migrate", "unexpected"]] {
+    for args in [
+        vec!["unknown"],
+        vec!["migrate", "unexpected"],
+        vec!["healthcheck", "unexpected"],
+    ] {
         let output = server().args(args).output().unwrap();
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("command_invalid"));
@@ -1360,6 +1364,7 @@ async fn seed_demo_applies_changed_demo_password(pool: sqlx::PgPool) {
 
 const USAGE: &str = "\
 usage: katwork-server [serve]
+       katwork-server healthcheck
        katwork-server migrate
        katwork-server seed-demo [--reset-password]
        katwork-server create-user --email <email> --workspace <name|id> --role <owner|admin|member> [--space-policy <local|hosted>] [--locale <en|th>]

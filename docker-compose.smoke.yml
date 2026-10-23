@@ -1,0 +1,27 @@
+services:
+  katwork:
+    image: ${KATWORK_IMAGE:-katwork-smoke:local}
+    build:
+      target: smoke
+      args:
+        CARGO_FEATURES: smoke-fixtures
+    environment: &smoke-environment
+      KATWORK_SMOKE_HOLD_SECS: "20"
+      KATWORK_DEMO: "1"
+      KATWORK_ALLOW_DEMO_ON_HTTPS: ${KATWORK_ALLOW_DEMO_ON_HTTPS:-}
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+      KATWORK_LOCAL_BASE_URL: ""
+      KATWORK_LOCAL_MODEL: ""
+      KATWORK_LOCAL_API_KEY: ""
+      SMTP_HOST: ""
+      SMTP_USERNAME: ""
+      SMTP_PASSWORD: ""
+      RUST_LOG: debug,rig=trace
+  migrate:
+    environment: *smoke-environment
+    image: ${KATWORK_IMAGE:-katwork-smoke:local}
+    build:
+      target: smoke
+      args:
+        CARGO_FEATURES: smoke-fixtures
