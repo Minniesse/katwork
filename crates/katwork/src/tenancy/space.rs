@@ -24,7 +24,7 @@ pub async fn create(
         "INSERT INTO spaces (id, workspace_id, name, allow_external) VALUES ($1, $2, $3, $4)",
     )
     .bind(id)
-    .bind(tenant.workspace_id)
+    .bind(tenant.workspace_id())
     .bind(name)
     .bind(policy.allow_external)
     .execute(pool)
@@ -36,7 +36,7 @@ pub async fn list(pool: &PgPool, tenant: &Tenant) -> Result<Vec<Space>, KatError
     let rows: Vec<(SpaceId, String, bool)> = sqlx::query_as(
         "SELECT id, name, allow_external FROM spaces WHERE workspace_id = $1 ORDER BY id",
     )
-    .bind(tenant.workspace_id)
+    .bind(tenant.workspace_id())
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -53,7 +53,7 @@ pub async fn get(pool: &PgPool, tenant: &Tenant, id: SpaceId) -> Result<Space, K
     let (id, name, allow_external) = sqlx::query_as(
         "SELECT id, name, allow_external FROM spaces WHERE workspace_id = $1 AND id = $2",
     )
-    .bind(tenant.workspace_id)
+    .bind(tenant.workspace_id())
     .bind(id)
     .fetch_optional(pool)
     .await?

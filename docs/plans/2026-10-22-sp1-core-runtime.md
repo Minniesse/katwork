@@ -182,7 +182,7 @@ web/
 **Interfaces:**
 - Consumes: `AuthUser`.
 - Produces:
-  - `Tenant { workspace_id: WorkspaceId, user_id: UserId, role: Role }`, an extractor that reads `:workspace_id` from the path and checks membership, otherwise **404**
+  - `Tenant`, an extractor with private fields that reads `:workspace_id` from the path and checks membership, otherwise **404**; exposes `workspace_id() -> WorkspaceId`, `user_id() -> UserId`, `role() -> Role` and `require_admin()`
   - `Role::{Owner, Admin, Member}`
   - `workspace::create(pool, name, owner) -> Result<WorkspaceId, KatError>`
   - `space::create(pool, &Tenant, name) -> Result<SpaceId, KatError>`

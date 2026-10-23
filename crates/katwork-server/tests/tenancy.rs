@@ -257,6 +257,35 @@ async fn member_cannot_pause_workspace_admin_can(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../katwork/migrations")]
+async fn member_cannot_pause_workspace_with_invalid_body(pool: PgPool) {
+    let (id, password) = user(&pool).await;
+    let workspace_id = workspace(&pool, "Office").await;
+    membership(&pool, workspace_id, id, "member").await;
+    let app = app(&pool, None);
+    let cookie = cookie(&login(&app, &password).await);
+    let path = format!("/api/workspaces/{workspace_id}/paused");
+    for payload in [
+        Some(json!({})),
+        Some(json!({"paused": "yes"})),
+        Some(json!({"paused": null})),
+        None,
+    ] {
+        assert_code(
+            request(&app, "PUT", &path, payload, Some(&cookie)).await,
+            403,
+            "forbidden",
+        )
+        .await;
+    }
+    let paused: bool = sqlx::query_scalar("SELECT paused FROM workspaces WHERE id = $1")
+        .bind(workspace_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!paused);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
 async fn create_workspace_assigns_only_authenticated_owner(pool: PgPool) {
     let (id, password) = user(&pool).await;
     let other = workspace(&pool, "Private").await;
@@ -342,9 +371,9 @@ async fn repositories_resolve_roles_and_scope_space_ids(pool: PgPool) {
         let tenant = tenancy::resolve(&pool, UserId(id), WorkspaceId(own))
             .await
             .unwrap();
-        assert_eq!(tenant.user_id, UserId(id));
-        assert_eq!(tenant.workspace_id, WorkspaceId(own));
-        assert_eq!(tenant.role, role);
+        assert_eq!(tenant.user_id(), UserId(id));
+        assert_eq!(tenant.workspace_id(), WorkspaceId(own));
+        assert_eq!(tenant.role(), role);
         let found = spaces::get(&pool, &tenant, SpaceId(own_space))
             .await
             .unwrap();
@@ -384,7 +413,7 @@ async fn tenant_extractor_reads_workspace_id_by_name(pool: PgPool) {
         .route(
             "/probe/{space_id}/{workspace_id}/{dot_id}",
             get(|tenant: Tenant| async move {
-                Json(json!({"workspace_id": tenant.workspace_id, "user_id": tenant.user_id}))
+                Json(json!({"workspace_id": tenant.workspace_id(), "user_id": tenant.user_id()}))
             }),
         )
         .with_state(AppState {
@@ -490,29 +519,28 @@ async fn workspace_creation_rolls_back_without_valid_owner(pool: PgPool) {
     assert_eq!(count, 0);
 }
 
-async fn assert_invalid_name(pool: &PgPool, name: &str) {
+async fn assert_invalid_names(pool: &PgPool, names: &[&str]) {
     let (id, password) = user(pool).await;
     let own = workspace(pool, "Own").await;
     membership(pool, own, id, "owner").await;
     let app = app(pool, None);
     let cookie = cookie(&login(&app, &password).await);
-    for path in [
-        "/api/workspaces".to_owned(),
-        format!("/api/workspaces/{own}/spaces"),
-    ] {
-        assert_code(
-            request(
+    for name in names {
+        for path in [
+            "/api/workspaces".to_owned(),
+            format!("/api/workspaces/{own}/spaces"),
+        ] {
+            let response = request(
                 &app,
                 "POST",
                 &path,
                 Some(json!({"name": name, "allow_external": false})),
                 Some(&cookie),
             )
-            .await,
-            400,
-            "request_invalid",
-        )
-        .await;
+            .await;
+            assert_eq!(response.status(), 400, "name {name:?} on {path}");
+            assert_eq!(body(response).await, json!({"code": "request_invalid"}));
+        }
     }
     let counts: (i64, i64, i64) = sqlx::query_as(
         "SELECT (SELECT count(*) FROM workspaces), (SELECT count(*) FROM memberships), (SELECT count(*) FROM spaces)",
@@ -525,27 +553,83 @@ async fn assert_invalid_name(pool: &PgPool, name: &str) {
 
 #[sqlx::test(migrations = "../katwork/migrations")]
 async fn empty_names_are_rejected(pool: PgPool) {
-    assert_invalid_name(&pool, "").await;
+    assert_invalid_names(&pool, &[""]).await;
 }
 
 #[sqlx::test(migrations = "../katwork/migrations")]
 async fn whitespace_only_names_are_rejected(pool: PgPool) {
-    assert_invalid_name(&pool, "  \u{2003}  ").await;
+    assert_invalid_names(&pool, &["  \u{2003}  "]).await;
 }
 
 #[sqlx::test(migrations = "../katwork/migrations")]
 async fn names_over_120_characters_are_rejected(pool: PgPool) {
-    assert_invalid_name(&pool, &"界".repeat(121)).await;
+    assert_invalid_names(&pool, &[&"界".repeat(121)]).await;
 }
 
 #[sqlx::test(migrations = "../katwork/migrations")]
 async fn nul_names_are_rejected(pool: PgPool) {
-    assert_invalid_name(&pool, "Office\0").await;
+    assert_invalid_names(&pool, &["Office\0"]).await;
 }
 
 #[sqlx::test(migrations = "../katwork/migrations")]
 async fn control_characters_in_names_are_rejected(pool: PgPool) {
-    assert_invalid_name(&pool, "\nOffice\u{0085}").await;
+    assert_invalid_names(&pool, &["\nOffice\u{0085}"]).await;
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn format_characters_in_names_are_rejected(pool: PgPool) {
+    assert_invalid_names(
+        &pool,
+        &[
+            "\u{200B}",
+            "\u{FEFF}",
+            "Off\u{200B}ice",
+            "Off\u{FEFF}ice",
+            "Off\u{00AD}ice",
+            "Off\u{061C}ice",
+            "Off\u{200C}ice",
+            "Off\u{200D}ice",
+            "Off\u{2060}ice",
+            "Off\u{E0001}ice",
+            "Off\u{E0020}ice",
+        ],
+    )
+    .await;
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn bidi_controls_in_names_are_rejected(pool: PgPool) {
+    assert_invalid_names(
+        &pool,
+        &[
+            "abc\u{202A}gpj.exe",
+            "abc\u{202B}gpj.exe",
+            "abc\u{202C}gpj.exe",
+            "abc\u{202D}gpj.exe",
+            "abc\u{202E}gpj.exe",
+            "abc\u{2066}gpj.exe",
+            "abc\u{2067}gpj.exe",
+            "abc\u{2068}gpj.exe",
+            "abc\u{2069}gpj.exe",
+        ],
+    )
+    .await;
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn line_and_paragraph_separators_in_names_are_rejected(pool: PgPool) {
+    assert_invalid_names(
+        &pool,
+        &[
+            "\u{2028}Office",
+            "Office\u{2028}",
+            "Off\u{2028}ice",
+            "\u{2029}Office",
+            "Office\u{2029}",
+            "Off\u{2029}ice",
+        ],
+    )
+    .await;
 }
 
 #[sqlx::test(migrations = "../katwork/migrations")]

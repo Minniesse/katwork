@@ -42,7 +42,7 @@ pub async fn set_paused(pool: &PgPool, tenant: &Tenant, paused: bool) -> Result<
     tenant.require_admin()?;
     // A non-key update locks only this workspace and permits concurrent foreign-key checks.
     let result = sqlx::query("UPDATE workspaces SET paused = $2 WHERE id = $1")
-        .bind(tenant.workspace_id)
+        .bind(tenant.workspace_id())
         .bind(paused)
         .execute(pool)
         .await?;
