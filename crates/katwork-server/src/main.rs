@@ -87,6 +87,7 @@ fn dependency_log_allowed(metadata: &tracing::Metadata<'_>) -> bool {
 
 const USAGE: &str = "\
 usage: katwork-server [serve]
+       katwork-server healthcheck
        katwork-server migrate
        katwork-server seed-demo [--reset-password]
        katwork-server create-user --email <email> --workspace <name|id> --role <owner|admin|member> [--space-policy <local|hosted>] [--locale <en|th>]
@@ -116,6 +117,7 @@ fn flags(
 enum Command {
     Help,
     Serve,
+    Healthcheck,
     Migrate,
     SeedDemo {
         reset_password: bool,
@@ -147,6 +149,7 @@ fn parse(args: &[String]) -> Result<Command, KatError> {
     let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
     Ok(match (command, rest.as_slice()) {
         ("serve", []) => Command::Serve,
+        ("healthcheck", []) => Command::Healthcheck,
         ("migrate", []) => Command::Migrate,
         ("seed-demo", []) => Command::SeedDemo {
             reset_password: false,
@@ -255,6 +258,7 @@ async fn run() -> Result<(), KatError> {
             served?;
             Ok(())
         }
+        Command::Healthcheck => Ok(healthcheck(([127, 0, 0, 1], 3000).into()).await?),
         Command::Migrate => {
             let config = Config::from_env()?;
             let pool = db::connect(&config.database_url).await?;
@@ -304,6 +308,24 @@ async fn run() -> Result<(), KatError> {
             print_link(&link)
         }
     }
+}
+
+async fn healthcheck(address: std::net::SocketAddr) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut socket = tokio::net::TcpStream::connect(address).await?;
+        socket
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await?;
+        let mut status = [0; 13];
+        socket.read_exact(&mut status).await?;
+        if &status != b"HTTP/1.1 200 " {
+            return Err(std::io::Error::other("health endpoint failed"));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?
 }
 
 /// Writes an operator command's link, the only thing it prints. A closed or failing stdout is
@@ -357,6 +379,45 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn healthcheck_accepts_only_a_complete_success_status() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (response, healthy) in [
+            ("HTTP/1.1 200 OK\r\n", true),
+            ("HTTP/1.1 503 Unavailable\r\n", false),
+            ("HTTP", false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let expected = b"GET /healthz HTTP/1.1\r\n";
+                let mut request = vec![0; expected.len()];
+                socket.read_exact(&mut request).await.unwrap();
+                assert_eq!(request, expected);
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+            assert_eq!(super::healthcheck(address).await.is_ok(), healthy);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn healthcheck_times_out_when_the_server_stalls() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let check = tokio::spawn(super::healthcheck(address));
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 1];
+        socket.read_exact(&mut request).await.unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert_eq!(
+            check.await.unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+    }
+
     use super::*;
 
     struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);

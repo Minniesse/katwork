@@ -2,6 +2,7 @@ services:
   katwork:
     image: ${KATWORK_IMAGE:-katwork-smoke:local}
     build:
+      target: smoke
       args:
         CARGO_FEATURES: smoke-fixtures
     environment: &smoke-environment
@@ -21,5 +22,6 @@ services:
     environment: *smoke-environment
     image: ${KATWORK_IMAGE:-katwork-smoke:local}
     build:
+      target: smoke
       args:
         CARGO_FEATURES: smoke-fixtures

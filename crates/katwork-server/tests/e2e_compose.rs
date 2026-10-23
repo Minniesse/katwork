@@ -31,9 +31,11 @@ struct Stack {
     password: String,
     image: String,
     https: bool,
+    demo: bool,
     endpoint: String,
     client: reqwest::Client,
     cookie: String,
+    database: String,
 }
 impl Stack {
     fn new(https: bool) -> Self {
@@ -52,8 +54,14 @@ impl Stack {
                 .env("KATWORK_ENV_FILE", dir.join(".env")),
         );
         fs::create_dir(dir.join("backups")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // The private parent protects this directory; the cap-dropped container must write here.
+            fs::set_permissions(dir.join("backups"), fs::Permissions::from_mode(0o777)).unwrap();
+        }
         let ports = if https {
-            "  katwork:\n    ports: !reset []\n  caddy:\n    ports: !override [\"127.0.0.1::443\"]\n"
+            "  katwork:\n    ports: !reset []\n  caddy:\n    ports: !override [\"127.0.0.1::443\", \"127.0.0.1::80\"]\n"
         } else {
             "  katwork:\n    ports: !override [\"127.0.0.1::3000\"]\n"
         };
@@ -70,9 +78,11 @@ impl Stack {
             password: Uuid::now_v7().to_string(),
             image: std::env::var("KATWORK_IMAGE").unwrap_or_else(|_| "katwork-smoke:local".into()),
             https,
+            demo: false,
             endpoint: String::new(),
             client: reqwest::Client::new(),
             cookie: String::new(),
+            database: "katwork".into(),
         }
     }
     fn compose(&self) -> Command {
@@ -114,7 +124,7 @@ impl Stack {
             "-U",
             "katwork",
             "-d",
-            "katwork",
+            &self.database,
             "-Atc",
             sql,
         ])
@@ -124,6 +134,8 @@ impl Stack {
     fn public_url(&self) -> &str {
         if self.https {
             "https://localhost"
+        } else if self.demo {
+            "http://localhost:3001"
         } else {
             "http://localhost:3000"
         }
@@ -136,6 +148,9 @@ impl Stack {
         let (service, port) = if self.https {
             self.run(&["up", "-d", "--no-build", "caddy"]);
             ("caddy", "443")
+        } else if self.demo {
+            self.run(&["up", "-d", "--no-build", "demo-proxy"]);
+            ("demo-proxy", "3000")
         } else {
             ("katwork", "3000")
         };
@@ -146,6 +161,8 @@ impl Stack {
             if self.https { "https" } else { "http" }
         );
         let mut builder = reqwest::Client::builder()
+            // The assigned transport port differs from the canonical Host; HTTP/2 rejects that pair.
+            .http1_only()
             .no_proxy()
             .timeout(Duration::from_secs(180));
         if self.https {
@@ -165,33 +182,24 @@ impl Stack {
             );
         }
         self.client = builder.build().unwrap();
-        tokio::time::timeout(Duration::from_secs(90), async {
+        let mut last = String::new();
+        let ready = tokio::time::timeout(Duration::from_secs(90), async {
             loop {
-                if self
-                    .request("GET", "/healthz")
-                    .send()
-                    .await
-                    .is_ok_and(|r| r.status().is_success())
-                {
-                    break;
+                match self.request("GET", "/healthz").send().await {
+                    Ok(response) if response.status().is_success() => break,
+                    Ok(response) => last = format!("health status {}", response.status()),
+                    Err(error) => last = format!("{error:?}"),
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         })
-        .await
-        .expect("healthz becomes ready");
+        .await;
+        assert!(ready.is_ok(), "healthz becomes ready: {last}");
     }
     fn request(&self, method: &str, path: &str) -> reqwest::RequestBuilder {
         self.client
             .request(method.parse().unwrap(), format!("{}{path}", self.endpoint))
-            .header(
-                "Host",
-                if self.https {
-                    "localhost"
-                } else {
-                    "localhost:3000"
-                },
-            )
+            .header("Host", self.public_url().split_once("://").unwrap().1)
             .header("Origin", self.public_url())
             .header("Cookie", &self.cookie)
     }
@@ -314,6 +322,13 @@ impl Stack {
 }
 impl Drop for Stack {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            let logs = output(self.compose().args(["logs", "--no-color", "--tail", "40"]));
+            eprintln!(
+                "Compose diagnostics: {}",
+                String::from_utf8_lossy(&logs.stdout)
+            );
+        }
         let _ = output(self.compose().args(["down", "-v", "--remove-orphans"]));
         let _ = fs::remove_dir_all(&self.dir);
     }
@@ -384,11 +399,33 @@ fn first_run_and_profile_configuration() {
             stack
                 .compose()
                 .env("COMPOSE_FILE", files)
+                .env("CARGO_FEATURES", "smoke-fixtures")
                 .env("KATWORK_HTTPS_HOST", "smoke.example")
                 .args(["config", "--format", "json"]),
         ))
         .unwrap();
         let app = &config["services"]["katwork"];
+        assert_eq!(app["restart"], "unless-stopped");
+        assert_eq!(config["services"]["postgres"]["restart"], "unless-stopped");
+        assert_eq!(
+            app["build"]["target"],
+            if overrides.contains(&"smoke") {
+                "smoke"
+            } else {
+                "release"
+            }
+        );
+        if !overrides.contains(&"smoke") {
+            assert!(app["build"]["args"].is_null());
+        }
+        assert_eq!(
+            app["healthcheck"]["test"],
+            json!(["CMD", "/app/katwork-server", "healthcheck"])
+        );
+        assert_eq!(
+            config["services"]["backup"]["environment"]["DATABASE_URL"],
+            config["services"]["migrate"]["environment"]["DATABASE_URL"]
+        );
         assert_eq!(config["networks"]["backend"]["internal"], true);
         assert_eq!(
             config["services"]["postgres"]["networks"]
@@ -399,6 +436,10 @@ fn first_run_and_profile_configuration() {
         );
         assert!(config["services"]["postgres"]["ports"].is_null());
         if overrides.contains(&"https") {
+            assert_eq!(
+                config["services"]["caddy"]["depends_on"]["katwork"]["condition"],
+                "service_healthy"
+            );
             assert_eq!(app["networks"]["edge"]["ipv4_address"], "172.31.250.3");
             assert_eq!(
                 app["environment"]["KATWORK_TRUSTED_PROXIES"],
@@ -420,6 +461,20 @@ fn first_run_and_profile_configuration() {
             }
         }
         if overrides.contains(&"demo") {
+            assert!(app["ports"].is_null() || app["ports"] == json!([]));
+            for network in app["networks"].as_object().unwrap().keys() {
+                assert_eq!(config["networks"][network]["internal"], true);
+            }
+            assert!(
+                config["services"]["demo-proxy"]["networks"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("default")
+            );
+            assert_eq!(
+                config["services"]["demo-proxy"]["ports"][0]["published"],
+                "3001"
+            );
             assert_eq!(app["environment"]["KATWORK_DEMO"], "1");
             assert_eq!(
                 config["services"]["migrate"]["environment"]["KATWORK_DEMO"],
@@ -464,6 +519,7 @@ async fn thai_demo_stream_is_synthetic_and_dependency_logs_are_blocked() {
 #[ignore = "Docker daemon; run scripts/smoke.sh"]
 async fn offline_demo_uses_synthetic_provider_with_host_keys_cleared() {
     let mut stack = Stack::new(false);
+    stack.demo = true;
     let settings = stack.dir.join(".env");
     let mut env = fs::read_to_string(&settings).unwrap();
     env.push_str(&format!("\nOPENAI_API_KEY={}\nANTHROPIC_API_KEY={}\nKATWORK_LOCAL_BASE_URL=http://model.invalid/v1\nKATWORK_LOCAL_MODEL=fixture\nSMTP_HOST=mail.invalid\n", Uuid::now_v7(), Uuid::now_v7()));
@@ -474,6 +530,10 @@ async fn offline_demo_uses_synthetic_provider_with_host_keys_cleared() {
         &override_path,
         &format!(":{ROOT}/docker-compose.demo.yml{override_path}"),
     );
+    let overrides = stack.dir.join("test.yml");
+    let mut config = fs::read_to_string(&overrides).unwrap().replace("  katwork:\n    ports: !override [\"127.0.0.1::3000\"]", "  katwork:\n    ports: !reset []\n  demo-proxy:\n    ports: !override [\"127.0.0.1::3000\"]");
+    config.push_str("  egress-target:\n    image: postgres:17\n    networks: [default]\n    environment:\n      POSTGRES_HOST_AUTH_METHOD: trust\n");
+    fs::write(overrides, config).unwrap();
     stack.start().await;
     stack.seed_login().await;
     let id = stack.run(&["ps", "-q", "katwork"]);
@@ -494,6 +554,37 @@ async fn offline_demo_uses_synthetic_provider_with_host_keys_cleared() {
             "demo must clear {setting}"
         );
     }
+    stack.run(&["up", "-d", "egress-target"]);
+    let target = stack.run(&["ps", "-q", "egress-target"]);
+    let target_ip = checked(Command::new("docker").args([
+        "inspect",
+        "--format",
+        "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+        target.trim(),
+    ]));
+    let proxy = stack.run(&["ps", "-q", "demo-proxy"]);
+    let can_connect = |container: &str| {
+        output(Command::new("docker").args([
+            "run",
+            "--rm",
+            "--network",
+            &format!("container:{}", container.trim()),
+            "postgres:17",
+            "pg_isready",
+            "-h",
+            target_ip.trim(),
+            "-t",
+            "3",
+        ]))
+        .status
+        .success()
+    };
+    // A reachable TCP listener outside backend rules out an unavailable internet test target.
+    poll(|| can_connect(&proxy)).await;
+    assert!(
+        !can_connect(&id),
+        "the app network namespace must have no outbound route"
+    );
     let thread = stack.thread().await;
     let job = stack.post(&thread).await;
     stack.answered(&thread, &job).await;
@@ -541,7 +632,38 @@ async fn backup_archive_restores_seeded_data() {
     assert_eq!(fs::read_dir(stack.dir.join("backups")).unwrap().count(), 0);
     stack.seed_login().await;
     let versions = stack.sql("SELECT version FROM _sqlx_migrations ORDER BY version");
-    stack.run(&["up", "-d", "--no-build", "katwork"]);
+    stack.run(&["stop", "katwork"]);
+    stack.run(&[
+        "exec",
+        "-T",
+        "postgres",
+        "psql",
+        "-U",
+        "katwork",
+        "-d",
+        "postgres",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-c",
+        "ALTER DATABASE katwork RENAME TO seeded",
+    ]);
+    stack.run(&[
+        "exec", "-T", "postgres", "createdb", "-U", "katwork", "-O", "katwork", "katwork",
+    ]);
+    assert_eq!(
+        stack.sql("SELECT to_regclass('public._sqlx_migrations') IS NULL"),
+        "t"
+    );
+    let settings = stack.dir.join(".env");
+    fs::write(
+        &settings,
+        fs::read_to_string(&settings)
+            .unwrap()
+            .replace("/katwork\n", "/seeded\n"),
+    )
+    .unwrap();
+    stack.database = "seeded".into();
+    stack.start().await;
     let archives: Vec<_> = fs::read_dir(stack.dir.join("backups"))
         .unwrap()
         .map(|e| e.unwrap().file_name())
@@ -613,6 +735,40 @@ async fn backup_archive_restores_seeded_data() {
         restored("SELECT version FROM _sqlx_migrations ORDER BY version"),
         versions
     );
+    // Exercise the documented bundled-Postgres restore commands without replacing live data.
+    stack.run(&["stop", "katwork"]);
+    stack.run(&[
+        "exec", "-T", "postgres", "createdb", "-U", "katwork", "-O", "katwork", "restored",
+    ]);
+    let restored_archive = stack.dir.join("restore.dump");
+    stack.run(&[
+        "cp",
+        &format!("backup:/backups/{archive}"),
+        restored_archive.to_str().unwrap(),
+    ]);
+    stack.run(&[
+        "cp",
+        restored_archive.to_str().unwrap(),
+        "postgres:/tmp/restore.dump",
+    ]);
+    stack.run(&[
+        "exec",
+        "-T",
+        "postgres",
+        "pg_restore",
+        "--exit-on-error",
+        "--no-owner",
+        "-U",
+        "katwork",
+        "-d",
+        "restored",
+        "/tmp/restore.dump",
+    ]);
+    stack.database = "restored".into();
+    assert_eq!(
+        stack.sql("SELECT count(*) FROM users WHERE email='demo@katwork.local'"),
+        "1"
+    );
 }
 
 #[tokio::test]
@@ -674,6 +830,24 @@ async fn backup_failure_blocks_migrate() {
 async fn https_profile_survives_caddy_restart() {
     let mut stack = Stack::new(true);
     stack.start().await;
+    let health = stack.request("GET", "/healthz").send().await.unwrap();
+    assert_eq!(
+        health.headers()["strict-transport-security"],
+        "max-age=31536000"
+    );
+    let http = stack.run(&["port", "caddy", "80"]);
+    let redirect = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+        .get(format!("http://{}/healthz", http.trim()))
+        .header("Host", "localhost")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(redirect.status(), 308);
+    assert_eq!(redirect.headers()["location"], "https://localhost/healthz");
     stack.seed_login().await;
     let thread = stack.thread().await;
     let job = stack.post(&thread).await;
@@ -728,8 +902,10 @@ async fn https_profile_survives_caddy_restart() {
         Sha256::digest(der).to_vec()
     };
     let before = fingerprint(&stack);
-    stack.run(&["restart", "caddy"]);
-    stack.connect().await;
+    let old_id = stack.run(&["ps", "-q", "caddy"]);
+    stack.run(&["down"]);
+    stack.start().await;
+    assert_ne!(stack.run(&["ps", "-q", "caddy"]), old_id);
     assert_eq!(fingerprint(&stack), before);
 }
 

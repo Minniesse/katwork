@@ -36,17 +36,27 @@ scripts/demo.sh
 
 The first run builds or downloads the images, so it needs internet access.
 Once those images are available, the demo works without internet access. Open
-**http://localhost:3000** and sign in as **demo@katwork.local**. Open the private
+**http://localhost:3001** and sign in as **demo@katwork.local**. Open the private
 `.demo-credentials` file on the host to read the initial password. If you set
-`KATWORK_DEMO_PASSWORD` in `.env`, use that instead. Scripts never print passwords.
+`KATWORK_DEMO_PASSWORD` in `.env.demo`, use that instead. Scripts never print passwords.
 Rerunning the script preserves an existing account's password.
+
+The demo uses its own `katwork-demo` project, database volumes and `.env.demo`
+settings. It does not change your install's database. The script refuses to run
+while your install is running; pass `--allow-running-install` to deliberately
+run both. Stop the demo with:
+
+```sh
+docker compose -p katwork-demo --env-file .env.demo -f docker-compose.yml -f docker-compose.demo.yml down
+```
 
 The demo includes English `Demo` and Thai `เดโม` workspaces, each with a team of
 six Kats. Replies are synthetic and marked as such; no model or mail service is
 called. The demo override clears provider and mail settings. It is available
-only from this host. Docker keeps a normal app network to publish the local port;
-the demo configuration disables external services, rather than acting as a firewall. It exercises the
-API and streaming pipeline; available web pages depend on your checkout.
+only from this host. The app has no outbound network route. A small Caddy proxy
+publishes the local port and forwards requests to the private app network.
+The demo exercises the API and streaming pipeline; available web pages depend
+on your checkout.
 
 ### First account
 
@@ -118,6 +128,8 @@ old stack with `docker compose down`, then start it again. Open your HTTPS addre
 Caddy obtains the certificate and is the only public entry point. KatWork has no
 published port in this configuration. Caddy's certificate state lives in the
 `caddy_data` and `caddy_config` volumes; keep both across upgrades.
+HTTP redirects to HTTPS. HTTPS responses tell browsers to keep using HTTPS for
+one year (HSTS); the policy does not preload the domain or cover subdomains.
 
 The override trusts only Caddy at `172.31.250.2`, on subnet `172.31.250.0/29`.
 The app uses `172.31.250.3`, so it cannot take Caddy's address during startup.
@@ -131,6 +143,27 @@ rate limits before exposing a large public installation.
 Demo mode is refused on HTTPS unless `KATWORK_ALLOW_DEMO_ON_HTTPS=1` is explicitly
 set. Keep demo mode off for normal installations. `localhost` uses Caddy's local
 certificate authority, suitable for testing; a browser must trust that authority.
+
+For an office LAN, ask your network administrator to point `work.home.arpa`
+at this server's LAN address. Use `scripts/init-env.sh --https work.home.arpa`
+on a fresh install, or change `KATWORK_HTTPS_HOST` in the existing `.env`.
+Start with the HTTPS override as above. Caddy automatically uses its private
+certificate authority for `.home.arpa` and `.internal` names; see
+[Caddy's local HTTPS guide](https://caddyserver.com/docs/automatic-https#local-https).
+Export the public root certificate:
+
+```sh
+docker compose cp caddy:/data/caddy/pki/authorities/local/root.crt ./katwork-root.crt
+```
+
+Give only this `.crt` file to office users, never the authority's private key.
+Have your administrator install it in Windows' **Trusted Root Certification
+Authorities**, or the macOS **System** keychain with **Always Trust**. On iPhones
+and iPads, install the certificate profile, then enable it under **Settings →
+General → About → Certificate Trust Settings**. On Android, use **Settings →
+Security → Install a certificate → CA certificate** (names vary by device).
+Managed devices may require the administrator to do this. Then open
+**https://work.home.arpa**; do not bypass certificate warnings.
 
 ### Backups and upgrades
 
@@ -158,19 +191,36 @@ to secure storage and remove old files yourself after checking a restore.
 
 A dump contains **one database**, including users and migration history. It does
 not contain PostgreSQL roles or tablespaces, `.env`, or Caddy's certificates.
-Keep those separately. To restore into a fresh PostgreSQL 17 server, first create
-the role and empty database, using that server's operator connection settings:
+Keep those separately. SP1 Compose supports only its bundled PostgreSQL 17
+service. Backup and migrate stay on the private database network; external
+database hosts are not supported by these files.
+
+To restore safely, stop the app, start only PostgreSQL, and restore into a new
+database. Replace `YOUR_ARCHIVE.dump` with your archive filename. The bundled
+server already has the `katwork` role; do not create it again. On Linux, `sudo`
+lets Docker read the root-owned backup:
 
 ```sh
-createuser --login --pwprompt katwork
-createdb --owner=katwork katwork
-pg_restore --exit-on-error --no-owner --username=katwork --dbname=katwork /path/to/backup.dump
+docker compose down
+docker compose up -d --wait postgres
+docker compose exec -T postgres createdb -U katwork -O katwork restored
+sudo docker compose cp backups/YOUR_ARCHIVE.dump postgres:/tmp/restore.dump
+docker compose exec -T postgres pg_restore --exit-on-error --no-owner -U katwork -d restored /tmp/restore.dump
+docker compose exec -T postgres rm /tmp/restore.dump
 ```
 
-Set the restored role's password to match your private settings. Stop KatWork
-while restoring, and point its `DATABASE_URL` at the restored database before
-starting it. The restore smoke check verifies the demo user and all migration
-versions in a separate PostgreSQL 17 container.
+In `.env`, change only the final database name in `DATABASE_URL` from `/katwork`
+to `/restored`, preserving the user, password, `postgres` host and port `5432`.
+Run `docker compose up -d`. Backup reads this same URL, so it saves the restored
+database before migration. Check your data before removing the old database.
+If `restored` already exists, choose a new name rather than overwriting it.
+
+Keep the simple URL form written by `init-env.sh`:
+`postgres://USER:PASSWORD@HOST:PORT/DATABASE`. Fields accept letters, digits,
+`_`, `.`, `~` and `-`; the port must be 1–65535. Percent escapes, query options,
+IPv6 addresses and multi-host URLs are rejected before migration. The generated
+password already fits this form. The restore checks verify the documented
+commands, the selected database, the demo user and every migration version.
 
 ### Local model provider (development)
 
@@ -272,6 +322,30 @@ separate retention/training review. Use public or approved retrospective samples
 
 <a id="thai"></a>
 ## ภาษาไทย
+
+### เริ่มใช้งาน
+
+กรุณาติดตั้ง Docker และ Docker Compose ก่อน แล้วเปิดเทอร์มินัลในโฟลเดอร์ KatWork ครับ
+สร้างไฟล์ตั้งค่าส่วนตัวและเริ่มระบบด้วยคำสั่งนี้:
+
+```sh
+scripts/init-env.sh
+docker compose up -d --build
+docker compose exec katwork /app/katwork-server create-user \
+  --email you@example.com --workspace "ทีมของฉัน" --role owner \
+  --space-policy local --locale th
+```
+
+เปลี่ยนอีเมลเป็นของคุณ แล้วเปิดลิงก์ที่ปรากฏเพื่อตั้งรหัสผ่านภายใน 72 ชั่วโมงครับ
+เข้าใช้งานที่ **http://localhost:3000** หากทีมใช้เครื่องอื่น กรุณาตั้งค่า HTTPS ตามหัวข้อด้านบน
+ทีมจะมี Kats หกตัว หากต้องการคำตอบจริง กรุณาตั้งค่าโมเดลก่อนใช้งาน
+
+หากต้องการทดลองแยกจากข้อมูลจริง ให้ใช้ `scripts/demo.sh` แล้วเปิด **http://localhost:3001**
+เข้าสู่ระบบด้วย `demo@katwork.local` และอ่านรหัสผ่านเริ่มต้นจากไฟล์ `.demo-credentials`
+หากตั้ง `KATWORK_DEMO_PASSWORD` ใน `.env.demo` ให้ใช้รหัสนั้นครับ
+การดาวน์โหลดอิมเมจครั้งแรกต้องใช้อินเทอร์เน็ต หลังจากนั้นเดโมใช้งานแบบออฟไลน์ได้
+พื้นที่ `เดโม` มี Kats ที่ตอบด้วยข้อมูลจำลอง โดยไม่ส่งคำขอออกไปยังบริการภายนอก
+เดโมใช้ฐานข้อมูลแยกต่างหาก และจะไม่เริ่มหากระบบหลักกำลังทำงาน เว้นแต่ระบุ `--allow-running-install`
 
 KatWork ยังอยู่ระหว่างพัฒนาครับ การช่วยเตรียมร่างรายงานพร้อมแหล่งอ้างอิง
 และการอนุมัติโดยผู้รับผิดชอบยังอยู่ในแผนพัฒนา (planned)

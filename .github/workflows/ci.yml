@@ -12,18 +12,20 @@ jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: 1.97.1
           components: rustfmt
       - run: cargo fmt --check
 
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: 1.97.1
           components: clippy
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -46,26 +48,38 @@ jobs:
     env:
       DATABASE_URL: postgres://katwork@localhost:5432/katwork
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.97.1
       - run: cargo test --workspace --locked
       - run: cargo test -p katwork --locked --features smoke-fixtures --test smoke_fixtures
       - run: scripts/init-env.sh
       - run: docker compose config -q
       - run: docker compose build katwork
+        env:
+          CARGO_FEATURES: smoke-fixtures
+      - name: Release target rejects smoke features even when passed directly
+        run: |
+          if docker build --target release --build-arg CARGO_FEATURES=smoke-fixtures .; then
+            echo 'ERROR: the release target accepted smoke fixtures.' >&2
+            exit 1
+          fi
 
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.97.1
       - run: cargo +1.97.1 check --workspace --locked
 
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check
 
@@ -75,8 +89,8 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
@@ -90,15 +104,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.97.1
       - run: scripts/smoke.sh
 
   upgrade_from_previous_release:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
       - name: Find previous release tag
@@ -110,8 +126,10 @@ jobs:
           else
             echo "tag=$tag" >> "$GITHUB_OUTPUT"
           fi
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         if: steps.previous.outputs.tag != ''
+        with:
+          toolchain: 1.97.1
       - name: Build previous release image
         if: steps.previous.outputs.tag != ''
         env:
@@ -120,9 +138,11 @@ jobs:
           mkdir "$RUNNER_TEMP/katwork-previous"
           git archive "$PREVIOUS_TAG" | tar -x -C "$RUNNER_TEMP/katwork-previous"
           docker build -t katwork-previous:local "$RUNNER_TEMP/katwork-previous"
-      - name: Build current image and run smoke scenarios
+      - name: Build current smoke image
         if: steps.previous.outputs.tag != ''
-        run: scripts/smoke.sh
+        run: |
+          scripts/init-env.sh
+          docker compose -f docker-compose.yml -f docker-compose.smoke.yml build katwork
       - name: Upgrade seeded previous release through backup and migrate
         if: steps.previous.outputs.tag != ''
         env:

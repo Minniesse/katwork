@@ -9,13 +9,14 @@ services:
       KATWORK_TRUSTED_PROXIES: 172.31.250.2
       KATWORK_PUBLIC_URL: https://${KATWORK_HTTPS_HOST:?set KATWORK_HTTPS_HOST in .env}
   caddy:
-    image: caddy:2
+    image: caddy:2.11.7-alpine
     init: true
     restart: unless-stopped
     cap_drop: [ALL]
     cap_add: [NET_BIND_SERVICE]
     security_opt: ["no-new-privileges:true"]
     networks:
+      default:
       edge:
         ipv4_address: 172.31.250.2
     ports:
@@ -29,7 +30,7 @@ services:
       - caddy_config:/config
     depends_on:
       katwork:
-        condition: service_started
+        condition: service_healthy
 networks:
   edge:
     ipam:

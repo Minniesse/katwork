@@ -1,9 +1,10 @@
 services:
   katwork:
-    ports: !override ["127.0.0.1:3000:3000"]
+    networks: !override [backend]
+    ports: !reset []
     environment: &demo-environment
       KATWORK_DEMO: "1"
-      KATWORK_PUBLIC_URL: http://localhost:3000
+      KATWORK_PUBLIC_URL: http://localhost:3001
       KATWORK_BIND: 127.0.0.1
       KATWORK_TRUSTED_PROXIES: ""
       OPENAI_API_KEY: ""
@@ -16,3 +17,18 @@ services:
       SMTP_PASSWORD: ""
   migrate:
     environment: *demo-environment
+  demo-proxy:
+    image: caddy:2.11.7-alpine
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [backend, default]
+    ports: ["127.0.0.1:3001:3000"]
+    command: ["caddy", "reverse-proxy", "--from", "http://:3000", "--to", "http://katwork:3000"]
+    depends_on:
+      katwork:
+        condition: service_healthy
+networks:
+  # Keep the app private even when the HTTPS override is combined with the demo.
+  edge:
+    internal: true
