@@ -148,7 +148,8 @@ async fn serve_connections(
 fn warn_transport_error(last_warning: &mut Option<Instant>, operation: &str, error: &io::Error) {
     let now = Instant::now();
     if last_warning.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(60)) {
-        tracing::warn!(operation, error = ?error.kind(), "TCP transport operation failed");
+        // The OS message names the cause (EMFILE has no stable ErrorKind) and carries no peer address.
+        tracing::warn!(operation, error = %error, "TCP transport operation failed");
         *last_warning = Some(now);
     }
 }
@@ -295,6 +296,10 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel();
+        // With one dispatcher registered, tracing takes a callsite's interest from whichever thread
+        // hits it first; a parallel test hitting it uncaptured would cache "never". A second, idle
+        // dispatcher makes every callsite's interest come from all registered dispatchers.
+        let _idle = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let logs = Logs::default();
         let writer = logs.clone();
         let subscriber = tracing_subscriber::fmt()
