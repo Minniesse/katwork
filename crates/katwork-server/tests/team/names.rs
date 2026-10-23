@@ -3,7 +3,7 @@ use super::*;
 #[sqlx::test(migrations = "../katwork/migrations")]
 async fn names_allow_at_most_four_combining_marks_per_base(pool: PgPool) {
     let f = Fixture::new(&pool).await;
-    let dot = f.hire("Writer", json!("writer")).await;
+    let kat = f.hire("Writer", json!("writer")).await;
     for name in [
         format!("a{}", "\u{301}".repeat(5)),
         format!("é{}", "\u{301}".repeat(4)),
@@ -12,7 +12,7 @@ async fn names_allow_at_most_four_combining_marks_per_base(pool: PgPool) {
         assert_code(
             f.call(
                 "POST",
-                &format!("spaces/{}/dots", f.space),
+                &format!("spaces/{}/kats", f.space),
                 Some(json!({"name":name,"role":"writer","persona":""})),
             )
             .await,
@@ -23,7 +23,7 @@ async fn names_allow_at_most_four_combining_marks_per_base(pool: PgPool) {
         assert_code(
             f.call(
                 "PATCH",
-                &format!("dots/{}", id(&dot)),
+                &format!("kats/{}", id(&kat)),
                 Some(json!({"name":name})),
             )
             .await,
@@ -46,13 +46,13 @@ async fn names_allow_at_most_four_combining_marks_per_base(pool: PgPool) {
 async fn unicode_17_names_are_rejected_in_hire_rename_and_membership_writes(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let lead = f.hire("Lead", json!("lead")).await;
-    let dot = f.hire("Writer", json!("writer")).await;
+    let kat = f.hire("Writer", json!("writer")).await;
     let team = f.team(&lead, &[]).await;
     for name in ["Writer\u{a7ce}", "Writer\u{a7cf}"] {
         assert_code(
             f.call(
                 "POST",
-                &format!("spaces/{}/dots", f.space),
+                &format!("spaces/{}/kats", f.space),
                 Some(json!({"name":name,"role":"writer","persona":""})),
             )
             .await,
@@ -63,7 +63,7 @@ async fn unicode_17_names_are_rejected_in_hire_rename_and_membership_writes(pool
         assert_code(
             f.call(
                 "PATCH",
-                &format!("dots/{}", id(&dot)),
+                &format!("kats/{}", id(&kat)),
                 Some(json!({"name":name})),
             )
             .await,
@@ -72,8 +72,8 @@ async fn unicode_17_names_are_rejected_in_hire_rename_and_membership_writes(pool
         )
         .await;
         // Existing rows from the former Unicode 17 validator must not bypass team-write validation.
-        sqlx::query("UPDATE dots SET name=$2 WHERE id=$1")
-            .bind(Uuid::parse_str(id(&dot)).unwrap())
+        sqlx::query("UPDATE kats SET name=$2 WHERE id=$1")
+            .bind(Uuid::parse_str(id(&kat)).unwrap())
             .bind(name)
             .execute(&pool)
             .await
@@ -82,7 +82,7 @@ async fn unicode_17_names_are_rejected_in_hire_rename_and_membership_writes(pool
             f.call(
                 "POST",
                 &format!("spaces/{}/teams", f.space),
-                Some(json!({"name":"Team","lead":lead["id"],"members":[dot["id"]]})),
+                Some(json!({"name":"Team","lead":lead["id"],"members":[kat["id"]]})),
             )
             .await,
             400,
@@ -92,7 +92,7 @@ async fn unicode_17_names_are_rejected_in_hire_rename_and_membership_writes(pool
         assert_code(
             f.call(
                 "PUT",
-                &format!("teams/{}/members/{}", id(&team["team"]), id(&dot)),
+                &format!("teams/{}/members/{}", id(&team["team"]), id(&kat)),
                 Some(json!({"is_lead":false})),
             )
             .await,
@@ -100,8 +100,8 @@ async fn unicode_17_names_are_rejected_in_hire_rename_and_membership_writes(pool
             "request_invalid",
         )
         .await;
-        sqlx::query("UPDATE dots SET name='Writer' WHERE id=$1")
-            .bind(Uuid::parse_str(id(&dot)).unwrap())
+        sqlx::query("UPDATE kats SET name='Writer' WHERE id=$1")
+            .bind(Uuid::parse_str(id(&kat)).unwrap())
             .execute(&pool)
             .await
             .unwrap();
@@ -145,10 +145,10 @@ async fn blank_invisible_and_unassigned_names_are_rejected(pool: PgPool) {
         for (method, path, payload) in [
             (
                 "POST",
-                format!("spaces/{}/dots", f.space),
+                format!("spaces/{}/kats", f.space),
                 json!({"name":name,"role":"writer","persona":""}),
             ),
-            ("PATCH", format!("dots/{}", id(&lead)), json!({"name":name})),
+            ("PATCH", format!("kats/{}", id(&lead)), json!({"name":name})),
             (
                 "POST",
                 format!("spaces/{}/teams", f.space),

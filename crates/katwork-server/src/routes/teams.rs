@@ -12,7 +12,7 @@ use axum::{
     http::StatusCode,
 };
 use katwork::{
-    ids::{DotId, SpaceId, TeamId},
+    ids::{KatId, SpaceId, TeamId},
     team::{NewTeam, Team, TeamView, team},
     tenancy::Tenant,
 };
@@ -29,7 +29,7 @@ pub(crate) struct TeamPath {
 #[derive(Deserialize)]
 pub(crate) struct MemberPath {
     team_id: TeamId,
-    dot_id: DotId,
+    kat_id: KatId,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -81,7 +81,7 @@ pub(crate) async fn add_member(
         &state.core.pool,
         &tenant,
         path.team_id,
-        path.dot_id,
+        path.kat_id,
         payload(body)?.is_lead,
     )
     .await?;
@@ -93,6 +93,6 @@ pub(crate) async fn remove_member(
     path: Result<Path<MemberPath>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
     let path = route_path(path)?;
-    team::remove_member(&state.core.pool, &tenant, path.team_id, path.dot_id).await?;
+    team::remove_member(&state.core.pool, &tenant, path.team_id, path.kat_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

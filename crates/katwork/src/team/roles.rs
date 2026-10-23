@@ -1,52 +1,52 @@
-use super::{Appearance, Autonomy, DotRole, NewDot};
+use super::{Appearance, Autonomy, KatRole, NewKat};
 use crate::types::{Locale, ModelTier};
 
-pub fn template(role: &DotRole, locale: Locale) -> NewDot {
+pub fn template(role: &KatRole, locale: Locale) -> NewKat {
     let (en, th, avatar, instructions) = match role {
-        DotRole::Lead => (
+        KatRole::Lead => (
             "Lead",
             "หัวหน้าทีม",
             "compass",
-            "Coordinate the Dots and clarify the user's goal.",
+            "Coordinate the Kats and clarify the user's goal.",
         ),
-        DotRole::Researcher => (
+        KatRole::Researcher => (
             "Researcher",
             "นักวิจัย",
             "magnifier",
             "Gather research, cite sources, and flag uncertainty.",
         ),
-        DotRole::Writer => (
+        KatRole::Writer => (
             "Writer",
             "นักเขียน",
             "pen",
             "Write clear drafts suited to the user's audience.",
         ),
-        DotRole::Analyst => (
+        KatRole::Analyst => (
             "Analyst",
             "นักวิเคราะห์",
             "chart",
             "Analyze data, check assumptions, and explain findings.",
         ),
-        DotRole::Scheduler => (
+        KatRole::Scheduler => (
             "Scheduler",
             "เลขา",
             "calendar",
             "Organize schedules and clarify timing and dependencies.",
         ),
-        DotRole::Reviewer => (
+        KatRole::Reviewer => (
             "Reviewer",
             "ผู้ตรวจ",
             "check",
             "Review work for accuracy, completeness, and risks.",
         ),
-        DotRole::Custom(name) => (
+        KatRole::Custom(name) => (
             name.as_str(),
             name.as_str(),
-            "dot",
+            "kat",
             "Help with the user's task and ask when clarification is needed.",
         ),
     };
-    NewDot {
+    NewKat {
         name: match locale {
             Locale::En => en,
             Locale::Th => th,
@@ -65,14 +65,14 @@ pub fn template(role: &DotRole, locale: Locale) -> NewDot {
     }
 }
 
-pub fn default_roster(locale: Locale) -> Vec<NewDot> {
+pub fn default_roster(locale: Locale) -> Vec<NewKat> {
     [
-        DotRole::Lead,
-        DotRole::Researcher,
-        DotRole::Writer,
-        DotRole::Analyst,
-        DotRole::Scheduler,
-        DotRole::Reviewer,
+        KatRole::Lead,
+        KatRole::Researcher,
+        KatRole::Writer,
+        KatRole::Analyst,
+        KatRole::Scheduler,
+        KatRole::Reviewer,
     ]
     .iter()
     .map(|role| template(role, locale))

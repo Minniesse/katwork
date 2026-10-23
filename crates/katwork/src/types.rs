@@ -24,7 +24,7 @@ pub enum Locale {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
-pub enum DotStatus {
+pub enum KatStatus {
     Active,
     Paused,
 }
@@ -55,7 +55,7 @@ wire_enum!(JobStatus {
 });
 
 wire_enum!(HoldReason {
-    DotBusy => "dot_busy",
+    KatBusy => "kat_busy",
     ProviderQuota => "provider_quota",
     WorkspacePaused => "workspace_paused",
 });
@@ -159,12 +159,12 @@ wire_enum!(ReasonCode {
     ApprovalPending => "approval_pending",
     QuestionPending => "question_pending",
     InterruptedReviewRequired => "interrupted_review_required",
-    DotPaused => "dot_paused",
+    KatPaused => "kat_paused",
     RetriesExhausted => "retries_exhausted",
     Cancelled => "cancelled",
     OutcomeUnknown => "outcome_unknown",
-    NoEligibleDot => "no_eligible_dot",
-    DotNotInSpace => "dot_not_in_space",
+    NoEligibleKat => "no_eligible_kat",
+    KatNotInSpace => "kat_not_in_space",
     LeaseLost => "lease_lost",
 });
 
@@ -187,12 +187,12 @@ impl ReasonCode {
         Self::ApprovalPending,
         Self::QuestionPending,
         Self::InterruptedReviewRequired,
-        Self::DotPaused,
+        Self::KatPaused,
         Self::RetriesExhausted,
         Self::Cancelled,
         Self::OutcomeUnknown,
-        Self::NoEligibleDot,
-        Self::DotNotInSpace,
+        Self::NoEligibleKat,
+        Self::KatNotInSpace,
         Self::LeaseLost,
     ];
 }

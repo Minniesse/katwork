@@ -95,9 +95,9 @@ describe('subscribe', () => {
     const log = numbered([
       ev.userStored('u1', 'Hi team'),
       ev.runStarted('rA'),
-      ev.kwRunStarted('rA', 'dot-a', 'mA'),
+      ev.kwRunStarted('rA', 'kat-a', 'mA'),
       ev.runStarted('rB'),
-      ev.kwRunStarted('rB', 'dot-b', 'mB'),
+      ev.kwRunStarted('rB', 'kat-b', 'mB'),
       ev.textStart('mA'),
       ev.textStart('mB'),
       ev.text('mA', 'สวัสดี'),
@@ -171,7 +171,7 @@ describe('foldEvent', () => {
     const state = fold(
       numbered([
         ev.runStarted('r1'),
-        ev.kwRunStarted('r1', 'dot-a', 'm1'),
+        ev.kwRunStarted('r1', 'kat-a', 'm1'),
         ev.toolStart('tc1', 'search', 'm1'),
         ev.toolStart('tc2', 'read_file', 'm1'),
         ev.toolArgs('tc1', '{"q":'),
@@ -200,8 +200,8 @@ describe('foldEvent', () => {
     const firstRun = numbered([
       ev.userStored('u1', 'Summarise the report'),
       ev.runStarted('r1'),
-      ev.kwRunStarted('r1', 'dot-a', 'm1'),
-      ev.dotState('dot-a', 'working'),
+      ev.kwRunStarted('r1', 'kat-a', 'm1'),
+      ev.katState('kat-a', 'working'),
       ev.textStart('m1'),
       ev.text('m1', 'Partial text from the lost run'),
       ev.runError('lease_lost'),
@@ -213,15 +213,15 @@ describe('foldEvent', () => {
     const recovery = numbered(
       [
         ev.runStarted('r2'),
-        ev.kwRunStarted('r2', 'dot-a', 'm1'),
-        ev.dotState('dot-a', 'working'),
+        ev.kwRunStarted('r2', 'kat-a', 'm1'),
+        ev.katState('kat-a', 'working'),
         ev.textStart('m1'),
         ev.text('m1', 'Recovered draft'),
         ev.textEnd('m1'),
         ev.decision('j1'),
         ev.stored('m1', 'The stored summary.'),
         ev.jobStatus('j1', 'answered'),
-        ev.dotState('dot-a', 'idle'),
+        ev.katState('kat-a', 'idle'),
         ev.runFinished('r2'),
         ev.kwRunClosed('r2', 'finished'),
       ],
@@ -237,9 +237,9 @@ describe('foldEvent', () => {
     const log = numbered([
       ev.userStored('u1', '@Researcher @Writer please help'),
       ev.runStarted('rA'),
-      ev.kwRunStarted('rA', 'dot-a', 'mA'),
+      ev.kwRunStarted('rA', 'kat-a', 'mA'),
       ev.runStarted('rB'),
-      ev.kwRunStarted('rB', 'dot-b', 'mB'),
+      ev.kwRunStarted('rB', 'kat-b', 'mB'),
       ev.textStart('mA'),
       ev.textStart('mB'),
       ev.text('mA', 'Researching'),
@@ -259,7 +259,7 @@ describe('foldEvent', () => {
         ev.text('mB', ' more'),
         ev.textEnd('mB'),
         ev.decision('jB'),
-        ev.stored('mB', 'The Writer’s stored reply', { author: { kind: 'dot', id: 'dot-b' } }),
+        ev.stored('mB', 'The Writer’s stored reply', { author: { kind: 'kat', id: 'kat-b' } }),
         ev.jobStatus('jB', 'answered'),
         ev.runFinished('rB'),
         ev.kwRunClosed('rB', 'finished'),
@@ -276,13 +276,13 @@ describe('foldEvent', () => {
       numbered([
         ev.userStored('u1', 'Draft the letter'),
         ev.runStarted('r1'),
-        ev.kwRunStarted('r1', 'dot-a', 'm1'),
+        ev.kwRunStarted('r1', 'kat-a', 'm1'),
         ev.textStart('m1'),
         ev.text('m1', 'Dear'),
         ev.decision('j1'),
         ev.notice('n1', 'provider_unavailable'),
         ev.jobStatus('j1', 'stopped', 'provider_unavailable'),
-        ev.dotState('dot-a', 'idle'),
+        ev.katState('kat-a', 'idle'),
         ev.runFinished('r1'),
         ev.kwRunClosed('r1', 'finished'),
       ]),
@@ -298,7 +298,7 @@ describe('foldEvent', () => {
     const state = fold(
       numbered([
         ev.runStarted('r1'),
-        ev.kwRunStarted('r1', 'dot-a', 'm1'),
+        ev.kwRunStarted('r1', 'kat-a', 'm1'),
         ev.textStart('m1'),
         ev.text('m1', 'Draft answr'),
         ev.textEnd('m1'),
@@ -313,7 +313,7 @@ describe('foldEvent', () => {
         body: 'Final answer.',
         provisional: false,
         synthetic: true,
-        author: { kind: 'dot', id: 'dot-a' },
+        author: { kind: 'kat', id: 'kat-a' },
       }),
     ]);
   });
@@ -328,7 +328,7 @@ describe('foldEvent', () => {
     const state = fold(
       numbered([
         ev.runStarted('r1'),
-        ev.kwRunStarted('r1', 'dot-a', 'm1'),
+        ev.kwRunStarted('r1', 'kat-a', 'm1'),
         ev.textStart('m1'),
         ev.text('m1', 'Let me look that up.'),
         ev.textEnd('m1'),
@@ -347,19 +347,19 @@ describe('foldEvent', () => {
     const events = [
       ev.userStored('u1', 'Check the numbers'),
       ev.runStarted('r1'),
-      ev.kwRunStarted('r1', 'dot-a', 'm1'),
+      ev.kwRunStarted('r1', 'kat-a', 'm1'),
       ev.textStart('m1'),
       ev.text('m1', 'Checking'),
       ev.runError('lease_lost'),
       ev.kwRunClosed('r1', 'interrupted'),
       ev.runStarted('r2'),
-      ev.kwRunStarted('r2', 'dot-a', 'm1'),
+      ev.kwRunStarted('r2', 'kat-a', 'm1'),
       ev.textStart('m1'),
       ev.text('m1', 'All good'),
       ev.decision('j1'),
       ev.stored('m1', 'The numbers match.'),
       ev.jobStatus('j1', 'answered'),
-      ev.dotState('dot-a', 'idle'),
+      ev.katState('kat-a', 'idle'),
       ev.runFinished('r2'),
       ev.kwRunClosed('r2', 'finished'),
     ];
@@ -380,8 +380,8 @@ describe('foldEvent', () => {
     const state = fold(
       numbered([
         ev.runStarted('r1'),
-        ev.kwRunStarted('r1', 'dot-a', 'm1'),
-        ev.dotState('dot-a', 'working'),
+        ev.kwRunStarted('r1', 'kat-a', 'm1'),
+        ev.katState('kat-a', 'working'),
         ev.textStart('m1'),
         ev.text('m1', 'Sending'),
         ev.runError('lease_lost'),
@@ -390,7 +390,7 @@ describe('foldEvent', () => {
         ev.decision('j1'),
         ev.notice('n1', 'interrupted_review_required'),
         ev.jobStatus('j1', 'stopped', 'interrupted_review_required'),
-        ev.dotState('dot-a', 'idle'),
+        ev.katState('kat-a', 'idle'),
       ]),
     );
     expect(state.runError).toBe('lease_lost');
@@ -424,9 +424,9 @@ describe('foldEvent', () => {
     const log = numbered([
       ev.userStored('u1', '@Researcher @Writer please help'),
       ev.runStarted('rA'),
-      ev.kwRunStarted('rA', 'dot-a', 'mA'),
+      ev.kwRunStarted('rA', 'kat-a', 'mA'),
       ev.runStarted('rB'),
-      ev.kwRunStarted('rB', 'dot-b', 'mB'),
+      ev.kwRunStarted('rB', 'kat-b', 'mB'),
       ev.textStart('mA'),
       ev.textStart('mB'),
       ev.text('mA', 'Researching'),
@@ -435,7 +435,7 @@ describe('foldEvent', () => {
       ev.runError('lease_lost'),
       ev.kwRunClosed('rA', 'interrupted'),
       ev.text('mB', ' more'),
-      ev.stored('mB', 'The Writer’s stored reply', { author: { kind: 'dot', id: 'dot-b' } }),
+      ev.stored('mB', 'The Writer’s stored reply', { author: { kind: 'kat', id: 'kat-b' } }),
       ev.jobStatus('jB', 'answered'),
       ev.runFinished('rB'),
       ev.kwRunClosed('rB', 'finished'),
@@ -457,8 +457,8 @@ describe('foldEvent', () => {
 
     // Taken after both runs started: text that streams later still belongs to its run.
     const live = fold(log.slice(0, 10), snapshotAt(5));
-    expect(live.messages['mA']).toMatchObject({ runId: 'rA', author: { kind: 'dot', id: 'dot-a' } });
-    expect(live.messages['mB']).toMatchObject({ runId: 'rB', author: { kind: 'dot', id: 'dot-b' } });
+    expect(live.messages['mA']).toMatchObject({ runId: 'rA', author: { kind: 'kat', id: 'kat-a' } });
+    expect(live.messages['mB']).toMatchObject({ runId: 'rB', author: { kind: 'kat', id: 'kat-b' } });
 
     const final = stored(
       ['u1', '@Researcher @Writer please help'],
@@ -471,8 +471,8 @@ describe('foldEvent', () => {
 });
 
 test('parse_author_accepts_tagged_and_serde_default_shapes', () => {
-  expect(parseAuthor({ kind: 'dot', id: 'd1' })).toEqual({ kind: 'dot', id: 'd1' });
-  expect(parseAuthor({ Dot: 'd1' })).toEqual({ kind: 'dot', id: 'd1' });
+  expect(parseAuthor({ kind: 'kat', id: 'd1' })).toEqual({ kind: 'kat', id: 'd1' });
+  expect(parseAuthor({ Kat: 'd1' })).toEqual({ kind: 'kat', id: 'd1' });
   expect(parseAuthor({ User: 'u1' })).toEqual({ kind: 'user', id: 'u1' });
   expect(parseAuthor('System')).toEqual({ kind: 'system' });
   expect(parseAuthor({ kind: 'system' })).toEqual({ kind: 'system' });

@@ -44,8 +44,8 @@ export const ev = {
     toolCallId,
     content,
   }),
-  kwRunStarted: (runId: string, dotId: string, replyMessageId: string) =>
-    custom('katwork.run_started', { runId, dotId, replyMessageId }),
+  kwRunStarted: (runId: string, katId: string, replyMessageId: string) =>
+    custom('katwork.run_started', { runId, katId, replyMessageId }),
   kwRunClosed: (runId: string, end: 'finished' | 'cancelled' | 'interrupted') =>
     custom('katwork.run_closed', { runId, end }),
   stored: (
@@ -59,7 +59,7 @@ export const ev = {
   ) =>
     custom('katwork.message_stored', {
       messageId,
-      author: opts.author ?? { kind: 'dot', id: 'dot-a' },
+      author: opts.author ?? { kind: 'kat', id: 'kat-a' },
       body,
       synthetic: opts.synthetic ?? false,
       question: opts.question ?? null,
@@ -70,7 +70,7 @@ export const ev = {
     ev.stored(messageId, code, { author: { kind: 'system' } }),
   jobStatus: (jobId: string, status: string | null, reason: string | null = null) =>
     custom('katwork.job_status', { jobId, status, reason, holdReason: null }),
-  dotState: (dotId: string, state: string) => custom('katwork.dot_state', { dotId, state }),
+  katState: (katId: string, state: string) => custom('katwork.kat_state', { katId, state }),
   decision: (jobId: string) =>
     custom('katwork.decision', {
       jobId,
