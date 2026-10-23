@@ -225,6 +225,8 @@ async fn worker_cancels_run_when_renewal_fails(pool: PgPool) {
     let f = setup(&pool).await;
     let single = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
+        // Pool acquisition must not cancel the run before the watchdog does.
+        .acquire_timeout(Duration::from_secs(600))
         .connect_with((*pool.connect_options()).clone())
         .await
         .unwrap();
@@ -393,6 +395,17 @@ async fn shutdown_abandons_active_work_for_restart(pool: PgPool) {
     }
     assert!(provider.dropped.load(Ordering::SeqCst));
     assert_eq!(outcome(&pool, JobId(f.job)).await, (None, None));
+    let ev = events(&pool, ThreadId(f.thread)).await;
+    assert_eq!(
+        ev.iter().find(|e| e["type"] == "RUN_ERROR").unwrap()["code"],
+        "lease_lost"
+    );
+    assert_eq!(
+        ev.iter()
+            .find(|e| e["name"] == "katwork.run_closed")
+            .unwrap()["value"]["end"],
+        "interrupted"
+    );
     let restarted = super::core(&pool);
     let c = claim(&restarted, "restart").await.unwrap();
     assert_eq!(c.kind, RunKind::Recovery);
@@ -471,7 +484,7 @@ async fn infrastructure_failure_in_worker_gets_no_policy_verdict(pool: PgPool) {
     finish(&core, &c, "restarted").await;
 }
 
-struct Panicking;
+struct Panicking(Option<(PgPool, Arc<Fixture>)>);
 #[async_trait]
 impl ModelProvider for Panicking {
     fn id(&self) -> &str {
@@ -488,6 +501,37 @@ impl ModelProvider for Panicking {
         &self,
         _: ChatRequest,
     ) -> Result<BoxStream<'static, Result<ChatChunk, ModelError>>, ModelError> {
+        if let Some((pool, f)) = &self.0 {
+            let (run, epoch, policy): (RunId, LeaseEpoch, i64) = sqlx::query_as(
+                "SELECT r.id,r.lease_epoch,t.kat_policy_version FROM runs r JOIN tasks t ON t.id=r.task_id WHERE t.id=$1 AND r.state='running'",
+            )
+            .bind(f.task)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            let ctx = ToolCtx {
+                tenant: tenant(pool, f).await,
+                thread_id: ThreadId(f.thread),
+                space_id: SpaceId(f.space),
+                kat_id: KatId(f.kat),
+                job_id: JobId(f.job),
+                task_id: TaskId(f.task),
+                run_id: run,
+                step: 1,
+                tool_call_id: "panic_probe".into(),
+                idempotency_key: run.to_string(),
+                lease_epoch: epoch,
+                policy_version: policy,
+                actor: UserId(f.user),
+                initiator: Initiator::Person,
+                computer: None,
+                pool: pool.clone(),
+                cancel: CancellationToken::new(),
+            };
+            ledger::start_tool_call(pool, &ctx, "panic_probe", SideEffect::WorkspaceWrite, "{}")
+                .await
+                .unwrap();
+        }
         panic!("injected provider panic")
     }
 }
@@ -495,7 +539,7 @@ impl ModelProvider for Panicking {
 async fn panicking_tasks_finish_and_cannot_wipe_out_pool(pool: PgPool) {
     let f = setup(&pool).await;
     let other = setup(&pool).await;
-    let core = Arc::new(core(&pool).with_registry(registry(Arc::new(Panicking))));
+    let core = Arc::new(core(&pool).with_registry(registry(Arc::new(Panicking(None)))));
     let mut workers = worker::spawn_pool(core.clone(), 1, TTL);
     finished(&pool, JobId(other.job)).await;
     for f in [f, other] {
@@ -529,6 +573,43 @@ async fn panicking_tasks_finish_and_cannot_wipe_out_pool(pool: PgPool) {
     while let Some(result) = workers.join_next().await {
         result.unwrap();
     }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn panic_after_effect_requires_review_before_retry(pool: PgPool) {
+    let f = Arc::new(setup(&pool).await);
+    let provider = Panicking(Some((pool.clone(), f.clone())));
+    let core = Arc::new(core(&pool).with_registry(registry(Arc::new(provider))));
+    let mut workers = worker::spawn_pool(core.clone(), 1, TTL);
+    finished(&pool, JobId(f.job)).await;
+    core.shutdown.cancel();
+    while let Some(result) = workers.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(
+        outcome(&pool, JobId(f.job)).await,
+        (
+            Some("stopped".into()),
+            Some("interrupted_review_required".into())
+        )
+    );
+    assert_eq!(task_state(&pool, TaskId(f.task)).await, "interrupted");
+    let (run, state): (RunId, String) =
+        sqlx::query_as("SELECT run_id,state FROM tool_calls WHERE tool_name='panic_probe'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "outcome_unknown");
+    assert_eq!(terminals(&pool, run).await, ["RUN_ERROR"]);
+    let ev = events(&pool, ThreadId(f.thread)).await;
+    assert_eq!(
+        ev.iter().find(|e| e["type"] == "RUN_ERROR").unwrap()["code"],
+        "internal_error"
+    );
+    let notices: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE job_id=$1 AND meta->>'code'='interrupted_review_required'")
+        .bind(f.job).fetch_one(&pool).await.unwrap();
+    assert_eq!(notices, 1);
+    assert!(claim(&core, "retry").await.is_none());
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -637,6 +718,13 @@ async fn shutdown_drains_claim_before_releasing_lease(pool: PgPool) {
         .bind(f.task).fetch_one(&pool).await.unwrap();
     assert_eq!(attempts, 1, "shutdown dropped the in-flight claim");
     assert!(!live, "shutdown stranded the committed claim");
+    let runs: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM runs WHERE task_id=$1 AND lease_epoch>0")
+            .bind(f.task)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(runs, 0, "shutdown started a newly claimed run");
 }
 
 #[sqlx::test(migrations = "./migrations")]

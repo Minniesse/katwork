@@ -19,6 +19,7 @@ use futures::StreamExt;
 use serde_json::Value;
 use std::{collections::HashSet, time::Duration};
 use tokio::time::{Instant, sleep_until, timeout_at};
+use tokio_util::sync::CancellationToken;
 
 const MAX_ARGS_BYTES: usize = 65_536;
 
@@ -27,6 +28,16 @@ pub async fn execute(
     kat: &Kat,
     input: RunInput,
     limits: &Limits,
+) -> Result<RunFacts, RunAbort> {
+    execute_with_shutdown(env, kat, input, limits, None).await
+}
+
+pub(crate) async fn execute_with_shutdown(
+    env: &RunEnv<'_>,
+    kat: &Kat,
+    input: RunInput,
+    limits: &Limits,
+    shutdown: Option<&CancellationToken>,
 ) -> Result<RunFacts, RunAbort> {
     let started = Instant::now();
     let mut facts = RunFacts::not_run(StopReason::Interrupted);
@@ -48,10 +59,15 @@ pub async fn execute(
     runner.insert().await?;
     runner.drive().await?;
     if runner.facts.stop == Some(StopReason::Cancelled) {
+        let (end, code) = if shutdown.is_some_and(CancellationToken::is_cancelled) {
+            (RunEnd::Interrupted, "lease_lost")
+        } else {
+            (RunEnd::Cancelled, "cancelled")
+        };
         runner
             .env
             .sink
-            .close_run(RunEnd::Cancelled, "cancelled")
+            .close_run(end, code)
             .await
             .map_err(|e| runner.abort(e))?;
         for call in &mut runner.facts.tool_calls {
