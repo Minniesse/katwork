@@ -15,6 +15,7 @@ pub struct Config {
     pub smtp: Option<SmtpConfig>,
     pub openai: Option<ProviderEnv>,
     pub anthropic: Option<ProviderEnv>,
+    pub local: Option<LocalEnv>,
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +66,12 @@ pub struct SmtpConfig {
     pub username: Option<String>,
     pub password: Option<String>,
     pub from: Option<String>,
+}
+
+pub struct LocalEnv {
+    pub base_url: String,
+    pub model: String,
+    pub api_key: Option<String>,
 }
 
 pub struct ProviderEnv {
@@ -267,6 +274,9 @@ impl Config {
         secrets.extend(
             [
                 Some(self.secret.as_str()),
+                self.local
+                    .as_ref()
+                    .and_then(|local| local.api_key.as_deref()),
                 self.demo_password.as_deref(),
                 self.smtp.as_ref().and_then(|smtp| smtp.password.as_deref()),
                 self.openai
@@ -297,10 +307,22 @@ impl Config {
             .filter(|value| value.len() >= 32)
             .ok_or(invalid("KATWORK_SECRET"))?;
         let optional = |name: &str| lookup(name).filter(|value| !value.is_empty());
-        for key in ["OPENAI_BASE_URL", "ANTHROPIC_BASE_URL"] {
+        for key in [
+            "OPENAI_BASE_URL",
+            "ANTHROPIC_BASE_URL",
+            "KATWORK_LOCAL_BASE_URL",
+        ] {
             if let Some(value) = optional(key) {
                 let url = Url::parse(&value).map_err(|_| invalid(key))?;
                 if !matches!(url.scheme(), "http" | "https") || !url.has_host() {
+                    return Err(invalid(key));
+                }
+                if key == "KATWORK_LOCAL_BASE_URL"
+                    && (!url.username().is_empty()
+                        || url.password().is_some()
+                        || url.query().is_some()
+                        || url.fragment().is_some())
+                {
                     return Err(invalid(key));
                 }
             }
@@ -405,7 +427,21 @@ impl Config {
         } else {
             None
         };
+        let local = match (
+            optional("KATWORK_LOCAL_BASE_URL"),
+            optional("KATWORK_LOCAL_MODEL"),
+        ) {
+            (None, None) => None,
+            (Some(_), None) => return Err(invalid("KATWORK_LOCAL_MODEL")),
+            (None, Some(_)) => return Err(invalid("KATWORK_LOCAL_BASE_URL")),
+            (Some(base_url), Some(model)) => Some(LocalEnv {
+                base_url,
+                model,
+                api_key: optional("KATWORK_LOCAL_API_KEY"),
+            }),
+        };
         Ok(Self {
+            local,
             database_url,
             secret,
             demo,
@@ -436,6 +472,7 @@ impl fmt::Debug for Config {
             .field("smtp", &self.smtp)
             .field("openai", &self.openai)
             .field("anthropic", &self.anthropic)
+            .field("local", &self.local)
             .finish()
     }
 }
@@ -464,6 +501,16 @@ impl fmt::Debug for ProviderEnv {
         f.debug_struct("ProviderEnv")
             .field("api_key", &"[redacted]")
             .field("base_url", &self.base_url.as_deref().map(redact_origin))
+            .finish()
+    }
+}
+
+impl fmt::Debug for LocalEnv {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalEnv")
+            .field("base_url", &redact_origin(&self.base_url))
+            .field("model", &self.model)
+            .field("api_key", &"[redacted]")
             .finish()
     }
 }

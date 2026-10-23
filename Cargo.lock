@@ -1231,6 +1231,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "unicode-normalization",
  "unicode-properties",
  "url",
