@@ -4,6 +4,8 @@
 )]
 #[path = "schema/chat_indexes.rs"]
 mod chat_indexes;
+#[path = "schema/contracts.rs"]
+mod contracts;
 #[path = "schema/legacy.rs"]
 mod legacy;
 mod support;

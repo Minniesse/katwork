@@ -50,6 +50,7 @@ fn shared_wire_values_match_json() {
     for (value, wire) in statuses {
         assert_eq!(value.wire(), wire);
         assert_eq!(to_value(value).unwrap(), json!(wire));
+        assert_eq!(from_value::<JobStatus>(json!(wire)).unwrap(), value);
     }
     for (value, wire) in [
         (HoldReason::KatBusy, "kat_busy"),
@@ -58,6 +59,7 @@ fn shared_wire_values_match_json() {
     ] {
         assert_eq!(value.wire(), wire);
         assert_eq!(to_value(value).unwrap(), json!(wire));
+        assert_eq!(from_value::<HoldReason>(json!(wire)).unwrap(), value);
     }
     let expected = [
         "provider_unavailable",
@@ -97,9 +99,51 @@ fn shared_wire_values_match_json() {
         assert_eq!(to_value(value).unwrap(), json!(wire));
         assert_eq!(from_value::<ReasonCode>(json!(wire)).unwrap(), *value);
     }
-    assert_eq!(to_value(ModelTier::Standard).unwrap(), json!("standard"));
-    assert_eq!(to_value(Locale::Th).unwrap(), json!("th"));
-    assert_eq!(to_value(KatStatus::Paused).unwrap(), json!("paused"));
+    for invalid in [json!("unknown"), json!(null), json!(1)] {
+        assert!(from_value::<JobStatus>(invalid.clone()).is_err());
+        assert!(from_value::<HoldReason>(invalid.clone()).is_err());
+        assert!(from_value::<ReasonCode>(invalid).is_err());
+    }
+}
+
+#[test]
+fn shared_type_wire_matrix_round_trips_every_variant() {
+    macro_rules! variants {
+        ($kind:ident, $($variant:ident => $wire:literal),+ $(,)?) => {{
+            $(
+                assert_eq!(to_value($kind::$variant).unwrap(), json!($wire));
+                assert_eq!(from_value::<$kind>(json!($wire)).unwrap(), $kind::$variant);
+            )+
+            for invalid in [json!("unknown"), json!(null), json!(1)] {
+                assert!(from_value::<$kind>(invalid).is_err());
+            }
+        }};
+    }
+    variants!(ModelTier, Fast => "fast", Standard => "standard", Strong => "strong");
+    variants!(Locale, En => "en", Th => "th");
+    variants!(KatStatus, Active => "active", Paused => "paused");
+    variants!(OutwardKind, Send => "send", Publish => "publish", Pay => "pay",
+        Share => "share", ExternalApi => "external_api");
+
+    for value in [i64::MIN, -1, 0, 1, i64::MAX] {
+        assert_eq!(to_value(EventSeq(value)).unwrap(), json!(value));
+        assert_eq!(
+            from_value::<EventSeq>(json!(value)).unwrap(),
+            EventSeq(value)
+        );
+        assert_eq!(EventSeq(value).to_string(), value.to_string());
+        assert_eq!(to_value(LeaseEpoch(value)).unwrap(), json!(value));
+        assert_eq!(
+            from_value::<LeaseEpoch>(json!(value)).unwrap(),
+            LeaseEpoch(value)
+        );
+        assert_eq!(LeaseEpoch(value).to_string(), value.to_string());
+    }
+    for invalid in [json!("1"), json!(null), json!(1.5), json!(u64::MAX)] {
+        assert!(from_value::<EventSeq>(invalid.clone()).is_err());
+        assert!(from_value::<LeaseEpoch>(invalid).is_err());
+    }
+    assert!(LeaseEpoch(1) < LeaseEpoch(2));
 }
 
 #[test]

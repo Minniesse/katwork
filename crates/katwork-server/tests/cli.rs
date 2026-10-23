@@ -13,6 +13,9 @@ fn server() -> Command {
         .env_clear()
         .env("DATABASE_URL", "postgres://localhost/katwork")
         .env("KATWORK_SECRET", uuid::Uuid::now_v7().to_string());
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
     command
 }
 
@@ -1105,6 +1108,13 @@ async fn reset_link_for_an_unknown_email_is_not_found(pool: sqlx::PgPool) {
 async fn operator_commands_need_no_smtp_or_demo_mode(pool: sqlx::PgPool) {
     // `server()` clears the environment: no SMTP_* variables, no KATWORK_DEMO, no public URL.
     let command = server();
+    assert_eq!(
+        command
+            .get_envs()
+            .find(|(key, _)| *key == "LLVM_PROFILE_FILE")
+            .and_then(|(_, value)| value),
+        std::env::var_os("LLVM_PROFILE_FILE").as_deref(),
+    );
     for name in ["SMTP_HOST", "KATWORK_DEMO", "KATWORK_PUBLIC_URL"] {
         assert!(
             !command
