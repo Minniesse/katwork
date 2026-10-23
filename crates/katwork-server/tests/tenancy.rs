@@ -1,10 +1,58 @@
 mod support;
 
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    cell::Cell,
+};
+
+use axum::{body::Body, http::Request};
 use katwork::auth;
 use serde_json::json;
 use sqlx::PgPool;
 use support::*;
+use tower::ServiceExt;
 use uuid::Uuid;
+
+struct CountingAllocator;
+
+thread_local! {
+    static LARGE_ALLOCATIONS: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+fn record_allocation(size: usize) {
+    if size >= 65_536 {
+        let _ = LARGE_ALLOCATIONS.try_with(|count| {
+            if let Some(value) = count.get() {
+                count.set(Some(value + 1));
+            }
+        });
+    }
+}
+
+// SAFETY: Every operation forwards the original pointer and layout to System.
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        record_allocation(layout.size());
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        record_allocation(layout.size());
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        record_allocation(size);
+        unsafe { System.realloc(ptr, layout, size) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 async fn workspace(pool: &PgPool, name: &str) -> Uuid {
     let id = Uuid::now_v7();
@@ -286,6 +334,65 @@ async fn member_cannot_pause_workspace_with_invalid_body(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../katwork/migrations")]
+async fn member_write_bodies_are_not_deserialized(pool: PgPool) {
+    let (id, password) = user(&pool).await;
+    let workspace_id = workspace(&pool, "Office").await;
+    let app = app(&pool, None);
+    let cookie = cookie(&login(&app, &password).await);
+    let payloads = [
+        (
+            "POST",
+            "spaces",
+            format!(
+                r#"{{"name":"{}","allow_external":false}}"#,
+                "a".repeat(123_457)
+            ),
+            400,
+            true,
+        ),
+        (
+            "PUT",
+            "paused",
+            format!(r#"{{"paused":false,"{}":0}}"#, r#"\u0061"#.repeat(40_000)),
+            200,
+            true,
+        ),
+        ("POST", "spaces", "{".to_owned(), 400, false),
+        ("PUT", "paused", "{".to_owned(), 400, false),
+    ];
+    for role in ["member", "admin"] {
+        membership(&pool, workspace_id, id, role).await;
+        for (method, suffix, payload, admin_status, parses_large_string) in &payloads {
+            // Build the request before counting so only handler work is measured.
+            let request = Request::builder()
+                .method(*method)
+                .uri(format!("/api/workspaces/{workspace_id}/{suffix}"))
+                .header("host", "localhost")
+                .header("origin", "http://localhost:3000")
+                .header("content-type", "application/json")
+                .header("cookie", &cookie)
+                .body(Body::from(payload.clone()))
+                .unwrap();
+            LARGE_ALLOCATIONS.set(Some(0));
+            let response = app.clone().oneshot(request).await.unwrap();
+            let allocations = LARGE_ALLOCATIONS.replace(None).unwrap();
+            if role == "member" {
+                assert_code(response, 403, "forbidden").await;
+                assert_eq!(allocations, 0, "member body parsed by {suffix}");
+            } else {
+                assert_eq!(response.status(), *admin_status);
+                if *parses_large_string {
+                    assert!(allocations > 0, "admin positive control for {suffix}");
+                }
+            }
+        }
+    }
+    let stored: (bool, i64) = sqlx::query_as("SELECT paused, (SELECT count(*) FROM spaces WHERE workspace_id = $1) FROM workspaces WHERE id = $1")
+        .bind(workspace_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(stored, (false, 0));
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
 async fn create_workspace_assigns_only_authenticated_owner(pool: PgPool) {
     let (id, password) = user(&pool).await;
     let other = workspace(&pool, "Private").await;
@@ -396,6 +503,130 @@ async fn repositories_resolve_roles_and_scope_space_ids(pool: PgPool) {
             .code(),
         "not_found"
     );
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn repository_space_create_and_workspace_pause_enforce_roles(pool: PgPool) {
+    use katwork::{
+        ids::{UserId, WorkspaceId},
+        tenancy::{self, space as spaces, workspace as workspaces},
+        types::SpacePolicy,
+    };
+    let (id, _) = user(&pool).await;
+    let workspace_id = workspace(&pool, "Office").await;
+    for (role, requested_pause, count, expected_pause) in [
+        ("member", true, 0, false),
+        ("admin", true, 1, true),
+        ("owner", false, 2, false),
+    ] {
+        membership(&pool, workspace_id, id, role).await;
+        let tenant = tenancy::resolve(&pool, UserId(id), WorkspaceId(workspace_id))
+            .await
+            .unwrap();
+        let created = spaces::create(
+            &pool,
+            &tenant,
+            role,
+            SpacePolicy {
+                allow_external: false,
+            },
+        )
+        .await;
+        let paused = workspaces::set_paused(&pool, &tenant, requested_pause).await;
+        if role == "member" {
+            assert_eq!(created.unwrap_err().code(), "forbidden");
+            assert_eq!(paused.unwrap_err().code(), "forbidden");
+        } else {
+            let created = created.unwrap();
+            paused.unwrap();
+            let stored: (Uuid, String, bool) = sqlx::query_as(
+                "SELECT workspace_id, name, allow_external FROM spaces WHERE id = $1",
+            )
+            .bind(created)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(stored, (workspace_id, role.to_owned(), false));
+        }
+        let stored: (bool, i64) = sqlx::query_as("SELECT paused, (SELECT count(*) FROM spaces WHERE workspace_id = $1) FROM workspaces WHERE id = $1")
+            .bind(workspace_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(stored, (expected_pause, count), "{role}");
+    }
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn space_reads_preserve_both_policy_values(pool: PgPool) {
+    use katwork::{
+        ids::{UserId, WorkspaceId},
+        tenancy::{self, space as spaces},
+        types::SpacePolicy,
+    };
+    let (id, password) = user(&pool).await;
+    let workspace_id = workspace(&pool, "Office").await;
+    membership(&pool, workspace_id, id, "owner").await;
+    let tenant = tenancy::resolve(&pool, UserId(id), WorkspaceId(workspace_id))
+        .await
+        .unwrap();
+    let mut expected = Vec::new();
+    for (name, allow_external) in [("Local", false), ("Hosted", true)] {
+        let id = spaces::create(&pool, &tenant, name, SpacePolicy { allow_external })
+            .await
+            .unwrap();
+        let value = json!({"id": id, "name": name, "policy": {"allow_external": allow_external}});
+        let found = spaces::get(&pool, &tenant, id).await.unwrap();
+        assert_eq!(serde_json::to_value(found).unwrap(), value);
+        expected.push(value);
+    }
+    let expected = json!(expected);
+    assert_eq!(
+        serde_json::to_value(spaces::list(&pool, &tenant).await.unwrap()).unwrap(),
+        expected
+    );
+    let app = app(&pool, None);
+    let cookie = cookie(&login(&app, &password).await);
+    let response = request(
+        &app,
+        "GET",
+        &format!("/api/workspaces/{workspace_id}/spaces"),
+        None,
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(body(response).await, expected);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn workspace_list_preserves_each_membership_role_and_paused_state(pool: PgPool) {
+    use katwork::{ids::UserId, tenancy::workspace as workspaces};
+    let (id, password) = user(&pool).await;
+    let mut expected = Vec::new();
+    for (name, role, paused) in [
+        ("Owned", "owner", true),
+        ("Managed", "admin", false),
+        ("Joined", "member", true),
+    ] {
+        let workspace_id = workspace(&pool, name).await;
+        membership(&pool, workspace_id, id, role).await;
+        sqlx::query("UPDATE workspaces SET paused = $2 WHERE id = $1")
+            .bind(workspace_id)
+            .bind(paused)
+            .execute(&pool)
+            .await
+            .unwrap();
+        expected.push(json!({"id": workspace_id, "name": name, "role": role, "paused": paused}));
+    }
+    workspace(&pool, "Private").await;
+    let expected = json!(expected);
+    assert_eq!(
+        serde_json::to_value(workspaces::list_for(&pool, UserId(id)).await.unwrap()).unwrap(),
+        expected
+    );
+    let app = app(&pool, None);
+    let cookie = cookie(&login(&app, &password).await);
+    let response = request(&app, "GET", "/api/workspaces", None, Some(&cookie)).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(body(response).await, expected);
 }
 
 #[sqlx::test(migrations = "../katwork/migrations")]

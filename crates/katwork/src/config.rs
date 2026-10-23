@@ -419,7 +419,7 @@ impl fmt::Debug for SmtpConfig {
                 },
             )
             .field("port", &self.port)
-            .field("username", &self.username)
+            .field("username", &self.username.as_ref().map(|_| "[redacted]"))
             .field("password", &"[redacted]")
             .field("from", &self.from)
             .finish()

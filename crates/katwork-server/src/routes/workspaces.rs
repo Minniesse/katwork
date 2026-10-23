@@ -1,5 +1,6 @@
 use axum::{
     Json,
+    body::Bytes,
     extract::{State, rejection::JsonRejection},
     http::StatusCode,
 };
@@ -63,10 +64,10 @@ pub(crate) async fn list_spaces(
 pub(crate) async fn create_space(
     State(state): State<AppState>,
     tenant: Tenant,
-    body: Result<Json<NewSpace>, JsonRejection>,
+    body: Bytes,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     tenant.require_admin()?;
-    let body = payload(body)?;
+    let body = payload(Json::<NewSpace>::from_bytes(&body))?;
     let policy = SpacePolicy {
         allow_external: body.allow_external.ok_or(KatError::SpacePolicyRequired)?,
     };
@@ -77,10 +78,10 @@ pub(crate) async fn create_space(
 pub(crate) async fn set_paused(
     State(state): State<AppState>,
     tenant: Tenant,
-    body: Result<Json<Paused>, JsonRejection>,
+    body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
     tenant.require_admin()?;
-    let body = payload(body)?;
+    let body = payload(Json::<Paused>::from_bytes(&body))?;
     workspace::set_paused(&state.core.pool, &tenant, body.paused).await?;
     Ok(Json(json!({})))
 }

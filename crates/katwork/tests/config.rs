@@ -811,3 +811,25 @@ fn transport_defaults_and_overrides() {
     assert_eq!(config.transport.max_connections, 5);
     assert_eq!(config.transport.max_connections_per_ip, 2);
 }
+
+#[test]
+fn smtp_and_enclosing_config_debug_redact_username_tokens() {
+    let token = uuid::Uuid::now_v7().to_string();
+    let config = Config::from_lookup(|name| match name {
+        "SMTP_HOST" => Some("smtp.example.test".into()),
+        "SMTP_USERNAME" | "SMTP_PASSWORD" => Some(token.clone()),
+        _ => lookup(name),
+    })
+    .unwrap();
+    for debug in [
+        format!("{:?}", config.smtp.as_ref().unwrap()),
+        format!("{config:?}"),
+    ] {
+        assert!(!debug.contains(&token), "SMTP credential leaked in Debug");
+        assert!(debug.contains("username: Some(\"[redacted]\")"));
+        assert!(debug.contains("password: \"[redacted]\""));
+    }
+    let mut smtp = config.smtp.unwrap();
+    smtp.username = None;
+    assert!(format!("{smtp:?}").contains("username: None"));
+}
