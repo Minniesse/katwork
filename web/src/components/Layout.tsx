@@ -4,7 +4,7 @@ import { t, useLocale } from '../i18n';
 import { navigationCount } from '../router';
 import { Preferences } from './Preferences';
 
-/** The team as six kats: the Lead in yellow and five specialists. Decorative. */
+/** The team as six Kats: the Lead in yellow and five specialists. Decorative. */
 export function KatCluster({ size = 'large' }: { size?: 'large' | 'small' }) {
   return (
     <div className={`kat-cluster kat-cluster-${size}`} aria-hidden="true">
