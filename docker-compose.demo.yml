@@ -21,6 +21,8 @@ services:
     image: caddy:2.11.7-alpine
     restart: unless-stopped
     cap_drop: [ALL]
+    # The image's Caddy binary carries this file capability, even on port 3000.
+    cap_add: [NET_BIND_SERVICE]
     security_opt: ["no-new-privileges:true"]
     networks: [backend, default]
     ports: ["127.0.0.1:3001:3000"]

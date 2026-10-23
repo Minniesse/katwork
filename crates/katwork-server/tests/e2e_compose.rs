@@ -422,9 +422,10 @@ fn first_run_and_profile_configuration() {
             app["healthcheck"]["test"],
             json!(["CMD", "/app/katwork-server", "healthcheck"])
         );
-        assert_eq!(
-            config["services"]["backup"]["environment"]["DATABASE_URL"],
-            config["services"]["migrate"]["environment"]["DATABASE_URL"]
+        assert!(
+            config["services"]["backup"]["environment"]["DATABASE_URL"]
+                == config["services"]["migrate"]["environment"]["DATABASE_URL"],
+            "backup and migrate must share DATABASE_URL"
         );
         assert_eq!(config["networks"]["backend"]["internal"], true);
         assert_eq!(
@@ -461,6 +462,10 @@ fn first_run_and_profile_configuration() {
             }
         }
         if overrides.contains(&"demo") {
+            assert_eq!(
+                config["services"]["demo-proxy"]["cap_add"],
+                json!(["NET_BIND_SERVICE"])
+            );
             assert!(app["ports"].is_null() || app["ports"] == json!([]));
             for network in app["networks"].as_object().unwrap().keys() {
                 assert_eq!(config["networks"][network]["internal"], true);
@@ -487,7 +492,7 @@ fn first_run_and_profile_configuration() {
                 "KATWORK_LOCAL_MODEL",
                 "SMTP_HOST",
             ] {
-                assert_eq!(app["environment"][name], "");
+                assert!(app["environment"][name] == "", "demo must clear {name}");
             }
         }
     }
