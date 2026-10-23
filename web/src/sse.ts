@@ -32,6 +32,11 @@ export interface Question {
   options: string[];
 }
 
+export interface NoticeMeta {
+  code: string;
+  kats: { id: string; name: string }[];
+}
+
 export interface ChatMessage {
   id: string;
   author: Author | null;
@@ -40,6 +45,7 @@ export interface ChatMessage {
   provisional: boolean;
   synthetic: boolean;
   question: Question | null;
+  meta?: NoticeMeta | null;
   runId: string | null;
 }
 
@@ -50,6 +56,7 @@ export interface StoredMessage {
   body: string;
   synthetic: boolean;
   question: Question | null;
+  meta?: NoticeMeta | null;
 }
 
 export interface ToolCall {
@@ -322,6 +329,7 @@ function applyCustom(state: Transcript, name: string, value: Fields): Transcript
         provisional: false,
         synthetic: value.synthetic === true,
         question: parseQuestion(value.question),
+        meta: parseNoticeMeta(value.meta),
         runId: existing?.runId ?? null,
       });
     }
@@ -412,4 +420,16 @@ function updateToolCall(
     code: null,
   };
   return putToolCall(state, id, { ...call, ...change(call) });
+}
+
+function parseNoticeMeta(raw: unknown): NoticeMeta | null {
+  const meta = fields(raw);
+  if (!meta || !isString(meta.code) || !Array.isArray(meta.kats)) return null;
+  const kats: NoticeMeta['kats'] = [];
+  for (const rawKat of meta.kats) {
+    const kat = fields(rawKat);
+    if (!kat || !isString(kat.id) || !isString(kat.name)) return null;
+    kats.push({ id: kat.id, name: kat.name });
+  }
+  return { code: meta.code, kats };
 }

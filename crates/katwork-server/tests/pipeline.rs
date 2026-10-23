@@ -20,6 +20,18 @@ use std::{sync::Arc, time::Duration};
 use support::{body, request};
 use tokio::time::timeout;
 
+async fn wait_for_locks(pool: &PgPool, table: &str, count: i64) {
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let blocked: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE $1")
+                .bind(format!("SELECT%FROM {table}%"))
+                .fetch_one(pool).await.unwrap();
+            if blocked >= count { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("expected database lock wait");
+}
+
 struct Fixture {
     core: Arc<Core>,
     app: Router,
@@ -188,6 +200,7 @@ impl Fixture {
         while let Some(r) = workers.join_next().await {
             r.unwrap();
         }
+        safety::assert_pool_clean(&self.core.pool).await;
     }
     async fn pause(&self, kat: KatId) {
         sqlx::query("UPDATE kats SET status='paused',policy_version=policy_version+1 WHERE id=$1")
@@ -452,18 +465,33 @@ async fn two_simultaneous_submissions_with_five_recent_jobs_admit_one(pool: PgPo
     let other = thread::create(&pool, &f.tenant, f.space, current.team_id, "Other")
         .await
         .unwrap();
-    let (a, b) = tokio::join!(
-        f.submit("six"),
-        katwork::pipeline::submit(
-            &f.core,
-            &f.tenant,
-            other.id,
-            katwork::chat::UserPost {
-                body: "seven".into(),
-                client_msg_id: None
-            }
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM kats WHERE id=$1 FOR NO KEY UPDATE")
+        .bind(f.kats[0].id)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let submissions = async {
+        tokio::join!(
+            f.submit("six"),
+            katwork::pipeline::submit(
+                &f.core,
+                &f.tenant,
+                other.id,
+                katwork::chat::UserPost {
+                    body: "seven".into(),
+                    client_msg_id: None,
+                }
+            )
         )
-    );
+    };
+    tokio::pin!(submissions);
+    tokio::select! {
+        _ = &mut submissions => panic!("submissions bypassed the Kat lock"),
+        () = wait_for_locks(&pool, "kats", 2) => {}
+    }
+    holder.commit().await.unwrap();
+    let (a, b) = submissions.await;
     let statuses = [f.status(a.1).await, f.status(b.unwrap().job_id).await];
     assert_eq!(statuses.iter().filter(|s| s.0.is_none()).count(), 1);
     assert_eq!(
@@ -571,3 +599,60 @@ async fn ungranted_mention_names_the_kat_and_routes_to_lead(pool: PgPool) {
 }
 #[path = "pipeline/contracts.rs"]
 mod contracts;
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn mention_needs_space_names_english_and_thai_kats(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    for (name, text) in [
+        ("Writer", "@Writerplease help"),
+        ("เลขา", "@เลขาช่วยสรุปประชุม"),
+    ] {
+        sqlx::query("UPDATE kats SET name=$2 WHERE id=$1")
+            .bind(f.kats[2].id)
+            .bind(name)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (_, job) = f.submit(text).await;
+        let (kat, input) = f.task(job).await;
+        assert_eq!(kat, f.kats[0].id);
+        assert_eq!(input.routing.rule, katwork::jobs::RouteRule::Lead);
+        let notice = f.notices().await.pop().expect("missing delimiter notice");
+        assert_eq!(notice["code"], "mention_needs_space");
+        assert_eq!(notice["kats"], json!([{"id":f.kats[2].id,"name":name}]));
+    }
+}
+
+#[path = "pipeline/safety.rs"]
+mod safety;
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn mention_space_warning_respects_parser_and_lead_routing(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    for text in [
+        "`@Writerplease`",
+        "https://example.test/@Writerplease",
+        "@Writerplease @Researcher yes",
+    ] {
+        f.submit(text).await;
+        assert!(
+            !f.notices()
+                .await
+                .iter()
+                .any(|n| n["code"] == "mention_needs_space")
+        );
+    }
+    f.awaiting().await;
+    let (_, job) = f.submit("@Writerplease @Writerplease").await;
+    let (kat, input) = f.task(job).await;
+    assert_eq!(kat, f.kats[0].id);
+    assert_eq!(input.routing.rule, katwork::jobs::RouteRule::Lead);
+    assert_eq!(
+        f.notices()
+            .await
+            .iter()
+            .filter(|n| n["code"] == "mention_needs_space")
+            .count(),
+        1
+    );
+}

@@ -158,12 +158,13 @@ async fn quota_reject_racing_claim_does_not_deadlock(pool: PgPool) {
             Some("quota_exceeded")
         );
         assert!(claimed.is_ok(), "{claimed:?}");
-        assert_eq!(
-            f.call("POST", &format!("jobs/{queued}/cancel"), None)
-                .await
-                .status(),
-            202
-        );
+        assert_eq!(f.status(queued).await.1.as_deref(), Some("quota_exceeded"));
+        support::assert_code(
+            f.call("POST", &format!("jobs/{queued}/cancel"), None).await,
+            409,
+            "job_already_finished",
+        )
+        .await;
     }
 }
 #[sqlx::test(migrations = "../katwork/migrations")]
@@ -318,4 +319,96 @@ async fn quota_rechecks_budget_after_waiting_for_kat_lock(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(count, 0);
+}
+
+async fn eligibility_change_while_waiting(pool: PgPool, change: &'static str) {
+    let f = Fixture::new(&pool).await;
+    if change.starts_with("DELETE") {
+        let elsewhere = SpaceId::new();
+        sqlx::query("INSERT INTO spaces(id,workspace_id,name,allow_external) VALUES($1,$2,'Elsewhere',false)")
+            .bind(elsewhere).bind(f.tenant.workspace_id()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO kat_spaces(kat_id,workspace_id,space_id) VALUES($1,$2,$3)")
+            .bind(f.kats[2].id)
+            .bind(f.tenant.workspace_id())
+            .bind(elsewhere)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE kats SET default_space_id=$2 WHERE id=$1")
+            .bind(f.kats[2].id)
+            .bind(elsewhere)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM kats WHERE id=$1 FOR NO KEY UPDATE")
+        .bind(f.kats[2].id)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let post = f.post("@Writer hello", Some("eligibility"));
+    tokio::pin!(post);
+    tokio::select! {
+        _ = &mut post => panic!("intake bypassed Kat lock"),
+        () = wait_for_locks(&pool, "kats", 1) => {}
+    }
+    sqlx::query(change)
+        .bind(f.kats[2].id)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    holder.commit().await.unwrap();
+    support::assert_code(post.await, 503, "busy").await;
+    let counts: (i64,i64,i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM messages),(SELECT count(*) FROM jobs),(SELECT count(*) FROM tasks),(SELECT count(*) FROM events)")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(counts, (0, 0, 0, 0));
+    let retry = body(f.post("@Writer hello", Some("eligibility")).await).await;
+    let job = serde_json::from_value(retry["job_id"].clone()).unwrap();
+    let (kat, input) = f.task(job).await;
+    assert_eq!(kat, f.kats[0].id);
+    assert_eq!(input.routing.rule, katwork::jobs::RouteRule::Lead);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn intake_rechecks_pause_after_kat_lock(pool: PgPool) {
+    eligibility_change_while_waiting(pool, "UPDATE kats SET status='paused' WHERE id=$1").await;
+}
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn intake_rechecks_grant_after_kat_lock(pool: PgPool) {
+    eligibility_change_while_waiting(pool, "DELETE FROM kat_spaces WHERE kat_id=$1 AND space_id<>(SELECT default_space_id FROM kats WHERE id=$1)").await;
+}
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn intake_rechecks_membership_after_kat_lock(pool: PgPool) {
+    eligibility_change_while_waiting(pool, "UPDATE team_members SET active=false WHERE kat_id=$1")
+        .await;
+}
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn intake_refreshes_policy_version_after_kat_lock(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM kats WHERE id=$1 FOR NO KEY UPDATE")
+        .bind(f.kats[2].id)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let post = f.submit("@Writer hello");
+    tokio::pin!(post);
+    tokio::select! {
+        _ = &mut post => panic!("intake bypassed Kat lock"),
+        () = wait_for_locks(&pool, "kats", 1) => {}
+    }
+    sqlx::query("UPDATE kats SET policy_version=policy_version+1 WHERE id=$1")
+        .bind(f.kats[2].id)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    holder.commit().await.unwrap();
+    let (_, job) = post.await;
+    let version: i64 = sqlx::query_scalar("SELECT kat_policy_version FROM tasks WHERE job_id=$1")
+        .bind(job)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(version, f.kats[2].policy_version + 1);
 }

@@ -491,7 +491,8 @@ pub async fn cancel(
         RunStartedEvent,
         sink::{close_locked_calls, close_locked_run},
     };
-    let mut tx = pool.begin().await?;
+    let mut connection = crate::db::GuardedConnection::acquire(pool).await?;
+    let mut tx = connection.connection().begin().await?;
     crate::db::set_configured_lock_timeout(&mut tx).await?;
     let workspace = tenant.workspace_id();
     sqlx::query("SELECT id FROM jobs WHERE workspace_id=$1 AND id=$2 FOR NO KEY UPDATE")
@@ -607,6 +608,7 @@ pub async fn cancel(
     }
     let seq = finish_by_harness(&mut tx, job_id, HarnessEnd::Cancelled).await?;
     tx.commit().await?;
+    connection.release();
     hub.notify(job.thread_id, seq);
     Ok(())
 }
@@ -618,10 +620,13 @@ pub async fn view(
     tenant: &Tenant,
     job_id: JobId,
 ) -> Result<JobView, KatError> {
-    sqlx::query_as(include_str!("job_view.sql"))
+    let mut connection = crate::db::GuardedConnection::acquire(pool).await?;
+    let job = sqlx::query_as(include_str!("job_view.sql"))
         .bind(tenant.workspace_id())
         .bind(job_id)
-        .fetch_optional(pool)
+        .fetch_optional(connection.connection())
         .await?
-        .ok_or(KatError::NotFound)
+        .ok_or(KatError::NotFound);
+    connection.release();
+    job
 }

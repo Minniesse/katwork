@@ -78,6 +78,7 @@ fn shared_wire_values_match_json() {
         "question_pending",
         "interrupted_review_required",
         "kat_paused",
+        "internal_error",
         "retries_exhausted",
         "cancelled",
         "outcome_unknown",
@@ -87,6 +88,7 @@ fn shared_wire_values_match_json() {
         "too_many_requests",
         "workspace_paused_stopped",
         "kat_paused_stopped",
+        "mention_needs_space",
         "extra_mention_ignored",
     ];
     assert_eq!(ReasonCode::ALL.len(), expected.len());
