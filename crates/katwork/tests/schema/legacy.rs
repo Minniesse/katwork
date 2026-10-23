@@ -3,6 +3,56 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 #[sqlx::test(migrations = false)]
+async fn runs_job_index_upgrades_populated_0009_database(pool: PgPool) {
+    let mut historical = sqlx::migrate!();
+    historical.migrations = std::borrow::Cow::Owned(
+        historical
+            .iter()
+            .filter(|m| m.version <= 9)
+            .cloned()
+            .collect(),
+    );
+    historical.run(&pool).await.unwrap();
+    let version: i64 = sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(version, 9);
+    let f = Fixture::new(&pool).await;
+    let before: serde_json::Value =
+        sqlx::query_scalar("SELECT to_jsonb(r) FROM runs r WHERE id=$1")
+            .bind(f.run)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let index: Option<String> = sqlx::query_scalar("SELECT to_regclass('runs_job_id')::text")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(index, None);
+    katwork::db::migrate(&pool).await.unwrap();
+    katwork::db::migrate(&pool).await.unwrap();
+    let index: Option<String> = sqlx::query_scalar("SELECT to_regclass('runs_job_id')::text")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(index.as_deref(), Some("runs_job_id"));
+    let applied: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM _sqlx_migrations WHERE version=10 AND success)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(applied);
+    let after: serde_json::Value = sqlx::query_scalar("SELECT to_jsonb(r) FROM runs r WHERE id=$1")
+        .bind(f.run)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(after, before);
+}
+
+#[sqlx::test(migrations = false)]
 async fn team_membership_migration_preserves_existing_rows_and_constraints(pool: PgPool) {
     for migration in [
         include_str!("../../migrations/0001_init.sql"),
