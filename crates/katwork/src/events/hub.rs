@@ -53,6 +53,7 @@ impl EventHub {
     }
 
     /// `session` is the SHA-256 token digest, never the cookie token itself.
+    #[cfg(test)]
     pub fn open_stream(&self, session: &str) -> Result<StreamPermit, KatError> {
         self.reserve_stream(session, None)
     }
@@ -145,5 +146,25 @@ impl Drop for StreamPermit {
                 state.users.remove(&user);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fifth_stream_permit_is_refused_until_one_drops() {
+        let hub = EventHub::new();
+        let mut held: Vec<_> = (0..4)
+            .map(|_| hub.open_stream("session hash").unwrap())
+            .collect();
+        assert_eq!(
+            hub.open_stream("session hash").unwrap_err().code(),
+            "too_many_streams"
+        );
+        let _other = hub.open_stream("other session hash").unwrap();
+        held.pop();
+        assert!(hub.open_stream("session hash").is_ok());
     }
 }
