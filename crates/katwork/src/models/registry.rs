@@ -19,6 +19,7 @@ pub struct ModelEntry {
     pub max_output_tokens: u32,
     pub temperature: Option<f32>,
     pub price: Option<TokenPrice>,
+    pub timeouts: ModelTimeouts,
 }
 #[derive(Clone)]
 pub struct Selected {
@@ -55,7 +56,11 @@ impl Registry {
     }
     pub fn from_config(config: &Config) -> Self {
         let mut entries = Vec::new();
-        if config.openai.is_none() && config.anthropic.is_none() && config.demo {
+        if config.openai.is_none()
+            && config.anthropic.is_none()
+            && config.local.is_none()
+            && config.demo
+        {
             let provider: Arc<dyn ModelProvider> = Arc::new(FakeProvider::demo());
             for (tier, max_output_tokens, _, _) in MODELS {
                 entries.push((
@@ -67,6 +72,7 @@ impl Registry {
                         max_output_tokens,
                         temperature: None,
                         price: None,
+                        timeouts: ModelTimeouts::HOSTED,
                     },
                     provider.clone(),
                 ));
@@ -83,9 +89,18 @@ impl Registry {
             for (tier, max_output_tokens, openai, anthropic) in MODELS {
                 let model = if id == "openai" { openai } else { anthropic };
                 let provider = if id == "openai" {
-                    RigProvider::openai(env, model, OpenAiApi::Chat)
+                    RigProvider::openai(
+                        env,
+                        model,
+                        OpenAiApi::Chat,
+                        HttpLimits::for_entry(&ModelTimeouts::HOSTED),
+                    )
                 } else {
-                    RigProvider::anthropic(env, model)
+                    RigProvider::anthropic(
+                        env,
+                        model,
+                        HttpLimits::for_entry(&ModelTimeouts::HOSTED),
+                    )
                 };
                 match provider {
                     Ok(provider) => {
@@ -103,6 +118,7 @@ impl Registry {
                                 max_output_tokens,
                                 temperature: None,
                                 price: None,
+                                timeouts: ModelTimeouts::HOSTED,
                             },
                             provider,
                         ));
@@ -116,7 +132,44 @@ impl Registry {
             }
             entries.extend(configured);
         }
+        if let Some(env) = &config.local {
+            let mut configured = Vec::new();
+            for (tier, max_output_tokens, _, _) in MODELS {
+                let timeouts = ModelTimeouts::LOCAL;
+                match RigProvider::local(env, HttpLimits::for_entry(&timeouts)) {
+                    Ok(provider) => {
+                        let entry = ModelEntry {
+                            provider_id: provider.id().into(),
+                            model: env.model.clone(),
+                            tier,
+                            capabilities: provider.capabilities(),
+                            max_output_tokens,
+                            temperature: None,
+                            price: None,
+                            timeouts,
+                        };
+                        configured.push((entry, Arc::new(provider) as Arc<dyn ModelProvider>));
+                    }
+                    Err(_) => {
+                        tracing::warn!(provider_id = "local", "provider_init_failed");
+                        configured.clear();
+                        break;
+                    }
+                }
+            }
+            entries.extend(configured);
+        }
         Self::from_entries(entries)
+    }
+    pub fn log_tiers(&self) {
+        for (tier, _, _, _) in MODELS {
+            let serving = |allow_external| {
+                self.for_tier(tier, &SpacePolicy { allow_external })
+                    .map(|s| format!("{}/{}", s.entry.provider_id, s.entry.model))
+                    .unwrap_or_else(|_| "none".into())
+            };
+            tracing::info!(?tier, hosted_allowed = %serving(true), local_only = %serving(false), "model_tier");
+        }
     }
     pub fn for_tier(
         &self,

@@ -132,7 +132,10 @@ fn serve_config_error_does_not_print_database_password() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stderr), "config_invalid\n");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "config_invalid { var: KATWORK_SECRET }\n"
+    );
 }
 
 #[test]
@@ -169,7 +172,10 @@ fn migrate_rejects_missing_configuration() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stderr), "config_invalid\n");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "config_invalid { var: DATABASE_URL }\n"
+    );
 }
 
 #[sqlx::test(migrations = false)]
@@ -280,7 +286,10 @@ async fn seed_demo_reset_password_allows_login(pool: sqlx::PgPool) {
 fn seed_demo_requires_demo_mode_before_connecting() {
     let output = server().arg("seed-demo").output().unwrap();
     assert!(!output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stderr), "config_invalid\n");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "config_invalid { var: KATWORK_DEMO }\n"
+    );
 }
 
 async fn demo_login(app: &axum::Router, password: &str) -> axum::response::Response {

@@ -1,0 +1,6 @@
+data: {"id":"chat-local-fixture","object":"chat.completion.chunk","created":1,"model":"local-model","choices":[{"index":0,"delta":{"role":"assistant","content":"สวัสดี"},"finish_reason":null}]}
+
+data: {"id":"chat-local-fixture","object":"chat.completion.chunk","created":1,"model":"local-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}
+
+data: [DONE]
+

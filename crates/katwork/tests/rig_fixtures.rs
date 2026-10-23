@@ -1,5 +1,8 @@
 use futures::StreamExt;
-use katwork::{config::ProviderEnv, models::*};
+use katwork::{
+    config::{Config, LocalEnv, ProviderEnv},
+    models::*,
+};
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 use tokio::{
@@ -11,6 +14,7 @@ use tokio::{
 struct Server {
     url: String,
     request: Arc<Mutex<Option<Value>>>,
+    head: Arc<Mutex<String>>,
     arrived: Arc<Notify>,
     closed: Arc<Notify>,
     task: tokio::task::JoinHandle<()>,
@@ -36,11 +40,33 @@ impl Server {
         interval: Duration,
         truncate: bool,
     ) -> Self {
+        Self::delayed(
+            chunks,
+            status,
+            hold,
+            headers,
+            interval,
+            truncate,
+            Duration::ZERO,
+        )
+        .await
+    }
+    async fn delayed(
+        chunks: Vec<Vec<u8>>,
+        status: u16,
+        hold: bool,
+        headers: &str,
+        interval: Duration,
+        truncate: bool,
+        header_delay: Duration,
+    ) -> Self {
         let headers = headers.to_owned();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let request = Arc::new(Mutex::new(None));
         let captured = request.clone();
+        let head = Arc::new(Mutex::new(String::new()));
+        let captured_head = head.clone();
         let arrived = Arc::new(Notify::new());
         let received = arrived.clone();
         let closed = Arc::new(Notify::new());
@@ -66,6 +92,7 @@ impl Server {
                         })
                         .unwrap_or(0);
                     if raw.len() >= end + 4 + len {
+                        *captured_head.lock().await = headers.into_owned();
                         *captured.lock().await =
                             Some(serde_json::from_slice(&raw[end + 4..end + 4 + len]).unwrap());
                         break;
@@ -82,6 +109,7 @@ impl Server {
                 disconnected.notify_one();
                 return;
             }
+            tokio::time::sleep(header_delay).await;
             let header = format!(
                 "HTTP/1.1 {status} fixture\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n{headers}\r\n"
             );
@@ -118,10 +146,22 @@ impl Server {
         Self {
             url,
             request,
+            head,
             arrived,
             closed,
             task,
         }
+    }
+    fn local(&self, api_key: Option<String>, limits: HttpLimits) -> RigProvider {
+        RigProvider::local(
+            &LocalEnv {
+                base_url: format!("{}/v1", self.url),
+                model: "local-model".into(),
+                api_key,
+            },
+            limits,
+        )
+        .unwrap()
     }
     fn provider(&self, api: Option<OpenAiApi>) -> RigProvider {
         let env = ProviderEnv {
@@ -129,8 +169,8 @@ impl Server {
             base_url: Some(self.url.clone()),
         };
         match api {
-            Some(api) => RigProvider::openai(&env, "gpt-4.1", api),
-            None => RigProvider::anthropic(&env, "claude-sonnet-4-6"),
+            Some(api) => RigProvider::openai(&env, "gpt-4.1", api, HttpLimits::default()),
+            None => RigProvider::anthropic(&env, "claude-sonnet-4-6", HttpLimits::default()),
         }
         .unwrap()
     }
@@ -514,6 +554,7 @@ async fn live_openai_chat_smoke() {
         },
         "gpt-4.1-mini",
         OpenAiApi::Chat,
+        HttpLimits::default(),
     )
     .unwrap();
     turn(&collect(&provider).await);
@@ -1267,8 +1308,8 @@ async fn provider_errors_redact_keys_and_base_urls_in_display_and_debug() {
                 base_url: Some(base_url.clone()),
             };
             let provider = match api {
-                Some(api) => RigProvider::openai(&env, "gpt-4.1", api),
-                None => RigProvider::anthropic(&env, "claude-sonnet-4-6"),
+                Some(api) => RigProvider::openai(&env, "gpt-4.1", api, HttpLimits::default()),
+                None => RigProvider::anthropic(&env, "claude-sonnet-4-6", HttpLimits::default()),
             }
             .unwrap();
             let chunks = collect(&provider).await;
@@ -1360,4 +1401,496 @@ async fn http_body_stall_times_out_idle() {
     tokio::time::timeout(Duration::from_secs(10), server.closed.notified())
         .await
         .expect("client must disconnect");
+}
+
+#[test]
+fn http_limits_follow_the_entry_timeouts() {
+    for (t, first, read) in [
+        (ModelTimeouts::LOCAL, 120, 120),
+        (ModelTimeouts::HOSTED, 30, 30),
+        (
+            ModelTimeouts {
+                first_chunk: Duration::from_secs(15),
+                idle: Duration::from_secs(40),
+                run_wall_clock: Duration::from_secs(90),
+            },
+            15,
+            40,
+        ),
+    ] {
+        let limits = HttpLimits::for_entry(&t);
+        assert_eq!(limits.first_byte, Duration::from_secs(first));
+        assert_eq!(limits.read, Duration::from_secs(read));
+        assert!(limits.read >= t.first_chunk.max(t.idle));
+        assert_eq!(limits.connect, Duration::from_secs(10));
+        assert_eq!(limits.max_response_bytes, 16 * 1024 * 1024);
+        assert_eq!(limits.max_error_body_bytes, 64 * 1024);
+        assert_eq!(limits.max_sse_frame_bytes, 1024 * 1024);
+    }
+}
+
+#[tokio::test]
+async fn local_provider_streams_from_an_openai_compatible_server() {
+    for name in ["local_ollama.sse", "local_vllm.sse", "local_llamacpp.sse"] {
+        let server = Server::new(fixture(name), 200, None, false).await;
+        let provider = server.local(None, HttpLimits::for_entry(&ModelTimeouts::LOCAL));
+        let chunks = collect(&provider).await;
+        turn(&chunks);
+        let req = server.request.lock().await.clone().unwrap();
+        assert_eq!(req["model"], "local-model");
+        assert_eq!(req["stream"], true);
+        assert_eq!(req["stream_options"]["include_usage"], true);
+        assert!(req.get("tool_choice").is_none());
+        assert_eq!(req["tools"][0]["function"]["name"], "first");
+        assert!(
+            server
+                .head
+                .lock()
+                .await
+                .starts_with("POST /v1/chat/completions HTTP/1.1\r\n")
+        );
+    }
+}
+
+#[tokio::test]
+async fn local_provider_without_key_sends_no_authorization_header() {
+    for key in [None, Some(uuid::Uuid::now_v7().to_string())] {
+        let server = Server::new(fixture("local_ollama.sse"), 200, None, false).await;
+        turn(&collect(&server.local(key.clone(), HttpLimits::default())).await);
+        let headers = server.head.lock().await.to_ascii_lowercase();
+        match key {
+            None => assert!(!headers.contains("authorization:")),
+            Some(key) => assert!(headers.contains(&format!("authorization: bearer {key}"))),
+        }
+    }
+}
+
+#[tokio::test]
+async fn local_tool_fragments_emit_only_complete_call() {
+    let body = fixture("local_vllm.sse");
+    let split = body
+        .windows(b"call_local".len())
+        .position(|w| w == b"call_local")
+        .unwrap()
+        + 5;
+    let server = Server::new(body, 200, Some(split), false).await;
+    let chunks = collect(&server.local(None, HttpLimits::default())).await;
+    let calls: Vec<_> = chunks
+        .iter()
+        .filter_map(|c| match c {
+            Ok(ChatChunk::ToolCall(call)) => Some(call),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        calls,
+        vec![&ToolCall {
+            id: "call_local".into(),
+            name: "first".into(),
+            args_json: "{\"x\":1}".into()
+        }]
+    );
+    assert_eq!(turn(&chunks).tool_calls.len(), 1);
+    for (name, malformed) in [
+        ("chat_malformed.sse", true),
+        ("chat_truncated.sse", false),
+        ("chat_duplicate_id.sse", true),
+    ] {
+        let server = Server::new(fixture(name), 200, None, false).await;
+        let chunks = collect(&server.local(None, HttpLimits::default())).await;
+        assert!(
+            !chunks
+                .iter()
+                .any(|c| matches!(c, Ok(ChatChunk::ToolCall(_))))
+        );
+        if malformed {
+            protocol(&chunks);
+        } else {
+            assert!(turn(&chunks).tool_calls.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn local_usage_tail_and_absence_are_supported() {
+    for (name, input, output) in [
+        ("local_ollama.sse", Some(11), Some(7)),
+        ("local_vllm.sse", Some(13), Some(9)),
+        ("local_llamacpp.sse", None, None),
+    ] {
+        let server = Server::new(fixture(name), 200, None, false).await;
+        let chunks = collect(&server.local(None, HttpLimits::default())).await;
+        let usage: Vec<_> = chunks
+            .iter()
+            .filter_map(|c| match c {
+                Ok(ChatChunk::Usage(u)) => Some(u),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].input, input);
+        assert_eq!(usage[0].output, output);
+        assert_eq!(usage[0].complete, input.is_some());
+    }
+}
+
+#[tokio::test]
+async fn local_redirect_does_not_leave_configured_origin() {
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = Server::start(
+        vec![],
+        307,
+        false,
+        &format!(
+            "Location: http://{}/v1/chat/completions\r\n",
+            target.local_addr().unwrap()
+        ),
+        Duration::ZERO,
+        false,
+    )
+    .await;
+    let chunks = collect(&server.local(
+        Some(uuid::Uuid::now_v7().to_string()),
+        HttpLimits::default(),
+    ))
+    .await;
+    assert!(matches!(chunks.last(), Some(Err(_))));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), target.accept())
+            .await
+            .is_err()
+    );
+}
+
+// Keep the runtime runnable while socket I/O settles, so paused time advances only here.
+async fn settle_io() {
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    std::thread::sleep(Duration::from_millis(2));
+}
+async fn timed_local(
+    server: &Server,
+    timeouts: ModelTimeouts,
+) -> Vec<Result<ChatChunk, ModelError>> {
+    let cfg = Config::from_lookup(|name| match name {
+        "DATABASE_URL" => Some("postgres://localhost/katwork".into()),
+        "KATWORK_SECRET" => Some(uuid::Uuid::now_v7().to_string()),
+        "KATWORK_LOCAL_BASE_URL" => Some(format!("{}/v1", server.url)),
+        "KATWORK_LOCAL_MODEL" => Some("local-model".into()),
+        _ => None,
+    })
+    .unwrap();
+    let selected = Registry::from_config(&cfg)
+        .for_tier(
+            katwork::types::ModelTier::Fast,
+            &katwork::types::SpacePolicy {
+                allow_external: false,
+            },
+        )
+        .unwrap();
+    let provider: Arc<dyn ModelProvider> = if timeouts == ModelTimeouts::LOCAL {
+        selected.provider
+    } else {
+        Arc::new(server.local(None, HttpLimits::for_entry(&timeouts)))
+    };
+    let task = tokio::spawn(async move {
+        guard_stream(provider.stream(request()).await.unwrap(), timeouts.stream())
+            .collect::<Vec<_>>()
+            .await
+    });
+    let start = std::time::Instant::now();
+    while server.request.lock().await.is_none() && !task.is_finished() {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "request never reached fixture"
+        );
+        settle_io().await;
+    }
+    for _ in 0..250 {
+        settle_io().await;
+        if task.is_finished() {
+            return task.await.unwrap();
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+    panic!("stream did not terminate");
+}
+
+#[tokio::test(start_paused = true)]
+async fn local_entry_http_read_timeout_is_not_30s() {
+    for headers_late in [true, false] {
+        for t in [ModelTimeouts::LOCAL, ModelTimeouts::HOSTED] {
+            let body = fixture("local_ollama.sse");
+            let split = body.windows(2).position(|w| w == b"\n\n").unwrap() + 2;
+            let chunks = if headers_late {
+                vec![body]
+            } else {
+                vec![body[..split].to_vec(), body[split..].to_vec()]
+            };
+            let server = Server::delayed(
+                chunks,
+                200,
+                false,
+                "",
+                if headers_late {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs(45)
+                },
+                false,
+                if headers_late {
+                    Duration::from_secs(45)
+                } else {
+                    Duration::ZERO
+                },
+            )
+            .await;
+            let chunks = timed_local(&server, t).await;
+            if t == ModelTimeouts::LOCAL {
+                turn(&chunks);
+            } else {
+                assert!(
+                    matches!(chunks.last(), Some(Err(ModelError::Timeout { .. }))),
+                    "{chunks:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn transport_gap_never_preempts_first_content_deadline() {
+    let server = Server::start(
+        vec![b": keepalive\n\n".to_vec(), fixture("local_ollama.sse")],
+        200,
+        false,
+        "",
+        Duration::from_secs(90),
+        false,
+    )
+    .await;
+    let chunks = timed_local(&server, ModelTimeouts::LOCAL).await;
+    assert_eq!(turn(&chunks).content, "สวัสดี");
+}
+
+#[tokio::test]
+async fn local_response_and_frame_limits_fail_closed() {
+    for (name, limits, expected) in [
+        (
+            "oversized_response.sse",
+            HttpLimits {
+                max_response_bytes: 64,
+                ..HttpLimits::for_entry(&ModelTimeouts::LOCAL)
+            },
+            "response_too_large",
+        ),
+        (
+            "oversized_frame.sse",
+            HttpLimits {
+                max_sse_frame_bytes: 64,
+                ..HttpLimits::for_entry(&ModelTimeouts::LOCAL)
+            },
+            "sse_frame_too_large",
+        ),
+    ] {
+        let server = Server::new(fixture(name), 200, Some(32), false).await;
+        assert_eq!(
+            collect(&server.local(None, limits)).await.last(),
+            Some(&Err(ModelError::Protocol(expected.into())))
+        );
+    }
+}
+
+#[tokio::test]
+async fn local_oversized_error_is_capped_and_not_logged() {
+    // Install the subscriber before other tests can cache disabled callsites.
+    if std::env::var_os("KATWORK_TEST_LOCAL_ERROR_LOG").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "local_oversized_error_is_capped_and_not_logged",
+                "--nocapture",
+            ])
+            .env("KATWORK_TEST_LOCAL_ERROR_LOG", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    use rig_core::http_client::{HttpClientExt, Request};
+    let secret = uuid::Uuid::now_v7().to_string();
+    let body = format!("{secret}{}", "x".repeat(100_000));
+    let server = Server::new(body.as_bytes().to_vec(), 429, None, false).await;
+    let limits = HttpLimits {
+        max_error_body_bytes: 64,
+        ..HttpLimits::for_entry(&ModelTimeouts::LOCAL)
+    };
+    // The transport caps the body before handing an error to Rig.
+    let error = BoundedHttp::new(limits)
+        .unwrap()
+        .send_streaming(
+            Request::post(&server.url)
+                .body(bytes::Bytes::from_static(b"{}"))
+                .unwrap(),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.non_success_body().unwrap().len(), 64);
+
+    #[derive(Clone)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let output = Capture(Arc::new(std::sync::Mutex::new(Vec::new())));
+    let writer = output.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let server = Server::new(body.into_bytes(), 429, None, false).await;
+    assert_eq!(
+        collect(&server.local(None, limits)).await.last(),
+        Some(&Err(ModelError::RateLimited {
+            retry_after_secs: None
+        }))
+    );
+    let logged = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+    assert!(logged.contains("error_body_bytes=64"), "{logged}");
+    assert!(logged.contains("status=429"));
+    assert!(!logged.contains(&secret));
+}
+
+#[tokio::test]
+async fn local_tool_history_replays_with_error_prefix() {
+    let server = Server::new(fixture("local_vllm.sse"), 200, None, false).await;
+    let chunks = collect(&server.local(None, HttpLimits::default())).await;
+    let previous = turn(&chunks);
+    let mut req = request();
+    req.messages.push(ChatMsg::Assistant {
+        content: previous.content.clone(),
+        tool_calls: previous.tool_calls.clone(),
+        replay: previous.replay.clone(),
+    });
+    req.messages.push(ChatMsg::Tool {
+        tool_call_id: previous.tool_calls[0].id.clone(),
+        name: "first".into(),
+        content: "failed".into(),
+        is_error: true,
+    });
+    let server = Server::new(fixture("local_llamacpp.sse"), 200, None, false).await;
+    let chunks = server
+        .local(None, HttpLimits::default())
+        .stream(req)
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await;
+    turn(&chunks);
+    let req = server.request.lock().await.clone().unwrap();
+    assert_eq!(req["messages"][2]["tool_calls"][0]["id"], "call_local");
+    assert_eq!(req["messages"][3]["tool_call_id"], "call_local");
+    assert_eq!(req["messages"][3]["content"], "Error: failed");
+}
+
+#[tokio::test]
+async fn local_provider_ignores_proxy_environment() {
+    if std::env::var_os("KATWORK_TEST_LOCAL_PROXY").is_none() {
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+        // Only the child inherits proxy settings; parallel tests keep their environment.
+        let mut child = tokio::task::spawn_blocking(move || {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "local_provider_ignores_proxy_environment",
+                    "--nocapture",
+                ])
+                .env("KATWORK_TEST_LOCAL_PROXY", "1")
+                .env("NO_PROXY", "")
+                .env("no_proxy", "")
+                .env_remove("REQUEST_METHOD");
+            for name in [
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+            ] {
+                command.env(name, &proxy_url);
+            }
+            command.output().unwrap()
+        });
+        let output = tokio::select! {
+            biased;
+            connection = proxy.accept() => {
+                drop(connection.unwrap());
+                let _ = child.await.unwrap();
+                panic!("local provider connected to the environment proxy");
+            }
+            output = &mut child => output.unwrap(),
+        };
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let server = Server::new(fixture("local_ollama.sse"), 200, None, false).await;
+    let key = uuid::Uuid::now_v7().to_string();
+    let provider = server.local(
+        Some(key.clone()),
+        HttpLimits::for_entry(&ModelTimeouts::LOCAL),
+    );
+    turn(&collect(&provider).await);
+    assert!(server.request.lock().await.is_some());
+    let head = server.head.lock().await.to_ascii_lowercase();
+    assert!(head.starts_with("post /v1/chat/completions "));
+    assert!(head.contains(&format!("authorization: bearer {key}")));
+}
+
+#[tokio::test]
+async fn local_url_userinfo_does_not_add_authorization() {
+    let server = Server::new(fixture("local_ollama.sse"), 200, None, false).await;
+    let mut base = url::Url::parse(&format!("{}/v1", server.url)).unwrap();
+    base.set_username("operator").unwrap();
+    base.set_password(Some(&uuid::Uuid::now_v7().to_string()))
+        .unwrap();
+    let provider = RigProvider::local(
+        &LocalEnv {
+            base_url: base.to_string(),
+            model: "local-model".into(),
+            api_key: None,
+        },
+        HttpLimits::default(),
+    )
+    .unwrap();
+    turn(&collect(&provider).await);
+    assert!(
+        !server
+            .head
+            .lock()
+            .await
+            .to_ascii_lowercase()
+            .contains("authorization:")
+    );
 }

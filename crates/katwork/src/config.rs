@@ -16,6 +16,7 @@ pub struct Config {
     pub smtp: Option<SmtpConfig>,
     pub openai: Option<ProviderEnv>,
     pub anthropic: Option<ProviderEnv>,
+    pub local: Option<LocalEnv>,
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +66,12 @@ pub struct SmtpConfig {
     pub username: Option<String>,
     pub password: Option<String>,
     pub from: Option<String>,
+}
+
+pub struct LocalEnv {
+    pub base_url: String,
+    pub model: String,
+    pub api_key: Option<String>,
 }
 
 pub struct ProviderEnv {
@@ -267,6 +274,9 @@ impl Config {
         secrets.extend(
             [
                 Some(self.secret.as_str()),
+                self.local
+                    .as_ref()
+                    .and_then(|local| local.api_key.as_deref()),
                 self.demo_password.as_deref(),
                 self.smtp.as_ref().and_then(|smtp| smtp.password.as_deref()),
                 self.openai
@@ -288,28 +298,48 @@ impl Config {
     }
 
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, KatError> {
-        let database_url = lookup("DATABASE_URL").ok_or(KatError::ConfigInvalid)?;
-        let secret = lookup("KATWORK_SECRET").ok_or(KatError::ConfigInvalid)?;
-        if database_url.trim().is_empty() || secret.len() < 32 {
-            return Err(KatError::ConfigInvalid);
-        }
+        let database_url = lookup("DATABASE_URL")
+            .filter(|v| !v.trim().is_empty())
+            .ok_or(KatError::ConfigInvalid {
+                var: "DATABASE_URL",
+            })?;
+        let secret =
+            lookup("KATWORK_SECRET")
+                .filter(|v| v.len() >= 32)
+                .ok_or(KatError::ConfigInvalid {
+                    var: "KATWORK_SECRET",
+                })?;
         let optional = |name: &str| lookup(name).filter(|value| !value.is_empty());
-        for key in ["OPENAI_BASE_URL", "ANTHROPIC_BASE_URL"] {
+        for key in [
+            "OPENAI_BASE_URL",
+            "ANTHROPIC_BASE_URL",
+            "KATWORK_LOCAL_BASE_URL",
+        ] {
             if let Some(value) = optional(key) {
-                let url = Url::parse(&value).map_err(|_| KatError::ConfigInvalid)?;
+                let url = Url::parse(&value).map_err(|_| KatError::ConfigInvalid { var: key })?;
                 if !matches!(url.scheme(), "http" | "https") || !url.has_host() {
-                    return Err(KatError::ConfigInvalid);
+                    return Err(KatError::ConfigInvalid { var: key });
+                }
+                if key == "KATWORK_LOCAL_BASE_URL"
+                    && (!url.username().is_empty()
+                        || url.password().is_some()
+                        || url.query().is_some()
+                        || url.fragment().is_some())
+                {
+                    return Err(KatError::ConfigInvalid { var: key });
                 }
             }
         }
         for name in ["SMTP_PASSWORD", "KATWORK_DEMO_PASSWORD"] {
             if optional(name).is_some_and(|value| value.chars().count() < 8) {
-                return Err(KatError::ConfigInvalid);
+                return Err(KatError::ConfigInvalid { var: name });
             }
         }
         let mut public_url = optional("KATWORK_PUBLIC_URL");
         if let Some(value) = &public_url {
-            let url = Url::parse(value).map_err(|_| KatError::ConfigInvalid)?;
+            let url = Url::parse(value).map_err(|_| KatError::ConfigInvalid {
+                var: "KATWORK_PUBLIC_URL",
+            })?;
             if !matches!(url.scheme(), "http" | "https")
                 || !url.has_host()
                 || !url.username().is_empty()
@@ -318,7 +348,9 @@ impl Config {
                 || url.query().is_some()
                 || url.fragment().is_some()
             {
-                return Err(KatError::ConfigInvalid);
+                return Err(KatError::ConfigInvalid {
+                    var: "KATWORK_PUBLIC_URL",
+                });
             }
             public_url = Some(url.origin().ascii_serialization());
         }
@@ -329,7 +361,9 @@ impl Config {
                 .is_some_and(|url| url.starts_with("https://"))
             && lookup("KATWORK_ALLOW_DEMO_ON_HTTPS").as_deref() != Some("1")
         {
-            return Err(KatError::ConfigInvalid);
+            return Err(KatError::ConfigInvalid {
+                var: "KATWORK_ALLOW_DEMO_ON_HTTPS",
+            });
         }
         let trusted_proxies = optional("KATWORK_TRUSTED_PROXIES")
             .map(|value| {
@@ -337,11 +371,19 @@ impl Config {
                     .split(',')
                     .map(|cidr| {
                         let (ip, prefix) =
-                            cidr.trim().split_once('/').ok_or(KatError::ConfigInvalid)?;
-                        let ip: IpAddr = ip.parse().map_err(|_| KatError::ConfigInvalid)?;
-                        let prefix: u8 = prefix.parse().map_err(|_| KatError::ConfigInvalid)?;
+                            cidr.trim().split_once('/').ok_or(KatError::ConfigInvalid {
+                                var: "KATWORK_TRUSTED_PROXIES",
+                            })?;
+                        let ip: IpAddr = ip.parse().map_err(|_| KatError::ConfigInvalid {
+                            var: "KATWORK_TRUSTED_PROXIES",
+                        })?;
+                        let prefix: u8 = prefix.parse().map_err(|_| KatError::ConfigInvalid {
+                            var: "KATWORK_TRUSTED_PROXIES",
+                        })?;
                         if prefix > if ip.is_ipv4() { 32 } else { 128 } {
-                            return Err(KatError::ConfigInvalid);
+                            return Err(KatError::ConfigInvalid {
+                                var: "KATWORK_TRUSTED_PROXIES",
+                            });
                         }
                         Ok((ip, prefix))
                     })
@@ -349,14 +391,14 @@ impl Config {
             })
             .transpose()?
             .unwrap_or_default();
-        let positive = |name: &str, default: u32| -> Result<u32, KatError> {
+        let positive = |name: &'static str, default: u32| -> Result<u32, KatError> {
             let value = optional(name)
                 .map(|value| value.parse::<u32>())
                 .transpose()
-                .map_err(|_| KatError::ConfigInvalid)?
+                .map_err(|_| KatError::ConfigInvalid { var: name })?
                 .unwrap_or(default);
             if value == 0 {
-                return Err(KatError::ConfigInvalid);
+                return Err(KatError::ConfigInvalid { var: name });
             }
             Ok(value)
         };
@@ -373,24 +415,34 @@ impl Config {
             None => Duration::from_millis(5000),
             Some(value) => {
                 if !value.bytes().all(|b| b.is_ascii_digit()) {
-                    return Err(KatError::ConfigInvalid);
+                    return Err(KatError::ConfigInvalid {
+                        var: "KATWORK_LOCK_TIMEOUT_MS",
+                    });
                 }
-                let millis: u32 = value.parse().map_err(|_| KatError::ConfigInvalid)?;
+                let millis: u32 = value.parse().map_err(|_| KatError::ConfigInvalid {
+                    var: "KATWORK_LOCK_TIMEOUT_MS",
+                })?;
                 if millis == 0 || millis > i32::MAX as u32 {
-                    return Err(KatError::ConfigInvalid);
+                    return Err(KatError::ConfigInvalid {
+                        var: "KATWORK_LOCK_TIMEOUT_MS",
+                    });
                 }
                 Duration::from_millis(millis.into())
             }
         };
         let smtp = if let Some(host) = optional("SMTP_HOST") {
             if host.contains('@') {
-                return Err(KatError::ConfigInvalid);
+                return Err(KatError::ConfigInvalid { var: "SMTP_HOST" });
             }
             let port = optional("SMTP_PORT")
-                .map(|value| value.parse::<u16>().map_err(|_| KatError::ConfigInvalid))
+                .map(|value| {
+                    value
+                        .parse::<u16>()
+                        .map_err(|_| KatError::ConfigInvalid { var: "SMTP_PORT" })
+                })
                 .transpose()?;
             if port == Some(0) {
-                return Err(KatError::ConfigInvalid);
+                return Err(KatError::ConfigInvalid { var: "SMTP_PORT" });
             }
             Some(SmtpConfig {
                 host,
@@ -402,8 +454,30 @@ impl Config {
         } else {
             None
         };
+        let local = match (
+            optional("KATWORK_LOCAL_BASE_URL"),
+            optional("KATWORK_LOCAL_MODEL"),
+        ) {
+            (None, None) => None,
+            (Some(_), None) => {
+                return Err(KatError::ConfigInvalid {
+                    var: "KATWORK_LOCAL_MODEL",
+                });
+            }
+            (None, Some(_)) => {
+                return Err(KatError::ConfigInvalid {
+                    var: "KATWORK_LOCAL_BASE_URL",
+                });
+            }
+            (Some(base_url), Some(model)) => Some(LocalEnv {
+                base_url,
+                model,
+                api_key: optional("KATWORK_LOCAL_API_KEY"),
+            }),
+        };
         Ok(Self {
             lock_timeout,
+            local,
             database_url,
             secret,
             demo,
@@ -434,6 +508,7 @@ impl fmt::Debug for Config {
             .field("smtp", &self.smtp)
             .field("openai", &self.openai)
             .field("anthropic", &self.anthropic)
+            .field("local", &self.local)
             .finish()
     }
 }
@@ -462,6 +537,16 @@ impl fmt::Debug for ProviderEnv {
         f.debug_struct("ProviderEnv")
             .field("api_key", &"[redacted]")
             .field("base_url", &self.base_url.as_deref().map(redact_origin))
+            .finish()
+    }
+}
+
+impl fmt::Debug for LocalEnv {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalEnv")
+            .field("base_url", &redact_origin(&self.base_url))
+            .field("model", &self.model)
+            .field("api_key", &"[redacted]")
             .finish()
     }
 }
