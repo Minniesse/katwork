@@ -4,6 +4,8 @@ pub enum KatError {
     DotNameConflict,
     #[error("default_space_required")]
     DefaultSpaceRequired,
+    #[error("grant_in_use")]
+    GrantInUse,
     #[error("team_lead_conflict")]
     TeamLeadConflict,
     #[error("team_lead_required")]
@@ -75,6 +77,7 @@ impl KatError {
         match self {
             Self::DotNameConflict => "dot_name_conflict",
             Self::DefaultSpaceRequired => "default_space_required",
+            Self::GrantInUse => "grant_in_use",
             Self::TeamLeadConflict => "team_lead_conflict",
             Self::TeamLeadRequired => "team_lead_required",
             Self::DotNotInSpace => "dot_not_in_space",

@@ -51,19 +51,7 @@ pub(crate) async fn hire(
 ) -> Result<(StatusCode, Json<Dot>), ApiError> {
     let path = route_path(path)?;
     let body = payload(body)?;
-    let locale: String = sqlx::query_scalar("SELECT locale FROM users WHERE id=$1")
-        .bind(tenant.user_id())
-        .fetch_one(&state.core.pool)
-        .await
-        .map_err(katwork::error::KatError::from)?;
-    let mut new = roles::template(
-        &body.role,
-        if locale == "th" {
-            Locale::Th
-        } else {
-            Locale::En
-        },
-    );
+    let mut new = roles::template(&body.role, Locale::En);
     new.name = body.name;
     new.persona = body.persona;
     let id = dot::hire(&state.core.pool, &tenant, path.space_id, new).await?;

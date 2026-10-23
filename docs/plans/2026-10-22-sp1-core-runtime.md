@@ -34,6 +34,7 @@
 - Secrets come only from environment variables; `.env.example` lists them and never contains values.
 - **Demo mode with no keys must work.** Replies are visibly labelled `SYNTHETIC` (spec §15).
 - Default team roles: Lead, Researcher, Writer, Analyst, Scheduler, Reviewer (spec §2).
+- Team memberships are soft-removed with `team_members.active=false`; readers must filter active rows.
 
 ## Review Focus
 
@@ -215,7 +216,18 @@ web/
   - `roles::default_roster(locale: Locale) -> Vec<NewDot>`: 6 Dots with English and Thai display names, for example Lead/หัวหน้าทีม, Researcher/นักวิจัย, Writer/นักเขียน, Analyst/นักวิเคราะห์, Scheduler/เลขา, Reviewer/ผู้ตรวจ
   - `team::create_default(pool, &Tenant, SpaceId, Locale) -> Result<TeamId, KatError>`
   - `team::get(pool, &Tenant, TeamId) -> Result<TeamView, KatError>`
+  - Transaction readers: `dot::get_on(executor, &Tenant, DotId)`, `dot::is_granted(&mut PgConnection, &Tenant, DotId, SpaceId) -> Result<bool, KatError>`, and `team::eligible_members(&mut PgConnection, &Tenant, TeamId) -> Result<Vec<Dot>, KatError>`. Eligibility requires an active Dot and a grant; team eligibility also requires active membership. Every reader scopes by the resolved tenant's workspace. Unknown or foreign grants return false; unknown or foreign teams return `not_found`.
 - Routes: CRUD under `/api/workspaces/:w/spaces/:s/dots` and `/teams`. "Hire" is a `POST` to `dots` with role, name and persona.
+
+**Task 5 validation and policy decisions (PR #24 fix round):**
+- Increment `policy_version` only for effective changes to `tool_allowlist`, `status`, Space grants, `autonomy`, and `model_tier` (residency). Concurrency, budget, persona, instructions, name, and appearance edits leave it unchanged. Persona and instructions still affect the audit `config_hash` for the next run.
+- Free text rejects Cc, Cf (including bidi), Zl, and Zp characters, including NUL, tabs, and newlines. Initial scalar limits: persona 4,000, instructions 8,000, each appearance field 200. Invalid input returns 400 `request_invalid` from both hire and update.
+- Tool IDs match `^[a-z][a-z0-9_.]{0,63}$`; store at most 32 distinct IDs, sorted and deduplicated. Reordering or repeating IDs is a no-op.
+- Avatars: `compass`, `magnifier`, `pen`, `chart`, `calendar`, `check`, `dot`. Accent palette: `blue`, `yellow`, `red`, `green`, `purple`.
+- Refuse non-default grant revocation with 422 `grant_in_use` while any active team membership uses that Space, including a Lead. Soft-removed memberships do not block revocation; default grants still return `default_space_required`.
+- Name keys use compatibility normalization and full case folding (NFKC_Casefold for accepted names, which exclude default ignorables). Fullwidth letters and no-break spaces collide with their ordinary forms. Reject names without a letter or decimal digit, leading combining marks, invisible fillers, variation selectors, private-use and unassigned code points; preserve accepted display spelling.
+- Canonicalize contiguous Thai combining-mark runs, putting vowels and nikhahit before tone marks. This covers tone/vowel input-order differences and sara am versus nikhahit plus sara aa. This is name matching, not Thai spelling validation.
+- Cross-script confusables such as Latin `Writer` and Cyrillic-i `Wrіter` remain distinct: [UTS #39 skeleton matching](https://www.unicode.org/reports/tr39/#Confusable_Detection) is outside this initial name-key contract. Task 12 must reuse this normalization contract for mentions; it must not assume it prevents every visual impersonation.
 
 - [ ] **Step 1: Write the failing tests:**
   - `default_team_has_one_lead_and_five_specialists`

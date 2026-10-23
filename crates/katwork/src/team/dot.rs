@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Executor, PgConnection, PgPool, Postgres};
+use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
 use crate::{
     error::KatError,
@@ -140,7 +141,59 @@ fn double_option<'de, D: serde::Deserializer<'de>>(
     Option::deserialize(deserializer).map(Some)
 }
 
-pub(super) async fn get_on<'e, E: Executor<'e, Database = Postgres>>(
+fn validate_config(
+    persona: &str,
+    instructions: &str,
+    appearance: &Appearance,
+    tools: &mut Vec<String>,
+) -> Result<(), KatError> {
+    for (text, limit) in [
+        (persona, 4_000),
+        (instructions, 8_000),
+        (appearance.avatar.as_str(), 200),
+        (appearance.accent.as_str(), 200),
+    ] {
+        if text.chars().count() > limit
+            || text.chars().any(|ch| {
+                matches!(
+                    ch.general_category(),
+                    GeneralCategory::Control
+                        | GeneralCategory::Format
+                        | GeneralCategory::LineSeparator
+                        | GeneralCategory::ParagraphSeparator
+                )
+            })
+        {
+            return Err(KatError::RequestInvalid);
+        }
+    }
+    if !matches!(
+        appearance.avatar.as_str(),
+        "compass" | "magnifier" | "pen" | "chart" | "calendar" | "check" | "dot"
+    ) || !matches!(
+        appearance.accent.as_str(),
+        "blue" | "yellow" | "red" | "green" | "purple"
+    ) {
+        return Err(KatError::RequestInvalid);
+    }
+    if tools.iter().any(|id| {
+        id.len() > 64
+            || !id.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+            || !id.bytes().all(|ch| {
+                ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, b'_' | b'.')
+            })
+    }) {
+        return Err(KatError::RequestInvalid);
+    }
+    tools.sort();
+    tools.dedup();
+    if tools.len() > 32 {
+        return Err(KatError::RequestInvalid);
+    }
+    Ok(())
+}
+
+pub async fn get_on<'e, E: Executor<'e, Database = Postgres>>(
     executor: E,
     tenant: &Tenant,
     id: DotId,
@@ -155,6 +208,17 @@ pub(super) async fn get_on<'e, E: Executor<'e, Database = Postgres>>(
 
 pub async fn get(pool: &PgPool, tenant: &Tenant, id: DotId) -> Result<Dot, KatError> {
     get_on(pool, tenant, id).await
+}
+
+/// Check current eligibility on the caller's connection, including uncommitted grant changes.
+pub async fn is_granted(
+    conn: &mut PgConnection,
+    tenant: &Tenant,
+    id: DotId,
+    space: SpaceId,
+) -> Result<bool, KatError> {
+    Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM dots d JOIN dot_spaces s ON s.dot_id=d.id AND s.workspace_id=d.workspace_id WHERE d.workspace_id=$1 AND d.id=$2 AND d.status='active' AND s.space_id=$3)")
+        .bind(tenant.workspace_id()).bind(id).bind(space).fetch_one(conn).await?)
 }
 
 pub async fn list(pool: &PgPool, tenant: &Tenant, space: SpaceId) -> Result<Vec<Dot>, KatError> {
@@ -187,6 +251,12 @@ pub(super) async fn hire_on(
     if let DotRole::Custom(name) = &mut new.role {
         *name = tenancy::validate_name(name)?.to_owned();
     }
+    validate_config(
+        &new.persona,
+        &new.instructions,
+        &new.appearance,
+        &mut new.tool_allowlist,
+    )?;
     let template = super::roles::template(&new.role, Locale::En);
     if new.instructions != template.instructions
         || new.tool_allowlist != template.tool_allowlist
@@ -251,11 +321,13 @@ pub async fn update(
         }
         dot.name = name.to_owned();
     }
+    dot.tool_allowlist.sort();
+    dot.tool_allowlist.dedup();
     let before = (
-        dot.config_hash(),
+        dot.tool_allowlist.clone(),
         dot.status,
-        dot.max_concurrency,
-        dot.daily_token_budget,
+        dot.autonomy,
+        dot.model_tier,
     );
     if let Some(value) = patch.persona {
         dot.persona = value;
@@ -287,12 +359,18 @@ pub async fn update(
     if dot.max_concurrency == 0 || dot.daily_token_budget.is_some_and(|n| n < 0) {
         return Err(KatError::RequestInvalid);
     }
+    validate_config(
+        &dot.persona,
+        &dot.instructions,
+        &dot.appearance,
+        &mut dot.tool_allowlist,
+    )?;
     if before
         != (
-            dot.config_hash(),
+            dot.tool_allowlist.clone(),
             dot.status,
-            dot.max_concurrency,
-            dot.daily_token_budget,
+            dot.autonomy,
+            dot.model_tier,
         )
     {
         dot.policy_version += 1;
@@ -338,6 +416,13 @@ async fn change_grant(
     super::check_space(&mut tx, tenant, space).await?;
     if !grant && get_on(&mut *tx, tenant, id).await?.default_space_id == space {
         return Err(KatError::DefaultSpaceRequired);
+    }
+    if !grant {
+        let in_use: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM team_members m JOIN teams t ON t.id=m.team_id AND t.workspace_id=m.workspace_id WHERE m.workspace_id=$1 AND m.dot_id=$2 AND m.active AND t.space_id=$3)")
+            .bind(tenant.workspace_id()).bind(id).bind(space).fetch_one(&mut *tx).await?;
+        if in_use {
+            return Err(KatError::GrantInUse);
+        }
     }
     let mutation = if grant {
         "WITH changed AS (INSERT INTO dot_spaces (workspace_id, dot_id, space_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING RETURNING dot_id) UPDATE dots SET policy_version=policy_version+1 WHERE workspace_id=$1 AND id=$2 AND EXISTS (SELECT 1 FROM changed)"

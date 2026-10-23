@@ -1,4 +1,16 @@
+#[path = "team/concurrency.rs"]
+mod concurrency;
+#[path = "team/coverage.rs"]
+mod coverage;
+#[path = "team/grants.rs"]
+mod grants;
+#[path = "team/names.rs"]
+mod names;
+#[path = "team/readers.rs"]
+mod readers;
 mod support;
+#[path = "team/validation.rs"]
+mod validation;
 
 use axum::{Router, response::Response};
 use katwork::auth;
@@ -145,7 +157,7 @@ async fn hire_uses_role_template_defaults(pool: PgPool) {
     let dot = f.hire("  Research  ", json!("researcher")).await;
     assert_eq!(dot["name"], "Research");
     assert_eq!(dot["persona"], "Careful");
-    assert_eq!(dot["tool_allowlist"], json!(["read_thread", "ask_user"]));
+    assert_eq!(dot["tool_allowlist"], json!(["ask_user", "read_thread"]));
     assert_eq!(dot["model_tier"], "standard");
     assert_eq!(dot["autonomy"], "ask_first");
     assert_eq!(dot["status"], "active");
@@ -196,15 +208,15 @@ async fn member_cannot_change_execution_settings_admin_can(pool: PgPool) {
         )
         .await;
     }
-    let response = f.call("PATCH", &path, Some(json!({"name":"Chief", "persona":"Patient", "appearance":{"avatar":"star", "accent":"blue"}}))).await;
+    let response = f.call("PATCH", &path, Some(json!({"name":"Chief", "persona":"Patient", "appearance":{"avatar":"pen", "accent":"blue"}}))).await;
     assert_eq!(response.status(), 200);
     let before = body(response).await;
     f.role(&pool, "admin").await;
     let mut version = before["policy_version"].as_i64().unwrap();
-    for patch in patches {
+    for (patch, bump) in patches.into_iter().zip([0, 1, 1, 1, 1, 0, 0, 0]) {
         let response = f.call("PATCH", &path, Some(patch.clone())).await;
         assert_eq!(response.status(), 200);
-        version += 1;
+        version += bump;
         assert_eq!(body(response).await["policy_version"], version);
         let same = f.call("PATCH", &path, Some(patch)).await;
         assert_eq!(same.status(), 200);
@@ -330,6 +342,12 @@ async fn duplicate_dot_name_in_team_is_rejected(pool: PgPool) {
         ("Caf\u{e9}", "CAFE\u{301}"),
         ("ΟΣ", "ος"),
         ("Straße", "STRASSE"),
+        ("Ｗｒｉｔｅｒ", "Writer"),
+        ("Lead Dot", "Lead\u{a0}Dot"),
+        ("ปี่", "ป\u{e48}\u{e35}"),
+        ("นำ", "น\u{e4d}า"),
+        ("น้ำ", "น\u{e4d}\u{e49}า"),
+        ("กุ่", "ก\u{e48}\u{e38}"),
     ] {
         let lead = f.hire(first, json!("lead")).await;
         let duplicate = f.hire(second, json!("writer")).await;
@@ -668,9 +686,14 @@ async fn thai_default_roster_is_atomic_and_idempotent(pool: PgPool) {
     let tenant = tenancy::resolve(&pool, UserId(f.user), WorkspaceId(f.workspace))
         .await
         .unwrap();
-    let (a, b) = tokio::join!(
+    let lock = concurrency::lock_workspace(&pool, f.workspace).await;
+    let (a, b, ()) = tokio::join!(
         team::create_default(&pool, &tenant, SpaceId(f.space), Locale::Th),
         team::create_default(&pool, &tenant, SpaceId(f.space), Locale::Th),
+        async {
+            concurrency::wait_for_blocked_writers(&pool, 2).await;
+            lock.rollback().await.unwrap();
+        }
     );
     let id = a.unwrap();
     assert_eq!(id, b.unwrap());
@@ -712,7 +735,7 @@ async fn config_hash_tracks_canonical_execution_config_not_cosmetics(pool: PgPoo
     let f = Fixture::new(&pool).await;
     let dot: Dot = serde_json::from_value(f.hire("Lead", json!("lead")).await).unwrap();
     let expected = format!(
-        "{{\"autonomy\":\"ask_first\",\"instructions\":{},\"model_tier\":\"standard\",\"persona\":\"Careful\",\"policy_version\":1,\"tool_allowlist\":[\"read_thread\",\"ask_user\"]}}",
+        "{{\"autonomy\":\"ask_first\",\"instructions\":{},\"model_tier\":\"standard\",\"persona\":\"Careful\",\"policy_version\":1,\"tool_allowlist\":[\"ask_user\",\"read_thread\"]}}",
         serde_json::to_string(&dot.instructions).unwrap()
     );
     assert_eq!(
@@ -725,7 +748,7 @@ async fn config_hash_tracks_canonical_execution_config_not_cosmetics(pool: PgPoo
             f.call(
                 "PATCH",
                 &path,
-                Some(json!({"name":"Chief", "appearance":{"avatar":"star", "accent":"red"}})),
+                Some(json!({"name":"Chief", "appearance":{"avatar":"pen", "accent":"red"}})),
             )
             .await,
         )
@@ -743,7 +766,7 @@ async fn config_hash_tracks_canonical_execution_config_not_cosmetics(pool: PgPoo
     )
     .unwrap();
     assert_ne!(persona.config_hash(), cosmetic.config_hash());
-    assert_eq!(persona.policy_version, 2);
+    assert_eq!(persona.policy_version, 1);
 }
 
 #[sqlx::test(migrations = "../katwork/migrations")]
@@ -780,13 +803,18 @@ async fn concurrent_policy_edits_keep_both_changes_and_versions(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let dot = f.hire("Lead", json!("lead")).await;
     let path = format!("dots/{}", id(&dot));
-    let (a, b) = tokio::join!(
+    let lock = concurrency::lock_workspace(&pool, f.workspace).await;
+    let (a, b, ()) = tokio::join!(
         f.call("PATCH", &path, Some(json!({"status":"paused"}))),
         f.call(
             "PATCH",
             &path,
             Some(json!({"tool_allowlist":["read_thread"]}))
-        )
+        ),
+        async {
+            concurrency::wait_for_blocked_writers(&pool, 2).await;
+            lock.rollback().await.unwrap();
+        }
     );
     assert_eq!(a.status(), 200);
     assert_eq!(b.status(), 200);

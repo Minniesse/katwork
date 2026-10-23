@@ -52,6 +52,17 @@ pub async fn get(pool: &PgPool, tenant: &Tenant, id: TeamId) -> Result<TeamView,
     Ok(TeamView { team, members })
 }
 
+/// Read active, granted team members in roster order within the caller's transaction.
+pub async fn eligible_members(
+    conn: &mut PgConnection,
+    tenant: &Tenant,
+    id: TeamId,
+) -> Result<Vec<Dot>, KatError> {
+    let team = get_team(&mut *conn, tenant, id).await?;
+    Ok(sqlx::query_as("SELECT d.*, ARRAY(SELECT s.space_id FROM dot_spaces s WHERE s.dot_id=d.id AND s.workspace_id=d.workspace_id ORDER BY s.space_id) AS spaces FROM dots d JOIN team_members m ON m.dot_id=d.id AND m.workspace_id=d.workspace_id WHERE m.workspace_id=$1 AND m.team_id=$2 AND m.active AND d.status='active' AND EXISTS (SELECT 1 FROM dot_spaces s WHERE s.workspace_id=d.workspace_id AND s.dot_id=d.id AND s.space_id=$3) ORDER BY m.is_lead DESC, m.position, d.id")
+        .bind(tenant.workspace_id()).bind(id).bind(team.space_id).fetch_all(conn).await?)
+}
+
 pub async fn list(pool: &PgPool, tenant: &Tenant, space: SpaceId) -> Result<Vec<Team>, KatError> {
     tenancy::space::get(pool, tenant, space).await?;
     Ok(sqlx::query_as(

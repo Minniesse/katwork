@@ -13,7 +13,15 @@ use unicode_normalization::UnicodeNormalization;
 use crate::{error::KatError, tenancy::Tenant};
 
 fn name_key(name: &str) -> String {
-    name.nfc().default_case_fold().nfc().collect()
+    // Validated names exclude default ignorables; compatibility folding preserves display text.
+    let mut key: Vec<_> = name.nfkc().default_case_fold().nfkc().collect();
+    // Thai above-vowels have combining class zero; Unicode normalization alone keeps tone-first input distinct.
+    for marks in key.split_mut(
+        |ch| !matches!(ch, '\u{0e31}' | '\u{0e34}'..='\u{0e3a}' | '\u{0e47}'..='\u{0e4e}'),
+    ) {
+        marks.sort_by_key(|ch| if *ch == '\u{0e4d}' { '\u{0e47}' } else { *ch });
+    }
+    key.into_iter().nfc().collect()
 }
 
 pub(crate) async fn lock_workspace(

@@ -42,6 +42,93 @@ async fn migrations_apply_cleanly(pool: PgPool) {
     Fixture::new(&pool).await;
 }
 
+#[sqlx::test(migrations = false)]
+async fn team_membership_migration_preserves_existing_rows_and_constraints(pool: PgPool) {
+    for migration in [
+        include_str!("../migrations/0001_init.sql"),
+        include_str!("../migrations/0002_email_unique.sql"),
+        include_str!("../migrations/0003_email_lowercase.sql"),
+    ] {
+        sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+    }
+    let f = Fixture::new(&pool).await;
+    sqlx::query("INSERT INTO team_members (workspace_id,team_id,dot_id,is_lead,position) VALUES ($1,$2,$3,true,7)")
+        .bind(f.workspace).bind(f.team).bind(f.dot).execute(&pool).await.unwrap();
+    let mut member: serde_json::Value =
+        sqlx::query_scalar("SELECT to_jsonb(m) FROM team_members m")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let mut team: serde_json::Value = sqlx::query_scalar("SELECT to_jsonb(t) FROM teams t")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0004_team_membership.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    member["active"] = serde_json::json!(true);
+    team["is_default"] = serde_json::json!(false);
+    assert_eq!(
+        sqlx::query_scalar::<_, serde_json::Value>("SELECT to_jsonb(m) FROM team_members m")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        member
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, serde_json::Value>("SELECT to_jsonb(t) FROM teams t")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        team
+    );
+    for query in [
+        "UPDATE dots SET daily_token_budget=-1 WHERE id=$1",
+        "UPDATE dots SET max_concurrency=65536 WHERE id=$1",
+    ] {
+        sqlstate(
+            sqlx::query(query)
+                .bind(f.dot)
+                .execute(&pool)
+                .await
+                .unwrap_err(),
+            "23514",
+        );
+    }
+    let other_dot = Uuid::now_v7();
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("INSERT INTO dots (id,workspace_id,default_space_id,name,role,persona,instructions,tool_allowlist,model_tier,autonomy) SELECT $1,workspace_id,default_space_id,'Other',role,persona,instructions,tool_allowlist,model_tier,autonomy FROM dots WHERE id=$2")
+        .bind(other_dot).bind(f.dot).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO dot_spaces (workspace_id,dot_id,space_id) VALUES ($1,$2,$3)")
+        .bind(f.workspace)
+        .bind(other_dot)
+        .bind(f.space)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    sqlstate(sqlx::query("INSERT INTO team_members (workspace_id,team_id,dot_id,is_lead,position) VALUES ($1,$2,$3,true,8)")
+        .bind(f.workspace).bind(f.team).bind(other_dot).execute(&pool).await.unwrap_err(), "23505");
+    sqlx::query("INSERT INTO team_members (workspace_id,team_id,dot_id,is_lead,position,active) VALUES ($1,$2,$3,true,8,false)")
+        .bind(f.workspace).bind(f.team).bind(other_dot).execute(&pool).await.unwrap();
+    sqlstate(
+        sqlx::query("UPDATE team_members SET active=true WHERE dot_id=$1")
+            .bind(other_dot)
+            .execute(&pool)
+            .await
+            .unwrap_err(),
+        "23505",
+    );
+    sqlx::query("UPDATE teams SET is_default=true WHERE id=$1")
+        .bind(f.team)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlstate(sqlx::query("INSERT INTO teams (id,workspace_id,space_id,name,is_default) VALUES ($1,$2,$3,'Second default',true)")
+        .bind(Uuid::now_v7()).bind(f.workspace).bind(f.space).execute(&pool).await.unwrap_err(), "23505");
+}
+
 #[sqlx::test]
 async fn job_status_rejects_unknown_value(pool: PgPool) {
     let f = Fixture::new(&pool).await;

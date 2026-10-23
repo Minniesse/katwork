@@ -20,6 +20,7 @@ impl IntoResponse for ApiError {
             KatError::Forbidden => StatusCode::FORBIDDEN,
             KatError::DotNameConflict
             | KatError::DefaultSpaceRequired
+            | KatError::GrantInUse
             | KatError::TeamLeadConflict
             | KatError::TeamLeadRequired
             | KatError::DotNotInSpace

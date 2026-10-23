@@ -55,7 +55,7 @@ pub fn template(role: &DotRole, locale: Locale) -> NewDot {
         role: role.clone(),
         persona: String::new(),
         instructions: instructions.into(),
-        tool_allowlist: vec!["read_thread".into(), "ask_user".into()],
+        tool_allowlist: vec!["ask_user".into(), "read_thread".into()],
         model_tier: ModelTier::Standard,
         autonomy: Autonomy::AskFirst,
         appearance: Appearance {
