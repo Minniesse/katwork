@@ -15,15 +15,18 @@ it and the reason on stderr goes back to the agent. Blocks:
 - `gh pr merge` with --admin, --auto, --squash or --rebase; without a review
   that covers the PR (see merge_verdict); or with --delete-branch while open
   PRs use the head branch as their base
-- `gh api` writes that merge, move or delete refs or write contents
+- `gh api` writes that merge, move or delete refs or write contents, in any
+  flag spelling, and GraphQL merge or ref mutations, including bodies read
+  from stdin or files (an unreadable GraphQL body is refused)
 
 Commands are parsed with a quote-aware shell lexer. It follows `;`, `&&`, `|`
 chains, subshells, `$(...)` and backticks, `sh -c`, `eval`, heredocs and
 here-strings fed to a shell, shell scripts run by path, git and gh aliases, and
 wrappers such as env, command, sudo, timeout, xargs and find -exec.
 
-This is a guardrail for cooperative agents, not a security boundary: server-side
-branch protection is what actually stops a push to main.
+It stops agents' accidents, not deliberate evasion: the server-side ruleset on
+main is the boundary. docs/agents/environment.md ("Guard scope") lists the
+evasion classes it accepts.
 
 Run the self-test with `.claude/hooks/guard.py --self-test`.
 """
@@ -80,11 +83,12 @@ class Command:
     """A simple command: its words, plus what it reads on stdin from heredocs
     and here-strings."""
 
-    __slots__ = ("words", "stdin")
+    __slots__ = ("words", "stdin", "stdin_files")
 
     def __init__(self):
         self.words = []
         self.stdin = []
+        self.stdin_files = []  # targets of < redirections
 
 
 class Parsed:
@@ -180,6 +184,8 @@ def parse(s):
             cmd.words.append(Word(text, dynamic))
         elif redirect in ("<<", "<<-"):
             heredocs.append((text, redirect == "<<-", word_quoted, cmd))
+        elif redirect == "<":
+            cmd.stdin_files.append(text)
         elif redirect == "<<<":
             cmd.stdin.append(text)
         redirect = None
@@ -606,8 +612,38 @@ def check_script(text, cwd, depth=0):
     for pipeline in parsed.pipelines:
         for k, cmd in enumerate(pipeline):
             feeds_shell = any(is_stdin_shell(later, depth) for later in pipeline[k + 1 :])
-            cwd = check_command(cmd, cwd, depth, feeds_shell, shell_vars)
+            stdin = stdin_of(cmd, pipeline[k - 1] if k else None, cwd, depth)
+            cwd = check_command(cmd, cwd, depth, feeds_shell, shell_vars, stdin)
     return cwd
+
+
+def stdin_of(cmd, previous, cwd, depth):
+    """What a command reads on stdin, as (texts, complete). complete is False
+    when some of it can't be seen: a file that can't be read, or a pipe from a
+    program whose output isn't known."""
+    texts, complete = list(cmd.stdin), True
+    for path in cmd.stdin_files:
+        body = read_script_file(path, cwd)
+        if body is None:
+            complete = False
+        else:
+            texts.append(body)
+    if previous is not None:
+        argv, _, _, _ = unwrap(previous.words, depth)
+        producer = program_name(argv[0].text) if argv else ""
+        if producer in ("echo", "printf"):
+            texts.append(" ".join(w.text for w in argv[1:]))
+        elif producer == "cat":
+            texts.extend(previous.stdin)
+            for w in argv[1:]:
+                body = None if w.dynamic or w.text.startswith("-") else read_script_file(w.text, cwd)
+                if body is None:
+                    complete = False
+                else:
+                    texts.append(body)
+        else:
+            complete = False
+    return texts, complete
 
 
 def read_script_file(path, cwd):
@@ -621,7 +657,7 @@ def read_script_file(path, cwd):
     return None
 
 
-def check_command(cmd, cwd, depth, feeds_shell, shell_vars):
+def check_command(cmd, cwd, depth, feeds_shell, shell_vars, stdin=([], True)):
     argv, env, opaque, scripts = unwrap(cmd.words, depth)
     for script in scripts:
         check_script(script, cwd, depth + 1)
@@ -673,7 +709,7 @@ def check_command(cmd, cwd, depth, feeds_shell, shell_vars):
         check_git(args, cwd, opaque, depth, env)
         return cwd
     if head == "gh":
-        check_gh(args, cwd, opaque, depth)
+        check_gh(args, cwd, opaque, depth, stdin)
         return cwd
     if head in ("curl", "wget", "http", "https", "xh"):
         check_http_client(args)
@@ -689,7 +725,7 @@ def check_command(cmd, cwd, depth, feeds_shell, shell_vars):
         if "git" in names:
             check_git(args, cwd, opaque, depth, env)
         if "gh" in names:
-            check_gh(args, cwd, opaque, depth)
+            check_gh(args, cwd, opaque, depth, stdin)
         return cwd
     if "/" in prog.text:  # a script run by path
         body = read_script_file(prog.text, cwd)
@@ -804,20 +840,32 @@ def check_identity(rest, cwd, git, env):
         )
 
 
+def long_option(arg, full, minimum):
+    """Git accepts any unambiguous prefix of a long option. Returns True for
+    --<prefix of full>, False for --no-<prefix of full>, None otherwise."""
+    body = arg[2:].split("=", 1)[0]
+    if body.startswith("no-") and len(body) - 3 >= minimum and full.startswith(body[3:]):
+        return False
+    if len(body) >= minimum and full.startswith(body):
+        return True
+    return None
+
+
 def check_clean(rest, cwd, git, opaque):
-    force = dry = False
+    force = dry = False  # each flag in order; the last dry-run flag wins
     i = 0
     while i < len(rest):
         a = rest[i].text
         if a == "--":
             break
         if a.startswith("--"):
-            name = a.split("=", 1)[0]
-            if name == "--force":
-                force = True
-            elif name == "--dry-run":
-                dry = True
-            elif name == "--exclude" and "=" not in a:
+            flag_dry = long_option(a, "dry-run", 1)
+            flag_force = long_option(a, "force", 3)
+            if flag_dry is not None:
+                dry = flag_dry
+            elif flag_force is not None:
+                force = flag_force
+            elif long_option(a, "exclude", 2) and "=" not in a:
                 i += 1
         elif a.startswith("-") and len(a) > 1:
             for k, ch in enumerate(a[1:]):
@@ -843,6 +891,7 @@ def check_push(rest, cwd, git, opaque):
     if opaque:
         raise Blocked("`git push` with arguments supplied at run time (xargs, find -exec) can't be checked. Run it directly.")
     positionals, deleting, repo_option, end = [], False, False, False
+    dry, everything = False, None  # the last dry-run flag wins
     i = 0
     while i < len(rest):
         w = rest[i]
@@ -853,11 +902,12 @@ def check_push(rest, cwd, git, opaque):
             end = True
         elif a.startswith("--"):
             name, eq, _ = a.partition("=")
-            if name == "--dry-run":
-                return
-            if name in ("--all", "--mirror", "--branches"):
-                raise Blocked(f"`git push {name}` would update main. Push only your branch.")
-            if name == "--delete":
+            flag_dry = long_option(a, "dry-run", 2)
+            if flag_dry is not None:
+                dry = flag_dry
+            elif name in ("--all", "--mirror", "--branches"):
+                everything = name
+            elif name == "--delete":
                 deleting = True
             elif name == "--repo":
                 repo_option = True
@@ -871,7 +921,7 @@ def check_push(rest, cwd, git, opaque):
             letters = a[1:]
             for k, ch in enumerate(letters):
                 if ch == "n":
-                    return
+                    dry = True
                 if ch == "d":
                     deleting = True
                 if ch == "o":
@@ -879,6 +929,10 @@ def check_push(rest, cwd, git, opaque):
                         i += 1
                     break
         i += 1
+    if dry:
+        return
+    if everything:
+        raise Blocked(f"`git push {everything}` would update main. Push only your branch.")
     for k, w in enumerate(positionals):
         if CURRENT_BRANCH_SUB.match(w.text):
             positionals[k] = Word("HEAD")  # the usual way to name the current branch
@@ -1014,7 +1068,7 @@ GRAPHQL_WRITES = re.compile(r"\b(mergePullRequest|enablePullRequestAutoMerge|upd
 API_WRITE_PATHS = re.compile(r"(^|/)(pulls/[^/]+/merge|merges|git/refs(/.*)?|contents/.*|branches/[^/]+/rename)$")
 
 
-def check_gh(args, cwd, opaque, depth):
+def check_gh(args, cwd, opaque, depth, stdin=([], True)):
     texts = [w.text for w in args]
     positionals, flags = [], []  # flags: (name, value or None)
     i = 0
@@ -1041,7 +1095,7 @@ def check_gh(args, cwd, opaque, depth):
         else:
             positionals.append(args[i])
             if len(positionals) == 1 and a == "api":
-                check_gh_api(args[i + 1 :], cwd)
+                check_gh_api(args[i + 1 :], cwd, stdin)
                 return
             if len(positionals) == 1 and a not in GH_COMMANDS:
                 check_gh_alias(a, texts[i + 1 :], cwd, depth)
@@ -1107,44 +1161,103 @@ def gh_alias(name, cwd):
     return None
 
 
-def check_gh_api(args, cwd):
-    method, endpoint, fields, texts = None, None, False, []
+GH_API_VALUE_FLAGS = {
+    "-X": "method", "--method": "method",
+    "-f": "field", "--raw-field": "field", "-F": "field", "--field": "field",
+    "--input": "input",
+    "-H": "other", "--header": "other", "-q": "other", "--jq": "other", "-t": "other", "--template": "other",
+    "--cache": "other", "--hostname": "other", "-p": "other", "--preview": "other",
+}
+
+
+def split_api_flag(arg):
+    """(flag, attached value or None) for a gh api option that takes a value,
+    in any spelling: -fkey=v, -f=key=v, --raw-field=key=v, -XPUT."""
+    if arg.startswith("--"):
+        name, eq, value = arg.partition("=")
+        return (name, value if eq else None) if name in GH_API_VALUE_FLAGS else (None, None)
+    if arg.startswith("-") and len(arg) >= 2 and arg[:2] in GH_API_VALUE_FLAGS:
+        rest = arg[2:]
+        if not rest:
+            return arg[:2], None
+        return arg[:2], rest[1:] if rest.startswith("=") else rest
+    return None, None
+
+
+def json_strings(text):
+    """Every string inside a JSON document, decoded, so escapes can't hide a word."""
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return ""
+    found = []
+
+    def walk(x):
+        if isinstance(x, str):
+            found.append(x)
+        elif isinstance(x, dict):
+            for k, v in x.items():
+                found.append(str(k))
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+
+    walk(doc)
+    return " ".join(found)
+
+
+def check_gh_api(args, cwd, stdin=([], True)):
+    method, endpoint, writes, bodies, unreadable = None, None, False, [], False
+    stdin_texts, stdin_complete = stdin
     i = 0
     while i < len(args):
         a = args[i].text
-        nxt = args[i + 1].text if i + 1 < len(args) else ""
-        if a in ("-X", "--method"):
-            method, i = nxt.upper(), i + 2
+        flag, value = split_api_flag(a)
+        if flag is None:
+            if not a.startswith("-") and endpoint is None:
+                endpoint = args[i]
+            i += 1
             continue
-        if a.startswith("--method="):
-            method = a.split("=", 1)[1].upper()
-        elif a.startswith("-X") and len(a) > 2:
-            method = a[2:].lstrip("=").upper()
-        elif a in ("-f", "-F", "--field", "--raw-field", "--input"):
-            fields = True
-            texts.append(nxt)
-            if a in ("-F", "--field", "--input"):
-                path = nxt.split("=", 1)[1] if "=" in nxt and a != "--input" else nxt
-                body = read_script_file(path.lstrip("@"), cwd) if path.startswith("@") or a == "--input" else None
-                if body:
-                    texts.append(body)
-            i += 2
-            continue
-        elif a in ("-H", "--header", "-q", "--jq", "-t", "--template", "--cache", "--hostname", "-p", "--preview"):
-            i += 2
-            continue
-        elif not a.startswith("-") and endpoint is None:
-            endpoint = args[i]
-        else:
-            texts.append(a)
+        if value is None:
+            value = args[i + 1].text if i + 1 < len(args) else ""
+            i += 1
         i += 1
+        kind = GH_API_VALUE_FLAGS[flag]
+        if kind == "method":
+            method = value.upper()
+            continue
+        if kind == "other":
+            continue
+        writes = True  # any field or input body makes gh send a POST by default
+        if kind == "field":
+            bodies.append(value)
+            source = value.split("=", 1)[1] if "=" in value else ""
+            if flag in ("-f", "--raw-field") or not source.startswith("@"):
+                continue
+            source = source[1:]
+        else:
+            source = value
+        if source == "-":
+            bodies.extend(stdin_texts)
+            unreadable = unreadable or not stdin_complete
+        else:
+            body = read_script_file(source, cwd)
+            if body is None:
+                unreadable = True
+            else:
+                bodies.append(body)
     if endpoint is None:
         return
     if endpoint.text == "graphql":
-        if GRAPHQL_WRITES.search(" ".join(texts)):
+        text = " ".join(bodies + [json_strings(b) for b in bodies])
+        if GRAPHQL_WRITES.search(text):
             raise Blocked("GraphQL mutations that merge PRs or move refs are blocked. Use `gh pr merge --merge`.")
+        if unreadable:
+            raise Blocked("can't read this GraphQL request's body, so it can't be checked for merges or ref writes. "
+                          "Pass the query inline with -f query=..., or from a file in the repo.")
         return
-    write = (method or ("POST" if fields else "GET")) not in ("GET", "HEAD")
+    write = (method or ("POST" if writes else "GET")) not in ("GET", "HEAD")
     path = endpoint.text.split("?", 1)[0].rstrip("/")
     if write and (endpoint.dynamic or API_WRITE_PATHS.search(path)):
         raise Blocked("`gh api` writes that merge PRs or move, delete or write branches are blocked. "
@@ -1153,48 +1266,62 @@ def check_gh_api(args, cwd):
 
 # ---------------------------------------------------------------- merge review rule
 
-def merge_verdict(head, reviews, parents, base_ancestor, changes_at):
+def merge_verdict(head, reviews, parents, base_ancestor, merge_clean):
     """Decide whether a PR may merge. Returns None, or the reason it can't.
 
     - head: the PR's head commit
-    - reviews: [{"commit": sha, "submittedAt": iso, "state": str, "body": str}]
+    - reviews: [{"commit": sha, "submittedAt": iso, ...}]
     - parents: {sha: [parent shas]} for the PR's commits
     - base_ancestor(sha): True if sha is already in the base branch
-    - changes_at(sha): a fingerprint of the PR's own changes (base...sha), or
-      None if it can't be computed
+    - merge_clean(merge, first, second): True if the merge's tree is exactly
+      git's own clean merge of its two parents
 
     A review covers the head when every commit after the reviewed one, along
-    the first-parent chain, is a merge of commits already in the base branch,
-    and those merges left the PR's own changes exactly as reviewed. What the
-    review says is for the maintainer to weigh; the guard only checks that one
-    covers the code being merged.
+    the first-parent chain, is a two-parent merge that brings in commits
+    already in the base branch and is byte-for-byte git's clean automatic
+    merge. Such a merge adds nothing of its own, so the reviewed edits are
+    still exactly where they were reviewed. What the review says is for the
+    maintainer to weigh; the guard only checks that one covers the code.
     """
     reviewed = {r["commit"] for r in reviews if r.get("commit")}
     if not reviewed:
         return "it has no review. The cross-review posts one (see the katwork-review skill), then the maintainer merges."
-    chain, sha = [], head
+    sha = head
     while sha not in reviewed:
         ps = parents.get(sha)
         if not ps:
             return (f"no review covers its head {head[:7]}: the commits after the last review "
                     "aren't all merges of the base branch. Ask for a review of the delta.")
-        if len(ps) < 2:
+        if len(ps) == 1:
             return (f"commit {sha[:7]} came after the last review and isn't a merge of the base branch. "
                     "Ask for a review of the delta.")
-        for extra in ps[1:]:
-            if not base_ancestor(extra):
-                return f"merge {sha[:7]} after the last review brings in {extra[:7]}, which isn't in the base branch."
-        chain.append(sha)
+        if len(ps) > 2:
+            return f"merge {sha[:7]} after the last review has {len(ps)} parents. Ask for a review of the merge."
+        if not base_ancestor(ps[1]):
+            return f"merge {sha[:7]} after the last review brings in {ps[1][:7]}, which isn't in the base branch."
+        if not merge_clean(sha, ps[0], ps[1]):
+            return (f"merge {sha[:7]} after the last review isn't git's own clean merge of its parents: it resolves "
+                    "a conflict or changes code (or its commits couldn't be fetched here). Ask for a review of the merge.")
         sha = ps[0]
-    covered = sha
-    if chain:
-        before, after = changes_at(covered), changes_at(head)
-        if before is None or after is None:
-            return "couldn't compare the PR's changes before and after the base merges. Ask for a review on the head."
-        if before != after:
-            return (f"merging the base branch after review {covered[:7]} changed the PR's own diff "
-                    "(a conflict resolution, say). Ask for a review of the merge.")
     return None
+
+
+def merge_is_clean(merge, first, second, cwd):
+    """True when merge's tree is exactly what `git merge-tree` produces for a
+    conflict-free merge of first and second."""
+    out = run(["git", "merge-tree", "--write-tree", first, second], cwd)
+    actual = run(["git", "rev-parse", "--verify", "-q", merge + "^{tree}"], cwd)
+    return bool(out) and bool(actual) and out.splitlines()[0].strip() == actual
+
+
+def have_commits(shas, slug, cwd):
+    """Make sure the commits are in the local object store, fetching them by
+    id from GitHub if needed."""
+    missing = [s for s in shas if run(["git", "cat-file", "-e", s + "^{commit}"], cwd) is None]
+    if missing:
+        run(["git", "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+             f"https://github.com/{slug}.git", *missing], cwd, timeout=120)
+    return all(run(["git", "cat-file", "-e", s + "^{commit}"], cwd) is not None for s in shas)
 
 
 def review_check(target, repo, cwd):
@@ -1207,8 +1334,8 @@ def review_check(target, repo, cwd):
     if not m:
         return "couldn't tell which repository the PR is in."
     slug, number, base = m.group(1), m.group(2), pr.get("baseRefName", "")
-    reviews = [{"commit": (r.get("commit") or {}).get("oid"), "submittedAt": r.get("submittedAt"),
-                "state": r.get("state"), "body": r.get("body")} for r in pr.get("reviews", [])]
+    reviews = [{"commit": (r.get("commit") or {}).get("oid"), "submittedAt": r.get("submittedAt")}
+               for r in pr.get("reviews", [])]
     lines = run(["gh", "api", "--paginate", f"repos/{slug}/pulls/{number}/commits",
                  "--jq", ".[] | {sha, parents: [.parents[].sha]}"], cwd)
     if lines is None:
@@ -1223,35 +1350,10 @@ def review_check(target, repo, cwd):
         behind = run(["gh", "api", f"repos/{slug}/compare/{sha}...{base}", "--jq", ".behind_by"], cwd)
         return behind == "0"
 
-    def changes_at(sha):
-        out = run(["gh", "api", f"repos/{slug}/compare/{base}...{sha}", "--jq", ".files"], cwd, timeout=40)
-        return changes_fingerprint(out)
+    def merge_clean(merge, first, second):
+        return have_commits([merge, first, second], slug, cwd) and merge_is_clean(merge, first, second, cwd)
 
-    return merge_verdict(pr.get("headRefOid", ""), reviews, parents, base_ancestor, changes_at)
-
-
-def changes_fingerprint(files_json):
-    """The +/- lines of each changed file, which merges of unrelated base
-    changes leave alone. None when GitHub omits a patch or truncates the list."""
-    if files_json is None:
-        return None
-    try:
-        files = json.loads(files_json) or []
-    except ValueError:
-        return None
-    if len(files) >= 300:
-        return None
-    result = []
-    for f in files:
-        patch = f.get("patch")
-        if patch is None:
-            if f.get("status") == "removed":
-                result.append((f.get("filename"), "removed"))
-                continue
-            return None
-        lines = tuple(l for l in patch.splitlines() if l[:1] in "+-" and not l.startswith(("+++", "---")))
-        result.append((f.get("filename"), f.get("status"), lines))
-    return tuple(sorted(result, key=lambda x: x[0] or ""))
+    return merge_verdict(pr.get("headRefOid", ""), reviews, parents, base_ancestor, merge_clean)
 
 
 # ================================================================ entry
@@ -1327,6 +1429,10 @@ def self_test():
         f.write("#!/bin/bash\nset -e\ngit push origin main\n")
     with open(os.path.join(scripts, "fine.sh"), "w") as f:
         f.write("#!/usr/bin/env bash\ngit status\n")
+    with open(os.path.join(repo, "mutation.json"), "w") as f:
+        f.write('{"query": "mutation { mergePullRequest(input: {}) { clientMutationId } }"}')
+    with open(os.path.join(repo, "query.json"), "w") as f:
+        f.write('{"query": "query { viewer { login } }"}')
 
     blocked = [
         # push to main, every spelling
@@ -1421,6 +1527,24 @@ def self_test():
         "gh api graphql -f query='mutation { mergePullRequest(input: {pullRequestId: \"x\"}) { clientMutationId } }'",
         "gh api graphql -f query='mutation { updateRef(input: {}) { clientMutationId } }'",
         "gh repo sync o/r --branch main",
+        # attached field flags still mean a write (re-review finding 7)
+        "gh api repos/o/r/merges -fbase=main -fhead=feature", "gh api repos/o/r/merges --raw-field=base=main --raw-field=head=x",
+        "gh api repos/o/r/merges -Fbase=main -Fhead=x", "gh api repos/o/r/git/refs --field=ref=refs/heads/x --field=sha=y",
+        "gh api repos/o/r/merges -f=base=main", "gh api repos/o/r/merges --input=body.json",
+        # GraphQL bodies from stdin, files and fields (re-review finding 8)
+        "gh api graphql --input - <<'EOF'\n{\"query\": \"mutation { mergePullRequest(input: {pullRequestId: \\\"x\\\"}) { clientMutationId } }\"}\nEOF",
+        "gh api graphql --input - <<'EOF'\n{\"query\": \"mutation { enablePullRequestAutoMerge(input: {}) { clientMutationId } }\"}\nEOF",
+        "gh api graphql --input=- <<< '{\"query\": \"mutation { updateRefs(input: {}) { clientMutationId } }\"}'",
+        "gh api graphql -F query=@- <<'EOF'\nmutation { deleteRef(input: {refId: \"x\"}) { clientMutationId } }\nEOF",
+        "gh api graphql --input - <<'EOF'\n{\"query\": \"mutation { \\u006dergePullRequest(input: {}) { clientMutationId } }\"}\nEOF",
+        "gh api graphql --input mutation.json", "gh api graphql --input - < mutation.json", "cat mutation.json | gh api graphql --input -",
+        "echo '{\"query\": \"mutation { updateRef(input: {}) { clientMutationId } }\"}' | gh api graphql --input -",
+        "gh api graphql --input missing.json", "cat missing.json | gh api graphql --input -", "some-tool | gh api graphql --input -",
+        "gh api graphql -F query=@missing.graphql",
+        # a later negation cancels a dry run (re-review finding 9)
+        "git push --dry-run --no-dry-run origin main", "git push -n --no-dry-run origin main",
+        "git push --dry-run --no-dry origin main", "git push --dry-run --all --no-dry-run origin",
+        "git clean -f -n --no-dry-run -- x", "git clean -fn --no-dry-run", "git clean --dry-run -f --no-d",
     ]
     allowed = [
         "git push origin sp1/task-3-auth", "git push -u origin HEAD", "git push -u origin @",
@@ -1446,6 +1570,12 @@ def self_test():
         "gh api repos/o/r/pulls/12", "gh api repos/o/r/pulls/12/merge", "gh api repos/o/r/git/refs/heads/main",
         "gh api graphql -f query='query { viewer { login } }'", "gh pr comment 12 --body 'gh pr merge later'",
         "gh repo sync", "gh issue list", "gh pr review 12 --comment --body-file r.md",
+        "gh api graphql --input - <<'EOF'\n{\"query\": \"query { viewer { login } }\"}\nEOF",
+        "gh api graphql -f query='query { repository(owner: \"o\", name: \"r\") { id } }'", "gh api graphql --input query.json",
+        "cat query.json | gh api graphql --input -", "gh api repos/o/r/pulls -q '.[].number'", "gh api -H 'Accept: x' repos/o/r",
+        "gh pr create --body-file - <<'EOF'\nWe never call mergePullRequest or updateRef here.\nEOF",
+        "gh pr review 12 --comment --body-file - <<'EOF'\nThe guard blocks deleteRef.\nEOF",
+        "git push --no-dry-run --dry-run origin main", "git push --dry origin main", "git clean -f --no-dry-run -n", "git clean -f --d",
         "for f in a b; do echo $f; done", "x=1; echo $x", "cd /tmp && ls",
         "PG=/opt/pg/bin; $PG/initdb -D $SP/pg", "$PG/pg_ctl -D \"$S/pg\" -l $S/pg/log start", "$EDITOR notes.md", "curl -s https://api.github.com/repos/o/r/pulls/12", "git subtree push --prefix=docs origin docs-branch",
     ]
@@ -1487,18 +1617,17 @@ def self_test():
     return 1 if failures else 0
 
 
-MERGE_CASES = 10
+MERGE_CASES = 13
 
 
 def merge_self_test():
-    """merge_verdict on synthetic histories. Commits: A reviewed, B base commit,
-    M merge of base, D a plain commit, X a commit outside the base."""
-    same = ("diff",)
+    """merge_verdict on synthetic histories, then on real commits. Synthetic:
+    A reviewed, B a base commit, M a merge of the base, D a plain commit, X a
+    commit outside the base, and every merge is clean unless named in dirty."""
     base = {"B", "B2"}
 
-    def verdict(head, reviews, parents, changes=None):
-        changes = changes or {}
-        return merge_verdict(head, reviews, parents, lambda s: s in base, lambda s: changes.get(s, same))
+    def verdict(head, reviews, parents, dirty=()):
+        return merge_verdict(head, reviews, parents, lambda s: s in base, lambda m, a, b: m not in dirty)
 
     ready = {"commit": "A", "submittedAt": "1", "state": "COMMENTED", "body": "**Verdict: Ready for maintainer.**"}
     cases = [
@@ -1508,11 +1637,12 @@ def merge_self_test():
         ("two base merges", verdict("M2", [ready], {"M2": ["M", "B2"], "M": ["A", "B"]}), True),
         ("plain commit after review", verdict("D", [ready], {"D": ["A"]}), False),
         ("merge of a non-base branch", verdict("M", [ready], {"M": ["A", "X"]}), False),
-        ("conflict edits in the merge", verdict("M", [ready], {"M": ["A", "B"]}, {"M": ("other",)}), False),
-        ("diff unavailable", verdict("M", [ready], {"M": ["A", "B"]}, {"M": None}), False),
+        ("merge that isn't git's clean merge", verdict("M", [ready], {"M": ["A", "B"]}, {"M"}), False),
+        ("octopus merge", verdict("M", [ready], {"M": ["A", "B", "B2"]}), False),
         ("review on an older commit only", verdict("D", [ready], {"D": ["C"], "C": ["A"]}), False),
         ("base merge, then a plain commit", verdict("D", [ready], {"D": ["M"], "M": ["A", "B"]}), False),
     ]
+    cases += real_merge_cases()
     assert len(cases) == MERGE_CASES
     failures = 0
     for name, reason, ok in cases:
@@ -1520,6 +1650,70 @@ def merge_self_test():
             print(f"FAIL (merge rule, {name}): {'allowed' if reason is None else reason}")
             failures += 1
     return failures
+
+
+def real_merge_cases():
+    """Real commits. The PR's reviewed commit A turns preview_enabled() on;
+    base commit B edits the README. A clean merge of B keeps the review. A
+    merge with the same parents that instead turns admin_enabled() on moves
+    the reviewed edit (same +/- lines, different place) and must not. A merge
+    that resolves a conflict with base commit C needs a review too."""
+    import tempfile
+
+    repo = tempfile.mkdtemp()
+
+    def git(*a):
+        out = subprocess.run(["git", *a], cwd=repo, check=True, capture_output=True, text=True)
+        return out.stdout.strip()
+
+    def write(name, text):
+        with open(os.path.join(repo, name), "w") as f:
+            f.write(text)
+
+    app = "def preview_enabled():\n    return {p}\n\n\ndef helper():\n    return 1\n\n\ndef admin_enabled():\n    return {a}\n"
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "1+bot" + NOREPLY)
+    git("config", "user.name", "bot")
+    write("app.py", app.format(p="False", a="False"))
+    write("README.md", "base\n")
+    git("add", ".")
+    git("commit", "-q", "-m", "P")
+    git("switch", "-q", "-c", "pr")
+    write("app.py", app.format(p="True", a="False"))
+    git("commit", "-q", "-am", "A: turn preview on")
+    a = git("rev-parse", "HEAD")
+    git("switch", "-q", "main")
+    write("README.md", "base\nmore\n")
+    git("commit", "-q", "-am", "B: readme")
+    b = git("rev-parse", "HEAD")
+    git("switch", "-q", "pr")
+    git("merge", "-q", "--no-edit", "main")
+    good = git("rev-parse", "HEAD")
+    write("app.py", app.format(p="False", a="True"))
+    git("add", "app.py")
+    moved = git("commit-tree", git("write-tree"), "-p", a, "-p", b, "-m", "Merge main")
+    git("switch", "-q", "--discard-changes", "main")
+    write("app.py", app.format(p="None", a="False"))
+    git("commit", "-q", "-am", "C: preview returns None")
+    c = git("rev-parse", "HEAD")
+    write("app.py", app.format(p="True", a="False"))
+    git("add", "app.py")
+    resolved = git("commit-tree", git("write-tree"), "-p", a, "-p", c, "-m", "Merge main, keep ours")
+
+    def base_ancestor(sha):
+        return subprocess.run(["git", "merge-base", "--is-ancestor", sha, "main"], cwd=repo).returncode == 0
+
+    def verdict(head):
+        review = {"commit": a, "submittedAt": "1"}
+        parents = {good: [a, b], moved: [a, b], resolved: [a, c]}
+        return merge_verdict(head, [review], parents, base_ancestor,
+                             lambda m, x, y: merge_is_clean(m, x, y, repo))
+
+    return [
+        ("real clean merge of the base", verdict(good), True),
+        ("real merge that moves the reviewed edit", verdict(moved), False),
+        ("real merge that resolves a conflict", verdict(resolved), False),
+    ]
 
 
 if __name__ == "__main__":

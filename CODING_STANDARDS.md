@@ -13,6 +13,10 @@ The plan's **Global Constraints** (`docs/plans/2026-10-22-sp1-core-runtime.md`) 
 - **No secret-shaped literals.** No API key, token, password or private key appears as a literal anywhere in the diff, tests and docs included. GitGuardian scans every PR, and a test value that looks real fails it just like a real one. Tests build synthetic secrets at runtime, for example from `Uuid::now_v7()` or by joining pieces that match no detector, as `crates/katwork/tests/support/mod.rs` does for password hashes.
 - **The change is reviewed by the other model.** The commit trailers name the author. A Claude-written PR needs a Codex review; a Codex-written PR needs a Claude review and a separate review from a fresh Codex session.
 
+### Guard scope
+
+`guard.py` stops agents' accidents, not deliberate evasion; the server-side ruleset on `main` (PR required, no force-push or deletion, merge commits only, admins included) is the boundary. Evasion classes the guard accepts are listed in `docs/agents/environment.md` under **Guard scope**. Review a change to the guard for accidents an agent could plausibly make; a new deliberate-evasion trick isn't a finding.
+
 ## Judgement
 
 ### Tests

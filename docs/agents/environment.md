@@ -52,11 +52,23 @@ In Claude Code, every command run inside a worktree of this repo gets that workt
 - commits and merges whose author or committer email isn't a GitHub noreply address
 - `gh pr merge` with `--admin`, `--auto`, `--squash` or `--rebase`, or when no review covers the code being merged, and `gh api` or `curl` writes that merge PRs or move refs
 
-A review covers the head when it was posted on the head commit, or on an earlier commit followed only by merges of the base branch that leave the PR's own diff unchanged. Merging `main` into a reviewed PR keeps the review valid; resolving a conflict or adding a commit needs a new review. The guard doesn't read what a review says; the maintainer weighs that.
+A review covers the head when it was posted on the head commit, or on an earlier commit followed only by merges of the base branch, each byte-identical to git's own clean merge of its two parents (`git merge-tree --write-tree`). Merging `main` into a reviewed PR keeps the review valid; resolving a conflict, changing code in the merge or adding a commit needs a new review. The guard doesn't read what a review says; the maintainer weighs that.
 
 The blocking message says what to do instead. Run `.claude/hooks/guard.py --self-test` after changing it.
 
-The guard is a guardrail for agents, not a security boundary: anything that runs code it can't see (a compiled program, a script in another language, a fresh login) gets past it. Server-side branch protection or a ruleset on `main` is what actually refuses a direct push or an unreviewed merge.
+## Guard scope
+
+The guard stops accidents, not deliberate evasion. The boundary for `main` is the server-side GitHub ruleset: every change needs a PR, force-push and deletion are refused, only merge commits are allowed, and it applies to admins too.
+
+These ways around the guard are known and accepted, because only someone deliberately evading it would write them:
+
+- Git environment and repository overrides (`GIT_DIR`, `GIT_WORK_TREE`, `env -C`, a `-C` path computed at run time)
+- unusual push configuration (`--repo` combined with `remote.<name>.push`, a configured `:` matching refspec)
+- command substitutions nested in parameter or arithmetic expansions, and `function` bodies
+- destructive options passed through variables, or abbreviated (`git clean --for`)
+- code the guard can't read: compiled programs, other languages, a fresh shell or login
+
+Fix a hole when an agent could plausibly fall into it by mistake; otherwise leave it to the ruleset.
 
 ## Codex setup
 
