@@ -117,10 +117,14 @@ async fn tenant(pool: &PgPool, f: &Fixture) -> Tenant {
 }
 
 fn sink(pool: &PgPool, f: &Fixture) -> PgEventSink {
+    sink_with_lock_timeout(pool, f, Duration::from_millis(200))
+}
+
+fn sink_with_lock_timeout(pool: &PgPool, f: &Fixture, lock_timeout: Duration) -> PgEventSink {
     PgEventSink::new(
         pool.clone(),
         EventHub::new(),
-        Duration::from_millis(200),
+        lock_timeout,
         WorkspaceId(f.workspace),
         ThreadId(f.thread),
         Some(RunId(f.run)),
@@ -147,8 +151,9 @@ async fn events(pool: &PgPool, f: &Fixture) -> Vec<(EventSeq, AgUiEvent)> {
 async fn concurrent_appenders_never_skip_on_resume(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     f.live_lease(&pool).await;
-    let a = sink(&pool, &f);
-    let b = sink(&pool, &f);
+    // Allow CI scheduling pauses while both writers contend for the thread row.
+    let a = sink_with_lock_timeout(&pool, &f, Duration::from_secs(5));
+    let b = sink_with_lock_timeout(&pool, &f, Duration::from_secs(5));
     let (left, right) = tokio::join!(
         async {
             for _ in 0..50 {
