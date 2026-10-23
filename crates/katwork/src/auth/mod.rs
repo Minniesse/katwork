@@ -12,7 +12,7 @@ use sqlx::PgPool;
 use crate::{
     config::Config,
     error::KatError,
-    ids::{UserId, WorkspaceId},
+    ids::{SpaceId, UserId, WorkspaceId},
 };
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -117,8 +117,8 @@ pub async fn seed_demo(
     }
     let workspace: Option<WorkspaceId> = sqlx::query_scalar("SELECT w.id FROM workspaces w JOIN memberships m ON m.workspace_id = w.id WHERE m.user_id = $1 AND w.name = 'Demo' ORDER BY w.id LIMIT 1")
         .bind(user_id).fetch_optional(&mut *tx).await?;
+    let workspace_id = workspace.unwrap_or_default();
     if workspace.is_none() {
-        let workspace_id = WorkspaceId::new();
         sqlx::query("INSERT INTO workspaces (id, name) VALUES ($1, 'Demo')")
             .bind(workspace_id)
             .execute(&mut *tx)
@@ -131,6 +131,8 @@ pub async fn seed_demo(
         .execute(&mut *tx)
         .await?;
     }
+    sqlx::query("INSERT INTO spaces (id, workspace_id, name, allow_external) SELECT $1, $2, 'Demo', true WHERE NOT EXISTS (SELECT 1 FROM spaces WHERE workspace_id = $2 AND name = 'Demo')")
+        .bind(SpaceId::new()).bind(workspace_id).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(
         (reset_password || (existing.is_none() && config.demo_password.is_none()))
