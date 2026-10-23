@@ -147,6 +147,10 @@ pub async fn require_migrated(pool: &PgPool) -> Result<(), KatError> {
 mod cancellation;
 
 #[cfg(test)]
+#[path = "../tests/support/connect.rs"]
+mod connection_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
