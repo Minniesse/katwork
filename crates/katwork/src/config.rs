@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, env, fmt, net::IpAddr};
+use std::{collections::BTreeSet, env, fmt, net::IpAddr, time::Duration};
 
 use percent_encoding::percent_decode_str;
 use url::Url;
@@ -9,12 +9,32 @@ pub struct Config {
     pub database_url: String,
     pub secret: String,
     pub demo: bool,
+    pub transport: TransportConfig,
     pub trusted_proxies: Vec<(IpAddr, u8)>,
     pub public_url: Option<String>,
     pub demo_password: Option<String>,
     pub smtp: Option<SmtpConfig>,
     pub openai: Option<ProviderEnv>,
     pub anthropic: Option<ProviderEnv>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TransportConfig {
+    pub header_timeout: Duration,
+    pub idle_timeout: Duration,
+    pub max_connections: usize,
+    pub max_connections_per_ip: usize,
+}
+
+impl Default for TransportConfig {
+    fn default() -> Self {
+        Self {
+            header_timeout: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(60),
+            max_connections: 256,
+            max_connections_per_ip: 32,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -290,7 +310,7 @@ impl Config {
             && public_url
                 .as_deref()
                 .is_some_and(|url| url.starts_with("https://"))
-            && optional("KATWORK_ALLOW_DEMO_ON_HTTPS").is_none()
+            && lookup("KATWORK_ALLOW_DEMO_ON_HTTPS").as_deref() != Some("1")
         {
             return Err(KatError::ConfigInvalid);
         }
@@ -312,6 +332,25 @@ impl Config {
             })
             .transpose()?
             .unwrap_or_default();
+        let positive = |name: &str, default: u32| -> Result<u32, KatError> {
+            let value = optional(name)
+                .map(|value| value.parse::<u32>())
+                .transpose()
+                .map_err(|_| KatError::ConfigInvalid)?
+                .unwrap_or(default);
+            if value == 0 {
+                return Err(KatError::ConfigInvalid);
+            }
+            Ok(value)
+        };
+        let transport = TransportConfig {
+            header_timeout: Duration::from_secs(
+                positive("KATWORK_HEADER_TIMEOUT_SECONDS", 10)?.into(),
+            ),
+            idle_timeout: Duration::from_secs(positive("KATWORK_IDLE_TIMEOUT_SECONDS", 60)?.into()),
+            max_connections: positive("KATWORK_MAX_CONNECTIONS", 256)? as usize,
+            max_connections_per_ip: positive("KATWORK_MAX_CONNECTIONS_PER_IP", 32)? as usize,
+        };
         let smtp = if let Some(host) = optional("SMTP_HOST") {
             if host.contains('@') {
                 return Err(KatError::ConfigInvalid);
@@ -336,6 +375,7 @@ impl Config {
             database_url,
             secret,
             demo,
+            transport,
             trusted_proxies,
             public_url,
             demo_password: optional("KATWORK_DEMO_PASSWORD"),

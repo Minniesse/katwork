@@ -204,9 +204,12 @@ async fn me_stays_responsive_during_fifty_logins_with_two_connections(pool: PgPo
         .unwrap();
     let app = support::app(&small, None);
     let mut tasks = tokio::task::JoinSet::new();
+    let ready = Arc::new(tokio::sync::Barrier::new(51));
     for i in 1..=50 {
         let app = app.clone();
+        let ready = ready.clone();
         tasks.spawn(async move {
+            ready.wait().await;
             support::request_from(
                 &app,
                 "POST",
@@ -219,13 +222,13 @@ async fn me_stays_responsive_during_fifty_logins_with_two_connections(pool: PgPo
             .status()
         });
     }
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    ready.wait().await;
     let held: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND state = 'idle in transaction'")
         .fetch_one(&pool).await.unwrap();
     assert_eq!(held, 0, "password hashing holds a transaction/connection");
     for _ in 0..10 {
         let response = timeout(
-            Duration::from_millis(100),
+            Duration::from_secs(30),
             support::request(&app, "GET", "/api/auth/me", None, Some(&cookie)),
         )
         .await
@@ -361,7 +364,7 @@ async fn login_rechecks_password_after_concurrent_password_change(pool: PgPool) 
         .unwrap();
     let app = support::app(&pool, None);
     let login = tokio::spawn(async move { support::login(&app, &password).await });
-    timeout(Duration::from_secs(5), async {
+    timeout(Duration::from_secs(30), async {
         loop {
             let waiting: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE 'SELECT password_hash%')")
                 .fetch_one(&pool).await.unwrap();

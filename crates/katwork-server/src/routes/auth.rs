@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::time::Instant;
 
+use crate::peer::{client_ip, ip_bucket};
 use crate::{app::AppState, error::ApiError, extract::session_cookie};
 
 #[derive(Hash, PartialEq, Eq, Clone)]
@@ -60,11 +61,16 @@ impl Attempts {
     }
 }
 
+// Process-local fixed windows; restart or LRU eviction resets a bucket, replicas do not share it.
+// IP: 100/15 min, email+IP: 10/15 min, then email: 100/hour across admitted pairs.
+// Pair/IP rejections do not consume the email backstop. Distributed attempts can exhaust it.
+// Shared IPs share the IP quota; the same email+IP cannot distinguish an owner from an attacker.
 #[derive(Clone, Default)]
 pub(crate) struct LoginLimiter(Arc<Mutex<Attempts>>);
 
 impl LoginLimiter {
     fn check(&self, email: &str, ip: IpAddr) -> Result<(), KatError> {
+        let ip = ip_bucket(ip);
         let mut attempts = self.0.lock().map_err(|_| KatError::AuthFailed)?;
         let quarter_hour = Duration::from_secs(15 * 60);
         attempts.check(LimitKey::Ip(ip), 100, quarter_hour)?;
@@ -82,6 +88,7 @@ pub(crate) struct ResetLimiter(Arc<Mutex<Attempts>>);
 
 impl ResetLimiter {
     fn check(&self, email: &str, ip: IpAddr) -> Result<(), KatError> {
+        let ip = ip_bucket(ip);
         let mut attempts = self.0.lock().map_err(|_| KatError::AuthFailed)?;
         let hour = Duration::from_secs(3600);
         attempts.check(LimitKey::Ip(ip), 20, hour)?;
@@ -96,31 +103,6 @@ impl Default for ResetWork {
     fn default() -> Self {
         Self(Arc::new(tokio::sync::Semaphore::new(32)))
     }
-}
-
-fn client_ip(peer: IpAddr, headers: &HeaderMap, config: &katwork::config::Config) -> IpAddr {
-    if !config.trusts_proxy(peer) {
-        return peer;
-    }
-    let mut values = headers.get_all("x-forwarded-for").iter();
-    let Some(value) = values.next().and_then(|value| value.to_str().ok()) else {
-        return peer;
-    };
-    if values.next().is_some() {
-        return peer;
-    }
-    let mut client = peer;
-    // Walk from the trusted peer; ignore any attacker-supplied prefix beyond the first untrusted hop.
-    for hop in value.rsplit(',') {
-        if !config.trusts_proxy(client) {
-            break;
-        }
-        let Ok(ip) = hop.trim().parse() else {
-            return peer;
-        };
-        client = ip;
-    }
-    client
 }
 
 #[derive(Deserialize)]
@@ -292,6 +274,91 @@ mod security_tests {
         limiter
             .check("owner@example.test", "192.0.2.2".parse().unwrap())
             .unwrap();
+    }
+
+    #[test]
+    fn ipv6_rotation_shares_login_and_reset_ip_buckets() {
+        let login = LoginLimiter::default();
+        for i in 1..=100 {
+            let ip = format!("2001:db8:1:2::{i:x}").parse().unwrap();
+            login
+                .check(&format!("person-{i}@example.test"), ip)
+                .unwrap();
+        }
+        assert!(
+            login
+                .check("next@example.test", "2001:db8:1:2::ffff".parse().unwrap())
+                .is_err()
+        );
+        login
+            .check("next@example.test", "2001:db8:1:3::1".parse().unwrap())
+            .unwrap();
+        let pair = LoginLimiter::default();
+        for i in 1..=10 {
+            pair.check(
+                "owner@example.test",
+                format!("2001:db8::{i:x}").parse().unwrap(),
+            )
+            .unwrap();
+        }
+        assert!(
+            pair.check("owner@example.test", "2001:db8::ffff".parse().unwrap())
+                .is_err()
+        );
+        let reset = ResetLimiter::default();
+        for i in 1..=20 {
+            reset
+                .check(
+                    &format!("person-{i}@example.test"),
+                    format!("2001:db8::{i:x}").parse().unwrap(),
+                )
+                .unwrap();
+        }
+        assert!(
+            reset
+                .check("next@example.test", "2001:db8::ffff".parse().unwrap())
+                .is_err()
+        );
+        reset
+            .check("next@example.test", "2001:db8:0:1::1".parse().unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn rejected_pairs_do_not_consume_the_email_backstop() {
+        let limiter = LoginLimiter::default();
+        let attacker = "192.0.2.1".parse().unwrap();
+        for _ in 0..10 {
+            limiter.check("owner@example.test", attacker).unwrap();
+        }
+        for _ in 0..1000 {
+            assert!(limiter.check("owner@example.test", attacker).is_err());
+        }
+        for i in 2..=10 {
+            let ip = format!("192.0.2.{i}").parse().unwrap();
+            for _ in 0..10 {
+                limiter.check("owner@example.test", ip).unwrap();
+            }
+        }
+        assert!(
+            limiter
+                .check("owner@example.test", "192.0.2.11".parse().unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn shared_ip_different_emails_have_separate_pair_quotas() {
+        let limiter = LoginLimiter::default();
+        let shared = "192.0.2.1".parse().unwrap();
+        for _ in 0..10 {
+            limiter.check("attacker@example.test", shared).unwrap();
+        }
+        assert!(limiter.check("attacker@example.test", shared).is_err());
+        for _ in 0..10 {
+            limiter.check("owner@example.test", shared).unwrap();
+        }
+        assert!(limiter.check("owner@example.test", shared).is_err());
     }
 
     #[tokio::test(start_paused = true)]
