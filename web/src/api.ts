@@ -1,4 +1,5 @@
 import { hasMessage, t } from './i18n';
+import type { ApiMessage } from './sse';
 
 /** An API failure. `code` is the server's stable id, or `network_error` / `unknown` from the client. */
 export class ApiError extends Error {
@@ -69,6 +70,95 @@ export function errorMessage(error: unknown): string {
   return t(CODE.test(code) && hasMessage(key) ? key : 'reason.unknown');
 }
 
+export type Role = 'owner' | 'admin' | 'member';
+
+export interface WorkspaceSummary {
+  id: string;
+  name: string;
+  role: Role;
+  paused: boolean;
+}
+
+export interface Space {
+  id: string;
+  name: string;
+}
+
+export interface Team {
+  id: string;
+  space_id: string;
+  name: string;
+}
+
+/** `KatRole`: a snake_case name, or `{"custom": "<name>"}`. */
+export type KatRole = string | { custom: string };
+
+export interface Kat {
+  id: string;
+  name: string;
+  role: KatRole;
+  status: 'active' | 'paused';
+  appearance: { avatar: string; accent: string };
+}
+
+/** A team with its active members, the lead first (Task 5). */
+export interface TeamView {
+  team: Team;
+  members: Kat[];
+}
+
+export interface Thread {
+  id: string;
+  space_id: string;
+  team_id: string;
+  title: string;
+}
+
+export interface MessagePage {
+  messages: ApiMessage[];
+  event_seq: number;
+}
+
+export interface Posted {
+  message_id: string;
+  job_id: string | null;
+}
+
+/** Task 12's `JobView`; `queue_position` is set only while the job's task waits in the queue. */
+export interface JobView {
+  id: string;
+  status: string | null;
+  reason: string | null;
+  hold_reason: string | null;
+  queue_position: number | null;
+}
+
+export interface Member {
+  user_id: string;
+  email: string;
+  display_name: string;
+  role: Role;
+}
+
+export type InviteDelivery = 'email' | 'link';
+
+/** Whether this server can mail invites (SMTP configured). */
+export interface InviteOptions {
+  email: boolean;
+}
+
+/** Messages per page, Task 6's default; a shorter page means the thread has no older ones. */
+export const MESSAGE_PAGE = 50;
+
+export interface InviteResult {
+  user_id: string;
+  created: boolean;
+  link: string | null;
+}
+
+const workspacePath = (workspaceId: string) => `/api/workspaces/${encodeURIComponent(workspaceId)}`;
+const segment = encodeURIComponent;
+
 export const api = {
   login: (email: string, password: string) =>
     apiFetch<AuthUser>('/api/auth/login', { method: 'POST', body: { email, password } }),
@@ -87,5 +177,53 @@ export const api = {
     apiFetch<unknown>('/api/auth/invite/accept', {
       method: 'POST',
       body: { token, new_password: newPassword },
+    }).then(() => undefined),
+  workspaces: () => apiFetch<WorkspaceSummary[]>('/api/workspaces'),
+  spaces: (workspaceId: string) => apiFetch<Space[]>(`${workspacePath(workspaceId)}/spaces`),
+  teams: (workspaceId: string, spaceId: string) =>
+    apiFetch<Team[]>(`${workspacePath(workspaceId)}/spaces/${segment(spaceId)}/teams`),
+  team: (workspaceId: string, teamId: string) =>
+    apiFetch<TeamView>(`${workspacePath(workspaceId)}/teams/${segment(teamId)}`),
+  threads: (workspaceId: string, spaceId: string) =>
+    apiFetch<Thread[]>(`${workspacePath(workspaceId)}/spaces/${segment(spaceId)}/threads`),
+  createThread: (workspaceId: string, thread: { space_id: string; team_id: string; title: string }) =>
+    apiFetch<Thread>(`${workspacePath(workspaceId)}/threads`, { method: 'POST', body: thread }),
+  thread: (workspaceId: string, threadId: string) =>
+    apiFetch<Thread>(`${workspacePath(workspaceId)}/threads/${segment(threadId)}`),
+  /** The newest `MESSAGE_PAGE` messages, or those just before the message id `before`. */
+  messages: (workspaceId: string, threadId: string, before?: string) => {
+    const query = new URLSearchParams({ limit: String(MESSAGE_PAGE) });
+    if (before) query.set('before', before);
+    return apiFetch<MessagePage>(
+      `${workspacePath(workspaceId)}/threads/${segment(threadId)}/messages?${query}`,
+    );
+  },
+  inviteOptions: (workspaceId: string) =>
+    apiFetch<InviteOptions>(`${workspacePath(workspaceId)}/members/invite-options`),
+  postMessage: (workspaceId: string, threadId: string, body: string, clientMsgId: string) =>
+    apiFetch<Posted>(`${workspacePath(workspaceId)}/threads/${segment(threadId)}/messages`, {
+      method: 'POST',
+      body: { body, client_msg_id: clientMsgId },
+    }),
+  /** The thread's event stream path, without the `?after=` cursor `subscribe` adds. */
+  eventsPath: (workspaceId: string, threadId: string) =>
+    `${workspacePath(workspaceId)}/threads/${segment(threadId)}/events`,
+  job: (workspaceId: string, jobId: string) =>
+    apiFetch<JobView>(`${workspacePath(workspaceId)}/jobs/${segment(jobId)}`),
+  cancelJob: (workspaceId: string, jobId: string) =>
+    apiFetch<unknown>(`${workspacePath(workspaceId)}/jobs/${segment(jobId)}/cancel`, {
+      method: 'POST',
+    }).then(() => undefined),
+  members: (workspaceId: string) => apiFetch<Member[]>(`${workspacePath(workspaceId)}/members`),
+  invite: (workspaceId: string, invite: { email: string; role: Role; delivery: InviteDelivery }) =>
+    apiFetch<InviteResult>(`${workspacePath(workspaceId)}/members`, { method: 'POST', body: invite }),
+  setRole: (workspaceId: string, userId: string, role: Role) =>
+    apiFetch<unknown>(`${workspacePath(workspaceId)}/members/${segment(userId)}/role`, {
+      method: 'PUT',
+      body: { role },
+    }).then(() => undefined),
+  removeMember: (workspaceId: string, userId: string) =>
+    apiFetch<unknown>(`${workspacePath(workspaceId)}/members/${segment(userId)}`, {
+      method: 'DELETE',
     }).then(() => undefined),
 };

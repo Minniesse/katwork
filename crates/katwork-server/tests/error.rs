@@ -112,6 +112,21 @@ async fn api_errors_return_only_stable_codes() {
             StatusCode::SERVICE_UNAVAILABLE,
             "auth_busy",
         ),
+        (
+            KatError::MemberExists,
+            StatusCode::CONFLICT,
+            "member_exists",
+        ),
+        (
+            KatError::LastOwnerRequired,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "last_owner_required",
+        ),
+        (
+            KatError::SmtpUnconfigured,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "smtp_unconfigured",
+        ),
     ] {
         let response = ApiError::from(error).into_response();
         assert_eq!(response.status(), status);

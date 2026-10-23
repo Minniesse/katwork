@@ -2,12 +2,12 @@ use std::{path::Path, sync::Arc};
 
 use axum::{
     Extension, Router,
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 use katwork::runtime::Core;
 
 use crate::{
-    routes::{auth, events, health, jobs, kats, teams, threads, workspaces},
+    routes::{auth, events, health, jobs, kats, members, teams, threads, workspaces},
     static_files,
 };
 
@@ -53,6 +53,22 @@ fn router(state: AppState, web_dir: &Path, reset_work: ResetWork) -> Router {
         .route(
             "/api/workspaces/{workspace_id}/paused",
             put(workspaces::set_paused),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/members",
+            get(members::list).post(members::invite),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/members/invite-options",
+            get(members::invite_options),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/members/{user_id}/role",
+            put(members::set_role),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/members/{user_id}",
+            delete(members::remove),
         )
         .route(
             "/api/workspaces/{workspace_id}/spaces/{space_id}/kats",

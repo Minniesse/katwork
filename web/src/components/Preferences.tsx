@@ -29,7 +29,7 @@ export function Preferences() {
         <svg className="icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
           <path d="M15.5 12.6A6.5 6.5 0 0 1 7.4 4.5a6.5 6.5 0 1 0 8.1 8.1Z" />
         </svg>
-        {t('nav.dark_mode')}
+        <span className="button-label">{t('nav.dark_mode')}</span>
       </button>
     </div>
   );

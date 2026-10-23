@@ -19,6 +19,7 @@ use crate::{
 #[derive(Debug, Clone, Copy)]
 pub enum MailKind {
     PasswordReset,
+    Invite,
 }
 
 #[derive(Clone)]
@@ -56,6 +57,28 @@ pub fn reset_mail(to: String, locale: Locale, link: &str) -> Mail {
     };
     Mail {
         kind: MailKind::PasswordReset,
+        to,
+        subject: subjects.join(" / "),
+        body: format!("{}\n\n{}\n\n{link}", bodies[0], bodies[1]),
+    }
+}
+
+const INVITE_SUBJECT_TH: &str = "คำเชิญเข้าร่วม KatWork";
+const INVITE_SUBJECT_EN: &str = "You're invited to KatWork";
+
+/// An invite to `workspace` in both languages, the invitee's own first, with the link alone on
+/// the last line.
+pub fn invite_mail(to: String, locale: Locale, link: &str, workspace: &str) -> Mail {
+    let th = format!("คุณได้รับเชิญเข้าร่วม {workspace} บน KatWork ใช้ลิงก์นี้ภายใน 72 ชั่วโมงเพื่อตั้งรหัสผ่าน");
+    let en = format!(
+        "You have been invited to {workspace} on KatWork. Use this link within 72 hours to set your password."
+    );
+    let (subjects, bodies) = match locale {
+        Locale::Th => ([INVITE_SUBJECT_TH, INVITE_SUBJECT_EN], [th, en]),
+        Locale::En => ([INVITE_SUBJECT_EN, INVITE_SUBJECT_TH], [en, th]),
+    };
+    Mail {
+        kind: MailKind::Invite,
         to,
         subject: subjects.join(" / "),
         body: format!("{}\n\n{}\n\n{link}", bodies[0], bodies[1]),

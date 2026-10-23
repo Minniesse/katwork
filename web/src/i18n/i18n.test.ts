@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import en from './en.json';
 import th from './th.json';
-import { formatDate, getLocale, initialLocale, setLocale, t } from './index';
+import { formatDate, getLocale, initialLocale, setLocale, t, tPlural } from './index';
 
 // Mirrors katwork::types::ReasonCode::ALL; the Rust test in
 // crates/katwork-server/tests/i18n.rs checks the same keys against the enum itself.
@@ -38,8 +38,19 @@ const REASON_CODES = [
   'extra_mention_ignored',
 ];
 
-// API error codes the auth routes and guards can return (KatError::code).
+// API error codes the routes and guards can return (KatError::code) that a page shows.
 const API_CODES = [
+  'forbidden',
+  'member_exists',
+  'last_owner_required',
+  'smtp_unconfigured',
+  'message_empty',
+  'message_invalid',
+  'message_too_large',
+  'thread_title_invalid',
+  'client_msg_id_conflict',
+  'busy',
+  'too_many_streams',
   'unauthenticated',
   'reset_token_invalid',
   'invite_token_invalid',
@@ -96,6 +107,34 @@ describe('catalogues', () => {
     expect(th['reason.kat_paused_stopped']).toBe('งานหยุดแล้ว เพราะ Kat ที่รับงานนี้ถูกหยุดไว้ชั่วคราว โปรดส่งคำขออีกครั้งเมื่อเปิดใช้แล้ว หรือขอให้ Kat อื่นช่วยแทน');
   });
 
+  test('thai_copy_names_a_space_one_way_and_asks_politely', () => {
+    // The nav calls a Space พื้นที่, so no Thai copy says "Space".
+    for (const [key, value] of Object.entries(th)) expect(value, key).not.toMatch(/\bSpace\b/);
+    for (const key of [
+      'workspace.none',
+      'workspace.no_space',
+      'team.none',
+      'members.invite.link_hint',
+      'reason.message_empty',
+      'reason.thread_title_invalid',
+      'reason.too_many_streams',
+    ]) {
+      expect((th as Record<string, string>)[key], key).toContain('โปรด');
+    }
+    expect(th['reason.thread_title_invalid']).not.toContain('อักขระควบคุม');
+    expect(th['workspace.no_space']).toContain('เพื่อเพิ่มพื้นที่');
+    expect(th['team.none']).toContain('เพื่อตั้งทีม');
+    expect(th['chat.untitled_at']).toContain('เริ่มเมื่อ {time}');
+    expect(en['reason.thread_title_invalid']).not.toMatch(/control character/i);
+  });
+
+  test('lost_link_hint_says_a_reset_link_lasts_30_minutes', () => {
+    // `reset-link` prints a reset link (30 minutes), not an invite link (72 hours).
+    expect(en['members.invite.link_lost']).toContain('30 minutes');
+    expect(en['members.invite.link_lost']).not.toContain('72');
+    expect(th['members.invite.link_lost']).toContain('30 นาที');
+  });
+
   test('copy_calls_coworkers_kats_and_thai_never_says_ai_employee', () => {
     const enText = Object.values(en).join('\n');
     const thText = Object.values(th).join('\n');
@@ -117,6 +156,16 @@ describe('t', () => {
 
   test('unknown_key_returns_the_key', () => {
     expect(t('no.such.key')).toBe('no.such.key');
+  });
+});
+
+describe('plural', () => {
+  test('english_counts_one_and_other_and_thai_has_one_form', () => {
+    expect(tPlural('chat.earlier_loaded', 1)).toBe('1 earlier message loaded');
+    expect(tPlural('chat.earlier_loaded', 50)).toBe('50 earlier messages loaded');
+    setLocale('th');
+    expect(tPlural('chat.earlier_loaded', 1)).toBe('โหลดข้อความก่อนหน้าแล้ว 1 ข้อความ');
+    expect(tPlural('chat.earlier_loaded', 50)).toBe('โหลดข้อความก่อนหน้าแล้ว 50 ข้อความ');
   });
 });
 

@@ -54,6 +54,12 @@ pub enum KatError {
     UserExists,
     #[error("workspace_ambiguous")]
     WorkspaceAmbiguous,
+    #[error("member_exists")]
+    MemberExists,
+    #[error("last_owner_required")]
+    LastOwnerRequired,
+    #[error("smtp_unconfigured")]
+    SmtpUnconfigured,
     #[error("password_invalid")]
     PasswordInvalid,
     #[error("rate_limited")]
@@ -142,6 +148,9 @@ impl KatError {
             Self::InviteTokenInvalid => "invite_token_invalid",
             Self::UserExists => "user_exists",
             Self::WorkspaceAmbiguous => "workspace_ambiguous",
+            Self::MemberExists => "member_exists",
+            Self::LastOwnerRequired => "last_owner_required",
+            Self::SmtpUnconfigured => "smtp_unconfigured",
             Self::PasswordInvalid => "password_invalid",
             Self::RateLimited { .. } => "rate_limited",
             Self::RequestInvalid => "request_invalid",
