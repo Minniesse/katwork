@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
 mod support;
 
 use axum::{body::Body, http::Request};
@@ -348,7 +352,9 @@ async fn reset_invalidates_other_pending_reset_tokens(pool: PgPool) {
 async fn public_session_interface_authenticates_and_revokes(pool: PgPool) {
     use katwork::{auth::session, ids::UserId};
     let (id, _) = user(&pool).await;
-    let token = session::create(&pool, UserId(id)).await.unwrap();
+    let token = session::create(&pool, UserId(id), std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
     assert!(!format!("{token:?}").contains(&token.0));
     assert_eq!(
         session::authenticate(&pool, &token.0)
@@ -357,7 +363,9 @@ async fn public_session_interface_authenticates_and_revokes(pool: PgPool) {
             .user_id,
         UserId(id)
     );
-    session::revoke(&pool, &token.0).await.unwrap();
+    session::revoke(&pool, &token.0, std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
     assert_eq!(
         session::authenticate(&pool, &token.0)
             .await
@@ -701,6 +709,7 @@ async fn concurrent_create_user_creates_one_new_workspace(pool: PgPool) {
         types::Locale,
     };
     let acme = WorkspaceRef::parse("Acme");
+    let account_config = config(Some(LINK_BASE));
     let (first, second) = tokio::join!(
         create_user(
             &pool,
@@ -709,7 +718,7 @@ async fn concurrent_create_user_creates_one_new_workspace(pool: PgPool) {
             Role::Owner,
             local_space(),
             Locale::En,
-            LINK_BASE
+            &account_config
         ),
         create_user(
             &pool,
@@ -718,7 +727,7 @@ async fn concurrent_create_user_creates_one_new_workspace(pool: PgPool) {
             Role::Owner,
             local_space(),
             Locale::En,
-            LINK_BASE
+            &account_config
         ),
     );
     first.unwrap();
@@ -758,6 +767,7 @@ async fn concurrent_create_user_for_one_email_creates_one_account(pool: PgPool) 
         (WorkspaceRef::parse("Acme"), "by-name@example.test"),
     ] {
         let shouted = format!(" {} ", email.to_uppercase());
+        let account_config = config(Some(LINK_BASE));
         let (first, second) = tokio::join!(
             create_user(
                 &pool,
@@ -766,7 +776,7 @@ async fn concurrent_create_user_for_one_email_creates_one_account(pool: PgPool) 
                 Role::Member,
                 None,
                 Locale::En,
-                LINK_BASE
+                &account_config
             ),
             create_user(
                 &pool,
@@ -775,7 +785,7 @@ async fn concurrent_create_user_for_one_email_creates_one_account(pool: PgPool) 
                 Role::Admin,
                 None,
                 Locale::Th,
-                LINK_BASE
+                &account_config
             ),
         );
         let mut codes: Vec<_> = [first, second]

@@ -32,12 +32,14 @@ pub async fn submit(
     thread_id: ThreadId,
     post: UserPost,
 ) -> Result<Submitted, KatError> {
-    let mut connection = db::GuardedConnection::acquire(&core.pool).await?;
-    let mut tx = connection.connection().begin().await?;
-    db::set_lock_timeout(&mut tx, core.config.lock_timeout).await?;
-    let submitted = intake(&mut tx, core, tenant, thread_id, post).await?;
-    tx.commit().await?;
-    connection.release();
+    let submitted = db::guarded(&core.pool, async |conn| {
+        let mut tx = conn.begin().await?;
+        db::set_lock_timeout(&mut tx, core.config.lock_timeout).await?;
+        let submitted = intake(&mut tx, core, tenant, thread_id, post).await?;
+        tx.commit().await?;
+        Ok(submitted)
+    })
+    .await?;
     if let Some(seq) = submitted.last_event_seq {
         core.events.notify(thread_id, seq);
     }

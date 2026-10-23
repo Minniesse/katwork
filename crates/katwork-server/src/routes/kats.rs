@@ -54,7 +54,14 @@ pub(crate) async fn hire(
     let mut new = roles::template(&body.role, Locale::En);
     new.name = body.name;
     new.persona = body.persona;
-    let id = kat::hire(&state.core.pool, &tenant, path.space_id, new).await?;
+    let id = kat::hire(
+        &state.core.pool,
+        &tenant,
+        path.space_id,
+        new,
+        state.core.config.lock_timeout,
+    )
+    .await?;
     Ok((
         StatusCode::CREATED,
         Json(kat::get(&state.core.pool, &tenant, id).await?),
@@ -95,7 +102,14 @@ pub(crate) async fn update(
     let patch: KatPatch =
         serde_json::from_value(body).map_err(|_| katwork::error::KatError::RequestInvalid)?;
     Ok(Json(
-        kat::update(&state.core.pool, &tenant, path.kat_id, patch).await?,
+        kat::update(
+            &state.core.pool,
+            &tenant,
+            path.kat_id,
+            patch,
+            state.core.config.lock_timeout,
+        )
+        .await?,
     ))
 }
 pub(crate) async fn grant(
@@ -105,7 +119,14 @@ pub(crate) async fn grant(
 ) -> Result<StatusCode, ApiError> {
     tenant.require_admin()?;
     let path = route_path(path)?;
-    kat::grant_space(&state.core.pool, &tenant, path.kat_id, path.space_id).await?;
+    kat::grant_space(
+        &state.core.pool,
+        &tenant,
+        path.kat_id,
+        path.space_id,
+        state.core.config.lock_timeout,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 pub(crate) async fn revoke(
@@ -115,6 +136,13 @@ pub(crate) async fn revoke(
 ) -> Result<StatusCode, ApiError> {
     tenant.require_admin()?;
     let path = route_path(path)?;
-    kat::revoke_space(&state.core.pool, &tenant, path.kat_id, path.space_id).await?;
+    kat::revoke_space(
+        &state.core.pool,
+        &tenant,
+        path.kat_id,
+        path.space_id,
+        state.core.config.lock_timeout,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }

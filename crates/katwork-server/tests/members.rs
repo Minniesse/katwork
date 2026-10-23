@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
 #[allow(dead_code)]
 #[path = "support/mod.rs"]
 mod support;
@@ -62,7 +66,9 @@ async fn person(pool: &PgPool, email: &str, locale: &str) -> Person {
         .execute(pool)
         .await
         .unwrap();
-    let token = session::create(pool, id).await.unwrap();
+    let token = session::create(pool, id, std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
     Person {
         id,
         email: email.to_owned(),
@@ -915,9 +921,15 @@ async fn removing_a_member_keeps_their_message_history(pool: PgPool) {
     .await
     .unwrap();
     let owner_tenant = tenancy::resolve(&pool, owner.id, ws).await.unwrap();
-    let team_id = team::create_default(&pool, &owner_tenant, space, Locale::En)
-        .await
-        .unwrap();
+    let team_id = team::create_default(
+        &pool,
+        &owner_tenant,
+        space,
+        Locale::En,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     let chat = thread::create(&pool, &owner_tenant, space, team_id, "Plans")
         .await
         .unwrap();
@@ -1053,9 +1065,10 @@ async fn stale_admin_tenant_is_refused_behind_the_lock(pool: PgPool) {
         };
         let invited = members::invite(&pool, &config, mailer.clone(), &stale, new_invite()).await;
         assert_eq!(invited.unwrap_err().code(), expected);
-        let promoted = members::set_role(&pool, &stale, member.id, Role::Admin).await;
+        let promoted =
+            members::set_role(&pool, &stale, member.id, Role::Admin, config.lock_timeout).await;
         assert_eq!(promoted.unwrap_err().code(), expected);
-        let removed = members::remove(&pool, &stale, member.id).await;
+        let removed = members::remove(&pool, &stale, member.id, config.lock_timeout).await;
         assert_eq!(removed.unwrap_err().code(), expected);
 
         assert_eq!(users_with_email(&pool, "new@example.test").await, 0);

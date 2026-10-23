@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
 use super::*;
 
 struct LeaseWaitSink<'a> {
@@ -70,6 +74,7 @@ async fn expired_lease_during_kat_lock_must_not_dispatch_model(pool: PgPool) {
             .unwrap();
     };
     let env = RunEnv {
+        lock_timeout: std::time::Duration::from_secs(5),
         pool: &h.pool,
         models: &h.models,
         tools: &h.tools,
@@ -94,6 +99,7 @@ async fn expired_lease_during_kat_lock_must_not_authorize_write(pool: PgPool) {
     effects_table(&pool).await;
     let h = Harness::new(pool.clone(), vec![]).await;
     let ctx = ToolCtx {
+        lock_timeout: std::time::Duration::from_secs(5),
         tenant: h.input.tenant.clone(),
         thread_id: h.input.thread_id,
         space_id: h.input.space_id,

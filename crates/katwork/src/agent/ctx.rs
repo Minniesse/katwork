@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 pub struct ComputerHandle;
 #[derive(Debug, Clone)]
 pub struct ToolCtx {
+    pub lock_timeout: std::time::Duration,
     pub tenant: Tenant,
     pub thread_id: ThreadId,
     pub space_id: SpaceId,

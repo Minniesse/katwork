@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
 use super::*;
 
 pub(super) async fn waiting(pool: &PgPool, query: &str) {
@@ -49,7 +53,15 @@ async fn reclaimed_epoch_rejects_late_completion(pool: PgPool) {
         Err(KatError::LeaseLost)
     ));
     assert!(matches!(
-        lease::heartbeat(&pool, a.task_id, "a", a.lease_epoch, TTL).await,
+        lease::heartbeat(
+            &pool,
+            a.task_id,
+            "a",
+            a.lease_epoch,
+            TTL,
+            std::time::Duration::from_secs(5)
+        )
+        .await,
         Err(KatError::LeaseLost)
     ));
     assert_eq!(before, events(&pool, a.thread_id).await);
@@ -96,8 +108,17 @@ async fn heartbeat_rechecks_expiry_after_waiting_for_lease_row(pool: PgPool) {
     let other = pool.clone();
     let task = c.task_id;
     let epoch = c.lease_epoch;
-    let renewal =
-        tokio::spawn(async move { lease::heartbeat(&other, task, "a", epoch, TTL).await });
+    let renewal = tokio::spawn(async move {
+        lease::heartbeat(
+            &other,
+            task,
+            "a",
+            epoch,
+            TTL,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+    });
     waiting(&pool, "SELECT task_id FROM task_leases").await;
     sqlx::query(
         "UPDATE task_leases SET expires_at=clock_timestamp()-interval '1 second' WHERE task_id=$1",
@@ -167,7 +188,15 @@ async fn wrong_owner_cannot_renew_complete_or_abandon(pool: PgPool) {
     let run = start_run(&core, &c).await;
     let before = events(&pool, c.thread_id).await;
     assert!(matches!(
-        lease::heartbeat(&pool, c.task_id, "other", c.lease_epoch, TTL).await,
+        lease::heartbeat(
+            &pool,
+            c.task_id,
+            "other",
+            c.lease_epoch,
+            TTL,
+            std::time::Duration::from_secs(5)
+        )
+        .await,
         Err(KatError::LeaseLost)
     ));
     assert!(matches!(
@@ -214,6 +243,7 @@ async fn policy_version_changed_while_queued_finishes_without_run(pool: PgPool) 
             tool_allowlist: Some(vec!["read_thread".into()]),
             ..Default::default()
         },
+        std::time::Duration::from_secs(5),
     )
     .await
     .unwrap();
@@ -311,6 +341,7 @@ async fn advisory_hold_filter_preserves_deadlines_and_eligibility_stops(pool: Pg
             status: Some(KatStatus::Paused),
             ..Default::default()
         },
+        std::time::Duration::from_secs(5),
     )
     .await
     .unwrap();
@@ -350,8 +381,17 @@ async fn heartbeat_cannot_revive_lease_that_expires_during_policy_read(pool: PgP
     let other = pool.clone();
     let task = c.task_id;
     let epoch = c.lease_epoch;
-    let renewal =
-        tokio::spawn(async move { lease::heartbeat(&other, task, "a", epoch, TTL).await });
+    let renewal = tokio::spawn(async move {
+        lease::heartbeat(
+            &other,
+            task,
+            "a",
+            epoch,
+            TTL,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+    });
     waiting(&pool, "SELECT w.paused").await;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -494,6 +534,7 @@ async fn held_task_terminal_matrix(pool: PgPool) {
                         tool_allowlist: Some(vec!["read_thread".into()]),
                         ..Default::default()
                     },
+                    std::time::Duration::from_secs(5),
                 )
                 .await
                 .unwrap();
@@ -511,18 +552,30 @@ async fn held_task_terminal_matrix(pool: PgPool) {
                 )
                 .await
                 .unwrap();
-                kat::grant_space(&pool, &tenant, KatId(f.kat), other)
-                    .await
-                    .unwrap();
+                kat::grant_space(
+                    &pool,
+                    &tenant,
+                    KatId(f.kat),
+                    other,
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
                 sqlx::query("UPDATE kats SET default_space_id=$2 WHERE id=$1")
                     .bind(f.kat)
                     .bind(other)
                     .execute(&pool)
                     .await
                     .unwrap();
-                kat::revoke_space(&pool, &tenant, KatId(f.kat), SpaceId(f.space))
-                    .await
-                    .unwrap();
+                kat::revoke_space(
+                    &pool,
+                    &tenant,
+                    KatId(f.kat),
+                    SpaceId(f.space),
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
                 // Isolate the grant predicate from the separately tested policy-version predicate.
                 sqlx::query("UPDATE tasks t SET kat_policy_version=k.policy_version FROM kats k WHERE t.id=$1 AND k.id=t.kat_id AND k.workspace_id=t.workspace_id")
                     .bind(waiting).execute(&pool).await.unwrap();

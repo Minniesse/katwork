@@ -244,6 +244,7 @@ async fn budgeted_kat_keeps_concurrency_and_bounds_burst(pool: PgPool) {
                 latency_ms: 0,
                 outcome: "done".into(),
             },
+            std::time::Duration::from_secs(5),
         )
         .await
         .unwrap();

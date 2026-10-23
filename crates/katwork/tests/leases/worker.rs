@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
 use super::*;
 use async_trait::async_trait;
 use futures::{StreamExt, stream::BoxStream};
@@ -48,6 +52,7 @@ async fn execute(core: &Core, c: &ClaimedTask, remaining: Duration) -> Result<Ru
     let tools = ToolRegistry::builtin();
     run::execute(
         &RunEnv {
+            lock_timeout: std::time::Duration::from_secs(5),
             pool: &core.pool,
             models: &core.registry,
             tools: &tools,
@@ -510,6 +515,7 @@ impl ModelProvider for Panicking {
             .await
             .unwrap();
             let ctx = ToolCtx {
+                lock_timeout: std::time::Duration::from_secs(5),
                 tenant: tenant(pool, f).await,
                 thread_id: ThreadId(f.thread),
                 space_id: SpaceId(f.space),

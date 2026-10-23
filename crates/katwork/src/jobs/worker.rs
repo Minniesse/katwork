@@ -98,7 +98,16 @@ async fn renew(
         }
         // The watchdog cancels execution independently while this SQL drains to completion.
         let started = Instant::now();
-        match lease::heartbeat(&core.pool, c.task_id, worker, c.lease_epoch, ttl).await {
+        match lease::heartbeat(
+            &core.pool,
+            c.task_id,
+            worker,
+            c.lease_epoch,
+            ttl,
+            core.config.lock_timeout,
+        )
+        .await
+        {
             Ok(HeartbeatStatus::Continue) => {}
             Ok(HeartbeatStatus::Stop(reason)) => return Renewal::Stop(reason),
             Err(error) => {
@@ -276,6 +285,7 @@ async fn execute(
     let tools = ToolRegistry::builtin();
     run::execute_with_interruption(
         &RunEnv {
+            lock_timeout: core.config.lock_timeout,
             pool: &core.pool,
             models: &core.registry,
             tools: &tools,

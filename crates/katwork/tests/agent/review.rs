@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
 use super::*;
 
 #[derive(Clone, Copy)]
@@ -40,6 +44,7 @@ impl EventSink for InterruptSink<'_> {
                     status: Some(KatStatus::Paused),
                     ..KatPatch::default()
                 },
+                std::time::Duration::from_secs(5),
             )
             .await
             .unwrap();
@@ -63,6 +68,7 @@ impl EventSink for InterruptSink<'_> {
 async fn interrupted_run(h: &Harness, interruption: Interruption, tool_end: usize) -> RunFacts {
     run::execute(
         &RunEnv {
+            lock_timeout: std::time::Duration::from_secs(5),
             pool: &h.pool,
             models: &h.models,
             tools: &h.tools,
@@ -399,6 +405,7 @@ async fn stale_kat_snapshot_cannot_use_new_policy_version(pool: PgPool) {
             tool_allowlist: Some(vec![]),
             ..KatPatch::default()
         },
+        std::time::Duration::from_secs(5),
     )
     .await
     .unwrap();
@@ -465,6 +472,7 @@ async fn workspace_pause_waits_for_authorized_write(pool: PgPool) {
             &h.pool,
             &h.input.tenant,
             true,
+            std::time::Duration::from_secs(5),
         ));
         loop {
             tokio::select! {
@@ -529,6 +537,7 @@ async fn retry_interruption(
                         status: Some(KatStatus::Paused),
                         ..KatPatch::default()
                     },
+                    std::time::Duration::from_secs(5),
                 )
                 .await
                 .unwrap();
@@ -574,35 +583,8 @@ async fn cancelled_read_retry_after_timeout_preserves_unknown_outcome(pool: PgPo
     retry_interruption(pool, Interruption::Cancel, StopReason::Cancelled, true).await;
 }
 
-async fn configured_timeout_child(test: &str, pool: &PgPool) -> bool {
-    if std::env::var("KATWORK_TIMEOUT_TEST_CHILD").as_deref() == Ok(test) {
-        return true;
-    }
-    pool.close().await;
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test, "--nocapture"])
-        .env("KATWORK_LOCK_TIMEOUT_MS", "37")
-        .env("KATWORK_TIMEOUT_TEST_CHILD", test)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    false
-}
 #[sqlx::test]
 async fn configured_timeout_reaches_ledger_transactions(pool: PgPool) {
-    if !configured_timeout_child(
-        "review::configured_timeout_reaches_ledger_transactions",
-        &pool,
-    )
-    .await
-    {
-        return;
-    }
     let mut h = Harness::new(
         pool,
         vec![
@@ -611,6 +593,7 @@ async fn configured_timeout_reaches_ledger_transactions(pool: PgPool) {
         ],
     )
     .await;
+    h.lock_timeout = Duration::from_millis(37);
     sqlx::raw_sql("CREATE TABLE observed_timeout(value text);
         CREATE FUNCTION observe_timeout() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
         INSERT INTO observed_timeout VALUES(current_setting('lock_timeout')); RETURN NEW; END $$;
@@ -632,14 +615,6 @@ async fn configured_timeout_reaches_ledger_transactions(pool: PgPool) {
 }
 #[sqlx::test]
 async fn configured_timeout_reaches_tool_write_transaction(pool: PgPool) {
-    if !configured_timeout_child(
-        "review::configured_timeout_reaches_tool_write_transaction",
-        &pool,
-    )
-    .await
-    {
-        return;
-    }
     let mut h = Harness::new(
         pool,
         vec![
@@ -648,6 +623,7 @@ async fn configured_timeout_reaches_tool_write_transaction(pool: PgPool) {
         ],
     )
     .await;
+    h.lock_timeout = Duration::from_millis(37);
     h.add(
         Probe::new("write", SideEffect::WorkspaceWrite).action(|ctx, _| {
             async move {
@@ -714,6 +690,7 @@ async fn batch_authority_refuses_before_starting_next_call(pool: PgPool) {
     let n = h.add(Probe::new("other", SideEffect::WorkspaceWrite));
     let facts = run::execute(
         &RunEnv {
+            lock_timeout: std::time::Duration::from_secs(5),
             pool: &h.pool,
             models: &h.models,
             tools: &h.tools,

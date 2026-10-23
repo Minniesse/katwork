@@ -250,6 +250,10 @@ pub async fn conclude(
     idem_key: &str,
     facts: &RunFacts,
 ) -> Result<EventSeq, KatError> {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "A savepoint borrows the caller-owned transaction; request callers guard its connection and workers drain it"
+    )]
     let mut savepoint = tx.begin().await?;
     let tx = &mut savepoint;
     let job: JobRow = sqlx::query_as(
@@ -486,130 +490,133 @@ pub async fn cancel(
     hub: &crate::events::EventHub,
     tenant: &Tenant,
     job_id: JobId,
+    lock_timeout: std::time::Duration,
 ) -> Result<(), KatError> {
     use crate::events::{
         RunStartedEvent,
         sink::{close_locked_calls, close_locked_run},
     };
-    let mut connection = crate::db::GuardedConnection::acquire(pool).await?;
-    let mut tx = connection.connection().begin().await?;
-    crate::db::set_configured_lock_timeout(&mut tx).await?;
-    let workspace = tenant.workspace_id();
-    sqlx::query("SELECT id FROM jobs WHERE workspace_id=$1 AND id=$2 FOR NO KEY UPDATE")
-        .bind(workspace)
-        .bind(job_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(KatError::NotFound)?;
-    let requester: UserId =
-        sqlx::query_scalar("SELECT requested_by FROM jobs WHERE workspace_id=$1 AND id=$2")
+    let (thread, seq) = crate::db::guarded(pool, async |conn| {
+        let mut tx = sqlx::Connection::begin(conn).await?;
+        crate::db::set_lock_timeout(&mut tx, lock_timeout).await?;
+        let workspace = tenant.workspace_id();
+        sqlx::query("SELECT id FROM jobs WHERE workspace_id=$1 AND id=$2 FOR NO KEY UPDATE")
             .bind(workspace)
             .bind(job_id)
-            .fetch_one(&mut *tx)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(KatError::NotFound)?;
+        let requester: UserId =
+            sqlx::query_scalar("SELECT requested_by FROM jobs WHERE workspace_id=$1 AND id=$2")
+                .bind(workspace)
+                .bind(job_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let current = crate::tenancy::resolve(&mut *tx, tenant.user_id(), workspace).await?;
+        if requester != current.user_id() {
+            current.require_admin()?;
+        }
+        let job = owned_job(&mut tx, job_id).await?;
+        let tasks: Vec<TaskId> = sqlx::query_scalar(include_str!("cancel_tasks.sql"))
+            .bind(workspace)
+            .bind(job_id)
+            .fetch_all(&mut *tx)
             .await?;
-    let current = crate::tenancy::resolve(&mut *tx, tenant.user_id(), workspace).await?;
-    if requester != current.user_id() {
-        current.require_admin()?;
-    }
-    let job = owned_job(&mut tx, job_id).await?;
-    let tasks: Vec<TaskId> = sqlx::query_scalar(include_str!("cancel_tasks.sql"))
-        .bind(workspace)
-        .bind(job_id)
+        let ids: Vec<_> = tasks.iter().map(|id| id.0).collect();
+        sqlx::query(
+            "SELECT task_id FROM task_leases WHERE task_id=ANY($1) ORDER BY task_id FOR NO KEY UPDATE",
+        )
+        .bind(&ids)
         .fetch_all(&mut *tx)
         .await?;
-    let ids: Vec<_> = tasks.iter().map(|id| id.0).collect();
-    sqlx::query(
-        "SELECT task_id FROM task_leases WHERE task_id=ANY($1) ORDER BY task_id FOR NO KEY UPDATE",
-    )
-    .bind(&ids)
-    .fetch_all(&mut *tx)
-    .await?;
-    let runs: Vec<(RunId, KatId)> = sqlx::query_as("SELECT id,kat_id FROM runs WHERE workspace_id=$1 AND job_id=$2 ORDER BY id FOR NO KEY UPDATE")
-        .bind(workspace).bind(job_id).fetch_all(&mut *tx).await?;
-    let run_ids: Vec<_> = runs.iter().map(|(id, _)| id.0).collect();
-    let calls: Vec<(ToolCallRecordId, RunId)> = sqlx::query_as("SELECT id,run_id FROM tool_calls WHERE workspace_id=$1 AND run_id=ANY($2) AND ended_at IS NULL ORDER BY id FOR NO KEY UPDATE")
-        .bind(workspace).bind(&run_ids).fetch_all(&mut *tx).await?;
-    sqlx::query("SELECT id FROM threads WHERE workspace_id=$1 AND id=$2 FOR NO KEY UPDATE")
-        .bind(workspace)
-        .bind(job.thread_id)
-        .fetch_one(&mut *tx)
-        .await?;
-    sqlx::query("UPDATE tasks SET state='cancelled',hold_reason=NULL WHERE workspace_id=$1 AND job_id=$2 AND state IN ('queued','leased')")
-        .bind(workspace).bind(job_id).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM task_leases WHERE task_id=ANY($1)")
-        .bind(&ids)
-        .execute(&mut *tx)
-        .await?;
-    for (run, kat) in runs {
-        let running: bool = sqlx::query_scalar(
-            "SELECT state='running' AND ended_at IS NULL FROM runs WHERE workspace_id=$1 AND id=$2",
-        )
-        .bind(workspace)
-        .bind(run)
-        .fetch_one(&mut *tx)
-        .await?;
-        if !running {
-            continue;
-        }
-        let open: Vec<_> = calls
-            .iter()
-            .filter(|(_, r)| *r == run)
-            .map(|(id, _)| *id)
-            .collect();
-        close_locked_calls(&mut tx, workspace, job.thread_id, run, &open, "cancelled").await?;
-        let started: Option<Json<RunStartedEvent>> = sqlx::query_scalar("SELECT payload->'value' FROM events WHERE workspace_id=$1 AND thread_id=$2 AND run_id=$3 AND kind='katwork.run_started' ORDER BY seq DESC LIMIT 1")
-            .bind(workspace).bind(job.thread_id).bind(run).fetch_optional(&mut *tx).await?;
-        if let Some(Json(started)) = started {
-            let text: Option<String> = sqlx::query_scalar("SELECT string_agg(payload->>'delta','' ORDER BY seq) FROM events WHERE workspace_id=$1 AND thread_id=$2 AND run_id=$3 AND kind='TEXT_MESSAGE_CONTENT' AND payload->>'messageId'=$4 AND seq>(SELECT coalesce(max(seq),0) FROM events WHERE workspace_id=$1 AND thread_id=$2 AND run_id=$3 AND kind='TEXT_MESSAGE_START' AND payload->>'messageId'=$4)")
-                .bind(workspace).bind(job.thread_id).bind(run).bind(started.reply_message_id.to_string()).fetch_one(&mut *tx).await?;
-            if let Some(body) = text.filter(|s| !s.is_empty()) {
-                store_message(
-                    &mut tx,
-                    tenant,
-                    &job,
-                    NewMessage {
-                        id: Some(started.reply_message_id),
-                        author: Author::Kat(kat),
-                        body,
-                        client_msg_id: None,
-                        idempotency_key: Some(format!("stopped:{run}")),
-                        synthetic: started.synthetic,
-                        stopped: true,
-                        question: None,
-                        meta: None,
-                        job_id: Some(job_id),
-                    },
-                )
-                .await?;
+        let runs: Vec<(RunId, KatId)> = sqlx::query_as("SELECT id,kat_id FROM runs WHERE workspace_id=$1 AND job_id=$2 ORDER BY id FOR NO KEY UPDATE")
+            .bind(workspace).bind(job_id).fetch_all(&mut *tx).await?;
+        let run_ids: Vec<_> = runs.iter().map(|(id, _)| id.0).collect();
+        let calls: Vec<(ToolCallRecordId, RunId)> = sqlx::query_as("SELECT id,run_id FROM tool_calls WHERE workspace_id=$1 AND run_id=ANY($2) AND ended_at IS NULL ORDER BY id FOR NO KEY UPDATE")
+            .bind(workspace).bind(&run_ids).fetch_all(&mut *tx).await?;
+        sqlx::query("SELECT id FROM threads WHERE workspace_id=$1 AND id=$2 FOR NO KEY UPDATE")
+            .bind(workspace)
+            .bind(job.thread_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE tasks SET state='cancelled',hold_reason=NULL WHERE workspace_id=$1 AND job_id=$2 AND state IN ('queued','leased')")
+            .bind(workspace).bind(job_id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM task_leases WHERE task_id=ANY($1)")
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+        for (run, kat) in runs {
+            let running: bool = sqlx::query_scalar(
+                "SELECT state='running' AND ended_at IS NULL FROM runs WHERE workspace_id=$1 AND id=$2",
+            )
+            .bind(workspace)
+            .bind(run)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !running {
+                continue;
             }
+            let open: Vec<_> = calls
+                .iter()
+                .filter(|(_, r)| *r == run)
+                .map(|(id, _)| *id)
+                .collect();
+            close_locked_calls(&mut tx, workspace, job.thread_id, run, &open, "cancelled").await?;
+            let started: Option<Json<RunStartedEvent>> = sqlx::query_scalar("SELECT payload->'value' FROM events WHERE workspace_id=$1 AND thread_id=$2 AND run_id=$3 AND kind='katwork.run_started' ORDER BY seq DESC LIMIT 1")
+                .bind(workspace).bind(job.thread_id).bind(run).fetch_optional(&mut *tx).await?;
+            if let Some(Json(started)) = started {
+                let text: Option<String> = sqlx::query_scalar("SELECT string_agg(payload->>'delta','' ORDER BY seq) FROM events WHERE workspace_id=$1 AND thread_id=$2 AND run_id=$3 AND kind='TEXT_MESSAGE_CONTENT' AND payload->>'messageId'=$4 AND seq>(SELECT coalesce(max(seq),0) FROM events WHERE workspace_id=$1 AND thread_id=$2 AND run_id=$3 AND kind='TEXT_MESSAGE_START' AND payload->>'messageId'=$4)")
+                    .bind(workspace).bind(job.thread_id).bind(run).bind(started.reply_message_id.to_string()).fetch_one(&mut *tx).await?;
+                if let Some(body) = text.filter(|s| !s.is_empty()) {
+                    store_message(
+                        &mut tx,
+                        tenant,
+                        &job,
+                        NewMessage {
+                            id: Some(started.reply_message_id),
+                            author: Author::Kat(kat),
+                            body,
+                            client_msg_id: None,
+                            idempotency_key: Some(format!("stopped:{run}")),
+                            synthetic: started.synthetic,
+                            stopped: true,
+                            question: None,
+                            meta: None,
+                            job_id: Some(job_id),
+                        },
+                    )
+                    .await?;
+                }
+            }
+            log::append(
+                &mut tx,
+                workspace,
+                job.thread_id,
+                None,
+                &KatworkEvent::KatState(KatStateEvent {
+                    kat_id: kat,
+                    state: KatState::Idle,
+                })
+                .into(),
+            )
+            .await?;
+            close_locked_run(
+                &mut tx,
+                workspace,
+                job.thread_id,
+                run,
+                &[],
+                RunEnd::Cancelled,
+                "cancelled",
+            )
+            .await?;
         }
-        log::append(
-            &mut tx,
-            workspace,
-            job.thread_id,
-            None,
-            &KatworkEvent::KatState(KatStateEvent {
-                kat_id: kat,
-                state: KatState::Idle,
-            })
-            .into(),
-        )
-        .await?;
-        close_locked_run(
-            &mut tx,
-            workspace,
-            job.thread_id,
-            run,
-            &[],
-            RunEnd::Cancelled,
-            "cancelled",
-        )
-        .await?;
-    }
-    let seq = finish_by_harness(&mut tx, job_id, HarnessEnd::Cancelled).await?;
-    tx.commit().await?;
-    connection.release();
-    hub.notify(job.thread_id, seq);
+        let seq = finish_by_harness(&mut tx, job_id, HarnessEnd::Cancelled).await?;
+        tx.commit().await?;
+        Ok((job.thread_id, seq))
+    })
+    .await?;
+    hub.notify(thread, seq);
     Ok(())
 }
 
@@ -620,13 +627,13 @@ pub async fn view(
     tenant: &Tenant,
     job_id: JobId,
 ) -> Result<JobView, KatError> {
-    let mut connection = crate::db::GuardedConnection::acquire(pool).await?;
-    let job = sqlx::query_as(include_str!("job_view.sql"))
-        .bind(tenant.workspace_id())
-        .bind(job_id)
-        .fetch_optional(connection.connection())
-        .await?
-        .ok_or(KatError::NotFound);
-    connection.release();
-    job
+    crate::db::guarded(pool, async |conn| {
+        sqlx::query_as(include_str!("job_view.sql"))
+            .bind(tenant.workspace_id())
+            .bind(job_id)
+            .fetch_optional(conn)
+            .await?
+            .ok_or(KatError::NotFound)
+    })
+    .await
 }

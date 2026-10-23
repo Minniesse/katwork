@@ -16,6 +16,11 @@ pub fn link(link_base: &str, token: &str) -> String {
 /// Sets the password from an unused, unexpired invite token, ends the account's sessions and
 /// other pending tokens, and returns the account's email. Any other token is
 /// `invite_token_invalid`, reset tokens included.
-pub async fn accept(pool: &PgPool, token: &str, new_password: &str) -> Result<String, KatError> {
-    consume(pool, TokenKind::Invite, token, new_password).await
+pub async fn accept(
+    pool: &PgPool,
+    token: &str,
+    new_password: &str,
+    lock_timeout: std::time::Duration,
+) -> Result<String, KatError> {
+    consume(pool, TokenKind::Invite, token, new_password, lock_timeout).await
 }

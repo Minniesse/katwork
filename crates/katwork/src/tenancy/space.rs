@@ -20,16 +20,19 @@ pub async fn create(
     tenant.require_admin()?;
     let name = super::validate_name(name)?;
     let id = SpaceId::new();
-    sqlx::query(
-        "INSERT INTO spaces (id, workspace_id, name, allow_external) VALUES ($1, $2, $3, $4)",
-    )
-    .bind(id)
-    .bind(tenant.workspace_id())
-    .bind(name)
-    .bind(policy.allow_external)
-    .execute(pool)
-    .await?;
-    Ok(id)
+    crate::db::guarded(pool, async |conn| {
+        sqlx::query(
+            "INSERT INTO spaces (id, workspace_id, name, allow_external) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(id)
+        .bind(tenant.workspace_id())
+        .bind(name)
+        .bind(policy.allow_external)
+        .execute(&mut *conn)
+        .await?;
+        Ok(id)
+    })
+    .await
 }
 
 pub async fn list(pool: &PgPool, tenant: &Tenant) -> Result<Vec<Space>, KatError> {

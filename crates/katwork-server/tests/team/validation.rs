@@ -175,9 +175,15 @@ async fn multiline_persona_and_instructions_accept_lf_cr_and_tab(pool: PgPool) {
         .unwrap();
     let mut new = roles::template(&KatRole::Writer, Locale::En);
     new.instructions = text.into();
-    let id = kat::hire(&pool, &tenant, SpaceId(f.space), new)
-        .await
-        .unwrap();
+    let id = kat::hire(
+        &pool,
+        &tenant,
+        SpaceId(f.space),
+        new,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         kat::get(&pool, &tenant, id).await.unwrap().instructions,
         text
@@ -263,10 +269,16 @@ async fn repository_hire_validates_all_free_text_and_allowlist(pool: PgPool) {
                 _ => new.tool_allowlist = vec![invalid],
             }
             assert_eq!(
-                kat::hire(&pool, &tenant, SpaceId(f.space), new)
-                    .await
-                    .unwrap_err()
-                    .code(),
+                kat::hire(
+                    &pool,
+                    &tenant,
+                    SpaceId(f.space),
+                    new,
+                    std::time::Duration::from_secs(5)
+                )
+                .await
+                .unwrap_err()
+                .code(),
                 "request_invalid",
                 "{field}"
             );
@@ -278,9 +290,15 @@ async fn repository_hire_validates_all_free_text_and_allowlist(pool: PgPool) {
         .unwrap();
     let mut new = template;
     new.tool_allowlist = vec!["ask_user".into(), "read_thread".into(), "ask_user".into()];
-    let hired = kat::hire(&pool, &tenant, SpaceId(f.space), new)
-        .await
-        .unwrap();
+    let hired = kat::hire(
+        &pool,
+        &tenant,
+        SpaceId(f.space),
+        new,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         kat::get(&pool, &tenant, hired)
             .await

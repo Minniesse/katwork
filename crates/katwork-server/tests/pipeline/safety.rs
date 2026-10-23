@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
 use super::*;
 
 async fn single_connection(f: &mut Fixture) -> (PgPool, i32) {
@@ -64,7 +68,16 @@ async fn dropped_request(pool: PgPool, operation: &str) {
             )
             .await
             .map(|_| ()),
-            "cancel" => katwork::jobs::job::cancel(&single, &f.core.events, &f.tenant, job).await,
+            "cancel" => {
+                katwork::jobs::job::cancel(
+                    &single,
+                    &f.core.events,
+                    &f.tenant,
+                    job,
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+            }
             "view" => katwork::jobs::job::view(&single, &f.tenant, job)
                 .await
                 .map(|_| ()),
@@ -144,9 +157,15 @@ async fn completed_database_work_reuses_connection(pool: PgPool) {
     katwork::jobs::job::view(&single, &f.tenant, job)
         .await
         .unwrap();
-    katwork::jobs::job::cancel(&single, &f.core.events, &f.tenant, job)
-        .await
-        .unwrap();
+    katwork::jobs::job::cancel(
+        &single,
+        &f.core.events,
+        &f.tenant,
+        job,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     let reused: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&single)
         .await
@@ -155,35 +174,74 @@ async fn completed_database_work_reuses_connection(pool: PgPool) {
     single.close().await;
 }
 
-pub(super) async fn assert_pool_clean(pool: &PgPool) {
-    use sqlx::Connection;
-    let mut connections = Vec::new();
-    let mut pids: Vec<i32> = Vec::new();
-    for _ in 0..pool.options().get_max_connections() {
-        let mut conn = timeout(Duration::from_secs(5), pool.acquire())
-            .await
-            .unwrap()
-            .unwrap();
-        pids.push(
-            sqlx::query_scalar("SELECT pg_backend_pid()")
-                .fetch_one(&mut *conn)
-                .await
-                .unwrap(),
-        );
-        connections.push(conn);
-    }
-    let mut observer = sqlx::PgConnection::connect_with(&pool.connect_options())
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn pool_clean_probe_does_not_reserve_unused_parent_capacity(pool: PgPool) {
+    let parent = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with((*pool.connect_options()).clone())
         .await
         .unwrap();
-    let clean: bool =
-        sqlx::query_scalar("SELECT bool_and(state='idle') FROM pg_stat_activity WHERE pid=ANY($1)")
-            .bind(pids)
-            .fetch_one(&mut observer)
+    let held = parent.acquire().await.unwrap();
+    let child = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .parent(parent.clone())
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    assert_eq!(child.size(), 1);
+    timeout(Duration::from_secs(5), assert_pool_clean(&child))
+        .await
+        .expect("pool inspection tried to reserve another test's connection permit");
+    drop(held);
+    timeout(Duration::from_secs(5), child.close())
+        .await
+        .unwrap();
+    drop(child);
+    timeout(Duration::from_secs(5), parent.close())
+        .await
+        .unwrap();
+}
+
+pub(super) async fn assert_pool_clean(pool: &PgPool) {
+    // sqlx test pools share permits: inspecting a pool must never grow it to maximum capacity.
+    timeout(Duration::from_secs(30), async {
+        use sqlx::Connection;
+        let mut observer = sqlx::PgConnection::connect_with(&pool.connect_options())
             .await
             .unwrap();
+        loop {
+            let clean: bool = sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND backend_type='client backend' AND pid<>pg_backend_pid() AND state IS DISTINCT FROM 'idle')")
+                .fetch_one(&mut observer).await.unwrap();
+            if pool.num_idle() as u32 == pool.size() && clean {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        observer.close().await.unwrap();
+    })
+    .await
+    .expect("worker shutdown left a busy pool or a backend inside a transaction");
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn pool_clean_probe_rejects_idle_transaction(pool: PgPool) {
+    let single = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let mut conn = single.acquire().await.unwrap();
+    // Raw BEGIN intentionally bypasses sqlx's transaction-depth bookkeeping.
+    sqlx::query("BEGIN").execute(&mut *conn).await.unwrap();
+    conn.return_to_pool().await;
+    assert_eq!(single.num_idle(), 1);
     assert!(
-        clean,
-        "worker shutdown left a pooled connection inside a transaction"
+        timeout(Duration::from_millis(200), assert_pool_clean(&single))
+            .await
+            .is_err(),
+        "pool inspection accepted a backend idle in transaction"
     );
-    observer.close().await.unwrap();
+    sqlx::query("ROLLBACK").execute(&single).await.unwrap();
+    assert_pool_clean(&single).await;
+    single.close().await;
 }

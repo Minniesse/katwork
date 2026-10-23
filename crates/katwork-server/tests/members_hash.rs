@@ -1,5 +1,9 @@
 // Its own test binary: it holds every Argon2 work slot of the process, which would stall the
 // hashing of any test running beside it.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
 use std::sync::Arc;
 
 use katwork::{

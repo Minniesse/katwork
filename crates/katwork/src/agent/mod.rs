@@ -67,6 +67,7 @@ pub struct RunInput {
     pub cancel: CancellationToken,
 }
 pub struct RunEnv<'a> {
+    pub lock_timeout: std::time::Duration,
     pub pool: &'a PgPool,
     pub models: &'a Registry,
     pub tools: &'a ToolRegistry,

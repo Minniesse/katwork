@@ -141,7 +141,7 @@ impl Runner<'_, '_> {
         Ok(())
     }
     async fn authority(&self) -> Result<Option<StopReason>, RunAbort> {
-        let mut tx = ledger::transaction(self.env.pool)
+        let mut tx = ledger::transaction(self.env.pool, self.env.lock_timeout)
             .await
             .map_err(|e| self.abort(e))?;
         let stop = guards::authorize(
@@ -151,6 +151,7 @@ impl Runner<'_, '_> {
             self.kat.id,
             self.input.space_id,
             self.input.policy_version,
+            self.env.lock_timeout,
         )
         .await
         .map_err(|e| self.abort(e))?;
@@ -158,7 +159,7 @@ impl Runner<'_, '_> {
         Ok(stop)
     }
     async fn insert(&mut self) -> Result<(), RunAbort> {
-        let mut tx = ledger::transaction(self.env.pool)
+        let mut tx = ledger::transaction(self.env.pool, self.env.lock_timeout)
             .await
             .map_err(|e| self.abort(e))?;
         // Validate the full harness relationship before acquiring any tenant-owned row lock.
@@ -537,9 +538,10 @@ impl Runner<'_, '_> {
             latency_ms: started.elapsed().as_millis().min(i32::MAX as u128) as i32,
             outcome: outcome.into(),
         };
-        let id = ledger::record_model_call(self.env.pool, &self.fence(), &row)
-            .await
-            .map_err(|e| self.abort(e))?;
+        let id =
+            ledger::record_model_call(self.env.pool, &self.fence(), &row, self.env.lock_timeout)
+                .await
+                .map_err(|e| self.abort(e))?;
         self.facts.usage.push(id);
         self.emit(KatworkEvent::Usage(UsageEvent {
             run_id: self.input.run_id,
@@ -557,6 +559,7 @@ impl Runner<'_, '_> {
     }
     fn ctx(&self, call: &ToolCall) -> ToolCtx {
         ToolCtx {
+            lock_timeout: self.env.lock_timeout,
             tenant: self.input.tenant.clone(),
             thread_id: self.input.thread_id,
             space_id: self.input.space_id,
@@ -862,9 +865,14 @@ impl Runner<'_, '_> {
                         }
                         if !retry && self.interrupted().is_none() {
                             retry = true;
-                            ledger::retry_read(self.env.pool, &self.fence(), id)
-                                .await
-                                .map_err(|e| self.abort(e))?;
+                            ledger::retry_read(
+                                self.env.pool,
+                                &self.fence(),
+                                id,
+                                self.env.lock_timeout,
+                            )
+                            .await
+                            .map_err(|e| self.abort(e))?;
                             self.facts.tool_calls.last_mut().unwrap().state =
                                 ToolCallState::Started;
                             continue;
@@ -908,9 +916,15 @@ impl Runner<'_, '_> {
             self.end(id, ToolCallState::OutcomeUnknown, Some(reason.wire()))
                 .await?;
         } else {
-            ledger::refuse_started(self.env.pool, &self.fence(), id, reason.wire())
-                .await
-                .map_err(|e| self.abort(e))?;
+            ledger::refuse_started(
+                self.env.pool,
+                &self.fence(),
+                id,
+                reason.wire(),
+                self.env.lock_timeout,
+            )
+            .await
+            .map_err(|e| self.abort(e))?;
             self.facts
                 .tool_calls
                 .last_mut()
@@ -926,9 +940,16 @@ impl Runner<'_, '_> {
         state: ToolCallState,
         result: Option<&str>,
     ) -> Result<(), RunAbort> {
-        ledger::end_tool_call(self.env.pool, &self.fence(), id, state, result)
-            .await
-            .map_err(|e| self.abort(e))?;
+        ledger::end_tool_call(
+            self.env.pool,
+            &self.fence(),
+            id,
+            state,
+            result,
+            self.env.lock_timeout,
+        )
+        .await
+        .map_err(|e| self.abort(e))?;
         self.facts
             .tool_calls
             .last_mut()

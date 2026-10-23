@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
 #[allow(dead_code)]
 #[path = "support/mod.rs"]
 mod support;
@@ -105,6 +109,7 @@ async fn reset_tokens_are_capped_at_three_even_with_concurrent_requests(pool: Pg
                 mailer.as_ref(),
                 "person@example.test",
                 "http://localhost:3000",
+                std::time::Duration::from_secs(5),
             )
             .await
             .unwrap()
@@ -126,6 +131,7 @@ async fn reset_tokens_are_capped_at_three_even_with_concurrent_requests(pool: Pg
         mailer.as_ref(),
         "person@example.test",
         "http://localhost:3000",
+        std::time::Duration::from_secs(5),
     )
     .await
     .unwrap();
@@ -193,9 +199,13 @@ async fn login_does_not_reuse_a_preexisting_session_cookie(pool: PgPool) {
 #[sqlx::test(migrations = "../katwork/migrations")]
 async fn me_stays_responsive_during_fifty_logins_with_two_connections(pool: PgPool) {
     let (id, _) = support::user(&pool).await;
-    let token = katwork::auth::session::create(&pool, katwork::ids::UserId(id))
-        .await
-        .unwrap();
+    let token = katwork::auth::session::create(
+        &pool,
+        katwork::ids::UserId(id),
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     let cookie = format!("kw_session={}", token.0);
     let small = PgPoolOptions::new()
         .max_connections(2)

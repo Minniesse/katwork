@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
 #![allow(dead_code)]
 mod support;
 
@@ -93,6 +97,7 @@ impl EventSink for Sink {
     }
 }
 struct Harness {
+    lock_timeout: Duration,
     pool: PgPool,
     f: Fixture,
     kat: Kat,
@@ -167,6 +172,7 @@ impl Harness {
         let fake = FakeProvider::scripted(script);
         let models = Registry::from_entries(vec![(entry(&fake), Arc::new(fake.clone()))]);
         Self {
+            lock_timeout: Duration::from_secs(5),
             pool,
             f,
             kat,
@@ -190,6 +196,7 @@ impl Harness {
     async fn run(&self) -> Result<RunFacts, RunAbort> {
         run::execute(
             &RunEnv {
+                lock_timeout: self.lock_timeout,
                 pool: &self.pool,
                 models: &self.models,
                 tools: &self.tools,
@@ -1037,6 +1044,7 @@ async fn revoke(ctx: &ToolCtx, pause: bool, grant: bool) {
                 tool_allowlist: (!pause).then(Vec::new),
                 ..KatPatch::default()
             },
+            std::time::Duration::from_secs(5),
         )
         .await
         .unwrap();
@@ -1178,6 +1186,7 @@ async fn policy_revoked_before_write_commit_blocks_effect(pool: PgPool) {
                 tool_allowlist: Some(vec![]),
                 ..KatPatch::default()
             },
+            std::time::Duration::from_secs(5),
         )
         .await
         .unwrap();
@@ -1234,6 +1243,7 @@ async fn policy_edit_waits_for_an_open_write(pool: PgPool) {
                 tool_allowlist: Some(vec![]),
                 ..KatPatch::default()
             },
+            std::time::Duration::from_secs(5),
         ));
         // Observe the database lock wait, not scheduling or elapsed time.
         loop {
@@ -1722,6 +1732,7 @@ async fn old_worker_cannot_emit_text_after_reclaim(pool: PgPool) {
     };
     let result = run::execute(
         &RunEnv {
+            lock_timeout: std::time::Duration::from_secs(5),
             pool: &h.pool,
             models: &h.models,
             tools: &h.tools,

@@ -1,3 +1,9 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
+#[path = "../../katwork/tests/support/cancel.rs"]
+mod cancel;
 #[path = "../../katwork/tests/support/mod.rs"]
 #[allow(dead_code)]
 mod data;
@@ -34,7 +40,10 @@ struct Setup {
 impl Setup {
     async fn new(pool: &PgPool) -> Self {
         let data = data::Fixture::new(pool).await;
-        let token = session::create(pool, UserId(data.user)).await.unwrap().0;
+        let token = session::create(pool, UserId(data.user), std::time::Duration::from_secs(5))
+            .await
+            .unwrap()
+            .0;
         let core = Arc::new(Core::new(pool.clone(), Arc::new(support::config(None))));
         let app = build_router(AppState { core: core.clone() });
         Self {
@@ -128,6 +137,36 @@ async fn assert_end(stream: &mut BodyDataStream) {
             .unwrap()
             .is_none()
     );
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn dropped_sse_read_returns_idle_backend_and_releases_subscription(pool: PgPool) {
+    let single = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let s = Setup::new(&single).await;
+    let mut stream = s.stream(None).await;
+    assert!(has(&next(&mut stream).await, "retry:"));
+    let pid = cancel::backend_pid(&single).await;
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query("LOCK threads IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let mut reading = Box::pin(stream.next());
+    tokio::select! {
+        _ = reading.as_mut() => panic!("SSE read escaped its barrier"),
+        () = cancel::wait_for_lock(&pool, pid) => {},
+    }
+    drop(reading);
+    drop(stream);
+    assert_eq!(s.core.events.sender_count(), 0);
+    blocker.rollback().await.unwrap();
+    assert_eq!(cancel::backend_pid(&single).await, pid);
+    cancel::assert_backend_idle(&pool, pid).await;
+    single.close().await;
 }
 
 // Keep PostgreSQL's real I/O from triggering Tokio's automatic virtual-time jumps.
@@ -334,12 +373,17 @@ async fn stream_closes_after_session_revoked_or_member_removed(pool: PgPool) {
             .await
             .unwrap();
             s.data.user = viewer;
-            s.token = session::create(&pool, UserId(viewer)).await.unwrap().0;
+            s.token = session::create(&pool, UserId(viewer), std::time::Duration::from_secs(5))
+                .await
+                .unwrap()
+                .0;
         }
         let mut stream = s.stream(None).await;
         next(&mut stream).await;
         if revoke {
-            session::revoke(&pool, &s.token).await.unwrap();
+            session::revoke(&pool, &s.token, std::time::Duration::from_secs(5))
+                .await
+                .unwrap();
         } else {
             sqlx::query("DELETE FROM memberships WHERE workspace_id=$1 AND user_id=$2")
                 .bind(s.data.workspace)
@@ -391,14 +435,28 @@ async fn ninth_stream_across_user_sessions_gets_too_many_streams_frame(pool: PgP
     let mut s = Setup::new(&pool).await;
     let mut held = Vec::new();
     for _ in 0..2 {
-        s.token = session::create(&pool, UserId(s.data.user)).await.unwrap().0;
+        s.token = session::create(
+            &pool,
+            UserId(s.data.user),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap()
+        .0;
         for _ in 0..4 {
             let mut stream = s.stream(None).await;
             assert_eq!(&next(&mut stream).await[..], b"retry: 3000\n\n");
             held.push(stream);
         }
     }
-    s.token = session::create(&pool, UserId(s.data.user)).await.unwrap().0;
+    s.token = session::create(
+        &pool,
+        UserId(s.data.user),
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap()
+    .0;
     let mut overflow = s.stream(None).await;
     assert_eq!(&next(&mut overflow).await[..], b"retry: 30000\n\n");
     let bytes = next(&mut overflow).await;
@@ -409,7 +467,10 @@ async fn ninth_stream_across_user_sessions_gets_too_many_streams_frame(pool: PgP
 
     // Another account still has its own budget on this same hub.
     let other = data::Fixture::new(&pool).await;
-    let token = session::create(&pool, UserId(other.user)).await.unwrap().0;
+    let token = session::create(&pool, UserId(other.user), std::time::Duration::from_secs(5))
+        .await
+        .unwrap()
+        .0;
     let response = support::request(
         &s.app,
         "GET",
@@ -485,7 +546,14 @@ async fn open_streams_do_not_count_against_the_request_limit(pool: PgPool) {
             s.data = data::Fixture::new(&pool).await;
         }
         if i % 4 == 0 {
-            s.token = session::create(&pool, UserId(s.data.user)).await.unwrap().0;
+            s.token = session::create(
+                &pool,
+                UserId(s.data.user),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap()
+            .0;
         }
         let mut stream = s.stream(None).await;
         assert_eq!(&next(&mut stream).await[..], b"retry: 3000\n\n");

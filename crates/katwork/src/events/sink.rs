@@ -50,6 +50,10 @@ impl PgEventSink {
 
 #[async_trait]
 impl EventSink for PgEventSink {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "The worker drains event-sink SQL on cancellation and shutdown"
+    )]
     async fn emit(&self, event: AgUiEvent) -> Result<EventSeq, KatError> {
         if matches!(
             event,
@@ -75,6 +79,10 @@ impl EventSink for PgEventSink {
         Ok(seq)
     }
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "The worker drains event-sink SQL on cancellation and shutdown"
+    )]
     async fn close_run(&self, end: RunEnd, code: &str) -> Result<EventSeq, KatError> {
         let run = self.run_id.ok_or(KatError::RequestInvalid)?;
         let fence = self.fence.as_ref().ok_or(KatError::RequestInvalid)?;
