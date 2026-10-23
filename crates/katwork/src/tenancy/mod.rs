@@ -1,3 +1,4 @@
+pub mod members;
 pub mod space;
 pub mod workspace;
 

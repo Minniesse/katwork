@@ -3,6 +3,7 @@ pub mod events;
 pub mod health;
 pub mod jobs;
 pub mod kats;
+pub mod members;
 pub mod teams;
 pub mod threads;
 pub mod workspaces;

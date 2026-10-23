@@ -41,7 +41,12 @@ impl IntoResponse for ApiError {
             | KatError::InviteTokenInvalid
             | KatError::PasswordInvalid
             | KatError::RequestInvalid => StatusCode::BAD_REQUEST,
-            KatError::UserExists | KatError::WorkspaceAmbiguous => StatusCode::CONFLICT,
+            KatError::UserExists | KatError::WorkspaceAmbiguous | KatError::MemberExists => {
+                StatusCode::CONFLICT
+            }
+            KatError::LastOwnerRequired | KatError::SmtpUnconfigured => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
             KatError::RateLimited { retry_after_secs } => {
                 return (
                     StatusCode::TOO_MANY_REQUESTS,

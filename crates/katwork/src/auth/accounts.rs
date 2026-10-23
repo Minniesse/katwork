@@ -37,10 +37,27 @@ pub async fn ensure_user(
     email: &str,
     locale: Locale,
 ) -> Result<EnsuredUser, KatError> {
+    let hash = unusable_password_hash().await?;
+    ensure_user_with_hash(conn, email, locale, hash).await
+}
+
+/// The Argon2id hash of 32 random bytes nobody ever sees. It can wait for a hash slot, so a
+/// caller that holds row locks computes it before taking them.
+pub async fn unusable_password_hash() -> Result<String, KatError> {
+    let unknown = random_token()?;
+    password::run(move || password::hash(&unknown)).await?
+}
+
+/// `ensure_user` with the new account's password hash computed by the caller, from
+/// [`unusable_password_hash`].
+pub async fn ensure_user_with_hash(
+    conn: &mut PgConnection,
+    email: &str,
+    locale: Locale,
+    hash: String,
+) -> Result<EnsuredUser, KatError> {
     let email = normalize_email(email)?;
     let display_name = email.split('@').next().unwrap_or_default().to_owned();
-    let unknown = random_token()?;
-    let hash = password::run(move || password::hash(&unknown)).await??;
     // A concurrent insert of the same email makes this one wait, then do nothing; the select
     // that follows is a new statement and sees the committed row.
     let inserted: Option<UserId> = sqlx::query_scalar("INSERT INTO users (id, email, password_hash, display_name, locale) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING RETURNING id")

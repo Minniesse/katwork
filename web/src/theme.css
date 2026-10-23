@@ -29,6 +29,12 @@
   --kat-c: #ffe08a;
   --kat-d: #5b8cff;
   --kat-e: #c9d8ff;
+  /* Task 5's Kat accent palette: decorative rings only, never text or a text background. */
+  --accent-blue: #3b6fe0;
+  --accent-yellow: #f2b705;
+  --accent-red: #d94a3d;
+  --accent-green: #2e9e62;
+  --accent-purple: #8458d6;
   --shadow: 0 1px 2px rgb(18 28 61 / 8%), 0 8px 24px rgb(18 28 61 / 8%);
 }
 
@@ -57,6 +63,11 @@
   --kat-c: #ffe08a;
   --kat-d: #8fb0ff;
   --kat-e: #34478f;
+  --accent-blue: #7aa2ff;
+  --accent-yellow: #ffd45c;
+  --accent-red: #ff8a7a;
+  --accent-green: #5fd497;
+  --accent-purple: #b69bff;
   --shadow: 0 1px 2px rgb(0 0 0 / 30%), 0 8px 24px rgb(0 0 0 / 30%);
   color-scheme: dark;
 }

@@ -62,6 +62,17 @@ export function t(key: string, vars?: Vars): string {
   );
 }
 
+/**
+ * A message that depends on a count: `{key}.{plural category}` (`one`, `other`, …) for the
+ * current locale, falling back to `{key}.other`, with `{count}` filled. English says "1 earlier
+ * message", Thai has one form.
+ */
+export function tPlural(key: string, count: number, vars?: Vars): string {
+  const category = new Intl.PluralRules(current === 'th' ? 'th-TH' : 'en-GB').select(count);
+  const variant = `${key}.${category}`;
+  return t(hasMessage(variant) ? variant : `${key}.other`, { ...vars, count });
+}
+
 /** Gregorian by default (UI chrome); pass `calendar: 'buddhist'` where a template asks for the Buddhist Era. */
 export function formatDate(
   date: Date | string | number,
@@ -70,6 +81,28 @@ export function formatDate(
   const tag = current === 'th' ? 'th-TH' : 'en-GB';
   return new Intl.DateTimeFormat(`${tag}-u-ca-${options.calendar ?? 'gregory'}`, {
     dateStyle: 'long',
+    timeZone: options.timeZone,
+  }).format(new Date(date));
+}
+
+/** A time of day for the UI chrome, such as when a message was sent. */
+export function formatTime(date: Date | string | number, options: { timeZone?: string } = {}): string {
+  const tag = current === 'th' ? 'th-TH' : 'en-GB';
+  return new Intl.DateTimeFormat(`${tag}-u-ca-gregory`, {
+    timeStyle: 'short',
+    timeZone: options.timeZone,
+  }).format(new Date(date));
+}
+
+/** A date and time for the UI chrome, such as when an untitled conversation started. */
+export function formatDateTime(
+  date: Date | string | number,
+  options: { timeZone?: string } = {},
+): string {
+  const tag = current === 'th' ? 'th-TH' : 'en-GB';
+  return new Intl.DateTimeFormat(`${tag}-u-ca-gregory`, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
     timeZone: options.timeZone,
   }).format(new Date(date));
 }

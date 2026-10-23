@@ -7,6 +7,9 @@ license.workspace = true
 
 [features]
 smoke-fixtures = []
+# Test seams that must never reach a production build. Only katwork-server's dev-dependency
+# turns this on, so a release binary cannot call them.
+test-support = []
 
 [dependencies]
 jsonschema.workspace = true
