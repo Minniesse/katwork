@@ -28,6 +28,9 @@ export function App() {
   useLocale();
   const location = useLocation();
   const [session, setSession] = useState<Session>({ state: 'checking' });
+  // Bumped to ask the server again who is signed in.
+  const [sessionCheck, setSessionCheck] = useState(0);
+  const [signOutProblem, setSignOutProblem] = useState<{ error: unknown } | null>(null);
   const token = resetToken(location);
 
   useEffect(() => {
@@ -39,7 +42,7 @@ export function App() {
     return () => {
       live = false;
     };
-  }, []);
+  }, [sessionCheck]);
 
   const tokenInUrl = location.pathname === '/reset' && location.searchParams.has('token');
   useEffect(() => {
@@ -57,16 +60,31 @@ export function App() {
   }, [path, signedIn, signedOut]);
 
   const signOut = async () => {
+    setSignOutProblem(null);
     try {
       await api.logout();
-    } finally {
-      setSession({ state: 'signed_out' });
-      navigate('/login');
+    } catch (error) {
+      // The server clears the cookie only after it revokes the session, so the person is
+      // still signed in: say so, and leave the button there to try again.
+      setSignOutProblem({ error });
+      return;
     }
+    setSession({ state: 'signed_out' });
+    navigate('/login');
+  };
+
+  // A reset revokes every session of the account it was for, which may be this one.
+  const recheckSession = () => {
+    setSession({ state: 'checking' });
+    setSessionCheck((n) => n + 1);
   };
 
   if (path === '/reset') {
-    return token ? <ResetConfirm key={token} token={token} /> : <ResetRequest />;
+    return token ? (
+      <ResetConfirm key={token} token={token} onReset={recheckSession} />
+    ) : (
+      <ResetRequest />
+    );
   }
   if (session.state === 'checking') {
     return <div className="loading" aria-busy="true" />;
@@ -82,7 +100,7 @@ export function App() {
     );
   }
   if (!signedIn) return null;
-  if (path === '/') return <Home onSignOut={signOut} />;
+  if (path === '/') return <Home onSignOut={signOut} signOutProblem={signOutProblem} />;
   // TODO(13b): routes for the Team and Chat pages.
   return <NotFound />;
 }

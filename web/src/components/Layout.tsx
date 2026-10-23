@@ -1,4 +1,5 @@
 import { useEffect, useRef, type ReactNode } from 'react';
+import { errorMessage } from '../api';
 import { t, useLocale } from '../i18n';
 import { navigationCount } from '../router';
 import { Preferences } from './Preferences';
@@ -76,8 +77,19 @@ export function AuthLayout({ children }: { children: ReactNode }) {
   );
 }
 
-/** Signed-in pages: a header with the brand, preferences and sign-out. */
-export function AppLayout({ children, onSignOut }: { children: ReactNode; onSignOut: () => void }) {
+/**
+ * Signed-in pages: a header with the brand, preferences and sign-out, and an alert above the
+ * page when signing out failed.
+ */
+export function AppLayout({
+  children,
+  onSignOut,
+  signOutProblem,
+}: {
+  children: ReactNode;
+  onSignOut: () => void;
+  signOutProblem: { error: unknown } | null;
+}) {
   useLocale();
   return (
     <div className="shell">
@@ -92,6 +104,12 @@ export function AppLayout({ children, onSignOut }: { children: ReactNode; onSign
         </nav>
       </header>
       <main id="main" className="shell-main">
+        {signOutProblem && (
+          <div className="alert" role="alert">
+            <p>{t('nav.sign_out_failed')}</p>
+            <p>{errorMessage(signOutProblem.error)}</p>
+          </div>
+        )}
         {children}
       </main>
     </div>

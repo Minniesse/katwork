@@ -11,7 +11,8 @@ const MAX_BYTES = 1024;
 
 type Problem = { kind: 'api'; error: unknown } | { kind: 'mismatch' };
 
-export function ResetConfirm({ token }: { token: string }) {
+/** `onReset` runs after the server accepts the new password and revokes the account's sessions. */
+export function ResetConfirm({ token, onReset }: { token: string; onReset: () => void }) {
   useLocale();
   const id = useId();
   const [password, setPassword] = useState('');
@@ -36,6 +37,7 @@ export function ResetConfirm({ token }: { token: string }) {
     try {
       await api.confirmReset(token, password);
       setDone(true);
+      onReset();
     } catch (failure) {
       setProblem({ kind: 'api', error: failure });
     } finally {

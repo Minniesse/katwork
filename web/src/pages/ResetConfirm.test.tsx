@@ -16,10 +16,12 @@ async function choose(password: string, again = password) {
 
 test('reset_confirm_sends_token_and_new_password', async () => {
   const fetchMock = stubFetch([200, {}]);
-  render(<ResetConfirm token="token-from-link" />);
+  const onReset = vi.fn();
+  render(<ResetConfirm token="token-from-link" onReset={onReset} />);
   await choose('a new long password');
 
   expect(await screen.findByRole('status')).toHaveTextContent(en['reset.confirm.done']);
+  expect(onReset).toHaveBeenCalledOnce();
   expect(screen.getByRole('link', { name: en['reset.back_to_login'] })).toHaveAttribute(
     'href',
     '/login',
@@ -33,9 +35,11 @@ test('reset_confirm_sends_token_and_new_password', async () => {
 
 test('reset_confirm_explains_an_invalid_or_used_link', async () => {
   stubFetch([400, { code: 'reset_token_invalid' }]);
-  render(<ResetConfirm token="used-token" />);
+  const onReset = vi.fn();
+  render(<ResetConfirm token="used-token" onReset={onReset} />);
   await choose('a new long password');
   expect(await screen.findByRole('alert')).toHaveTextContent(en['reason.reset_token_invalid']);
+  expect(onReset).not.toHaveBeenCalled();
   expect(screen.getByRole('link', { name: en['reset.request_again'] })).toHaveAttribute(
     'href',
     '/reset',
@@ -44,7 +48,7 @@ test('reset_confirm_explains_an_invalid_or_used_link', async () => {
 
 test('reset_confirm_checks_length_before_sending', async () => {
   const fetchMock = stubFetch([200, {}]);
-  render(<ResetConfirm token="t" />);
+  render(<ResetConfirm token="t" onReset={() => {}} />);
   await choose('short');
   expect(await screen.findByRole('alert')).toHaveTextContent(en['reason.password_invalid']);
   expect(fetchMock).not.toHaveBeenCalled();
@@ -52,7 +56,7 @@ test('reset_confirm_checks_length_before_sending', async () => {
 
 test('reset_confirm_rejects_mismatched_passwords', async () => {
   const fetchMock = stubFetch([200, {}]);
-  render(<ResetConfirm token="t" />);
+  render(<ResetConfirm token="t" onReset={() => {}} />);
   await choose('a new long password', 'a different password');
   expect(await screen.findByRole('alert')).toHaveTextContent(en['reset.confirm.mismatch']);
   expect(fetchMock).not.toHaveBeenCalled();

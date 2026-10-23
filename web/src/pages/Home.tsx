@@ -2,10 +2,16 @@ import { AppLayout, DotCluster, PageTitle } from '../components/Layout';
 import { formatDate, t, useLocale } from '../i18n';
 
 /** The signed-in landing page. Team and Chat arrive in Task 13b. */
-export function Home({ onSignOut }: { onSignOut: () => void }) {
+export function Home({
+  onSignOut,
+  signOutProblem,
+}: {
+  onSignOut: () => void;
+  signOutProblem: { error: unknown } | null;
+}) {
   useLocale();
   return (
-    <AppLayout onSignOut={onSignOut}>
+    <AppLayout onSignOut={onSignOut} signOutProblem={signOutProblem}>
       <div className="home-intro">
         <PageTitle>{t('home.title')}</PageTitle>
         <p className="home-date">{t('home.today', { date: formatDate(new Date()) })}</p>

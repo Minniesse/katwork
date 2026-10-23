@@ -468,6 +468,10 @@ h2 {
   padding: 3rem 2.5rem;
 }
 
+.shell-main > .alert {
+  margin-bottom: 2rem;
+}
+
 .home-intro {
   display: grid;
   gap: 0.75rem;

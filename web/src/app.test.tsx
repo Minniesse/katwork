@@ -51,6 +51,35 @@ test('sign_out_returns_to_login', async () => {
   expect(fetchMock.mock.calls[1]![1]?.method).toBe('POST');
 });
 
+test('failed_sign_out_keeps_the_session_and_can_be_retried', async () => {
+  const fetchMock = stubFetch(
+    [200, { user_id: 'user-1' }],
+    [503, { code: 'database_unavailable' }],
+    [200, {}],
+  );
+  const user = userEvent.setup({ delay: null });
+  render(<App />);
+  await user.click(await screen.findByRole('button', { name: en['nav.sign_out'] }));
+
+  // The server clears the cookie only after it revokes the session, so nothing may suggest
+  // the person is signed out.
+  const alert = await screen.findByRole('alert');
+  expect(alert).toHaveTextContent(en['nav.sign_out_failed']);
+  expect(alert).toHaveTextContent(en['reason.database_unavailable']);
+  expect(screen.getByRole('heading', { level: 1, name: en['home.title'] })).toBeVisible();
+  expect(screen.queryByRole('heading', { name: en['login.title'] })).toBeNull();
+  expect(window.location.pathname).toBe('/');
+
+  await user.click(screen.getByRole('button', { name: en['nav.sign_out'] }));
+  expect(await screen.findByRole('heading', { level: 1, name: en['login.title'] })).toBeVisible();
+  expect(screen.queryByRole('alert')).toBeNull();
+  expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+    '/api/auth/me',
+    '/api/auth/logout',
+    '/api/auth/logout',
+  ]);
+});
+
 test('reset_link_opens_confirm_and_hides_token_from_address_bar', async () => {
   window.history.replaceState(null, '', '/reset?token=abc123');
   stubFetch([401, { code: 'unauthenticated' }]);
@@ -74,6 +103,30 @@ test('request_again_link_from_a_used_reset_link_opens_the_request_form', async (
   expect(
     await screen.findByRole('heading', { level: 1, name: en['reset.request.title'] }),
   ).toBeVisible();
+});
+
+test('reset_while_signed_in_rechecks_the_session_before_sign_in', async () => {
+  window.history.replaceState(null, '', '/reset?token=abc123');
+  // Signed in when the link opens; the reset revokes every session, so the re-check is 401.
+  const fetchMock = stubFetch(
+    [200, { user_id: 'user-1' }],
+    [200, {}],
+    [401, { code: 'unauthenticated' }],
+  );
+  const user = userEvent.setup({ delay: null });
+  render(<App />);
+  await user.type(await screen.findByLabelText(en['reset.confirm.password']), 'a new long password');
+  await user.type(screen.getByLabelText(en['reset.confirm.again']), 'a new long password');
+  await user.click(screen.getByRole('button', { name: en['reset.confirm.submit'] }));
+  await user.click(await screen.findByRole('link', { name: en['reset.back_to_login'] }));
+
+  expect(await screen.findByRole('heading', { level: 1, name: en['login.title'] })).toBeVisible();
+  expect(window.location.pathname).toBe('/login');
+  expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+    '/api/auth/me',
+    '/api/auth/reset/confirm',
+    '/api/auth/me',
+  ]);
 });
 
 test('reset_without_token_opens_the_request_form', async () => {
