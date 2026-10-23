@@ -7,23 +7,9 @@ import { InviteAccept } from './pages/InviteAccept';
 import { Login } from './pages/Login';
 import { ResetConfirm } from './pages/ResetConfirm';
 import { ResetRequest } from './pages/ResetRequest';
-import { Link, navigate, useLocation } from './router';
+import { Link, navigate, useLinkToken, useLocation } from './router';
 
 type Session = { state: 'checking' } | { state: 'signed_out' } | { state: 'signed_in'; user: AuthUser };
-
-/**
- * The token from an emailed `/reset?token=…` link. Once read it moves from the URL into the
- * history entry's state, so it stays out of the address bar and any later Referer, survives
- * a reload, and is gone as soon as the person navigates anywhere else.
- */
-function resetToken(location: URL): string | null {
-  if (location.pathname !== '/reset') return null;
-  const fromLink = location.searchParams.get('token');
-  if (fromLink) return fromLink;
-  const state: unknown = window.history.state;
-  const saved = (state as { resetToken?: unknown } | null)?.resetToken;
-  return typeof saved === 'string' && saved ? saved : null;
-}
 
 export function App() {
   useLocale();
@@ -32,7 +18,8 @@ export function App() {
   // Bumped to ask the server again who is signed in.
   const [sessionCheck, setSessionCheck] = useState(0);
   const [signOutProblem, setSignOutProblem] = useState<{ error: unknown } | null>(null);
-  const token = resetToken(location);
+  // The token from an emailed or printed `/reset?token=…` link, held in memory only: see useLinkToken.
+  const token = useLinkToken('/reset');
 
   useEffect(() => {
     let live = true;
@@ -44,11 +31,6 @@ export function App() {
       live = false;
     };
   }, [sessionCheck]);
-
-  const tokenInUrl = location.pathname === '/reset' && location.searchParams.has('token');
-  useEffect(() => {
-    if (tokenInUrl) navigate('/reset', { replace: true, state: { resetToken: token } });
-  }, [tokenInUrl, token]);
 
   const path = location.pathname;
   const signedIn = session.state === 'signed_in';

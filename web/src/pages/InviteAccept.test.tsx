@@ -33,6 +33,8 @@ test('invite_accept_sets_a_password_and_hides_the_token', async () => {
   expect(window.location.pathname).toBe('/invite');
   expect(window.location.search).toBe('');
   expect(window.location.href).not.toContain('token-from-link');
+  // The token lives only in the page's memory, never in the history entry.
+  expect(window.history.state).toBeNull();
 
   await choose(en, 'a new long password');
   expect(await screen.findByRole('status')).toHaveTextContent(en['invite.done']);
@@ -51,22 +53,20 @@ test('invite_accept_sets_a_password_and_hides_the_token', async () => {
   expect(window.location.href).not.toContain('token-from-link');
 });
 
-test('invite_accept_keeps_the_token_across_a_reload', async () => {
+test('invite_token_is_not_kept_for_a_reload', async () => {
   window.history.replaceState(null, '', '/invite?token=token-from-link');
   const fetchMock = stubFetch([204]);
   const first = render(<InviteAccept />);
   await screen.findByRole('heading', { level: 1, name: en['invite.title'] });
   expect(window.location.search).toBe('');
+  expect(window.history.state).toBeNull();
   first.unmount();
 
-  // A reload keeps the history entry's state but not the query string.
+  // A reload starts again from this history entry, and nothing in it holds the token.
   render(<InviteAccept />);
-  await choose(en, 'a new long password');
-  expect(await screen.findByRole('status')).toHaveTextContent(en['invite.done']);
-  expect(sentJson(fetchMock)).toEqual({
-    token: 'token-from-link',
-    new_password: 'a new long password',
-  });
+  expect(await screen.findByRole('alert')).toHaveTextContent(en['invite.no_token']);
+  expect(screen.queryByRole('button', { name: en['invite.submit'] })).toBeNull();
+  expect(fetchMock).not.toHaveBeenCalled();
 });
 
 test.each(['en', 'th'] as const)(
@@ -95,7 +95,7 @@ test('invite_without_token_explains_the_link_is_incomplete', async () => {
   window.history.replaceState(null, '', '/invite');
   const fetchMock = stubFetch([204]);
   render(<InviteAccept />);
-  expect(await screen.findByRole('alert')).toHaveTextContent(en['reason.invite_token_invalid']);
+  expect(await screen.findByRole('alert')).toHaveTextContent(en['invite.no_token']);
   expect(screen.queryByRole('button', { name: en['invite.submit'] })).toBeNull();
   expect(screen.getByRole('link', { name: en['invite.use_reset'] })).toHaveAttribute(
     'href',

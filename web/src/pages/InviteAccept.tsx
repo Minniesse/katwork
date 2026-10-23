@@ -1,9 +1,9 @@
-import { useEffect, useId, useState, type FormEvent } from 'react';
+import { useId, useState, type FormEvent } from 'react';
 import { ApiError, api, errorMessage } from '../api';
 import { Announce } from '../components/Announce';
 import { AuthLayout, PageTitle } from '../components/Layout';
 import { t, useLocale } from '../i18n';
-import { Link, navigate, useLocation } from '../router';
+import { Link, useLinkToken } from '../router';
 
 // Matches katwork::auth::password: at least 8 characters, at most 1024 bytes.
 const MIN_CHARS = 8;
@@ -11,35 +11,17 @@ const MAX_BYTES = 1024;
 
 type Problem = { kind: 'api'; error: unknown } | { kind: 'mismatch' };
 
-/**
- * The token from a `/invite?token=…` link. Once read it moves from the URL into the history
- * entry's state, as a reset token does, so it stays out of the address bar and any later
- * Referer, survives a reload, and is gone as soon as the person navigates anywhere else.
- */
-function inviteToken(location: URL): string | null {
-  const fromLink = location.searchParams.get('token');
-  if (fromLink) return fromLink;
-  const state: unknown = window.history.state;
-  const saved = (state as { inviteToken?: unknown } | null)?.inviteToken;
-  return typeof saved === 'string' && saved ? saved : null;
-}
-
 /** Where an invite link lands: the invited person chooses their first password. */
 export function InviteAccept({ onAccepted }: { onAccepted?: () => void }) {
   useLocale();
-  const location = useLocation();
-  const token = inviteToken(location);
+  // Held in memory only: see useLinkToken.
+  const token = useLinkToken('/invite');
   const id = useId();
   const [password, setPassword] = useState('');
   const [again, setAgain] = useState('');
   const [problem, setProblem] = useState<Problem | null>(null);
   const [done, setDone] = useState(false);
   const [busy, setBusy] = useState(false);
-
-  const tokenInUrl = location.searchParams.has('token');
-  useEffect(() => {
-    if (tokenInUrl) navigate('/invite', { replace: true, state: { inviteToken: token } });
-  }, [tokenInUrl, token]);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -92,7 +74,7 @@ export function InviteAccept({ onAccepted }: { onAccepted?: () => void }) {
     <div id={errorId} className="alert" role="alert">
       <p>
         {!token
-          ? t('reason.invite_token_invalid')
+          ? t('invite.no_token')
           : problem?.kind === 'mismatch'
             ? t('invite.mismatch')
             : errorMessage(problem?.error)}
