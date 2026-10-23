@@ -15,7 +15,7 @@ Many self-hosted installs start without a mail relay. Password reset needs SMTP:
 - Workspace owners and admins use a Members page to invite by email (which needs SMTP) or by a link they copy, and to change roles. Only an owner grants or changes the owner role, and the last owner cannot be demoted.
 - Invite links are their own token kind, valid 72 hours and single use, with their own accept route. A reset token never works as an invite, and an invite token never works as a reset.
 - The web issues a link only for an account that the invite itself created. Inviting an email that already has an account adds the membership and nothing else.
-- A link appears only on the command's stdout or in the invite response, and never in a log.
+- A link appears only on the command's stdout or in the invite response, and KatWork never writes one to a log. The command's stdout is the operator's to keep out of logs: Docker's logging driver keeps the stdout of a container started with `docker compose run`, so the README runs the commands with `docker compose exec`, whose output goes only to the terminal.
 
 ## Consequences
 
