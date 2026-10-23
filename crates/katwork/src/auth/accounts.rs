@@ -117,6 +117,7 @@ pub async fn create_user(
     link_base: &str,
 ) -> Result<String, KatError> {
     let email = normalize_email(email)?;
+    let hash = unusable_password_hash().await?;
     crate::db::guarded(pool, async |conn| {
         let mut tx = conn.begin().await?;
         crate::db::set_configured_lock_timeout(&mut tx).await?;
@@ -174,7 +175,7 @@ pub async fn create_user(
                 }
             }
         };
-        let user = ensure_user(&mut tx, &email, locale).await?;
+        let user = ensure_user_with_hash(&mut tx, &email, locale, hash).await?;
         if !user.created {
             return Err(KatError::UserExists);
         }

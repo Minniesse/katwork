@@ -110,20 +110,13 @@ pub async fn seed_demo(
         .unwrap_or_else(random_token)?;
     let candidate = password.clone();
     let hash = password::run(move || password::hash(&candidate)).await??;
-    crate::db::guarded(pool, async |conn| {
-        let mut tx = conn.begin().await?;
-        crate::db::set_lock_timeout(&mut tx, config.lock_timeout).await?;
-        // A transaction-scoped lock makes concurrent seed commands idempotent before a user exists.
-        sqlx::query("SELECT pg_advisory_xact_lock(3000003)")
-            .execute(&mut *tx)
-            .await?;
-        let existing: Option<(UserId, String)> = sqlx::query_as(
-            "SELECT id, password_hash FROM users WHERE email = 'demo@katwork.local' FOR NO KEY UPDATE",
+    for _ in 0..2 {
+        let observed: Option<(UserId, String)> = sqlx::query_as(
+            "SELECT id, password_hash FROM users WHERE email = 'demo@katwork.local'",
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(pool)
         .await?;
-        let user_id = existing.as_ref().map(|(id, _)| *id).unwrap_or_default();
-        let changed = match (&existing, &config.demo_password) {
+        let changed = match (&observed, &config.demo_password) {
             (Some(_), _) if reset_password => true,
             // The operator changed KATWORK_DEMO_PASSWORD: apply it, as a reset would.
             (Some((_, stored)), Some(chosen)) => {
@@ -132,65 +125,87 @@ pub async fn seed_demo(
             }
             _ => false,
         };
-        if existing.is_none() {
-            sqlx::query("INSERT INTO users (id, email, password_hash, display_name, locale) VALUES ($1, 'demo@katwork.local', $2, 'Demo', 'en')")
-                .bind(user_id).bind(&hash).execute(&mut *tx).await?;
-        } else if changed {
-            sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
-                .bind(user_id)
-                .bind(&hash)
+        let completed = crate::db::guarded(pool, async |conn| {
+            let mut tx = conn.begin().await?;
+            crate::db::set_lock_timeout(&mut tx, config.lock_timeout).await?;
+            // A transaction-scoped lock makes concurrent seed commands idempotent before a user exists.
+            sqlx::query("SELECT pg_advisory_xact_lock(3000003)")
                 .execute(&mut *tx)
                 .await?;
-            reset::revoke_credentials(&mut tx, user_id).await?;
-        }
-        let mut seeded = Vec::new();
-        for (name, space, locale) in DEMO_WORKSPACES {
-            let workspace: Option<WorkspaceId> = sqlx::query_scalar("SELECT w.id FROM workspaces w JOIN memberships m ON m.workspace_id = w.id WHERE m.user_id = $1 AND w.name = $2 ORDER BY w.id LIMIT 1")
-                .bind(user_id).bind(name).fetch_optional(&mut *tx).await?;
-            let workspace_id = workspace.unwrap_or_default();
-            if workspace.is_none() {
-                sqlx::query("INSERT INTO workspaces (id, name) VALUES ($1, $2)")
-                    .bind(workspace_id)
-                    .bind(name)
+            let existing: Option<(UserId, String)> = sqlx::query_as(
+                "SELECT id, password_hash FROM users WHERE email = 'demo@katwork.local' FOR NO KEY UPDATE",
+            )
+            .fetch_optional(&mut *tx)
+            .await?;
+            if existing != observed {
+                // Retry verification after releasing the transaction if the account changed.
+                return Ok(None);
+            }
+            let user_id = existing.as_ref().map(|(id, _)| *id).unwrap_or_default();
+            if existing.is_none() {
+                sqlx::query("INSERT INTO users (id, email, password_hash, display_name, locale) VALUES ($1, 'demo@katwork.local', $2, 'Demo', 'en')")
+                    .bind(user_id).bind(&hash).execute(&mut *tx).await?;
+            } else if changed {
+                sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+                    .bind(user_id)
+                    .bind(&hash)
                     .execute(&mut *tx)
                     .await?;
-                sqlx::query(
-                    "INSERT INTO memberships (workspace_id, user_id, role) VALUES ($1, $2, 'owner')",
+                reset::revoke_credentials(&mut tx, user_id).await?;
+            }
+            let mut seeded = Vec::new();
+            for (name, space, locale) in DEMO_WORKSPACES {
+                let workspace: Option<WorkspaceId> = sqlx::query_scalar("SELECT w.id FROM workspaces w JOIN memberships m ON m.workspace_id = w.id WHERE m.user_id = $1 AND w.name = $2 ORDER BY w.id LIMIT 1")
+                    .bind(user_id).bind(name).fetch_optional(&mut *tx).await?;
+                let workspace_id = workspace.unwrap_or_default();
+                if workspace.is_none() {
+                    sqlx::query("INSERT INTO workspaces (id, name) VALUES ($1, $2)")
+                        .bind(workspace_id)
+                        .bind(name)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query(
+                        "INSERT INTO memberships (workspace_id, user_id, role) VALUES ($1, $2, 'owner')",
+                    )
+                    .bind(workspace_id)
+                    .bind(user_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                sqlx::query("INSERT INTO spaces (id, workspace_id, name, allow_external) SELECT $1, $2, $3, true WHERE NOT EXISTS (SELECT 1 FROM spaces WHERE workspace_id = $2 AND name = $3)")
+                    .bind(SpaceId::new()).bind(workspace_id).bind(space).execute(&mut *tx).await?;
+                seeded.push((workspace_id, space, locale));
+            }
+            // Lock order: both workspace rows, in ascending id, before either roster is written.
+            let mut locked: Vec<_> = seeded.iter().map(|(id, ..)| id.0).collect();
+            locked.sort();
+            for id in locked {
+                sqlx::query("SELECT id FROM workspaces WHERE id = $1 FOR NO KEY UPDATE")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            for (workspace_id, space, locale) in seeded {
+                let tenant = crate::tenancy::resolve(&mut *tx, user_id, workspace_id).await?;
+                let space_id = sqlx::query_scalar(
+                    "SELECT id FROM spaces WHERE workspace_id=$1 AND name=$2 ORDER BY id LIMIT 1",
                 )
                 .bind(workspace_id)
-                .bind(user_id)
-                .execute(&mut *tx)
+                .bind(space)
+                .fetch_one(&mut *tx)
                 .await?;
+                crate::team::team::create_default_on(&mut tx, &tenant, space_id, locale).await?;
             }
-            sqlx::query("INSERT INTO spaces (id, workspace_id, name, allow_external) SELECT $1, $2, $3, true WHERE NOT EXISTS (SELECT 1 FROM spaces WHERE workspace_id = $2 AND name = $3)")
-                .bind(SpaceId::new()).bind(workspace_id).bind(space).execute(&mut *tx).await?;
-            seeded.push((workspace_id, space, locale));
+            tx.commit().await?;
+            Ok(Some(
+                (reset_password || (existing.is_none() && config.demo_password.is_none()))
+                    .then(|| password.clone()),
+            ))
+        })
+        .await?;
+        if let Some(result) = completed {
+            return Ok(result);
         }
-        // Lock order: both workspace rows, in ascending id, before either roster is written.
-        let mut locked: Vec<_> = seeded.iter().map(|(id, ..)| id.0).collect();
-        locked.sort();
-        for id in locked {
-            sqlx::query("SELECT id FROM workspaces WHERE id = $1 FOR NO KEY UPDATE")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-        }
-        for (workspace_id, space, locale) in seeded {
-            let tenant = crate::tenancy::resolve(&mut *tx, user_id, workspace_id).await?;
-            let space_id = sqlx::query_scalar(
-                "SELECT id FROM spaces WHERE workspace_id=$1 AND name=$2 ORDER BY id LIMIT 1",
-            )
-            .bind(workspace_id)
-            .bind(space)
-            .fetch_one(&mut *tx)
-            .await?;
-            crate::team::team::create_default_on(&mut tx, &tenant, space_id, locale).await?;
-        }
-        tx.commit().await?;
-        Ok(
-            (reset_password || (existing.is_none() && config.demo_password.is_none()))
-                .then_some(password),
-        )
-    })
-    .await
+    }
+    Err(KatError::Busy)
 }
