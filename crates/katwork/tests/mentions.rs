@@ -188,6 +188,28 @@ fn mentions_mixed_thai_marks_keep_the_literal_recipient() {
 }
 
 #[test]
+fn mentions_mixed_thai_marks_share_one_fixed_point() {
+    for spellings in [
+        [
+            "ก\u{0e38}\u{0e31}\u{3099}\u{0e31}",
+            "ก\u{0e31}\u{3099}\u{0e38}\u{0e31}",
+            "ก\u{0e31}\u{3099}\u{0e31}\u{0e38}",
+        ],
+        [
+            "ก\u{0e38}\u{0e34}\u{3099}\u{0e34}",
+            "ก\u{0e34}\u{3099}\u{0e38}\u{0e34}",
+            "ก\u{0e34}\u{3099}\u{0e34}\u{0e38}",
+        ],
+    ] {
+        for name in spellings {
+            for spelling in spellings {
+                check(&format!("@{spelling}"), &[name], &[0]);
+            }
+        }
+    }
+}
+
+#[test]
 fn mentions_survive_long_compatibility_hangul_tails() {
     for jamo in ['ㅋ', 'ㅎ', 'ㅠ'] {
         check(
