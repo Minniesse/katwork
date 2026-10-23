@@ -17,20 +17,23 @@ pub async fn create(
     if title.chars().any(char::is_control) || title.trim().chars().count() > 120 {
         return Err(KatError::ThreadTitleInvalid);
     }
-    sqlx::query_as(
-        "INSERT INTO threads (id, workspace_id, space_id, team_id, title)
+    crate::db::guarded(pool, async |conn| {
+        sqlx::query_as(
+            "INSERT INTO threads (id, workspace_id, space_id, team_id, title)
         SELECT $1, workspace_id, space_id, id, $5 FROM teams
         WHERE workspace_id=$2 AND space_id=$3 AND id=$4
         RETURNING id, space_id, team_id, title",
-    )
-    .bind(ThreadId::new())
-    .bind(tenant.workspace_id())
-    .bind(space)
-    .bind(team)
-    .bind(title.trim())
-    .fetch_optional(pool)
-    .await?
-    .ok_or(KatError::NotFound)
+        )
+        .bind(ThreadId::new())
+        .bind(tenant.workspace_id())
+        .bind(space)
+        .bind(team)
+        .bind(title.trim())
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or(KatError::NotFound)
+    })
+    .await
 }
 
 pub async fn get(pool: &PgPool, tenant: &Tenant, id: ThreadId) -> Result<Thread, KatError> {

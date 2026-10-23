@@ -1,6 +1,6 @@
 use std::fmt;
 
-use sqlx::{PgConnection, PgPool};
+use sqlx::{Connection, PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::{AuthUser, random_token, token_hash, valid_token};
@@ -15,14 +15,18 @@ impl fmt::Debug for SessionToken {
 }
 
 pub async fn create(pool: &PgPool, user_id: UserId) -> Result<SessionToken, KatError> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE")
-        .bind(user_id)
-        .fetch_one(&mut *tx)
-        .await?;
-    let token = create_on(&mut tx, user_id).await?;
-    tx.commit().await?;
-    Ok(token)
+    crate::db::guarded(pool, async |conn| {
+        let mut tx = conn.begin().await?;
+        crate::db::set_configured_lock_timeout(&mut tx).await?;
+        sqlx::query("SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let token = create_on(&mut tx, user_id).await?;
+        tx.commit().await?;
+        Ok(token)
+    })
+    .await
 }
 
 pub(super) async fn create_on(
@@ -45,9 +49,13 @@ pub async fn authenticate(pool: &PgPool, token: &str) -> Result<AuthUser, KatErr
 }
 
 pub async fn revoke(pool: &PgPool, token: &str) -> Result<(), KatError> {
-    if valid_token(token) {
-        sqlx::query("UPDATE sessions SET revoked_at = clock_timestamp() WHERE token_sha256 = $1 AND revoked_at IS NULL")
-            .bind(token_hash(token)).execute(pool).await?;
+    if !valid_token(token) {
+        return Ok(());
     }
-    Ok(())
+    crate::db::guarded(pool, async |conn| {
+        sqlx::query("UPDATE sessions SET revoked_at = clock_timestamp() WHERE token_sha256 = $1 AND revoked_at IS NULL")
+            .bind(token_hash(token)).execute(&mut *conn).await?;
+        Ok(())
+    })
+    .await
 }

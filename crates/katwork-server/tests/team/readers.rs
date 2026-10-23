@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
 use super::*;
 use katwork::{
     ids::{KatId, SpaceId, TeamId, UserId, WorkspaceId},
@@ -22,7 +26,15 @@ async fn connection_readers_filter_workspace_status_membership_and_grants(pool: 
         .map(|kat| serde_json::from_value(kat["id"].clone()).unwrap())
         .collect();
     for id in &ids {
-        kat::grant_space(&pool, &tenant, *id, second).await.unwrap();
+        kat::grant_space(
+            &pool,
+            &tenant,
+            *id,
+            second,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
     }
     let team_id = team::create(
         &pool,
@@ -33,6 +45,7 @@ async fn connection_readers_filter_workspace_status_membership_and_grants(pool: 
             lead: ids[0],
             members: ids[1..].to_vec(),
         },
+        std::time::Duration::from_secs(5),
     )
     .await
     .unwrap();
@@ -46,9 +59,15 @@ async fn connection_readers_filter_workspace_status_membership_and_grants(pool: 
         .status(),
         200
     );
-    team::remove_member(&pool, &tenant, team_id, ids[3])
-        .await
-        .unwrap();
+    team::remove_member(
+        &pool,
+        &tenant,
+        team_id,
+        ids[3],
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     // Simulate a legacy membership whose grant was revoked before the grant-in-use guard existed.
     sqlx::query("DELETE FROM kat_spaces WHERE workspace_id=$1 AND kat_id=$2 AND space_id=$3")
         .bind(f.workspace)
@@ -169,7 +188,9 @@ async fn paused_kats_keep_grants_but_are_not_eligible(pool: PgPool) {
     let tenant = tenancy::resolve(&pool, UserId(f.user), WorkspaceId(f.workspace))
         .await
         .unwrap();
-    kat::grant_space(&pool, &tenant, id, space).await.unwrap();
+    kat::grant_space(&pool, &tenant, id, space, std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
     let mut tx = pool.begin().await.unwrap();
     assert!(kat::is_granted(&mut tx, &tenant, id, space).await.unwrap());
     assert!(kat::is_eligible(&mut tx, &tenant, id, space).await.unwrap());

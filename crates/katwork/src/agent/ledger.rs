@@ -15,6 +15,10 @@ pub(crate) fn sha256(text: &str) -> String {
 pub(crate) fn clean(text: &str) -> String {
     text.replace('\0', "\u{fffd}")
 }
+#[allow(
+    clippy::disallowed_methods,
+    reason = "Worker execution drains ledger SQL before ending or abandoning the run"
+)]
 pub(crate) async fn transaction(pool: &PgPool) -> Result<Transaction<'_, Postgres>, KatError> {
     let mut tx = pool.begin().await?;
     db::set_configured_lock_timeout(&mut tx).await?;

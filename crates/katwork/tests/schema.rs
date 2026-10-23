@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
 #[path = "schema/chat_indexes.rs"]
 mod chat_indexes;
 #[path = "schema/legacy.rs"]

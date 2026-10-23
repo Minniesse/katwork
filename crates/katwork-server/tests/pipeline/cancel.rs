@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
 use super::*;
 
 #[sqlx::test(migrations = "../katwork/migrations")]
@@ -405,7 +409,14 @@ async fn cancel_rejects_colleague_member_before_any_writes(pool: PgPool) {
     .await;
     support::assert_code(response, 403, "forbidden").await;
     assert!(matches!(
-        katwork::jobs::job::cancel(&pool, &f.core.events, &tenant, job).await,
+        katwork::jobs::job::cancel(
+            &pool,
+            &f.core.events,
+            &tenant,
+            job,
+            std::time::Duration::from_secs(5)
+        )
+        .await,
         Err(katwork::error::KatError::Forbidden)
     ));
     assert_eq!(f.events().await, before);
@@ -478,7 +489,13 @@ async fn cancel_rechecks_admin_role_after_job_lock(pool: PgPool) {
         .execute(&mut *holder)
         .await
         .unwrap();
-    let cancel = katwork::jobs::job::cancel(&pool, &f.core.events, &admin, job);
+    let cancel = katwork::jobs::job::cancel(
+        &pool,
+        &f.core.events,
+        &admin,
+        job,
+        std::time::Duration::from_secs(5),
+    );
     tokio::pin!(cancel);
     tokio::select! {
         result = &mut cancel => panic!("cancel bypassed job lock: {result:?}"),

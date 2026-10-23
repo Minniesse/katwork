@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
 use super::*;
 
 pub(super) async fn waiting(pool: &PgPool, query: &str) {
@@ -214,6 +218,7 @@ async fn policy_version_changed_while_queued_finishes_without_run(pool: PgPool) 
             tool_allowlist: Some(vec!["read_thread".into()]),
             ..Default::default()
         },
+        std::time::Duration::from_secs(5),
     )
     .await
     .unwrap();
@@ -311,6 +316,7 @@ async fn advisory_hold_filter_preserves_deadlines_and_eligibility_stops(pool: Pg
             status: Some(KatStatus::Paused),
             ..Default::default()
         },
+        std::time::Duration::from_secs(5),
     )
     .await
     .unwrap();
@@ -494,6 +500,7 @@ async fn held_task_terminal_matrix(pool: PgPool) {
                         tool_allowlist: Some(vec!["read_thread".into()]),
                         ..Default::default()
                     },
+                    std::time::Duration::from_secs(5),
                 )
                 .await
                 .unwrap();
@@ -511,18 +518,30 @@ async fn held_task_terminal_matrix(pool: PgPool) {
                 )
                 .await
                 .unwrap();
-                kat::grant_space(&pool, &tenant, KatId(f.kat), other)
-                    .await
-                    .unwrap();
+                kat::grant_space(
+                    &pool,
+                    &tenant,
+                    KatId(f.kat),
+                    other,
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
                 sqlx::query("UPDATE kats SET default_space_id=$2 WHERE id=$1")
                     .bind(f.kat)
                     .bind(other)
                     .execute(&pool)
                     .await
                     .unwrap();
-                kat::revoke_space(&pool, &tenant, KatId(f.kat), SpaceId(f.space))
-                    .await
-                    .unwrap();
+                kat::revoke_space(
+                    &pool,
+                    &tenant,
+                    KatId(f.kat),
+                    SpaceId(f.space),
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
                 // Isolate the grant predicate from the separately tested policy-version predicate.
                 sqlx::query("UPDATE tasks t SET kat_policy_version=k.policy_version FROM kats k WHERE t.id=$1 AND k.id=t.kat_id AND k.workspace_id=t.workspace_id")
                     .bind(waiting).execute(&pool).await.unwrap();

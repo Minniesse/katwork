@@ -923,16 +923,28 @@ async fn foreign_members_and_leads_are_hidden_and_role_is_workspace_scoped(pool:
         .await
         .unwrap();
     let new = roles::template(&katwork::team::KatRole::Lead, Locale::En);
-    let foreign = kat::hire(&pool, &tenant, SpaceId(other_space), new.clone())
-        .await
-        .unwrap();
+    let foreign = kat::hire(
+        &pool,
+        &tenant,
+        SpaceId(other_space),
+        new.clone(),
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     let mut forbidden = new;
     forbidden.tool_allowlist.push("exec".into());
     assert_eq!(
-        kat::hire(&pool, &tenant, SpaceId(other_space), forbidden)
-            .await
-            .unwrap_err()
-            .code(),
+        kat::hire(
+            &pool,
+            &tenant,
+            SpaceId(other_space),
+            forbidden,
+            std::time::Duration::from_secs(5)
+        )
+        .await
+        .unwrap_err()
+        .code(),
         "forbidden"
     );
     assert_code(

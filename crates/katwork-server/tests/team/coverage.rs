@@ -32,7 +32,8 @@ async fn repository_kat_update_and_grants_enforce_member_permissions(pool: PgPoo
                 &pool,
                 &member,
                 id,
-                serde_json::from_value(patch.clone()).unwrap()
+                serde_json::from_value(patch.clone()).unwrap(),
+                std::time::Duration::from_secs(5)
             )
             .await
             .unwrap_err()
@@ -41,10 +42,16 @@ async fn repository_kat_update_and_grants_enforce_member_permissions(pool: PgPoo
         );
     }
     assert_eq!(
-        kat::grant_space(&pool, &member, id, second)
-            .await
-            .unwrap_err()
-            .code(),
+        kat::grant_space(
+            &pool,
+            &member,
+            id,
+            second,
+            std::time::Duration::from_secs(5)
+        )
+        .await
+        .unwrap_err()
+        .code(),
         "forbidden"
     );
     assert_eq!(
@@ -62,6 +69,7 @@ async fn repository_kat_update_and_grants_enforce_member_permissions(pool: PgPoo
                 &admin,
                 id,
                 serde_json::from_value(patch.clone()).unwrap(),
+                std::time::Duration::from_secs(5),
             )
             .await
             .unwrap();
@@ -69,25 +77,35 @@ async fn repository_kat_update_and_grants_enforce_member_permissions(pool: PgPoo
                 assert_eq!(&serde_json::to_value(&updated).unwrap()[field], expected);
             }
         }
-        kat::grant_space(&pool, &admin, id, second).await.unwrap();
+        kat::grant_space(&pool, &admin, id, second, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
         let before = serde_json::to_value(kat::get(&pool, &member, id).await.unwrap()).unwrap();
         assert_eq!(
-            kat::revoke_space(&pool, &member, id, second)
-                .await
-                .unwrap_err()
-                .code(),
+            kat::revoke_space(
+                &pool,
+                &member,
+                id,
+                second,
+                std::time::Duration::from_secs(5)
+            )
+            .await
+            .unwrap_err()
+            .code(),
             "forbidden"
         );
         assert_eq!(
             serde_json::to_value(kat::get(&pool, &member, id).await.unwrap()).unwrap(),
             before
         );
-        kat::revoke_space(&pool, &admin, id, second).await.unwrap();
+        kat::revoke_space(&pool, &admin, id, second, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
         assert_eq!(
             kat::get(&pool, &admin, id).await.unwrap().spaces,
             [SpaceId(f.space)]
         );
-        kat::update(&pool, &admin, id, serde_json::from_value(json!({"instructions":hired["instructions"], "tool_allowlist":hired["tool_allowlist"], "model_tier":"standard", "autonomy":"ask_first", "status":"active", "max_concurrency":1})).unwrap()).await.unwrap();
+        kat::update(&pool, &admin, id, serde_json::from_value(json!({"instructions":hired["instructions"], "tool_allowlist":hired["tool_allowlist"], "model_tier":"standard", "autonomy":"ask_first", "status":"active", "max_concurrency":1})).unwrap(), std::time::Duration::from_secs(5)).await.unwrap();
     }
 }
 
@@ -405,9 +423,15 @@ async fn member_can_hire_from_either_locales_template_but_not_change_it(pool: Pg
     for role in every_role() {
         for locale in [Locale::En, Locale::Th] {
             let template = roles::template(&role, locale);
-            let id = kat::hire(&pool, &member, space, template.clone())
-                .await
-                .unwrap();
+            let id = kat::hire(
+                &pool,
+                &member,
+                space,
+                template.clone(),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
             let kat = kat::get(&pool, &member, id).await.unwrap();
             assert_eq!(kat.instructions, template.instructions);
             assert_eq!(kat.max_concurrency, template.max_concurrency);
@@ -421,10 +445,16 @@ async fn member_can_hire_from_either_locales_template_but_not_change_it(pool: Pg
     writer.max_concurrency = 3;
     for new in [changed, lead, writer] {
         assert_eq!(
-            kat::hire(&pool, &member, space, new.clone())
-                .await
-                .unwrap_err()
-                .code(),
+            kat::hire(
+                &pool,
+                &member,
+                space,
+                new.clone(),
+                std::time::Duration::from_secs(5)
+            )
+            .await
+            .unwrap_err()
+            .code(),
             "forbidden",
             "{new:?}"
         );
@@ -444,19 +474,31 @@ async fn admin_may_hire_with_any_positive_max_concurrency(pool: PgPool) {
         .unwrap();
     let mut writer = roles::template(&KatRole::Writer, Locale::En);
     writer.max_concurrency = 2;
-    let id = kat::hire(&pool, &admin, SpaceId(f.space), writer.clone())
-        .await
-        .unwrap();
+    let id = kat::hire(
+        &pool,
+        &admin,
+        SpaceId(f.space),
+        writer.clone(),
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         kat::get(&pool, &admin, id).await.unwrap().max_concurrency,
         2
     );
     writer.max_concurrency = 0;
     assert_eq!(
-        kat::hire(&pool, &admin, SpaceId(f.space), writer)
-            .await
-            .unwrap_err()
-            .code(),
+        kat::hire(
+            &pool,
+            &admin,
+            SpaceId(f.space),
+            writer,
+            std::time::Duration::from_secs(5)
+        )
+        .await
+        .unwrap_err()
+        .code(),
         "request_invalid"
     );
 }

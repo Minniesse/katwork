@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{Executor, PgConnection, PgPool, Postgres};
+use sqlx::{Connection, Executor, PgConnection, PgPool, Postgres};
 use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
 use crate::{
@@ -246,12 +246,17 @@ pub async fn hire(
     tenant: &Tenant,
     space: SpaceId,
     new: NewKat,
+    lock_timeout: std::time::Duration,
 ) -> Result<KatId, KatError> {
-    let mut tx = pool.begin().await?;
-    super::lock_workspace(&mut tx, tenant).await?;
-    let id = hire_on(&mut tx, tenant, space, new).await?;
-    tx.commit().await?;
-    Ok(id)
+    crate::db::guarded(pool, async |conn| {
+        let mut tx = conn.begin().await?;
+        crate::db::set_lock_timeout(&mut tx, lock_timeout).await?;
+        super::lock_workspace(&mut tx, tenant).await?;
+        let id = hire_on(&mut tx, tenant, space, new).await?;
+        tx.commit().await?;
+        Ok(id)
+    })
+    .await
 }
 
 pub(super) async fn hire_on(
@@ -315,6 +320,7 @@ pub async fn update(
     tenant: &Tenant,
     id: KatId,
     patch: KatPatch,
+    lock_timeout: std::time::Duration,
 ) -> Result<Kat, KatError> {
     if patch.instructions.is_some()
         || patch.tool_allowlist.is_some()
@@ -326,83 +332,87 @@ pub async fn update(
     {
         tenant.require_admin()?;
     }
-    let mut tx = pool.begin().await?;
-    super::lock_workspace(&mut tx, tenant).await?;
-    lock_kat(&mut tx, tenant, id).await?;
-    let mut kat = get_on(&mut *tx, tenant, id).await?;
-    if let Some(name) = patch.name {
-        let name = super::validate_name(&name)?;
-        let others: Vec<String> = sqlx::query_scalar("SELECT d.name FROM team_members mine JOIN team_members peer ON peer.team_id = mine.team_id AND peer.workspace_id = mine.workspace_id JOIN kats d ON d.id = peer.kat_id AND d.workspace_id = peer.workspace_id WHERE mine.workspace_id = $1 AND mine.kat_id = $2 AND mine.active AND peer.active AND peer.kat_id <> $2")
-            .bind(tenant.workspace_id()).bind(id).fetch_all(&mut *tx).await?;
-        if others
-            .iter()
-            .any(|other| super::name_key(other) == super::name_key(name))
-        {
-            return Err(KatError::KatNameConflict);
+    crate::db::guarded(pool, async |conn| {
+        let mut tx = conn.begin().await?;
+        crate::db::set_lock_timeout(&mut tx, lock_timeout).await?;
+        super::lock_workspace(&mut tx, tenant).await?;
+        lock_kat(&mut tx, tenant, id).await?;
+        let mut kat = get_on(&mut *tx, tenant, id).await?;
+        if let Some(name) = patch.name {
+            let name = super::validate_name(&name)?;
+            let others: Vec<String> = sqlx::query_scalar("SELECT d.name FROM team_members mine JOIN team_members peer ON peer.team_id = mine.team_id AND peer.workspace_id = mine.workspace_id JOIN kats d ON d.id = peer.kat_id AND d.workspace_id = peer.workspace_id WHERE mine.workspace_id = $1 AND mine.kat_id = $2 AND mine.active AND peer.active AND peer.kat_id <> $2")
+                .bind(tenant.workspace_id()).bind(id).fetch_all(&mut *tx).await?;
+            if others
+                .iter()
+                .any(|other| super::name_key(other) == super::name_key(name))
+            {
+                return Err(KatError::KatNameConflict);
+            }
+            kat.name = name.to_owned();
         }
-        kat.name = name.to_owned();
-    }
-    kat.tool_allowlist.sort();
-    kat.tool_allowlist.dedup();
-    let before = (
-        kat.tool_allowlist.clone(),
-        kat.status,
-        kat.autonomy,
-        kat.model_tier,
-    );
-    if let Some(value) = patch.persona {
-        kat.persona = value;
-    }
-    if let Some(value) = patch.instructions {
-        kat.instructions = value;
-    }
-    if let Some(value) = patch.tool_allowlist {
-        kat.tool_allowlist = value;
-    }
-    if let Some(value) = patch.model_tier {
-        kat.model_tier = value;
-    }
-    if let Some(value) = patch.autonomy {
-        kat.autonomy = value;
-    }
-    if let Some(value) = patch.status {
-        kat.status = value;
-    }
-    if let Some(value) = patch.appearance {
-        kat.appearance = value;
-    }
-    if let Some(value) = patch.max_concurrency {
-        kat.max_concurrency = value;
-    }
-    if let Some(value) = patch.daily_token_budget {
-        kat.daily_token_budget = value;
-    }
-    if kat.max_concurrency == 0 || kat.daily_token_budget.is_some_and(|n| n < 0) {
-        return Err(KatError::RequestInvalid);
-    }
-    validate_config(
-        &kat.persona,
-        &kat.instructions,
-        &kat.appearance,
-        &mut kat.tool_allowlist,
-    )?;
-    if before
-        != (
+        kat.tool_allowlist.sort();
+        kat.tool_allowlist.dedup();
+        let before = (
             kat.tool_allowlist.clone(),
             kat.status,
             kat.autonomy,
             kat.model_tier,
-        )
-    {
-        kat.policy_version += 1;
-    }
-    sqlx::query("UPDATE kats SET name=$3, persona=$4, instructions=$5, tool_allowlist=$6, model_tier=$7, autonomy=$8, status=$9, appearance=$10, max_concurrency=$11, daily_token_budget=$12, policy_version=$13 WHERE workspace_id=$1 AND id=$2")
-        .bind(tenant.workspace_id()).bind(id).bind(&kat.name).bind(&kat.persona).bind(&kat.instructions)
-        .bind(&kat.tool_allowlist).bind(kat.model_tier).bind(kat.autonomy).bind(kat.status)
-        .bind(sqlx::types::Json(&kat.appearance)).bind(i32::from(kat.max_concurrency)).bind(kat.daily_token_budget)
-        .bind(kat.policy_version).execute(&mut *tx).await?;
-    tx.commit().await?;
-    Ok(kat)
+        );
+        if let Some(value) = patch.persona {
+            kat.persona = value;
+        }
+        if let Some(value) = patch.instructions {
+            kat.instructions = value;
+        }
+        if let Some(value) = patch.tool_allowlist {
+            kat.tool_allowlist = value;
+        }
+        if let Some(value) = patch.model_tier {
+            kat.model_tier = value;
+        }
+        if let Some(value) = patch.autonomy {
+            kat.autonomy = value;
+        }
+        if let Some(value) = patch.status {
+            kat.status = value;
+        }
+        if let Some(value) = patch.appearance {
+            kat.appearance = value;
+        }
+        if let Some(value) = patch.max_concurrency {
+            kat.max_concurrency = value;
+        }
+        if let Some(value) = patch.daily_token_budget {
+            kat.daily_token_budget = value;
+        }
+        if kat.max_concurrency == 0 || kat.daily_token_budget.is_some_and(|n| n < 0) {
+            return Err(KatError::RequestInvalid);
+        }
+        validate_config(
+            &kat.persona,
+            &kat.instructions,
+            &kat.appearance,
+            &mut kat.tool_allowlist,
+        )?;
+        if before
+            != (
+                kat.tool_allowlist.clone(),
+                kat.status,
+                kat.autonomy,
+                kat.model_tier,
+            )
+        {
+            kat.policy_version += 1;
+        }
+        sqlx::query("UPDATE kats SET name=$3, persona=$4, instructions=$5, tool_allowlist=$6, model_tier=$7, autonomy=$8, status=$9, appearance=$10, max_concurrency=$11, daily_token_budget=$12, policy_version=$13 WHERE workspace_id=$1 AND id=$2")
+            .bind(tenant.workspace_id()).bind(id).bind(&kat.name).bind(&kat.persona).bind(&kat.instructions)
+            .bind(&kat.tool_allowlist).bind(kat.model_tier).bind(kat.autonomy).bind(kat.status)
+            .bind(sqlx::types::Json(&kat.appearance)).bind(i32::from(kat.max_concurrency)).bind(kat.daily_token_budget)
+            .bind(kat.policy_version).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(kat)
+    })
+    .await
 }
 
 pub async fn grant_space(
@@ -410,8 +420,9 @@ pub async fn grant_space(
     tenant: &Tenant,
     id: KatId,
     space: SpaceId,
+    lock_timeout: std::time::Duration,
 ) -> Result<(), KatError> {
-    change_grant(pool, tenant, id, space, true).await
+    change_grant(pool, tenant, id, space, true, lock_timeout).await
 }
 
 pub async fn revoke_space(
@@ -419,8 +430,9 @@ pub async fn revoke_space(
     tenant: &Tenant,
     id: KatId,
     space: SpaceId,
+    lock_timeout: std::time::Duration,
 ) -> Result<(), KatError> {
-    change_grant(pool, tenant, id, space, false).await
+    change_grant(pool, tenant, id, space, false, lock_timeout).await
 }
 
 async fn change_grant(
@@ -429,33 +441,38 @@ async fn change_grant(
     id: KatId,
     space: SpaceId,
     grant: bool,
+    lock_timeout: std::time::Duration,
 ) -> Result<(), KatError> {
     tenant.require_admin()?;
-    let mut tx = pool.begin().await?;
-    super::lock_workspace(&mut tx, tenant).await?;
-    lock_kat(&mut tx, tenant, id).await?;
-    super::check_space(&mut tx, tenant, space).await?;
-    if !grant && get_on(&mut *tx, tenant, id).await?.default_space_id == space {
-        return Err(KatError::DefaultSpaceRequired);
-    }
-    if !grant {
-        let in_use: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM team_members m JOIN teams t ON t.id=m.team_id AND t.workspace_id=m.workspace_id WHERE m.workspace_id=$1 AND m.kat_id=$2 AND m.active AND t.space_id=$3)")
-            .bind(tenant.workspace_id()).bind(id).bind(space).fetch_one(&mut *tx).await?;
-        if in_use {
-            return Err(KatError::GrantInUse);
+    crate::db::guarded(pool, async |conn| {
+        let mut tx = conn.begin().await?;
+        crate::db::set_lock_timeout(&mut tx, lock_timeout).await?;
+        super::lock_workspace(&mut tx, tenant).await?;
+        lock_kat(&mut tx, tenant, id).await?;
+        super::check_space(&mut tx, tenant, space).await?;
+        if !grant && get_on(&mut *tx, tenant, id).await?.default_space_id == space {
+            return Err(KatError::DefaultSpaceRequired);
         }
-    }
-    let mutation = if grant {
-        "WITH changed AS (INSERT INTO kat_spaces (workspace_id, kat_id, space_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING RETURNING kat_id) UPDATE kats SET policy_version=policy_version+1 WHERE workspace_id=$1 AND id=$2 AND EXISTS (SELECT 1 FROM changed)"
-    } else {
-        "WITH changed AS (DELETE FROM kat_spaces WHERE workspace_id=$1 AND kat_id=$2 AND space_id=$3 RETURNING kat_id) UPDATE kats SET policy_version=policy_version+1 WHERE workspace_id=$1 AND id=$2 AND EXISTS (SELECT 1 FROM changed)"
-    };
-    sqlx::query(mutation)
-        .bind(tenant.workspace_id())
-        .bind(id)
-        .bind(space)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(())
+        if !grant {
+            let in_use: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM team_members m JOIN teams t ON t.id=m.team_id AND t.workspace_id=m.workspace_id WHERE m.workspace_id=$1 AND m.kat_id=$2 AND m.active AND t.space_id=$3)")
+                .bind(tenant.workspace_id()).bind(id).bind(space).fetch_one(&mut *tx).await?;
+            if in_use {
+                return Err(KatError::GrantInUse);
+            }
+        }
+        let mutation = if grant {
+            "WITH changed AS (INSERT INTO kat_spaces (workspace_id, kat_id, space_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING RETURNING kat_id) UPDATE kats SET policy_version=policy_version+1 WHERE workspace_id=$1 AND id=$2 AND EXISTS (SELECT 1 FROM changed)"
+        } else {
+            "WITH changed AS (DELETE FROM kat_spaces WHERE workspace_id=$1 AND kat_id=$2 AND space_id=$3 RETURNING kat_id) UPDATE kats SET policy_version=policy_version+1 WHERE workspace_id=$1 AND id=$2 AND EXISTS (SELECT 1 FROM changed)"
+        };
+        sqlx::query(mutation)
+            .bind(tenant.workspace_id())
+            .bind(id)
+            .bind(space)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    })
+    .await
 }

@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
 use super::*;
 
 #[derive(Clone, Copy)]
@@ -40,6 +44,7 @@ impl EventSink for InterruptSink<'_> {
                     status: Some(KatStatus::Paused),
                     ..KatPatch::default()
                 },
+                std::time::Duration::from_secs(5),
             )
             .await
             .unwrap();
@@ -399,6 +404,7 @@ async fn stale_kat_snapshot_cannot_use_new_policy_version(pool: PgPool) {
             tool_allowlist: Some(vec![]),
             ..KatPatch::default()
         },
+        std::time::Duration::from_secs(5),
     )
     .await
     .unwrap();
@@ -529,6 +535,7 @@ async fn retry_interruption(
                         status: Some(KatStatus::Paused),
                         ..KatPatch::default()
                     },
+                    std::time::Duration::from_secs(5),
                 )
                 .await
                 .unwrap();

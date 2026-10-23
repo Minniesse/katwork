@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
 #[path = "../../../katwork/tests/support/mod.rs"]
 #[allow(dead_code)]
 mod data;

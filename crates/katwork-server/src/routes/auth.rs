@@ -275,7 +275,13 @@ pub(crate) async fn login(
     let email = email(&body.email)?;
     let peer = peer.ok_or(KatError::RequestInvalid)?.0.0.ip();
     let attempt = limiter.reserve(&email, client_ip(peer, &headers, &state.core.config))?;
-    let login = auth::login(&state.core.pool, &email, &body.password).await;
+    let login = auth::login(
+        &state.core.pool,
+        &email,
+        &body.password,
+        state.core.config.lock_timeout,
+    )
+    .await;
     attempt.finish(&login);
     let (user, token) = login?;
     Ok((
@@ -334,6 +340,7 @@ pub(crate) async fn request_reset(
                         state.core.mailer.as_ref(),
                         &email,
                         state.core.config.public_url_or_default(),
+                        state.core.config.lock_timeout,
                     )
                     .await
                     {
@@ -355,7 +362,13 @@ pub(crate) async fn confirm_reset(
     body: Result<Json<SetPassword>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let body = payload(body)?;
-    let email = reset::confirm(&state.core.pool, &body.token, &body.new_password).await?;
+    let email = reset::confirm(
+        &state.core.pool,
+        &body.token,
+        &body.new_password,
+        state.core.config.lock_timeout,
+    )
+    .await?;
     // The new password ends any lockout the old one earned.
     limiter.clear_email(&email);
     Ok(Json(json!({})))
@@ -367,7 +380,13 @@ pub(crate) async fn accept_invite(
     body: Result<Json<SetPassword>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
     let body = payload(body)?;
-    let email = invite::accept(&state.core.pool, &body.token, &body.new_password).await?;
+    let email = invite::accept(
+        &state.core.pool,
+        &body.token,
+        &body.new_password,
+        state.core.config.lock_timeout,
+    )
+    .await?;
     limiter.clear_email(&email);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -580,6 +599,10 @@ mod capacity_tests {
     }
 
     #[sqlx::test(migrations = "../katwork/migrations")]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "The fixture holds the only pool slot to test admission limits"
+    )]
     async fn reset_background_work_is_bounded_and_releases_capacity(pool: sqlx::PgPool) {
         let single = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)

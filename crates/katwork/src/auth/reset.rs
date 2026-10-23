@@ -1,4 +1,4 @@
-use sqlx::{PgConnection, PgPool};
+use sqlx::{Connection, PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::{
@@ -43,29 +43,37 @@ pub async fn request(
     mailer: &dyn Mailer,
     email: &str,
     link_base: &str,
+    lock_timeout: std::time::Duration,
 ) -> Result<(), KatError> {
-    let mut tx = pool.begin().await?;
-    let user: Option<(UserId, String, String)> =
-        sqlx::query_as("SELECT id, email, locale FROM users WHERE email = $1 FOR NO KEY UPDATE")
-            .bind(email.trim().to_lowercase())
-            .fetch_optional(&mut *tx)
-            .await?;
-    let Some((user_id, email, locale)) = user else {
+    let mail = crate::db::guarded(pool, async |conn| {
+        let mut tx = conn.begin().await?;
+        crate::db::set_lock_timeout(&mut tx, lock_timeout).await?;
+        let user: Option<(UserId, String, String)> =
+            sqlx::query_as("SELECT id, email, locale FROM users WHERE email = $1 FOR NO KEY UPDATE")
+                .bind(email.trim().to_lowercase())
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((user_id, email, locale)) = user else {
+            return Ok(None);
+        };
+        let outstanding: i64 = sqlx::query_scalar("SELECT count(*) FROM password_resets WHERE user_id = $1 AND kind = 'reset' AND used_at IS NULL AND expires_at > clock_timestamp()")
+            .bind(user_id).fetch_one(&mut *tx).await?;
+        if outstanding >= 3 {
+            return Ok(None);
+        }
+        let token = issue(&mut tx, user_id).await?;
+        tx.commit().await?;
+        let locale = if locale == "th" {
+            Locale::Th
+        } else {
+            Locale::En
+        };
+        Ok(Some(mailer::reset_mail(email, locale, &link(link_base, &token))))
+    })
+    .await?;
+    let Some(mail) = mail else {
         return Ok(());
     };
-    let outstanding: i64 = sqlx::query_scalar("SELECT count(*) FROM password_resets WHERE user_id = $1 AND kind = 'reset' AND used_at IS NULL AND expires_at > clock_timestamp()")
-        .bind(user_id).fetch_one(&mut *tx).await?;
-    if outstanding >= 3 {
-        return Ok(());
-    }
-    let token = issue(&mut tx, user_id).await?;
-    tx.commit().await?;
-    let locale = if locale == "th" {
-        Locale::Th
-    } else {
-        Locale::En
-    };
-    let mail = mailer::reset_mail(email, locale, &link(link_base, &token));
     // Delivery failures must not reveal whether the account exists.
     let _ = mailer.send(&mail).await;
     Ok(())
@@ -81,8 +89,13 @@ pub fn link(link_base: &str, token: &str) -> String {
 }
 
 /// Sets the password from an unused, unexpired reset token and returns the account's email.
-pub async fn confirm(pool: &PgPool, token: &str, new_password: &str) -> Result<String, KatError> {
-    consume(pool, TokenKind::Reset, token, new_password).await
+pub async fn confirm(
+    pool: &PgPool,
+    token: &str,
+    new_password: &str,
+    lock_timeout: std::time::Duration,
+) -> Result<String, KatError> {
+    consume(pool, TokenKind::Reset, token, new_password, lock_timeout).await
 }
 
 pub(super) async fn issue_kind(
@@ -107,6 +120,7 @@ pub(super) async fn consume(
     kind: TokenKind,
     token: &str,
     new_password: &str,
+    lock_timeout: std::time::Duration,
 ) -> Result<String, KatError> {
     if !valid_token(token) {
         return Err(kind.invalid());
@@ -117,30 +131,34 @@ pub(super) async fn consume(
         .bind(&digest).bind(kind.as_str()).fetch_optional(pool).await?.ok_or(kind.invalid())?;
     let new_password = new_password.to_owned();
     let hash = password::run(move || password::hash(&new_password)).await??;
-    let mut tx = pool.begin().await?;
-    let email: String =
-        sqlx::query_scalar("SELECT email FROM users WHERE id = $1 FOR NO KEY UPDATE")
-            .bind(user_id)
+    crate::db::guarded(pool, async |conn| {
+        let mut tx = conn.begin().await?;
+        crate::db::set_lock_timeout(&mut tx, lock_timeout).await?;
+        let email: String =
+            sqlx::query_scalar("SELECT email FROM users WHERE id = $1 FOR NO KEY UPDATE")
+                .bind(user_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        // Lock the token row, then check it in a separate statement, so expiry is judged after any wait.
+        sqlx::query("SELECT id FROM password_resets WHERE token_sha256 = $1 FOR NO KEY UPDATE")
+            .bind(&digest)
             .fetch_one(&mut *tx)
             .await?;
-    // Lock the token row, then check it in a separate statement, so expiry is judged after any wait.
-    sqlx::query("SELECT id FROM password_resets WHERE token_sha256 = $1 FOR NO KEY UPDATE")
-        .bind(&digest)
-        .fetch_one(&mut *tx)
-        .await?;
-    let consumed: Option<UserId> = sqlx::query_scalar("UPDATE password_resets SET used_at = clock_timestamp() WHERE token_sha256 = $1 AND kind = $2 AND used_at IS NULL AND expires_at > clock_timestamp() RETURNING user_id")
-        .bind(&digest).bind(kind.as_str()).fetch_optional(&mut *tx).await?;
-    if consumed != Some(user_id) {
-        return Err(kind.invalid());
-    }
-    sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
-        .bind(user_id)
-        .bind(hash)
-        .execute(&mut *tx)
-        .await?;
-    revoke_credentials(&mut tx, user_id).await?;
-    tx.commit().await?;
-    Ok(email)
+        let consumed: Option<UserId> = sqlx::query_scalar("UPDATE password_resets SET used_at = clock_timestamp() WHERE token_sha256 = $1 AND kind = $2 AND used_at IS NULL AND expires_at > clock_timestamp() RETURNING user_id")
+            .bind(&digest).bind(kind.as_str()).fetch_optional(&mut *tx).await?;
+        if consumed != Some(user_id) {
+            return Err(kind.invalid());
+        }
+        sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+            .bind(user_id)
+            .bind(hash)
+            .execute(&mut *tx)
+            .await?;
+        revoke_credentials(&mut tx, user_id).await?;
+        tx.commit().await?;
+        Ok(email)
+    })
+    .await
 }
 
 /// Ends the account's sessions and its pending tokens of both kinds.

@@ -74,6 +74,10 @@ fn ttl_micros(ttl: Duration) -> Result<i64, KatError> {
 
 /// Oldest first, best effort: SKIP LOCKED never waits for an earlier job/task.
 /// Each candidate owns a transaction; holds must not starve later candidates in this poll.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "The worker drains admission, renewal, and terminal transactions on shutdown"
+)]
 pub async fn claim(
     core: &Core,
     worker_id: &str,
@@ -455,6 +459,10 @@ async fn check_owner(conn: &mut PgConnection, task: TaskId, worker: &str) -> Res
     Ok(())
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "The worker drains admission, renewal, and terminal transactions on shutdown"
+)]
 pub async fn heartbeat(
     pool: &PgPool,
     task_id: TaskId,
@@ -492,6 +500,10 @@ pub async fn heartbeat(
     })
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "The worker drains admission, renewal, and terminal transactions on shutdown"
+)]
 pub async fn complete(
     core: &Core,
     task_id: TaskId,
@@ -545,6 +557,10 @@ pub async fn complete(
 }
 
 /// Invalidate this owner immediately; the next poll applies the single recovery path.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "The worker drains admission, renewal, and terminal transactions on shutdown"
+)]
 pub async fn abandon(
     core: &Core,
     task_id: TaskId,
@@ -572,6 +588,10 @@ pub async fn abandon(
 }
 
 /// Contain a run panic; committed effects require review before another attempt.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "The worker drains admission, renewal, and terminal transactions on shutdown"
+)]
 pub(crate) async fn fail(
     core: &Core,
     task: TaskId,

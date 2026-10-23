@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
 #![allow(dead_code)]
 mod support;
 
@@ -1037,6 +1041,7 @@ async fn revoke(ctx: &ToolCtx, pause: bool, grant: bool) {
                 tool_allowlist: (!pause).then(Vec::new),
                 ..KatPatch::default()
             },
+            std::time::Duration::from_secs(5),
         )
         .await
         .unwrap();
@@ -1178,6 +1183,7 @@ async fn policy_revoked_before_write_commit_blocks_effect(pool: PgPool) {
                 tool_allowlist: Some(vec![]),
                 ..KatPatch::default()
             },
+            std::time::Duration::from_secs(5),
         )
         .await
         .unwrap();
@@ -1234,6 +1240,7 @@ async fn policy_edit_waits_for_an_open_write(pool: PgPool) {
                 tool_allowlist: Some(vec![]),
                 ..KatPatch::default()
             },
+            std::time::Duration::from_secs(5),
         ));
         // Observe the database lock wait, not scheduling or elapsed time.
         loop {

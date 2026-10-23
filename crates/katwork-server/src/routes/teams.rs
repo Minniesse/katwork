@@ -54,7 +54,14 @@ pub(crate) async fn create(
     body: Result<Json<NewTeam>, JsonRejection>,
 ) -> Result<(StatusCode, Json<TeamView>), ApiError> {
     let path = route_path(path)?;
-    let id = team::create(&state.core.pool, &tenant, path.space_id, payload(body)?).await?;
+    let id = team::create(
+        &state.core.pool,
+        &tenant,
+        path.space_id,
+        payload(body)?,
+        state.core.config.lock_timeout,
+    )
+    .await?;
     Ok((
         StatusCode::CREATED,
         Json(team::get(&state.core.pool, &tenant, id).await?),
@@ -83,6 +90,7 @@ pub(crate) async fn add_member(
         path.team_id,
         path.kat_id,
         payload(body)?.is_lead,
+        state.core.config.lock_timeout,
     )
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -93,6 +101,13 @@ pub(crate) async fn remove_member(
     path: Result<Path<MemberPath>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
     let path = route_path(path)?;
-    team::remove_member(&state.core.pool, &tenant, path.team_id, path.kat_id).await?;
+    team::remove_member(
+        &state.core.pool,
+        &tenant,
+        path.team_id,
+        path.kat_id,
+        state.core.config.lock_timeout,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }

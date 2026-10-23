@@ -36,6 +36,7 @@ pub(crate) async fn cancel(
         &state.core.events,
         &tenant,
         path(id)?.job_id,
+        state.core.config.lock_timeout,
     )
     .await?;
     Ok(StatusCode::ACCEPTED)

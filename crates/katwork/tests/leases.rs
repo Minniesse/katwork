@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
 #[allow(dead_code)]
 mod support;
 
@@ -734,6 +738,7 @@ async fn expired_claim_racing_paused_kat_claim_does_not_deadlock(pool: PgPool) {
                 status: Some(KatStatus::Paused),
                 ..Default::default()
             },
+            std::time::Duration::from_secs(5),
         )
         .await
         .unwrap();
@@ -814,6 +819,7 @@ async fn kat_paused_while_queued_is_not_run(pool: PgPool) {
             status: Some(KatStatus::Paused),
             ..Default::default()
         },
+        std::time::Duration::from_secs(5),
     )
     .await
     .unwrap();
@@ -839,18 +845,30 @@ async fn grant_revoked_while_queued_is_not_run(pool: PgPool) {
     )
     .await
     .unwrap();
-    kat::grant_space(&pool, &tenant, KatId(f.kat), other)
-        .await
-        .unwrap();
+    kat::grant_space(
+        &pool,
+        &tenant,
+        KatId(f.kat),
+        other,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     sqlx::query("UPDATE kats SET default_space_id=$2 WHERE id=$1")
         .bind(f.kat)
         .bind(other)
         .execute(&pool)
         .await
         .unwrap();
-    kat::revoke_space(&pool, &tenant, KatId(f.kat), SpaceId(f.space))
-        .await
-        .unwrap();
+    kat::revoke_space(
+        &pool,
+        &tenant,
+        KatId(f.kat),
+        SpaceId(f.space),
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     assert!(claim(&core, "a").await.is_none());
     assert_eq!(task_state(&pool, TaskId(f.task)).await, "failed");
     assert_eq!(

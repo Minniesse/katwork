@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
 use super::*;
 
 async fn single_connection(f: &mut Fixture) -> (PgPool, i32) {
@@ -64,7 +68,16 @@ async fn dropped_request(pool: PgPool, operation: &str) {
             )
             .await
             .map(|_| ()),
-            "cancel" => katwork::jobs::job::cancel(&single, &f.core.events, &f.tenant, job).await,
+            "cancel" => {
+                katwork::jobs::job::cancel(
+                    &single,
+                    &f.core.events,
+                    &f.tenant,
+                    job,
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+            }
             "view" => katwork::jobs::job::view(&single, &f.tenant, job)
                 .await
                 .map(|_| ()),
@@ -144,9 +157,15 @@ async fn completed_database_work_reuses_connection(pool: PgPool) {
     katwork::jobs::job::view(&single, &f.tenant, job)
         .await
         .unwrap();
-    katwork::jobs::job::cancel(&single, &f.core.events, &f.tenant, job)
-        .await
-        .unwrap();
+    katwork::jobs::job::cancel(
+        &single,
+        &f.core.events,
+        &f.tenant,
+        job,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     let reused: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&single)
         .await
@@ -156,34 +175,37 @@ async fn completed_database_work_reuses_connection(pool: PgPool) {
 }
 
 pub(super) async fn assert_pool_clean(pool: &PgPool) {
-    use sqlx::Connection;
-    let mut connections = Vec::new();
-    let mut pids: Vec<i32> = Vec::new();
-    for _ in 0..pool.options().get_max_connections() {
-        let mut conn = timeout(Duration::from_secs(5), pool.acquire())
+    // Acquiring every slot also waits for close-on-drop and connection replacement to finish.
+    timeout(Duration::from_secs(30), async {
+        use sqlx::Connection;
+        let mut connections = Vec::new();
+        let mut pids: Vec<i32> = Vec::new();
+        for _ in 0..pool.options().get_max_connections() {
+            let mut conn = pool.acquire().await.unwrap();
+            pids.push(
+                sqlx::query_scalar("SELECT pg_backend_pid()")
+                    .fetch_one(&mut *conn)
+                    .await
+                    .unwrap(),
+            );
+            connections.push(conn);
+        }
+        let mut observer = sqlx::PgConnection::connect_with(&pool.connect_options())
             .await
-            .unwrap()
             .unwrap();
-        pids.push(
-            sqlx::query_scalar("SELECT pg_backend_pid()")
-                .fetch_one(&mut *conn)
-                .await
-                .unwrap(),
-        );
-        connections.push(conn);
-    }
-    let mut observer = sqlx::PgConnection::connect_with(&pool.connect_options())
+        let clean: bool = sqlx::query_scalar(
+            "SELECT bool_and(state='idle') FROM pg_stat_activity WHERE pid=ANY($1)",
+        )
+        .bind(pids)
+        .fetch_one(&mut observer)
         .await
         .unwrap();
-    let clean: bool =
-        sqlx::query_scalar("SELECT bool_and(state='idle') FROM pg_stat_activity WHERE pid=ANY($1)")
-            .bind(pids)
-            .fetch_one(&mut observer)
-            .await
-            .unwrap();
-    assert!(
-        clean,
-        "worker shutdown left a pooled connection inside a transaction"
-    );
-    observer.close().await.unwrap();
+        assert!(
+            clean,
+            "worker shutdown left a pooled connection inside a transaction"
+        );
+        observer.close().await.unwrap();
+    })
+    .await
+    .expect("pool did not finish returning or replacing its connections");
 }

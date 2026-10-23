@@ -102,10 +102,15 @@ async fn reset_token_never_appears_in_logs(pool: PgPool) {
     }
     assert!(!format!("{:?}", sent[0]).contains(token));
     let new_password = Uuid::now_v7().to_string();
-    reset::confirm(&pool, token, &new_password)
-        .with_subscriber(subscriber(&logs))
-        .await
-        .unwrap();
+    reset::confirm(
+        &pool,
+        token,
+        &new_password,
+        std::time::Duration::from_secs(5),
+    )
+    .with_subscriber(subscriber(&logs))
+    .await
+    .unwrap();
     let response = support::login(&app, &new_password)
         .with_subscriber(subscriber(&logs))
         .await;
@@ -118,6 +123,7 @@ async fn reset_token_never_appears_in_logs(pool: PgPool) {
         capture.as_ref(),
         "unknown@example.test",
         "http://localhost:3000",
+        std::time::Duration::from_secs(5),
     )
     .await
     .unwrap();
@@ -362,6 +368,7 @@ async fn reset_mail_is_bilingual_in_the_users_locale_order(pool: PgPool) {
         &capture,
         "person@example.test",
         "https://katwork.example/",
+        std::time::Duration::from_secs(5),
     )
     .await
     .unwrap();

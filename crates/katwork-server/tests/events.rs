@@ -1,3 +1,9 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
+#[path = "../../katwork/tests/support/cancel.rs"]
+mod cancel;
 #[path = "../../katwork/tests/support/mod.rs"]
 #[allow(dead_code)]
 mod data;
@@ -128,6 +134,36 @@ async fn assert_end(stream: &mut BodyDataStream) {
             .unwrap()
             .is_none()
     );
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn dropped_sse_read_returns_idle_backend_and_releases_subscription(pool: PgPool) {
+    let single = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let s = Setup::new(&single).await;
+    let mut stream = s.stream(None).await;
+    assert!(has(&next(&mut stream).await, "retry:"));
+    let pid = cancel::backend_pid(&single).await;
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query("LOCK threads IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let mut reading = Box::pin(stream.next());
+    tokio::select! {
+        _ = reading.as_mut() => panic!("SSE read escaped its barrier"),
+        () = cancel::wait_for_lock(&pool, pid) => {},
+    }
+    drop(reading);
+    drop(stream);
+    assert_eq!(s.core.events.sender_count(), 0);
+    blocker.rollback().await.unwrap();
+    assert_eq!(cancel::backend_pid(&single).await, pid);
+    cancel::assert_backend_idle(&pool, pid).await;
+    single.close().await;
 }
 
 // Keep PostgreSQL's real I/O from triggering Tokio's automatic virtual-time jumps.

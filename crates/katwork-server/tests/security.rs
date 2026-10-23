@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
+)]
 #[allow(dead_code)]
 #[path = "support/mod.rs"]
 mod support;
@@ -105,6 +109,7 @@ async fn reset_tokens_are_capped_at_three_even_with_concurrent_requests(pool: Pg
                 mailer.as_ref(),
                 "person@example.test",
                 "http://localhost:3000",
+                std::time::Duration::from_secs(5),
             )
             .await
             .unwrap()
@@ -126,6 +131,7 @@ async fn reset_tokens_are_capped_at_three_even_with_concurrent_requests(pool: Pg
         mailer.as_ref(),
         "person@example.test",
         "http://localhost:3000",
+        std::time::Duration::from_secs(5),
     )
     .await
     .unwrap();

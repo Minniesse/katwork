@@ -1,4 +1,4 @@
-use sqlx::{PgConnection, PgPool};
+use sqlx::{Connection, PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::{invite, password, random_token, reset};
@@ -100,90 +100,96 @@ pub async fn create_user(
     link_base: &str,
 ) -> Result<String, KatError> {
     let email = normalize_email(email)?;
-    let mut tx = pool.begin().await?;
-    // An existing account is served by `reset-link`, so an operator never overwrites one here.
-    let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE email = $1)")
-        .bind(&email)
-        .fetch_one(&mut *tx)
-        .await?;
-    if exists {
-        return Err(KatError::UserExists);
-    }
-    let (workspace_id, general) = match workspace {
-        WorkspaceRef::Id(id) => (
-            sqlx::query_scalar("SELECT id FROM workspaces WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or(KatError::NotFound)?,
-            None,
-        ),
-        WorkspaceRef::Name(name) => {
-            // Serializes name-based commands, so two of them never create one name twice.
-            sqlx::query("SELECT pg_advisory_xact_lock(3000004)")
-                .execute(&mut *tx)
-                .await?;
-            let found: Vec<WorkspaceId> =
-                sqlx::query_scalar("SELECT id FROM workspaces WHERE name = $1 ORDER BY id LIMIT 2")
-                    .bind(name.trim())
-                    .fetch_all(&mut *tx)
+    crate::db::guarded(pool, async |conn| {
+        let mut tx = conn.begin().await?;
+        crate::db::set_configured_lock_timeout(&mut tx).await?;
+        // An existing account is served by `reset-link`, so an operator never overwrites one here.
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE email = $1)")
+            .bind(&email)
+            .fetch_one(&mut *tx)
+            .await?;
+        if exists {
+            return Err(KatError::UserExists);
+        }
+        let (workspace_id, general) = match workspace {
+            WorkspaceRef::Id(id) => (
+                sqlx::query_scalar("SELECT id FROM workspaces WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .ok_or(KatError::NotFound)?,
+                None,
+            ),
+            WorkspaceRef::Name(name) => {
+                // Serializes name-based commands, so two of them never create one name twice.
+                sqlx::query("SELECT pg_advisory_xact_lock(3000004)")
+                    .execute(&mut *tx)
                     .await?;
-            match found[..] {
-                [id] => (id, None),
-                [_, _, ..] => return Err(KatError::WorkspaceAmbiguous),
-                [] if role != Role::Owner => return Err(KatError::NotFound),
-                [] => {
-                    let policy = space_policy.ok_or(KatError::ConfigInvalid {
-                        var: "--space-policy",
-                    })?;
-                    let name = tenancy::validate_name(name)?;
-                    let id = WorkspaceId::new();
-                    sqlx::query("INSERT INTO workspaces (id, name) VALUES ($1, $2)")
-                        .bind(id)
-                        .bind(name)
-                        .execute(&mut *tx)
+                let found: Vec<WorkspaceId> =
+                    sqlx::query_scalar("SELECT id FROM workspaces WHERE name = $1 ORDER BY id LIMIT 2")
+                        .bind(name.trim())
+                        .fetch_all(&mut *tx)
                         .await?;
-                    let space = SpaceId::new();
-                    sqlx::query("INSERT INTO spaces (id, workspace_id, name, allow_external) VALUES ($1, $2, 'General', $3)")
-                        .bind(space)
-                        .bind(id)
-                        .bind(policy.allow_external)
-                        .execute(&mut *tx)
-                        .await?;
-                    (id, Some(space))
+                match found[..] {
+                    [id] => (id, None),
+                    [_, _, ..] => return Err(KatError::WorkspaceAmbiguous),
+                    [] if role != Role::Owner => return Err(KatError::NotFound),
+                    [] => {
+                        let policy = space_policy.ok_or(KatError::ConfigInvalid {
+                            var: "--space-policy",
+                        })?;
+                        let name = tenancy::validate_name(name)?;
+                        let id = WorkspaceId::new();
+                        sqlx::query("INSERT INTO workspaces (id, name) VALUES ($1, $2)")
+                            .bind(id)
+                            .bind(name)
+                            .execute(&mut *tx)
+                            .await?;
+                        let space = SpaceId::new();
+                        sqlx::query("INSERT INTO spaces (id, workspace_id, name, allow_external) VALUES ($1, $2, 'General', $3)")
+                            .bind(space)
+                            .bind(id)
+                            .bind(policy.allow_external)
+                            .execute(&mut *tx)
+                            .await?;
+                        (id, Some(space))
+                    }
                 }
             }
+        };
+        let user = ensure_user(&mut tx, &email, locale).await?;
+        if !user.created {
+            return Err(KatError::UserExists);
         }
-    };
-    let user = ensure_user(&mut tx, &email, locale).await?;
-    if !user.created {
-        return Err(KatError::UserExists);
-    }
-    sqlx::query("INSERT INTO memberships (workspace_id, user_id, role) VALUES ($1, $2, $3)")
-        .bind(workspace_id)
-        .bind(user.user_id)
-        .bind(role)
-        .execute(&mut *tx)
-        .await?;
-    if let Some(space) = general {
-        // Resolved on this transaction, which can see the membership it just inserted.
-        let tenant = tenancy::resolve(&mut *tx, user.user_id, workspace_id).await?;
-        team::create_default_on(&mut tx, &tenant, space, locale).await?;
-    }
-    let token = invite::issue(&mut tx, user.user_id).await?;
-    tx.commit().await?;
-    Ok(invite::link(link_base, &token))
+        sqlx::query("INSERT INTO memberships (workspace_id, user_id, role) VALUES ($1, $2, $3)")
+            .bind(workspace_id)
+            .bind(user.user_id)
+            .bind(role)
+            .execute(&mut *tx)
+            .await?;
+        if let Some(space) = general {
+            // Resolved on this transaction, which can see the membership it just inserted.
+            let tenant = tenancy::resolve(&mut *tx, user.user_id, workspace_id).await?;
+            team::create_default_on(&mut tx, &tenant, space, locale).await?;
+        }
+        let token = invite::issue(&mut tx, user.user_id).await?;
+        tx.commit().await?;
+        Ok(invite::link(link_base, &token))
+    })
+    .await
 }
 
 /// A reset link for an existing account; an unknown email is `not_found`.
 pub async fn reset_link(pool: &PgPool, email: &str, link_base: &str) -> Result<String, KatError> {
     let email = normalize_email(email)?;
-    let mut conn = pool.acquire().await?;
-    let user_id: UserId = sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
-        .bind(&email)
-        .fetch_optional(&mut *conn)
-        .await?
-        .ok_or(KatError::NotFound)?;
-    let token = reset::issue(&mut conn, user_id).await?;
-    Ok(reset::link(link_base, &token))
+    crate::db::guarded(pool, async |conn| {
+        let user_id: UserId = sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
+            .bind(&email)
+            .fetch_optional(&mut *conn)
+            .await?
+            .ok_or(KatError::NotFound)?;
+        let token = reset::issue(conn, user_id).await?;
+        Ok(reset::link(link_base, &token))
+    })
+    .await
 }
