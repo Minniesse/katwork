@@ -1,0 +1,91 @@
+# Codex command rules for KatWork. Codex loads them only when the project is
+# trusted. The PreToolUse hook (.claude/hooks/guard.py) is the main guard and
+# catches more spellings; these prefix rules back it up if hooks are off.
+# Test with: codex execpolicy check --pretty --rules .codex/rules/katwork.rules -- <command>
+
+# --- forbidden ---------------------------------------------------------------
+
+prefix_rule(
+    pattern = ["git", "push", ["origin", "upstream"], ["main", "master", "HEAD:main", "HEAD:master", ":main", ":master", "+main", "+master"]],
+    decision = "forbidden",
+    justification = "Never push to main. Push your branch (git push -u origin HEAD) and open a PR.",
+    match = ["git push origin main", "git push origin HEAD:main"],
+    not_match = ["git push origin sp1/task-3-auth"],
+)
+
+prefix_rule(
+    pattern = ["git", "push", ["-f", "--force", "--force-with-lease"], ["origin", "upstream"], ["main", "master"]],
+    decision = "forbidden",
+    justification = "Never force-push main.",
+    match = ["git push --force origin main"],
+)
+
+prefix_rule(
+    pattern = ["git", "push", ["--repo=origin", "--repo=upstream"], ["main", "master", "HEAD:main", "HEAD:master", "HEAD:refs/heads/main", ":main", "+main"]],
+    decision = "forbidden",
+    justification = "Never push to main. Push your branch (git push -u origin HEAD) and open a PR.",
+    match = ["git push --repo=origin HEAD:main"],
+    not_match = ["git push --repo=origin HEAD:feature"],
+)
+
+prefix_rule(
+    pattern = ["git", "push", "--repo", ["origin", "upstream"], ["main", "master", "HEAD:main", "HEAD:master", "HEAD:refs/heads/main", ":main", "+main"]],
+    decision = "forbidden",
+    justification = "Never push to main. Push your branch (git push -u origin HEAD) and open a PR.",
+    match = ["git push --repo origin HEAD:main"],
+)
+
+prefix_rule(
+    pattern = ["git", "reset", "--hard"],
+    decision = "forbidden",
+    justification = "git reset --hard discards work. Use git stash, or git restore <path> for specific files.",
+)
+
+prefix_rule(
+    pattern = ["git", "clean", ["-f", "-fd", "-df", "-fdx", "-fxd", "-dfx", "-dxf", "-xdf", "-xfd", "-fx", "-xf", "--force"]],
+    decision = "forbidden",
+    justification = "git clean --force deletes untracked files. Run git clean -n and remove files by name.",
+    match = ["git clean -fd", "git clean -xdf"],
+    not_match = ["git clean -n"],
+)
+
+# The maintainer merges after cross-review; any merge asks a human first.
+prefix_rule(
+    pattern = ["gh", "pr", "merge"],
+    decision = "prompt",
+    justification = "The maintainer merges after cross-review (see the katwork-review skill).",
+)
+
+# --- allowed outside the sandbox without a prompt ----------------------------
+
+# Postgres can't create shared memory inside the macOS sandbox, so the private
+# test cluster has to start outside it.
+prefix_rule(
+    pattern = [["scripts/test-db.sh", "./scripts/test-db.sh"], ["start", "stop", "url"]],
+    decision = "allow",
+    justification = "Private per-worktree test database (scripts/test-db.sh --help).",
+)
+
+prefix_rule(
+    pattern = ["cargo", ["build", "check", "test", "fmt", "clippy", "deny", "tree", "metadata", "doc", "run"]],
+    decision = "allow",
+    justification = "Frequent cargo commands; they write to ~/.cargo outside the workspace.",
+)
+
+prefix_rule(
+    pattern = ["gh", "pr", ["view", "list", "diff", "checks", "status"]],
+    decision = "allow",
+    justification = "Read-only GitHub PR commands.",
+)
+
+prefix_rule(
+    pattern = ["gh", ["issue", "run"], ["view", "list"]],
+    decision = "allow",
+    justification = "Read-only GitHub issue and CI commands.",
+)
+
+prefix_rule(
+    pattern = ["git", ["status", "log", "diff", "show", "fetch"]],
+    decision = "allow",
+    justification = "Read-only git commands, plus fetch, which writes to the protected .git directory.",
+)

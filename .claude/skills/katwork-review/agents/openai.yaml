@@ -1,0 +1,3 @@
+interface:
+  display_name: "KatWork Review"
+  short_description: "Cross-review a PR and post one review"

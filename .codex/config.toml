@@ -1,0 +1,29 @@
+# Codex project config for KatWork workers. Codex loads .codex/ only after you
+# trust the project, and asks you to review these hooks (/hooks) before they run.
+# Command rules: .codex/rules/katwork.rules. Skills: .agents/skills.
+# Setup notes: docs/agents/environment.md.
+
+sandbox_mode = "workspace-write"
+approval_policy = "on-request"
+
+[sandbox_workspace_write]
+# cargo and gh need the network, and tests reach this worktree's private
+# Postgres on 127.0.0.1, which the sandbox blocks while network access is off.
+network_access = true
+
+# The same scripts Claude Code runs from .claude/settings.json.
+[[hooks.SessionStart]]
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = '"$(git rev-parse --show-toplevel)/.claude/hooks/session-env.sh"'
+timeout = 10
+
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = '"$(git rev-parse --show-toplevel)/.claude/hooks/guard.py"'
+timeout = 30
+statusMessage = "Checking git and gh commands"

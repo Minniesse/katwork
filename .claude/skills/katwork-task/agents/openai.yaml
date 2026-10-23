@@ -1,0 +1,3 @@
+interface:
+  display_name: "KatWork Task"
+  short_description: "Implement one plan task as a stacked PR"

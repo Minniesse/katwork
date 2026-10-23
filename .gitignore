@@ -17,6 +17,11 @@ dist/
 *.sqlite
 *.log
 
+# Local agent state
+.claude/settings.local.json
+.claude/worktrees/
+CLAUDE.local.md
+
 # OS / editors
 .DS_Store
 .idea/
