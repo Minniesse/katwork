@@ -16,6 +16,8 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use katwork::config::TransportConfig;
+
+use crate::log_throttle::LogThrottle;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
@@ -42,7 +44,7 @@ pub async fn serve_with_shutdown(
 ) -> io::Result<()> {
     let mut connections = JoinSet::new();
     let mut peers: HashMap<IpAddr, Weak<Semaphore>> = HashMap::new();
-    let mut drops = DropLog::default();
+    let mut drops = LogThrottle::default();
     let (stop, _) = watch::channel(());
     tokio::pin!(shutdown);
     let result = loop {
@@ -108,26 +110,6 @@ pub async fn serve_with_shutdown(
     result
 }
 
-/// Logs at most one dropped connection per peer bucket per window, so a flood cannot flood the log.
-#[derive(Default)]
-struct DropLog {
-    logged: HashMap<IpAddr, Instant>,
-}
-
-impl DropLog {
-    const WINDOW: Duration = Duration::from_secs(60);
-
-    fn should_log(&mut self, bucket: IpAddr, now: Instant) -> bool {
-        self.logged
-            .retain(|_, at| now.duration_since(*at) < Self::WINDOW);
-        if self.logged.contains_key(&bucket) {
-            return false;
-        }
-        self.logged.insert(bucket, now);
-        true
-    }
-}
-
 struct IdleConnection {
     stream: TcpStream,
     idle: Pin<Box<Sleep>>,
@@ -187,28 +169,5 @@ impl AsyncWrite for IdleConnection {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.stream).poll_shutdown(cx)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn drops_are_logged_once_per_bucket_per_minute() {
-        let mut drops = DropLog::default();
-        let start = Instant::now();
-        let first: IpAddr = "192.0.2.1".parse().unwrap();
-        let second: IpAddr = "192.0.2.2".parse().unwrap();
-        assert!(drops.should_log(first, start));
-        assert!(!drops.should_log(first, start + Duration::from_secs(1)));
-        assert!(drops.should_log(second, start + Duration::from_secs(1)));
-        assert!(!drops.should_log(first, start + Duration::from_millis(59_999)));
-        assert!(drops.should_log(first, start + Duration::from_secs(60)));
-        assert!(!drops.should_log(second, start + Duration::from_secs(60)));
-        assert!(drops.should_log(second, start + Duration::from_secs(61)));
-        // Entries older than the window are forgotten, so the map stays bounded by recent drops.
-        assert!(drops.should_log(first, start + Duration::from_secs(600)));
-        assert_eq!(drops.logged.len(), 1);
     }
 }

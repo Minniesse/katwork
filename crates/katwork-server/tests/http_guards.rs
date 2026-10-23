@@ -566,6 +566,10 @@ impl Logs {
     }
 
     async fn capture(&self, request: Request<Body>) -> Response {
+        self.capture_with(&app(), request).await
+    }
+
+    async fn capture_with(&self, app: &Router, request: Request<Body>) -> Response {
         use tracing::instrument::WithSubscriber;
         let logs = self.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -574,7 +578,7 @@ impl Logs {
             .with_max_level(tracing::Level::TRACE)
             .with_writer(move || logs.clone())
             .finish();
-        app()
+        app.clone()
             .oneshot(request)
             .with_subscriber(subscriber)
             .await
@@ -688,4 +692,64 @@ async fn host_and_origin_rejections_log_the_rejected_value() {
         text.contains(r#"origin="https://evil.example\t\"forged=1""#),
         "{text}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn rejection_logs_are_throttled_per_peer_and_kind() {
+    // See host_and_origin_rejections_log_the_rejected_value for the idle dispatcher.
+    let _idle = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let logs = Logs::default();
+    let app = app();
+    let from = |peer: &str, request: axum::http::request::Builder| {
+        request
+            .extension(axum::extract::ConnectInfo(
+                peer.parse::<std::net::SocketAddr>().unwrap(),
+            ))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let bad_host = || Request::get("/api/auth/me").header("host", "evil.example");
+    let cross_site = || {
+        Request::post("/api/auth/logout")
+            .header("host", "localhost")
+            .header("origin", "https://evil.example")
+    };
+    for _ in 0..3 {
+        let response = logs
+            .capture_with(&app, from("192.0.2.1:7000", bad_host()))
+            .await;
+        code(response, 403, "host_not_allowed").await;
+    }
+    let response = logs
+        .capture_with(&app, from("192.0.2.2:7000", bad_host()))
+        .await;
+    code(response, 403, "host_not_allowed").await;
+    for _ in 0..2 {
+        let response = logs
+            .capture_with(&app, from("192.0.2.1:7001", cross_site()))
+            .await;
+        code(response, 403, "cross_site_request").await;
+    }
+    let lines =
+        |text: String, event: &str| text.lines().filter(|line| line.contains(event)).count();
+    // Every request is refused; one line per peer and kind is logged per minute.
+    assert_eq!(lines(logs.text(), "host_not_allowed"), 2, "{}", logs.text());
+    assert_eq!(
+        lines(logs.text(), "cross_site_request"),
+        1,
+        "{}",
+        logs.text()
+    );
+    tokio::time::advance(std::time::Duration::from_secs(59)).await;
+    let response = logs
+        .capture_with(&app, from("192.0.2.1:7000", bad_host()))
+        .await;
+    code(response, 403, "host_not_allowed").await;
+    assert_eq!(lines(logs.text(), "host_not_allowed"), 2, "{}", logs.text());
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    let response = logs
+        .capture_with(&app, from("192.0.2.1:7000", bad_host()))
+        .await;
+    code(response, 403, "host_not_allowed").await;
+    assert_eq!(lines(logs.text(), "host_not_allowed"), 3, "{}", logs.text());
 }

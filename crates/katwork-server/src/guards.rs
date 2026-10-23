@@ -1,24 +1,40 @@
-use std::time::Duration;
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use axum::{
     Router,
     body::{Body, Bytes, HttpBody},
     error_handling::HandleErrorLayer,
-    extract::{DefaultBodyLimit, FromRequest, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, uri::Authority},
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
 use katwork::{config::Config, error::KatError};
+use tokio::time::Instant;
 use url::Url;
 
-use crate::error::ApiError;
+use crate::{error::ApiError, log_throttle::LogThrottle, peer::ip_bucket};
 
 #[derive(Clone)]
 struct GuardConfig {
     host: Option<String>,
     origin: Option<String>,
     scheme: Option<String>,
+    /// One rejection line per kind and peer bucket per minute.
+    rejections: Arc<Mutex<RejectionLogs>>,
+}
+
+type RejectionLogs = LogThrottle<(Rejection, Option<IpAddr>)>;
+
+/// The rejection a log line is about.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Rejection {
+    HostNotAllowed,
+    CrossSiteRequest,
 }
 
 /// Hosts a local browser or a port-forward reaches the server by, on any port.
@@ -35,6 +51,7 @@ pub fn apply(router: Router, config: &Config) -> Router {
             .and_then(|url| url.host_str().map(str::to_owned)),
         scheme: url.as_ref().map(|url| url.scheme().to_owned()),
         origin: url.map(|url| url.origin().ascii_serialization()),
+        rejections: Arc::default(),
     };
     router
         .layer(middleware::from_fn(read_body))
@@ -81,6 +98,19 @@ fn logged_value(headers: &HeaderMap, name: &str) -> String {
     value
 }
 
+/// Whether this rejection's line is due: the first for its kind and the socket peer's bucket
+/// in the last minute. Behind a proxy every client shares the proxy's bucket.
+fn log_due(request: &Request, config: &GuardConfig, kind: Rejection) -> bool {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| ip_bucket(addr.ip()));
+    config
+        .rejections
+        .lock()
+        .is_ok_and(|mut throttle| throttle.should_log((kind, peer), Instant::now()))
+}
+
 fn check(request: &Request, config: &GuardConfig) -> Result<(), KatError> {
     let safe = matches!(*request.method(), Method::GET | Method::HEAD);
     // A container health probe addresses the server by its service name.
@@ -112,10 +142,12 @@ fn check(request: &Request, config: &GuardConfig) -> Result<(), KatError> {
                     .is_some_and(|allowed| host.eq_ignore_ascii_case(allowed))
         });
     let Some(host) = host else {
-        tracing::warn!(
-            host = ?logged_value(request.headers(), "host"),
-            "host_not_allowed"
-        );
+        if log_due(request, config, Rejection::HostNotAllowed) {
+            tracing::warn!(
+                host = ?logged_value(request.headers(), "host"),
+                "host_not_allowed"
+            );
+        }
         return Err(KatError::HostNotAllowed);
     };
     if !safe {
@@ -134,10 +166,12 @@ fn check(request: &Request, config: &GuardConfig) -> Result<(), KatError> {
                 .iter()
                 .any(|value| value == "cross-site")
         {
-            tracing::warn!(
-                origin = ?logged_value(request.headers(), "origin"),
-                "cross_site_request"
-            );
+            if log_due(request, config, Rejection::CrossSiteRequest) {
+                tracing::warn!(
+                    origin = ?logged_value(request.headers(), "origin"),
+                    "cross_site_request"
+                );
+            }
             return Err(KatError::CrossSiteRequest);
         }
         if !request.body().is_end_stream()
