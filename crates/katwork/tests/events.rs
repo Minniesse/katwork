@@ -320,21 +320,11 @@ async fn run_error_message_is_the_code(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     f.live_lease(&pool).await;
     sink(&pool, &f)
-        .emit(AgUiEvent::RunError {
-            message: "provider diagnostic must not escape".into(),
-            code: Some("provider_unavailable".into()),
-        })
-        .await
-        .unwrap();
-    assert!(
-        matches!(&events(&pool, &f).await[0].1, AgUiEvent::RunError { message, code: Some(code) } if message == "provider_unavailable" && message == code)
-    );
-    sink(&pool, &f)
         .close_run(RunEnd::Interrupted, "lease_lost")
         .await
         .unwrap();
     assert!(
-        matches!(&events(&pool, &f).await[2].1, AgUiEvent::RunError { message, code: Some(code) } if message == "lease_lost" && message == code)
+        matches!(&events(&pool, &f).await[1].1, AgUiEvent::RunError { message, code: Some(code) } if message == "lease_lost" && message == code)
     );
 }
 
@@ -549,4 +539,33 @@ fn fifth_stream_permit_is_refused_until_one_drops() {
     let _other = hub.open_stream("other session hash").unwrap();
     held.pop();
     assert!(hub.open_stream("session hash").is_ok());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn emit_refuses_terminal_events(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    f.live_lease(&pool).await;
+    for event in [
+        AgUiEvent::RunError {
+            message: "diagnostic".into(),
+            code: Some("provider_unavailable".into()),
+        },
+        AgUiEvent::RunFinished {
+            thread_id: f.thread.to_string(),
+            run_id: f.run.to_string(),
+            outcome: None,
+        },
+    ] {
+        assert_eq!(
+            sink(&pool, &f).emit(event).await.unwrap_err().code(),
+            "request_invalid"
+        );
+    }
+    assert!(events(&pool, &f).await.is_empty());
+    assert_eq!(
+        log::tail(&pool, &tenant(&pool, &f).await, ThreadId(f.thread))
+            .await
+            .unwrap(),
+        EventSeq(0)
+    );
 }

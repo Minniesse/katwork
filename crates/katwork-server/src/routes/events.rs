@@ -10,7 +10,7 @@ use katwork::{
     auth::session,
     chat::thread,
     error::KatError,
-    events::{HubSubscription, StreamPermit, log},
+    events::{AgUiEvent, HubSubscription, StreamPermit, log},
     ids::{EventSeq, ThreadId},
     runtime::Core,
     tenancy::{self, Tenant},
@@ -26,7 +26,6 @@ const PAGE_SIZE: u32 = 500;
 const POLL: Duration = Duration::from_secs(2);
 const PING: Duration = Duration::from_secs(15);
 const AUTH: Duration = Duration::from_secs(30);
-const SLOW_CLIENT: Duration = Duration::from_secs(60);
 
 #[derive(Deserialize)]
 pub struct EventPath {
@@ -47,7 +46,11 @@ pub async fn subscribe(
         .ok_or(KatError::Unauthenticated)?
         .to_owned();
     let digest = format!("{:x}", Sha256::digest(token.as_bytes()));
-    let permit = match state.core.events.open_stream(&digest) {
+    let permit = match state
+        .core
+        .events
+        .open_stream_for_user(&digest, tenant.user_id())
+    {
         Ok(permit) => permit,
         Err(KatError::TooManyStreams) => {
             return Ok(Sse::new(futures::stream::iter([
@@ -130,8 +133,7 @@ fn events(
         let mut auth_at = Instant::now() + AUTH;
         let mut poll = tokio::time::interval_at(Instant::now() + POLL, POLL);
         poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        // Pull-based delivery holds one page. A stalled consumer closes and resumes from its last id.
-        let mut yielded_at = Instant::now();
+        // Pull-based delivery holds one page; the transport closes stalled writes independently.
         yield Ok(Event::default().retry(Duration::from_secs(3)));
         match log::tail(&core.pool, &tenant, thread).await {
             Ok(tail) if last > tail => {
@@ -144,10 +146,6 @@ fn events(
         let mut page = VecDeque::new();
         let mut read = true;
         loop {
-            if yielded_at.elapsed() >= SLOW_CLIENT {
-                yield Ok(control("stream_error", json!({"code":"slow_client"})));
-                return;
-            }
             if Instant::now() >= auth_at {
                 let access = async {
                     let user = session::authenticate(&core.pool, &token).await?;
@@ -161,16 +159,11 @@ fn events(
             }
             if Instant::now() >= ping_at {
                 ping_at = Instant::now() + PING;
-                yielded_at = Instant::now();
                 yield Ok(control("ping", json!({"tail":last.0})).comment("keep-alive"));
                 continue;
             }
-            if let Some((seq, event)) = page.pop_front() {
-                if seq > last {
-                    last = seq;
-                    yielded_at = Instant::now();
-                    yield Ok(Event::default().id(seq.to_string()).json_data(event).expect("log event is JSON"));
-                }
+            if let Some((seq, event)) = next_unseen(&mut page, &mut last) {
+                yield Ok(Event::default().id(seq.to_string()).json_data(event).expect("log event is JSON"));
                 continue;
             }
             if read {
@@ -187,5 +180,48 @@ fn events(
                 _ = tokio::time::sleep_until(auth_at) => {},
             }
         }
+    }
+}
+
+fn next_unseen(
+    page: &mut VecDeque<(EventSeq, AgUiEvent)>,
+    last: &mut EventSeq,
+) -> Option<(EventSeq, AgUiEvent)> {
+    while let Some((seq, event)) = page.pop_front() {
+        if seq > *last {
+            *last = seq;
+            return Some((seq, event));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use katwork::events::AgUiEvent;
+
+    #[test]
+    fn duplicate_replay_is_dropped() {
+        let mut last = EventSeq(0);
+        let mut seen = Vec::new();
+        for batch in [&[1, 2, 3][..], &[2, 3, 4, 5], &[4, 5], &[5, 6]] {
+            let mut page = batch
+                .iter()
+                .map(|seq| {
+                    (
+                        EventSeq(*seq),
+                        AgUiEvent::TextMessageEnd {
+                            message_id: "m".into(),
+                        },
+                    )
+                })
+                .collect();
+            while let Some((seq, _)) = next_unseen(&mut page, &mut last) {
+                seen.push(seq.0);
+            }
+        }
+        assert_eq!(seen, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(last, EventSeq(6));
     }
 }

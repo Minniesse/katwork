@@ -50,9 +50,12 @@ impl PgEventSink {
 
 #[async_trait]
 impl EventSink for PgEventSink {
-    async fn emit(&self, mut event: AgUiEvent) -> Result<EventSeq, KatError> {
-        if let AgUiEvent::RunError { message, code } = &mut event {
-            *message = code.as_ref().ok_or(KatError::RequestInvalid)?.clone();
+    async fn emit(&self, event: AgUiEvent) -> Result<EventSeq, KatError> {
+        if matches!(
+            event,
+            AgUiEvent::RunError { .. } | AgUiEvent::RunFinished { .. }
+        ) {
+            return Err(KatError::RequestInvalid);
         }
         let mut tx = self.pool.begin().await?;
         db::set_lock_timeout(&mut tx, self.lock_timeout).await?;

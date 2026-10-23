@@ -22,6 +22,7 @@ serde.workspace = true
 async-stream.workspace = true
 futures.workspace = true
 sha2.workspace = true
+socket2.workspace = true
 
 [dev-dependencies]
 eventsource-stream.workspace = true
