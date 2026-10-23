@@ -114,7 +114,7 @@ pub fn resolve(body: &str, names: &[(KatId, &str)]) -> Vec<KatId> {
                             tail_start = start;
                             tail = chunk;
                         } else {
-                            // Retain raw input: Thai sorting/deduplication must run only once per prefix.
+                            // Retain raw input so each longer prefix reaches its own fixed point.
                             let Some(folded) =
                                 fold_with_budget(&rest[tail_start..end], &mut budget)
                             else {
@@ -283,10 +283,26 @@ mod tests {
             "\u{0301}",
             "ก",
             "ข",
-            "\u{0e38}",
+            "\u{0e31}",
             "\u{0e34}",
+            "\u{0e35}",
+            "\u{0e36}",
+            "\u{0e37}",
+            "\u{0e38}",
+            "\u{0e39}",
+            "\u{0e3a}",
+            "\u{0e47}",
             "\u{0e48}",
+            "\u{0e49}",
+            "\u{0e4a}",
+            "\u{0e4b}",
+            "\u{0e4c}",
+            "\u{0e4d}",
             "\u{0e4e}",
+            "\u{0300}",
+            "\u{0315}",
+            "\u{0323}",
+            "\u{0345}",
             "\u{3099}",
             "ㄱ",
             "ㅏ",
@@ -348,11 +364,15 @@ mod tests {
             for _ in 0..1 + pick(8) {
                 literal.push_str(atoms[pick(atoms.len())]);
             }
-            // Keep both review shapes in the corpus, alongside random mixed-script strings.
+            // Keep the review shapes in the corpus, alongside random mixed-script strings.
             if case % 100 == 0 {
                 literal = "ก\u{0e38}\u{0e34}\u{0e38}\u{3099}ข".into();
             } else if case % 100 == 1 {
                 literal = "ß\u{0e38}\u{0308}\u{0e4e}\u{0e38}".into();
+            } else if case % 100 == 2 {
+                literal = "ก\u{0e38}\u{0e31}\u{3099}\u{0e31}".into();
+            } else if case % 100 == 3 {
+                literal = "ก\u{0e38}\u{0e34}\u{3099}\u{0e34}".into();
             }
             let once = fold_name(&literal);
             assert_eq!(fold_name(&once), once, "case {case}: {literal:?}");

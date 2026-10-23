@@ -1,6 +1,77 @@
 use super::*;
 
 #[sqlx::test(migrations = "../katwork/migrations")]
+async fn unconverged_names_are_rejected_in_hire_rename_and_team_create(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let kat = f.hire("Writer", json!("writer")).await;
+    let name = format!("ก\u{0e38}{}\u{0e31}", "\u{0e31}\u{ff9e}".repeat(5));
+    for (method, path, payload) in [
+        (
+            "POST",
+            format!("spaces/{}/kats", f.space),
+            json!({"name":name,"role":"writer","persona":""}),
+        ),
+        ("PATCH", format!("kats/{}", id(&kat)), json!({"name":name})),
+        (
+            "POST",
+            format!("spaces/{}/teams", f.space),
+            json!({"name":name,"lead":kat["id"],"members":[]}),
+        ),
+    ] {
+        assert_code(
+            f.call(method, &path, Some(payload)).await,
+            400,
+            "request_invalid",
+        )
+        .await;
+    }
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn mixed_thai_mark_spellings_conflict_in_team_create_and_rename(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    for (name, folded) in [
+        (
+            "ก\u{0e38}\u{0e31}\u{3099}\u{0e31}",
+            "ก\u{0e31}\u{3099}\u{0e31}\u{0e38}",
+        ),
+        (
+            "ก\u{0e38}\u{0e34}\u{3099}\u{0e34}",
+            "ก\u{0e34}\u{3099}\u{0e34}\u{0e38}",
+        ),
+    ] {
+        let lead = f.hire(name, json!("lead")).await;
+        let duplicate = f.hire(folded, json!("writer")).await;
+        assert_eq!(lead["name"], name);
+        assert_eq!(duplicate["name"], folded);
+        assert_code(
+            f.call(
+                "POST",
+                &format!("spaces/{}/teams", f.space),
+                Some(json!({"name":"Team","lead":lead["id"],"members":[duplicate["id"]]})),
+            )
+            .await,
+            422,
+            "kat_name_conflict",
+        )
+        .await;
+        let writer = f.hire("Writer", json!("writer")).await;
+        f.team(&lead, std::slice::from_ref(&writer)).await;
+        assert_code(
+            f.call(
+                "PATCH",
+                &format!("kats/{}", id(&writer)),
+                Some(json!({"name":folded})),
+            )
+            .await,
+            422,
+            "kat_name_conflict",
+        )
+        .await;
+    }
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
 async fn names_allow_at_most_four_combining_marks_per_base(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let kat = f.hire("Writer", json!("writer")).await;
