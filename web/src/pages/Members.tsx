@@ -36,6 +36,7 @@ export function Members({ workspaceId, workspaceName, me, myRole, onOwnRoleChang
   const kept = useRef(new Map<string, Role>());
   const sending = useRef(new Set<string>());
   const waiting = useRef(new Map<string, Role>());
+  const ownRoleChanged = useRef(false);
   const allowed = myRole !== 'member';
 
   useEffect(() => {
@@ -85,6 +86,7 @@ export function Members({ workspaceId, workspaceName, me, myRole, onOwnRoleChang
     try {
       await api.setRole(workspaceId, id, role);
       kept.current.set(id, role);
+      if (id === me) ownRoleChanged.current = true;
       outcome = { ok: true };
     } catch (error) {
       outcome = { ok: false, error };
@@ -99,6 +101,12 @@ export function Members({ workspaceId, workspaceName, me, myRole, onOwnRoleChang
     }
     const current = kept.current.get(id) ?? role;
     show(id, current);
+    // Any own change that went through, even one a later queued failure follows, changes what
+    // this person may do: the page's permissions follow it once the queue settles.
+    if (id === me && ownRoleChanged.current) {
+      ownRoleChanged.current = false;
+      onOwnRoleChanged?.();
+    }
     if (!outcome.ok) {
       setFailure(outcome.error);
       return;
@@ -107,7 +115,6 @@ export function Members({ workspaceId, workspaceName, me, myRole, onOwnRoleChang
       key: 'members.role_saved',
       vars: { name: member.display_name, role: `members.role.${current}` },
     });
-    if (id === me) onOwnRoleChanged?.();
   };
 
   const changeRole = (member: Member, role: Role) => {
@@ -366,6 +373,8 @@ function InviteForm({
   // A link always works; email only once the server says SMTP is set up.
   const [delivery, setDelivery] = useState<InviteDelivery>('link');
   const [emailWorks, setEmailWorks] = useState<boolean | null>(null);
+  // The options could not be read: say so, without claiming email is or isn't set up.
+  const [optionsFailed, setOptionsFailed] = useState(false);
   const chosen = useRef(false);
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<unknown>(null);
@@ -380,7 +389,7 @@ function InviteForm({
         setEmailWorks(options.email);
         if (!chosen.current) setDelivery(options.email ? 'email' : 'link');
       },
-      () => live && setEmailWorks(false),
+      () => live && setOptionsFailed(true),
     );
     return () => {
       live = false;
@@ -455,6 +464,7 @@ function InviteForm({
               {t(option === 'email' ? 'members.invite.by_email' : 'members.invite.by_link')}
             </label>
           ))}
+          {optionsFailed && <p className="hint">{t('members.invite.options_failed')}</p>}
           {emailWorks === false && (
             <p id={`${id}-no-email`} className="hint">
               {t('members.invite.email_unavailable')}

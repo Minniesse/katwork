@@ -376,3 +376,44 @@ test('focus_lands_on_the_outcome_after_removing_a_member', async () => {
   const outcome = await screen.findByText(en['members.removed'].replace('{name}', 'มาลี'));
   await waitFor(() => expect(outcome).toHaveFocus());
 });
+
+test('a_successful_self_demotion_refreshes_permissions_even_when_a_queued_change_fails', async () => {
+  const admins: Member[] = [
+    { user_id: 'user-2', email: 'malee@example.test', display_name: 'มาลี', role: 'owner' },
+    { user_id: ME, email: 'pat@example.test', display_name: 'Pat', role: 'admin' },
+  ];
+  const demotion = deferred<Reply>();
+  const sent: unknown[] = [];
+  const calls = mockApi({ [LIST]: [200, admins] });
+  calls.route(role(ME), ({ body }) => {
+    sent.push(body);
+    // Once demoted, the person is a member: their own re-promotion is refused.
+    return sent.length === 1 ? demotion.promise : [403, { code: 'forbidden' }];
+  });
+  const user = userEvent.setup({ delay: null });
+  const onOwnRoleChanged = renderMembers('admin');
+  const mine = await screen.findByRole('combobox', {
+    name: en['members.role_for'].replace('{name}', 'Pat'),
+  });
+  await user.selectOptions(mine, 'member');
+  await user.click(screen.getByRole('button', { name: en['members.self_role_yes'] }));
+  await user.selectOptions(mine, 'admin');
+  expect(sent).toEqual([{ role: 'member' }]);
+
+  await act(async () => demotion.resolve([204]));
+  await waitFor(() => expect(sent).toEqual([{ role: 'member' }, { role: 'admin' }]));
+  expect(await screen.findByRole('alert')).toHaveTextContent(en['reason.forbidden']);
+  // The demotion went through, so the page must follow it whatever the queued change did.
+  expect(onOwnRoleChanged).toHaveBeenCalledOnce();
+  await waitFor(() => expect(mine).toHaveValue('member'));
+});
+
+test('invite_options_failing_to_load_makes_no_claim_about_email', async () => {
+  mockApi({ [LIST]: [200, PEOPLE], [OPTIONS]: [503, { code: 'database_unavailable' }] });
+  renderMembers();
+  const form = await screen.findByRole('form', { name: en['members.invite.title'] });
+  expect(await within(form).findByText(en['members.invite.options_failed'])).toBeVisible();
+  expect(within(form).queryByText(en['members.invite.email_unavailable'])).toBeNull();
+  expect(within(form).getByRole('radio', { name: en['members.invite.by_link'] })).toBeChecked();
+  expect(within(form).getByRole('radio', { name: en['members.invite.by_email'] })).toBeEnabled();
+});
