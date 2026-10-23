@@ -9,9 +9,13 @@ use axum::{
     Json,
     body::Body,
     extract::Request,
-    http::{HeaderValue, StatusCode, header::CACHE_CONTROL},
+    http::{
+        HeaderValue, StatusCode,
+        header::{CACHE_CONTROL, CONTENT_TYPE},
+    },
     response::{IntoResponse, Response},
 };
+use percent_encoding::percent_decode_str;
 use serde_json::json;
 use tower::{Service, ServiceExt};
 use tower_http::services::{ServeDir, ServeFile};
@@ -47,8 +51,18 @@ async fn respond(dir: &Path, request: Request) -> Response {
     }
     // A path whose last segment has no extension is a client-side route; a missing file
     // with an extension stays a 404 rather than turning into HTML.
-    let client_route = !path.rsplit('/').next().unwrap_or_default().contains('.');
+    let last_segment = path.rsplit('/').next().unwrap_or_default();
+    let client_route = !last_segment.contains('.');
     let hashed_asset = path.starts_with("/assets/");
+    // HTML by name as well as by type: a 304 revalidation carries no `Content-Type`. The name is
+    // decoded as `ServeDir` decodes it, so `/index.%68tml` is `index.html` too.
+    let html_name = percent_decode_str(last_segment)
+        .decode_utf8()
+        .is_ok_and(|name| {
+            Path::new(&*name).extension().is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
+            })
+        });
     let served = if client_route {
         ServeFile::new(dir.join("index.html"))
             .oneshot(request)
@@ -60,12 +74,22 @@ async fn respond(dir: &Path, request: Request) -> Response {
         Ok(response) => response.map(Body::new),
         Err(never) => match never {},
     };
-    let cache = if hashed_asset && response.status().is_success() {
-        "public, max-age=31536000, immutable"
-    } else if client_route {
+    let html = client_route
+        || html_name
+        || response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("text/html"));
+    let cache = if html {
         // The app's HTML is never stored, so neither an HTTP cache nor the browser's
-        // back-forward cache keeps a page that held an invite or reset token in memory.
+        // back-forward cache keeps a page that held an invite or reset token in memory. That
+        // covers a direct `/index.html`, an HTML file or extensionless path under `/assets`, and
+        // their 304s, whose headers replace a stored copy's; only the hashed files are immutable.
         "no-store"
+    } else if hashed_asset && response.status().is_success() {
+        "public, max-age=31536000, immutable"
     } else {
         "no-cache"
     };

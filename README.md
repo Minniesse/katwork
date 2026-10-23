@@ -262,7 +262,14 @@ Ollama defaults to port `11434`, and vLLM to `8000`; for llama.cpp use `8080`
 (set `--port 8080` explicitly because defaults vary across releases).
 For Ollama on another machine, set `OLLAMA_HOST=0.0.0.0` on that machine and use
 its LAN hostname/IP in the base URL. The server must also listen on an interface
-reachable from the container when it runs on the Docker host.
+reachable from the container when it runs on the Docker host. On a Linux Docker
+host, Ollama on the same host listens on `127.0.0.1`, which the container cannot
+reach. Set `OLLAMA_HOST` to the Docker bridge address (for example `172.17.0.1`;
+`ip -4 addr show docker0` shows it), or to `0.0.0.0` behind a firewall.
+With a default-deny firewall such as ufw, also allow KatWork's Compose network to
+reach that port: `sudo ufw allow from <compose-subnet> to 172.17.0.1 port 11434 proto tcp`
+(`172.31.250.0/29` with the HTTPS override; otherwise see `docker network inspect`).
+Ollama has no authentication: anyone who can reach its port can use it.
 
 A local-only Space selects this provider without demo mode. A Space allowing
 external providers prefers a configured hosted entry. Configuring a local provider
@@ -389,11 +396,17 @@ scripts/init-env.sh --https work.home.arpa
 ```
 
 หากมี `.env` อยู่แล้ว ให้แก้ `KATWORK_HTTPS_HOST=work.home.arpa` และ
-`COMPOSE_FILE=docker-compose.yml:docker-compose.https.yml` ในไฟล์นั้น แล้วเริ่มระบบและนำใบรับรองออกมา:
+`COMPOSE_FILE=docker-compose.yml:docker-compose.https.yml` ในไฟล์นั้น แล้วเริ่มระบบใหม่:
 
 ```sh
 docker compose down
 docker compose up -d --build
+```
+
+ไม่ว่าจะติดตั้งใหม่หรือแก้ `.env` เดิม ต้องนำใบรับรองหลัก (root certificate) ออกมา
+และให้เครื่องของผู้ใช้เชื่อถือใบรับรองนี้ เมื่อระบบเริ่มทำงานแล้ว กรุณาใช้คำสั่งนี้:
+
+```sh
 docker compose cp caddy:/data/caddy/pki/authorities/local/root.crt ./katwork-root.crt
 ```
 

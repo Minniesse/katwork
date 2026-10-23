@@ -3,7 +3,11 @@ mod support;
 
 use std::{path::PathBuf, sync::Arc};
 
-use axum::{Router, body::to_bytes, http::Request};
+use axum::{
+    Router,
+    body::to_bytes,
+    http::{Method, Request},
+};
 use katwork::runtime::Core;
 use katwork_server::app::{AppState, build_router_with_web_dir};
 use sqlx::postgres::PgPoolOptions;
@@ -21,6 +25,11 @@ impl WebDir {
         )
         .unwrap();
         std::fs::write(dir.join("assets/app-1234.js"), "console.log('app')").unwrap();
+        std::fs::write(
+            dir.join("assets/page.html"),
+            "<!doctype html><title>Page</title>",
+        )
+        .unwrap();
         std::fs::write(dir.join("theme-init.js"), "// theme").unwrap();
         Self(dir)
     }
@@ -180,26 +189,25 @@ async fn unknown_host_is_refused_before_static_files() {
     assert_eq!(response.status(), 403);
 }
 
+/// The `Cache-Control` of a successful response.
+async fn cache_control(app: &Router, path: &str) -> String {
+    let request = Request::builder()
+        .uri(path)
+        .header("host", "localhost")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), 200, "{path}");
+    response.headers()["cache-control"]
+        .to_str()
+        .unwrap()
+        .to_owned()
+}
+
 #[tokio::test]
 async fn app_pages_are_never_stored() {
     let web = WebDir::new();
     let app = app(&web);
-    let cache_control = |path: &'static str| {
-        let app = app.clone();
-        async move {
-            let request = Request::builder()
-                .uri(path)
-                .header("host", "localhost")
-                .body(axum::body::Body::empty())
-                .unwrap();
-            let response = app.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), 200, "{path}");
-            response.headers()["cache-control"]
-                .to_str()
-                .unwrap()
-                .to_owned()
-        }
-    };
     // A page holding a link's token must not be kept by an HTTP cache or the back-forward cache.
     for path in [
         "/invite?token=AAAA",
@@ -209,12 +217,96 @@ async fn app_pages_are_never_stored() {
         "/login",
         "/",
     ] {
-        assert_eq!(cache_control(path).await, "no-store", "{path}");
+        assert_eq!(cache_control(&app, path).await, "no-store", "{path}");
     }
     // Other files keep their revalidating or immutable caching.
-    assert_eq!(cache_control("/theme-init.js").await, "no-cache");
+    assert_eq!(cache_control(&app, "/theme-init.js").await, "no-cache");
     assert_eq!(
-        cache_control("/assets/app-1234.js").await,
+        cache_control(&app, "/assets/app-1234.js").await,
         "public, max-age=31536000, immutable"
     );
+}
+
+#[tokio::test]
+async fn direct_index_html_is_never_stored() {
+    let web = WebDir::new();
+    let app = app(&web);
+    let (_, content_type, body) = get(&app, "/index.html").await;
+    assert!(content_type.starts_with("text/html"), "{content_type}");
+    assert!(body.contains("<title>KatWork</title>"));
+    assert_eq!(cache_control(&app, "/index.html").await, "no-store");
+}
+
+#[tokio::test]
+async fn extensionless_html_under_assets_is_never_stored() {
+    let web = WebDir::new();
+    let app = app(&web);
+    for path in ["/assets/page", "/assets/page?token=AAAA"] {
+        let (_, content_type, body) = get(&app, path).await;
+        assert!(
+            content_type.starts_with("text/html"),
+            "{path}: {content_type}"
+        );
+        assert!(body.contains("<title>KatWork</title>"), "{path}");
+        assert_eq!(cache_control(&app, path).await, "no-store", "{path}");
+    }
+    // The hashed files beside it keep their immutable caching.
+    assert_eq!(
+        cache_control(&app, "/assets/app-1234.js").await,
+        "public, max-age=31536000, immutable"
+    );
+}
+
+/// A browser revalidating its stored copy of `path` gets a 304 that is still never stored: the
+/// 304's headers replace the stored ones, and a 304 carries no `Content-Type`.
+async fn assert_revalidation_is_never_stored(app: &Router, path: &str) {
+    let request = |method: Method| {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "localhost")
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+    let first = app.clone().oneshot(request(Method::GET)).await.unwrap();
+    let last_modified = first.headers()["last-modified"].clone();
+    for method in [Method::GET, Method::HEAD] {
+        let mut conditional = request(method.clone());
+        conditional
+            .headers_mut()
+            .insert("if-modified-since", last_modified.clone());
+        let response = app.clone().oneshot(conditional).await.unwrap();
+        assert_eq!(response.status(), 304, "{method} {path}");
+        assert_eq!(
+            response.headers()["cache-control"],
+            "no-store",
+            "{method} {path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn index_html_revalidation_is_never_stored() {
+    let web = WebDir::new();
+    let app = app(&web);
+    assert_revalidation_is_never_stored(&app, "/index.html?token=AAAA").await;
+}
+
+#[tokio::test]
+async fn html_file_under_assets_is_never_stored() {
+    let web = WebDir::new();
+    let app = app(&web);
+    for path in [
+        "/assets/page.html?token=AAAA",
+        "/assets/page.%68tml?token=AAAA",
+    ] {
+        let (_, content_type, body) = get(&app, path).await;
+        assert!(
+            content_type.starts_with("text/html"),
+            "{path}: {content_type}"
+        );
+        assert!(body.contains("<title>Page</title>"), "{path}");
+        assert_eq!(cache_control(&app, path).await, "no-store", "{path}");
+        assert_revalidation_is_never_stored(&app, path).await;
+    }
 }
