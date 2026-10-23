@@ -18,8 +18,19 @@ pub async fn authorize(
     space_id: SpaceId,
     policy_version: i64,
 ) -> Result<Option<StopReason>, KatError> {
+    crate::db::set_configured_lock_timeout(conn).await?;
     scoped_task(conn, tenant, fence).await?;
+    sqlx::query("SELECT id FROM workspaces WHERE id=$1 FOR SHARE")
+        .bind(tenant.workspace_id())
+        .fetch_one(&mut *conn)
+        .await?;
     fence::check(conn, fence).await?;
+    sqlx::query("SELECT id FROM kats WHERE workspace_id=$1 AND id=$2 FOR SHARE")
+        .bind(tenant.workspace_id())
+        .bind(kat_id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or(KatError::NotFound)?;
     policy(conn, tenant, kat_id, space_id, policy_version).await
 }
 pub(crate) async fn scoped_task(
@@ -35,23 +46,16 @@ pub(crate) async fn scoped_task(
         .ok_or(KatError::NotFound)?;
     Ok(())
 }
-/// Call first inside a write transaction. The Kat share lock serializes policy edits with effects.
-/// Tools needing earlier row classes must acquire those locks before calling this guard.
+/// Call first inside a write transaction; workspace, task and Kat share locks remain until commit.
+/// Tools needing intervening row classes require a lock-order-aware guard before they can ship.
 pub async fn authorize_write(
     conn: &mut PgConnection,
     ctx: &ToolCtx,
 ) -> Result<Option<StopReason>, KatError> {
-    scoped_task(conn, &ctx.tenant, &ctx.fence()).await?;
-    fence::check(conn, &ctx.fence()).await?;
-    sqlx::query("SELECT id FROM kats WHERE workspace_id=$1 AND id=$2 FOR SHARE")
-        .bind(ctx.tenant.workspace_id())
-        .bind(ctx.kat_id)
-        .fetch_optional(&mut *conn)
-        .await?
-        .ok_or(KatError::NotFound)?;
-    policy(
+    authorize(
         conn,
         &ctx.tenant,
+        &ctx.fence(),
         ctx.kat_id,
         ctx.space_id,
         ctx.policy_version,

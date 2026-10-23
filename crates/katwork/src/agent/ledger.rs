@@ -17,7 +17,7 @@ pub(crate) fn clean(text: &str) -> String {
 }
 pub(crate) async fn transaction(pool: &PgPool) -> Result<Transaction<'_, Postgres>, KatError> {
     let mut tx = pool.begin().await?;
-    db::set_lock_timeout(&mut tx, std::time::Duration::from_secs(5)).await?;
+    db::set_configured_lock_timeout(&mut tx).await?;
     Ok(tx)
 }
 async fn insert(
@@ -116,6 +116,36 @@ pub async fn end_tool_call(
     if changed.rows_affected() != 1 {
         return Err(KatError::LeaseLost);
     }
+    tx.commit().await?;
+    Ok(())
+}
+// Only the owner of an unpolled call may undo its conservative effects marker.
+pub(crate) async fn refuse_started(
+    pool: &PgPool,
+    fence: &Fence,
+    id: ToolCallRecordId,
+    code: &str,
+) -> Result<(), KatError> {
+    let mut tx = transaction(pool).await?;
+    fence::lock(&mut tx, fence).await?;
+    let changed = sqlx::query(
+        "UPDATE tool_calls c SET state='refused',result=$4,ended_at=clock_timestamp() FROM runs r
+        WHERE c.id=$1 AND c.run_id=r.id AND c.workspace_id=r.workspace_id AND r.task_id=$2
+        AND r.lease_epoch=$3 AND r.state='running' AND c.state='started'",
+    )
+    .bind(id)
+    .bind(fence.task_id)
+    .bind(fence.epoch)
+    .bind(clean(code))
+    .execute(&mut *tx)
+    .await?;
+    if changed.rows_affected() != 1 {
+        return Err(KatError::LeaseLost);
+    }
+    sqlx::query("UPDATE tasks t SET effects_started_at=NULL WHERE t.id=$1
+        AND NOT EXISTS (SELECT 1 FROM tool_calls c JOIN runs r ON r.id=c.run_id AND r.workspace_id=c.workspace_id
+            WHERE r.task_id=t.id AND r.workspace_id=t.workspace_id AND c.side_effect <> 'read' AND c.state <> 'refused')")
+        .bind(fence.task_id).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
 }

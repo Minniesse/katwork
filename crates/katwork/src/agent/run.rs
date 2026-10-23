@@ -145,8 +145,9 @@ impl Runner<'_, '_> {
             .await
             .map_err(|e| self.abort(e))?;
         // Validate the full harness relationship before acquiring any tenant-owned row lock.
-        sqlx::query("SELECT t.id FROM tasks t JOIN jobs j ON j.id=t.job_id AND j.workspace_id=t.workspace_id
+        self.input.space_policy.allow_external = sqlx::query_scalar("SELECT s.allow_external FROM tasks t JOIN jobs j ON j.id=t.job_id AND j.workspace_id=t.workspace_id
             JOIN threads th ON th.id=j.thread_id AND th.workspace_id=j.workspace_id
+            JOIN spaces s ON s.id=th.space_id AND s.workspace_id=th.workspace_id
             WHERE t.workspace_id=$1 AND t.id=$2 AND t.job_id=$3 AND t.kat_id=$4 AND th.id=$5 AND th.space_id=$6")
             .bind(self.input.tenant.workspace_id()).bind(self.input.task_id).bind(self.input.job_id).bind(self.kat.id).bind(self.input.thread_id).bind(self.input.space_id)
             .fetch_optional(&mut *tx).await.map_err(|e|self.abort(e.into()))?.ok_or_else(||self.abort(KatError::NotFound))?;
@@ -191,6 +192,10 @@ impl Runner<'_, '_> {
         }
     }
     async fn drive(&mut self) -> Result<(), RunAbort> {
+        if self.kat.policy_version != self.input.policy_version {
+            self.stop(StopReason::PolicyChanged);
+            return Ok(());
+        }
         if let Some(reason) = self.interrupted() {
             self.stop(reason);
             return Ok(());
@@ -299,6 +304,19 @@ impl Runner<'_, '_> {
                     break;
                 }
             };
+            let mut ids = HashSet::new();
+            if turn.tool_calls.len() > 64
+                || turn.tool_calls.iter().any(|c| {
+                    c.id.is_empty()
+                        || c.id.len() > 256
+                        || !c.id.bytes().all(|b| b.is_ascii_graphic())
+                        || c.name.len() > 128
+                        || !ids.insert(&c.id)
+                })
+            {
+                self.stop(StopReason::ModelProtocol);
+                break;
+            }
             match stop {
                 StopKind::MaxTokens => {
                     self.facts.final_text =
@@ -315,15 +333,6 @@ impl Runner<'_, '_> {
                     self.stop(StopReason::ModelProtocol);
                     break;
                 }
-            }
-            let mut ids = HashSet::new();
-            if turn.tool_calls.len() > 64
-                || turn.tool_calls.iter().any(|c| {
-                    c.id.is_empty() || c.id.len() > 256 || c.id.contains('\0') || !ids.insert(&c.id)
-                })
-            {
-                self.stop(StopReason::ModelProtocol);
-                break;
             }
             if turn.tool_calls.is_empty() {
                 self.facts.final_text = (!turn.content.is_empty()).then(|| clean(&turn.content));
@@ -370,6 +379,10 @@ impl Runner<'_, '_> {
                 "stream_without_done".into(),
             ))),
         };
+        if let Some(reason) = self.authority().await? {
+            result.ending = Err(AttemptFailure::Stop(reason));
+            return Ok(result);
+        }
         let first_deadline =
             (Instant::now() + selected.entry.timeouts.first_chunk).min(self.deadline);
         let stream = tokio::select! {biased;
@@ -650,10 +663,12 @@ impl Runner<'_, '_> {
         for (index, call) in calls.iter().enumerate() {
             if let Some(reason) = self.interrupted() {
                 self.stop(reason);
-                if reason != StopReason::Cancelled {
-                    self.refuse_batch(&calls[index..], reason.wire(), true)
-                        .await?;
-                }
+                self.refuse_batch(
+                    &calls[index..],
+                    reason.wire(),
+                    reason != StopReason::Cancelled,
+                )
+                .await?;
                 break;
             }
             if let Some(reason) = self.authority().await? {
@@ -714,7 +729,10 @@ impl Runner<'_, '_> {
                     self.stop(StopReason::NeedsApproval);
                     break;
                 }
-                _ => {}
+                SideEffect::Read
+                | SideEffect::WorkspaceRead
+                | SideEffect::Draft
+                | SideEffect::WorkspaceWrite => {}
             }
             if !self.repeat.check(&RepeatKey {
                 tool_name: call.name.clone(),
@@ -740,20 +758,30 @@ impl Runner<'_, '_> {
             let mut retry = false;
             loop {
                 // Recheck after ledger/event I/O, immediately before polling the tool future.
-                if let Some(reason) = self.interrupted() {
-                    self.stop(reason);
-                    break;
-                }
-                if let Some(reason) = self.authority().await? {
-                    self.end(id, ToolCallState::Failed, Some(reason.wire()))
-                        .await?;
+                let reason = match self.interrupted() {
+                    Some(reason) => Some(reason),
+                    None => self.authority().await?.or_else(|| self.interrupted()),
+                };
+                if let Some(reason) = reason {
+                    self.refuse_started(id, reason).await?;
                     self.stop(reason);
                     break;
                 }
                 let deadline = (Instant::now() + self.limits.tool_timeout).min(self.deadline);
+                let mut dispatched = false;
                 let result = tokio::select! {biased;
-                    ()=self.input.cancel.cancelled()=>{self.stop(StopReason::Cancelled);break;},
-                    result=timeout_at(deadline,tool.call(&ctx,args.clone()))=>result.unwrap_or(Err(ToolError::Timeout))
+                    ()=self.input.cancel.cancelled()=>None,
+                    result=timeout_at(deadline, async {
+                        dispatched = true;
+                        tool.call(&ctx,args.clone()).await
+                    })=>Some(result.unwrap_or(Err(ToolError::Timeout)))
+                };
+                let Some(result) = result else {
+                    if !dispatched {
+                        self.refuse_started(id, StopReason::Cancelled).await?;
+                    }
+                    self.stop(StopReason::Cancelled);
+                    break;
                 };
                 match result {
                     Ok(output) => {
@@ -826,9 +854,37 @@ impl Runner<'_, '_> {
                     }
                 }
             }
-            if self.facts.stop.is_some() || self.facts.pending_question.is_some() {
+            if let Some(reason) = self.facts.stop {
+                self.refuse_batch(
+                    &calls[index + 1..],
+                    reason.wire(),
+                    reason != StopReason::Cancelled,
+                )
+                .await?;
                 break;
             }
+            if self.facts.pending_question.is_some() {
+                break;
+            }
+        }
+        Ok(())
+    }
+    async fn refuse_started(
+        &mut self,
+        id: ToolCallRecordId,
+        reason: StopReason,
+    ) -> Result<(), RunAbort> {
+        ledger::refuse_started(self.env.pool, &self.fence(), id, reason.wire())
+            .await
+            .map_err(|e| self.abort(e))?;
+        self.facts
+            .tool_calls
+            .last_mut()
+            .expect("started call")
+            .state = ToolCallState::Refused;
+        if reason != StopReason::Cancelled {
+            self.result_events(id, reason.wire(), Some(reason.wire()))
+                .await?;
         }
         Ok(())
     }
