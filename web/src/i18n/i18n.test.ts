@@ -86,6 +86,13 @@ describe('catalogues', () => {
     }
   });
 
+  test('stopped_pause_notices_explain_how_to_request_work_again', () => {
+    expect(en['reason.workspace_paused_stopped']).toBe('Stopped because the Kats in this workspace were paused. Send the request again after they resume.');
+    expect(en['reason.kat_paused_stopped']).toBe('Stopped because this Kat was paused. Send the request again after it resumes, or ask another Kat.');
+    expect(th['reason.workspace_paused_stopped']).toBe('งานหยุดแล้ว เพราะ Kats ในเวิร์กสเปซนี้ถูกหยุดไว้ชั่วคราว โปรดส่งคำขออีกครั้งเมื่อเปิดใช้แล้ว');
+    expect(th['reason.kat_paused_stopped']).toBe('งานหยุดแล้ว เพราะ Kat ที่รับงานนี้ถูกหยุดไว้ชั่วคราว โปรดส่งคำขออีกครั้งเมื่อเปิดใช้แล้ว หรือขอให้ Kat อื่นช่วยแทน');
+  });
+
   test('copy_calls_coworkers_kats_and_thai_never_says_ai_employee', () => {
     const enText = Object.values(en).join('\n');
     const thText = Object.values(th).join('\n');
