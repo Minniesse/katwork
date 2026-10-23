@@ -1235,10 +1235,11 @@ h2 {
     margin-left: auto;
   }
 
+  /* The links stay on one row; with two pickers, they wrap to a row of their own. */
   .shell-nav {
     order: 3;
     flex-basis: 100%;
-    flex-wrap: nowrap;
+    flex-wrap: wrap;
     gap: 0.5rem;
   }
 
@@ -1251,8 +1252,12 @@ h2 {
   }
 
   .pickers {
-    flex-wrap: nowrap;
+    flex-wrap: wrap;
     margin-left: auto;
+  }
+
+  .pickers .select {
+    max-width: 10rem;
   }
 
   .picker-label,
