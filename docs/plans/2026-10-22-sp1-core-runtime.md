@@ -19,7 +19,7 @@
 
 **Spec:** `docs/spec/katwork-design.md` (§2 decisions, §4 domain model and statuses, §5 architecture, §6 flow, §13 security, §15 testing, §19 sub-project 1).
 
-**Decisions:** `docs/adr/0001-katwork-owns-the-agent-loop.md`, `docs/adr/0002-needs-input-is-final-in-sp1.md`, `docs/adr/0003-own-ag-ui-event-types.md`.
+**Decisions:** `docs/adr/0001-katwork-owns-the-agent-loop.md`, `docs/adr/0002-needs-input-is-final-in-sp1.md`, `docs/adr/0003-own-ag-ui-event-types.md`, `docs/adr/0004-operator-accounts-without-smtp.md`, `docs/adr/0005-local-model-provider.md`.
 
 ## Global Constraints
 
@@ -27,16 +27,17 @@
 - Licence Apache-2.0. **No GPL/AGPL dependencies**: `cargo deny check licenses` runs in CI with those licences denied.
 - Self-host via **Docker Compose** on one Linux host (spec §1.1 goal 1).
 - Every cargo command in CI runs with `--locked`. The workspace `rust-version` is checked by the CI job `msrv` (Task 2): 1.94.0 from Task 2, 1.97.1 from Task 7.
-- **Axum 0.8 path captures use `{name}`; `/:name` panics when the router is built.** Routes name their captures `{workspace_id}`, `{space_id}`, `{dot_id}`, `{team_id}`, `{thread_id}` and `{job_id}`; the `Tenant` extractor reads `{workspace_id}`.
+- **Axum 0.8 path captures use `{name}`; `/:name` panics when the router is built.** Routes name their captures `{workspace_id}`, `{space_id}`, `{dot_id}`, `{team_id}`, `{thread_id}`, `{job_id}` and `{user_id}`; the `Tenant` extractor reads `{workspace_id}`.
 - **English and Thai together.** Every user-facing string comes from `web/src/i18n/{en,th}.json`. API errors are JSON `{"code": "<stable_id>"}`, never prose; each task adds the `KatError` variants for the codes it names.
 - **Words.** User-facing copy calls the coworkers "Dots" in both languages. Thai copy describes a Dot as ผู้ช่วย AI and the team as ทีม, and never says พนักงาน AI (spec §3).
 - **The harness never runs model output through a shell, in the core or in checks; checks run as argv arrays. Tool ids are matched against a registry** (spec §5.1, §13). From SP2, commands inside a Dot's sandbox run only through the agentOS exec API, as a per-Dot capability that is off by default, bounded, gated like any tool call, and recorded.
 - Every model call goes through `ModelProvider`; provider and Space data-residency rules are enforced in the gateway (spec §11).
+- **Dependency logs.** The server's tracing subscriber blocks every event whose target starts with `rig` (the `filter_fn` `dependency_log_allowed`, Task 7), and `sqlx` likewise, whatever `RUST_LOG` says; the default filter is `info,rig=info`. No log line carries provider text: a provider error is logged once, by Task 7's adapter, as `model_provider_error` with only the error kind (the `ModelError` code), the HTTP status, the provider request id and the body's byte count; nothing else in KatWork logs a provider body, diagnostic or prompt. Task 14's smoke test checks the `rig` filter.
 - The job status set is exactly `accepted | ready | answered | stopped | needs_input | cancelled | error` (spec §4). Only the policy function sets the first five; the harness sets `cancelled` and `error`. In SP1 a job can end as `answered`, `stopped`, `needs_input`, `cancelled` or `error` (`ready` needs an artifact, which arrives in SP2). `needs_input` is final in SP1: the person's answer starts a follow-up job linked by `parent_job_id` (ADR-0002).
 - Agent loop limits, initial defaults:
   - at most 24 steps per run, where a step is one model attempt, retries included
-  - run wall-clock 90 s; token budget per run 200,000 input+output tokens charged over attempts (a missing count is charged conservatively, Task 8); task deadline 5 minutes; job deadline 10 minutes. Every model or tool call's timeout is `min(its own, the run's remaining time)`
-  - tool timeout 60 s; a model stream gets 30 s to its first chunk and at most 30 s between chunks; at most 1 retry per model call, only before the first chunk
+  - run wall clock from the model entry (`ModelEntry.timeouts.run_wall_clock`, Task 7b): 90 s for hosted and demo entries, 300 s for local ones; token budget per run 200,000 input+output tokens charged over attempts (a missing count is charged conservatively, Task 8); task deadline 5 minutes from the task's first claim, not its creation; job deadline 10 minutes from the job's creation. Every model or tool call's timeout is `min(its own, the run's remaining time)`
+  - tool timeout 60 s. Each model entry carries its own stream timeouts: a hosted entry gets 30 s to its first content chunk and at most 30 s between content chunks; a local entry gets 120 s and 60 s (Task 7b). At most 1 retry per model call, only before its first content chunk (a non-empty `TextDelta`, `Progress`, `ToolCall` or `Done`; Task 8)
   - loop detection: the same tool with the same canonical arguments 3 times in a row, **or** 5 times within the last 10 calls, stops the run before that call runs
   - tool results capped at 8,000 Unicode scalar values, the truncation marker included
   - the history passed to a run is the newest messages up to 24,000 characters
@@ -44,8 +45,12 @@
 - **Demo mode with no keys must work.** Synthetic replies carry `messages.synthetic = true`, set only on the `FakeProvider::demo` path; the UI badge reads the flag (spec §15).
 - **Reply vs send.** A *reply* goes to the thread the request came from; the harness fills the target and it is not gated. A *send* goes to any other target, or is a proactive post; it is `Outward` and produces a Proposal (SP3). In SP1 the only write is the reply, written once by `job::conclude` (Task 10).
 - **Tenant isolation in the schema.** Every tenant-owned child row references its parent with a composite foreign key `(parent_id, workspace_id) REFERENCES parent (id, workspace_id)`, and each tenant-owned parent has `UNIQUE (id, workspace_id)` for it, so a row can never point into another workspace.
-- **Lock order.** Every transaction that waits for row locks takes them in one global order: workspace row → job row → task row, then its `task_leases`, `runs` and `tool_calls` rows → thread row (the row `log::append` updates for `last_event_seq`) → Dot row, then its `dot_spaces` rows. Within one class, rows are locked in ascending id. A path that needs a later lock takes every lock it needs at its start, in this order, with `SELECT … FOR NO KEY UPDATE` (`FOR SHARE` when it only reads the row), before any write. A transaction that will update a row locks it `FOR NO KEY UPDATE` from the start and never upgrades from `FOR SHARE`; a plain `UPDATE` that leaves the key unchanged takes the same lock. **No path uses `FOR UPDATE`, deletes a workspace, user, job, task, thread, Dot, message or run row, or changes any row's key.** The only deletes are `task_leases` rows and non-default `dot_spaces` grants, which no row references. Foreign-key checks on insert and update take `FOR KEY SHARE` on the parent row, which conflicts only with `FOR UPDATE`, a delete or a key change, so a foreign-key check never waits on a lock any path holds. Inserting a row whose parent sits earlier in the order, such as a follow-up job referencing its parent job or any tenant row referencing its workspace, is therefore safe after later locks. Rows a transaction inserts are invisible to others until commit, unique-index checks run under the thread or job lock that already serializes their writers (Task 12), and a `SKIP LOCKED` select never waits. Every remaining wait is for a lock later in the order than any lock already held, so no cycle of waits, and no deadlock, can form. Tasks 2, 4 and 8–12 name the locks each path takes.
-- Default team roles: Lead, Researcher, Writer, Analyst, Scheduler, Reviewer (spec §2).
+- **Roles before bodies.** Every write route that needs an owner or admin calls `Tenant::require_admin()` before it parses the request body, so a member gets 403 `forbidden` whatever the body holds. The Dot `PATCH` (Task 5), whose required role depends on which keys the body sets, checks the role right after reading the keys and before validating any value.
+- **Lock first, then check.** Never decide on time or lease validity inside a locking `SELECT`: lock the row first, then re-read it and check `lease_epoch`, state and `clock_timestamp()` expiry in a separate statement of the same transaction. A locking select evaluates its `WHERE` before it waits for the lock, and Postgres re-checks it after the wait only when the row changed, so a lease that expires during the wait, or one renewed after the snapshot, is misjudged. `fence::check`, `fence::lock` (Task 2) and `lease::claim` (Task 11) follow this rule.
+- **Time windows.** A quota or rate window uses one cutoff for the whole statement, `statement_timestamp() - interval '24 hours'` (or `'60 seconds'`), never a per-row `clock_timestamp()`: Postgres cannot bound an index scan with a volatile expression, so a per-row cutoff visits every historical row. The window's statement runs after the lock it depends on (the Dot row for quotas), so `statement_timestamp()` is sampled after any lock wait. Lease-expiry checks keep `clock_timestamp()`.
+- **Migrations.** A task that changes the schema adds the next numbered file in `crates/katwork/migrations/`: `0002_email_unique.sql` and `0003_email_lowercase.sql` (Task 3), `0004_team_membership.sql` (Task 5), `0005_invite_tokens.sql` (Task 3b, which merges after PR #24, so its number follows Task 5's), `0006_task_first_claim.sql` (Task 11), `0007_scheduler_indexes.sql` (Task 12). Tasks 7b and 13b add none.
+- **Lock order.** Every transaction that waits for row locks takes them in one global order: workspace row → job row → task row, then its `task_leases`, `runs` and `tool_calls` rows → thread row (the row `log::append` updates for `last_event_seq`) → Dot row, then its `dot_spaces` rows. Within one class, rows are locked in ascending id. A path that needs a later lock takes every lock it needs at its start, in this order, with `SELECT … FOR NO KEY UPDATE` (`FOR SHARE` when it only reads the row), before any write. A transaction that will update a row locks it `FOR NO KEY UPDATE` from the start and never upgrades from `FOR SHARE`; a plain `UPDATE` that leaves the key unchanged takes the same lock. **No path uses `FOR UPDATE`, deletes a workspace, user, job, task, thread, Dot, message or run row, or changes any row's key.** The only deletes are `task_leases` rows and non-default `dot_spaces` grants, which no row references. Foreign-key checks on insert and update take `FOR KEY SHARE` on the parent row, which conflicts only with `FOR UPDATE`, a delete or a key change, so a foreign-key check never waits on a lock any path holds. Inserting a row whose parent sits earlier in the order, such as a follow-up job referencing its parent job or any tenant row referencing its workspace, is therefore safe after later locks. Rows a transaction inserts are invisible to others until commit, unique-index checks run under the thread or job lock that already serializes their writers (Task 12), and a `SKIP LOCKED` select never waits. Every remaining wait is for a lock later in the order than any lock already held, so no cycle of waits, and no deadlock, can form. Tasks 2, 4, 8–12 and 13b name the locks each path takes.
+- Default team roles: Lead, Researcher, Writer, Analyst, Scheduler, Reviewer (spec §2). The Lead's default `max_concurrency` is 3 and each specialist's is 1 (initial defaults; Task 5 follow-up).
 - Team memberships are soft-removed with `team_members.active=false`; readers must filter active rows.
 
 ## Review Focus
@@ -53,17 +58,20 @@
 1. **Cross-tenant access.** A user of workspace A requests workspace B's Dots, threads, jobs or event stream by id. Expected: 404, never data. (Task 4, Task 9, Task 12.)
 2. **Lease double-run and repeated side effects after a crash.** Two workers poll at the same time, and a worker dies mid-run. Expected: a task never runs twice at once. An expired lease is re-queued at most once, and only if the task has not started a non-Read side effect; otherwise it ends `interrupted`. A restart mid-run gives exactly one Dot reply and one job status, or `stopped/interrupted_review_required`. (Task 11, Task 12, Task 14.)
 3. **SSE reconnect with `Last-Event-ID`.** The browser drops and reconnects mid-reply, including a Thai reply. Expected: no duplicate and no missing events, no gap when two appenders write to the same thread at once, and text never split inside a grapheme cluster. (Task 9.)
-4. **Password reset misuse.**
+4. **Password reset and set-password link misuse.**
    - A reset requested for an unknown email gets the same response as a known one.
-   - A token used twice, or after 30 minutes, fails.
+   - A reset token used twice, or after 30 minutes, fails, whether it came from a reset mail or `reset-link`. An invite token used twice, or after 72 hours, fails, whether it came from `create-user` or a Members-page invite. Neither kind works at the other's route.
    - A reset ends all of that user's existing sessions.
+   - An admin invites an email that already has an account. Expected: the membership is added and no link is returned or mailed, so an admin of one workspace can never take over an account another workspace created.
+   - No reset or set-password token appears in any log.
 
-   (Task 3.)
+   (Task 3, Task 3b, Task 13b.)
 5. **Provider down, limited or no keys.** The model provider errors, times out, rate-limits, runs out of quota, rejects the key, or isn't configured. Expected: the job ends `stopped` with reason one of `provider_unavailable | provider_rate_limited | provider_quota | provider_auth_failed` within the timeout, the thread shows a localized message, nothing hangs. In demo mode the reply has `synthetic: true`. (Task 7, Task 12.)
 6. **Tool gate bypass.** A tool outside the Dot's allowlist, a destructive or outward tool, a tool call from a failed or `MaxTokens` turn, a call after the allowlist changed mid-run, or a write repeated after its first outcome was lost. Expected: never dispatched; an error result, `needs_input/approval_pending`, `stopped/policy_changed` or `stopped/outcome_unknown`. (Task 8.)
 7. **Cross-site and wrong-host requests.** A POST from another origin, or any request with an unknown `Host`. Expected: 403 before a handler runs. (Task 3.)
 8. **Duplicate or stranded messages.** A client retries a post, two retries race, or the server crashes mid-intake. Expected: one message, one job and one task, or none at all; never a message without its job. (Task 12.)
 9. **Deadlocks between terminal writers.** Cancel racing completion, a recovery claim racing a claim for a paused Dot, a quota rejection racing a claim. Expected: every path takes its locks in the global order, so none fails with SQLSTATE `40P01`. (Tasks 11 and 12.)
+10. **Residency with a local and a hosted provider configured.** A local-only Space's job, including its retries and a provider change between attempts. Expected: every attempt goes to the `Local` entry and no request reaches a hosted provider. (Task 7b, Task 8.)
 
 ---
 
@@ -74,15 +82,27 @@ Cargo.toml                      workspace: crates/katwork, crates/katwork-server
 rust-toolchain.toml             channel = "stable"; workspace rust-version checked by the msrv CI job
 deny.toml                       licence + advisory policy (GPL/AGPL denied)
 .env.example                    DATABASE_URL, KATWORK_SECRET, POSTGRES_PASSWORD, KATWORK_DEMO, KATWORK_PUBLIC_URL,
-                                KATWORK_DEMO_PASSWORD, KATWORK_BIND, KATWORK_HTTPS_HOST, SMTP_*, OPENAI_*, ANTHROPIC_*
-docker-compose.yml              postgres:17 + qdrant on an internal network; backup → migrate → katwork; https profile (caddy)
-Caddyfile                       the optional https profile (Task 14)
+                                KATWORK_ALLOW_DEMO_ON_HTTPS, KATWORK_TRUSTED_PROXIES, KATWORK_HEADER_TIMEOUT_SECONDS,
+                                KATWORK_IDLE_TIMEOUT_SECONDS, KATWORK_MAX_CONNECTIONS, KATWORK_MAX_CONNECTIONS_PER_IP,
+                                KATWORK_DEMO_PASSWORD, KATWORK_BIND, KATWORK_HTTPS_HOST, SMTP_*, OPENAI_*, ANTHROPIC_*,
+                                KATWORK_LOCAL_BASE_URL, KATWORK_LOCAL_MODEL, KATWORK_LOCAL_API_KEY
+docker-compose.yml              postgres:17 + qdrant on an internal network; backup → migrate → katwork
+docker-compose.https.yml        the Caddy profile: caddy service + KATWORK_TRUSTED_PROXIES and KATWORK_PUBLIC_URL (Task 14)
+docker-compose.demo.yml         the offline demo profile (Task 14)
+Caddyfile                       used by docker-compose.https.yml (Task 14)
 Dockerfile                      multi-stage: web build (node 22) → cargo build --locked → distroless runtime
 .github/workflows/ci.yml        fmt, clippy, test, msrv, deny, web, e2e
+scripts/init-env.sh             writes .env with random secrets (Task 14)
+scripts/demo.sh                 one-command offline demo (Task 14)
 scripts/smoke.sh                compose smoke (Task 14)
 scripts/compose-backup.sh       pg_dump before migrate, run by the compose backup service (Task 14)
 crates/katwork/
   migrations/0001_init.sql      all SP1 tables (Task 2)
+  migrations/0002_email_unique.sql, 0003_email_lowercase.sql   (Task 3)
+  migrations/0004_team_membership.sql                          (Task 5)
+  migrations/0005_invite_tokens.sql                            (Task 3b)
+  migrations/0006_task_first_claim.sql                         (Task 11)
+  migrations/0007_scheduler_indexes.sql                        (Task 12)
   src/lib.rs
   src/config.rs                 Config (Task 1)
   src/error.rs                  KatError + stable codes
@@ -92,11 +112,14 @@ crates/katwork/
   src/fence.rs                  Fence: the lease check inside every run-scoped write
   src/db.rs                     pool + migrate
   src/auth/{mod,password,session,reset,mailer}.rs
+  src/auth/accounts.rs          operator-created accounts and set-password links (Task 3b)
+  src/auth/invite.rs            invite tokens: issue, link, accept (Task 3b)
   src/tenancy/{mod,workspace,space}.rs
+  src/tenancy/members.rs        member list, invites and role changes (Task 13b)
   src/team/{mod,dot,team,roles}.rs
   src/chat/{mod,thread,message,mentions}.rs
   src/events/{mod,agui,log,hub,sink,coalesce}.rs
-  src/models/{mod,provider,registry,guard,fake,rig_adapter}.rs
+  src/models/{mod,provider,registry,guard,fake,rig_adapter}.rs   (Task 7; Task 7b adds the local provider here)
   src/agent/{mod,tool,ctx,registry,builtin,run,guards,ledger}.rs
   src/policy.rs                 decide_job: facts → verdict (pure)
   src/jobs/{mod,job,task,lease,worker,quota}.rs
@@ -104,21 +127,30 @@ crates/katwork/
   tests/*.rs, tests/fixtures/{models,agui}/
 crates/katwork-server/
   src/main.rs                   `serve` | `migrate` | `seed-demo [--reset-password]`
+                                | `create-user --email <e> --workspace <name|id> --role <owner|admin|member>
+                                  [--space-policy <local|hosted>]`
+                                | `reset-link --email <e>` (the last two from Task 3b)
   src/lib.rs src/config.rs      config.rs re-exports katwork::config
   src/app.rs                    AppState { core: Arc<Core> }, build_router
   src/error.rs                  ApiError: KatError → HTTP status + {"code"}
   src/extract.rs                FromRequestParts<AppState> for AuthUser and Tenant
-  src/guards.rs                 Host, Origin, Sec-Fetch-Site, JSON-only, body limit, security headers
-  src/routes/{health,auth,workspaces,dots,teams,threads,events,jobs}.rs
+  src/guards.rs                 Host, Origin, Sec-Fetch-Site, JSON-only, body limit, request timeout,
+                                concurrency limit, security headers
+  src/transport.rs              HTTP/1 serving: header-read and idle timeouts, connection caps (Task 3)
+  src/peer.rs                   client IP behind trusted proxies, IPv6 /64 buckets (Task 3)
+  src/routes/{health,auth,workspaces,dots,teams,threads,events,jobs,members}.rs
   src/static_files.rs
   tests/*.rs                    HTTP-level tests via tower::ServiceExt; tests/fixtures/sse/
 web/
   package.json vite.config.ts tsconfig.json index.html
   scripts/check-contrast.ts
-  src/main.tsx src/app.tsx src/api.ts src/sse.ts src/theme.css
+  src/main.tsx src/app.tsx src/router.tsx src/api.ts src/sse.ts src/theme.css src/theme.ts
   src/i18n/{index.ts,en.json,th.json}
-  src/pages/{Login,ResetRequest,ResetConfirm,Team,Chat}.tsx
-  src/**/*.test.tsx
+  src/components/{Layout,Preferences,Announce,Transcript,Composer}.tsx      (Task 13a)
+  src/pages/{Login,ResetRequest,ResetConfirm,Home}.tsx                      (Task 13a)
+  src/pages/InviteAccept.tsx                                                (Task 3b)
+  src/pages/{Team,Chat,Members}.tsx                                         (Task 13b)
+  src/**/*.test.ts(x)
 ```
 
 ---
@@ -146,9 +178,9 @@ web/
   - The `katwork` service runs with `cap_drop: [ALL]`, `security_opt: ["no-new-privileges:true"]` and `init: true`, and publishes `"${KATWORK_BIND:-127.0.0.1}:3000:3000"`. It receives `DATABASE_URL`, `KATWORK_SECRET`, `KATWORK_DEMO`, `KATWORK_PUBLIC_URL`, `KATWORK_DEMO_PASSWORD`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL`.
   - `postgres:17` and `qdrant/qdrant:v1.19.2` sit only on the `internal: true` network `backend`, with no published ports.
   - CI jobs: `cargo fmt --check`; `cargo clippy --all-targets --locked -- -D warnings`; `cargo test --workspace --locked` with a `postgres:17` service, followed by `docker compose config -q` and `docker compose build`; `cargo deny check licenses advisories`; and the web job, skipped until `web/` exists.
-  - `Dockerfile`: a `node:20-bookworm-slim` web stage (Task 13 moves it to Node 22), `cargo build --locked --release -p katwork-server`, and a `gcr.io/distroless/cc-debian12:nonroot` runtime.
+  - `Dockerfile`: a `node:20-bookworm-slim` web stage (Task 13a moves it to Node 22), `cargo build --locked --release -p katwork-server`, and a `gcr.io/distroless/cc-debian12:nonroot` runtime.
 - Tests: `health_returns_ok_and_version`; `config_from_lookup_validates_required_values`, `optional_configuration_requires_host_or_api_key`, `optional_configuration_reads_all_fields`, `smtp_port_is_optional_and_must_be_a_valid_port_when_set`, `config_debug_redacts_secrets`, `redaction_handles_encoded_query_and_malformed_database_passwords`; `maintenance_commands_are_stubs`, `rejects_unknown_commands_and_extra_arguments`, `serve_rejects_missing_configuration`, `serve_reports_database_cause_without_password`.
-- Left for later tasks: the MSRV CI job (Task 2), HTTP guards (Task 3), Node 22 (Task 13), backup before migrate and the HTTPS profile (Task 14).
+- Left for later tasks: the MSRV CI job (Task 2), HTTP guards (Task 3), Node 22 (Task 13a), backup before migrate and the HTTPS profile (Task 14).
 
 - [x] **Step 1:** Failing test `health_returns_ok_and_version`, then the workspace, `Config`, `build_router` and the subcommands.
 - [x] **Step 2:** Redacting `Debug`, the hardened Compose file, `--locked` CI and the Docker build in CI.
@@ -172,9 +204,9 @@ web/
   - `types::JobStatus::{Accepted, Ready, Answered, Stopped, NeedsInput, Cancelled, Error}` and `types::HoldReason::{DotBusy, ProviderQuota, WorkspacePaused}`, each with `wire(&self) -> &'static str` matching the schema values; they live here because the event payloads (Task 9) carry them
   - `types::Question { question: String, options: Vec<String> }` (`Serialize`, `Deserialize`): a Dot's question to a person; the first option, when present, is the recommended one
   - `types::SideEffect::{Read, Navigate, WorkspaceRead, Draft, WorkspaceWrite, Exec, CredentialUse, Destructive, Outward(OutwardKind)}` and `types::OutwardKind::{Send, Publish, Pay, Share, ExternalApi}`, with `SideEffect::wire(&self) -> &'static str` giving `read, navigate, workspace_read, draft, workspace_write, exec, credential_use, destructive, outward_send, outward_publish, outward_pay, outward_share, outward_external_api`. `SideEffect` serializes as its single wire string (`"outward_send"`, never a nested object), and `SideEffect::from_wire(s: &str) -> Option<SideEffect>` reads it back.
-  - `types::ReasonCode` with `wire(&self) -> &'static str` and `ReasonCode::ALL`: `provider_unavailable, provider_rate_limited, provider_quota, provider_auth_failed, model_protocol_error, time_limit, quota_exceeded, workspace_paused, step_limit, token_budget, output_truncated, residency_denied, loop_detected, policy_changed, approval_pending, question_pending, interrupted_review_required, dot_paused, retries_exhausted, cancelled, outcome_unknown, no_eligible_dot, dot_not_in_space, lease_lost`. Each value is a job `reason`, a notice body or a `RUN_ERROR` code, and has a message in both locales (Task 13).
+  - `types::ReasonCode` with `wire(&self) -> &'static str` and `ReasonCode::ALL`: `provider_unavailable, provider_rate_limited, provider_quota, provider_auth_failed, model_protocol_error, time_limit, quota_exceeded, workspace_paused, step_limit, token_budget, output_truncated, residency_denied, loop_detected, policy_changed, approval_pending, question_pending, interrupted_review_required, dot_paused, retries_exhausted, cancelled, outcome_unknown, no_eligible_dot, dot_not_in_space, lease_lost`. Each value is a job `reason`, a notice body or a `RUN_ERROR` code, and has a message in both locales (Task 13a). Task 10 adds `too_many_requests`.
   - `db::connect(url: &str) -> Result<PgPool, KatError>` and `db::migrate(pool: &PgPool) -> Result<(), KatError>`
-  - `fence::Fence { task_id: TaskId, epoch: LeaseEpoch }` and `fence::check(conn: &mut PgConnection, f: &Fence) -> Result<(), KatError>`. Run inside the caller's write transaction, it selects the task joined to its lease where `tasks.state = 'leased'`, `tasks.lease_epoch` and `task_leases.lease_epoch` both equal `f.epoch`, and `expires_at > clock_timestamp()`, taking `FOR SHARE OF tasks`; no row is `lease_lost`. Every lease-expiry comparison uses `clock_timestamp()`, the time at that statement, never `now()`, which is fixed when the transaction starts and would keep a lease alive after a lock wait. Every path that ends a lease (complete, cancel, reclaim, abandon, and the deadline, retry and eligibility branches) changes `tasks.state` or increments `tasks.lease_epoch` in the same transaction, so the check can never pass for an ended lease. The share lock lasts until the write commits. Claim, cancel and every terminal transition take `FOR NO KEY UPDATE` on the task row, so they wait for an in-flight fenced write, and any write after them fails the check. `fence::lock(conn: &mut PgConnection, f: &Fence) -> Result<(), KatError>` is the same check taking `FOR NO KEY UPDATE OF tasks`, for a caller that will update the task row (`ledger::start_tool_call` for a non-Read call, `lease::complete`, `lease::abandon`), because a lock is never upgraded from `FOR SHARE`.
+  - `fence::Fence { task_id: TaskId, epoch: LeaseEpoch }` and `fence::check(conn: &mut PgConnection, f: &Fence) -> Result<(), KatError>`. Run inside the caller's write transaction, it runs two statements. The first locks the task row, `SELECT id FROM tasks WHERE id = $1 FOR SHARE`, and may wait for that lock. The second, in the same transaction, selects the task joined to its lease where `tasks.state = 'leased'`, `tasks.lease_epoch` and `task_leases.lease_epoch` both equal `f.epoch`, and `expires_at > clock_timestamp()`; no row is `lease_lost`. Checking in a second statement means a lease that expires while the first statement waits is rejected, even when the lock holder changed nothing and released its lock (issue #23, fixed in PR #25); a single locking select evaluates the expiry before the wait and never again. Every lease-expiry comparison uses `clock_timestamp()`, the time at that statement, never `now()`, which is fixed when the transaction starts and would keep a lease alive after a lock wait. Every path that ends a lease (complete, cancel, reclaim, abandon, and the deadline, retry and eligibility branches) changes `tasks.state` or increments `tasks.lease_epoch` in the same transaction, so the check can never pass for an ended lease. The share lock lasts until the write commits. Claim, cancel and every terminal transition take `FOR NO KEY UPDATE` on the task row, so they wait for an in-flight fenced write, and any write after them fails the check. `fence::lock(conn: &mut PgConnection, f: &Fence) -> Result<(), KatError>` is the same two statements with the first taking `FOR NO KEY UPDATE`, for a caller that will update the task row (`ledger::start_tool_call` for a non-Read call, `lease::complete`, `lease::abandon`), because a lock is never upgraded from `FOR SHARE`.
   - `runtime::Core { pool: PgPool, config: Arc<Config> }` and `Core::new(pool: PgPool, config: Arc<Config>) -> Core`. Task 7 adds `registry: Arc<Registry>` and Task 9 adds `events: EventHub`; both are filled inside `Core::new`, so its signature never changes.
   - `katwork_server::app::AppState { core: Arc<Core> }`
   - `katwork_server::error::ApiError(pub KatError)` with `From<KatError>` and `IntoResponse`: the body is `{"code": e.code()}` and the status comes from one `match` that each later task extends
@@ -214,6 +246,7 @@ web/
   - `client_msg_id_unique_per_thread_and_author`
   - `job_request_message_is_unique`: a second job for the same `request_message_id` errors
   - `fence_check_fails_after_epoch_or_state_change`: passes for the live lease; fails after the epoch is incremented, after the task leaves `leased`, and after `expires_at` passes
+  - `fence_check_rejects_expiry_during_lock_wait_after_commit`, `fence_check_rejects_expiry_during_lock_wait_after_rollback`, `fence_lock_rejects_expiry_during_lock_wait_after_commit` and `fence_lock_rejects_expiry_during_lock_wait_after_rollback` (PR #25): another transaction holds the task row while the lease expires, then commits or rolls back without changing it; both fence modes return `lease_lost`
   - `missing_usage_is_stored_as_null`
   - `space_allow_external_has_no_default`: an insert without `allow_external` errors
   - `side_effect_wire_values_pass_the_schema_check`: every `SideEffect::wire` value inserts into `tool_calls.side_effect`, and `'shell'` is rejected
@@ -225,20 +258,30 @@ web/
 
 ### Task 3: HTTP guards, password auth, sessions, reset, demo accounts
 
+**Status:** merged in PR #20. The interfaces below match its code; Task 3b adds operator accounts and first-run convenience on top.
+
 **Files:**
-- Create: `crates/katwork/src/auth/{mod,password,session,reset,mailer}.rs`, `crates/katwork-server/src/{extract.rs,guards.rs,routes/auth.rs}`, `crates/katwork-server/tests/{http_guards.rs,auth.rs}`
-- Modify: `crates/katwork/src/config.rs`, `crates/katwork-server/src/{app.rs,main.rs}`, `crates/katwork-server/tests/{health.rs,cli.rs}`
+- Create: `crates/katwork/src/auth/{mod,password,session,reset,mailer}.rs`, `crates/katwork/migrations/{0002_email_unique.sql,0003_email_lowercase.sql}`, `crates/katwork-server/src/{extract.rs,guards.rs,transport.rs,peer.rs,routes/auth.rs}`, `crates/katwork-server/tests/{http_guards.rs,auth.rs,mailer.rs,security.rs,transport.rs,support/mod.rs}`
+- Modify: `crates/katwork/src/config.rs`, `crates/katwork-server/src/{app.rs,main.rs}`, `crates/katwork-server/tests/{health.rs,cli.rs}`, `.env.example`, `docker-compose.yml`
 
 **Interfaces:**
 - Consumes: Task 2 tables and ids, `Core`, `AppState`, `ApiError`.
 - Produces:
-  - `Config::public_url_or_default(&self) -> &str`, which is `http://localhost:3000` when `public_url` is unset, and `Config::cookie_secure(&self) -> bool`, true when that URL starts with `https://`
+  - `Config::public_url_or_default(&self) -> &str`, which is `http://localhost:3000` when `public_url` is unset, and `Config::cookie_secure(&self) -> bool`, true when that URL starts with `https://`. `KATWORK_PUBLIC_URL` must be an `http` or `https` origin with no credentials, path, query or fragment, and is stored canonicalized.
+  - `Config` gains `transport: TransportConfig` and `trusted_proxies: Vec<(IpAddr, u8)>`, with `TransportConfig { header_timeout: Duration, idle_timeout: Duration, max_connections: usize, max_connections_per_ip: usize }` read from `KATWORK_HEADER_TIMEOUT_SECONDS` (default 10), `KATWORK_IDLE_TIMEOUT_SECONDS` (default 60), `KATWORK_MAX_CONNECTIONS` (default 256) and `KATWORK_MAX_CONNECTIONS_PER_IP` (default 32); each must be a positive integer, otherwise `config_invalid`.
+  - `KATWORK_TRUSTED_PROXIES` is a comma-separated list of CIDRs (Task 3b also accepts bare IPs). `Config::trusts_proxy(&self, ip: IpAddr) -> bool`. Only a socket peer inside one of them may supply `X-Forwarded-For`; the client IP is the first untrusted hop walking back from the peer, and a missing, repeated or malformed header falls back to the peer address. Unset trusts no proxy.
+  - Demo mode on an `https://` public URL is `config_invalid` unless `KATWORK_ALLOW_DEMO_ON_HTTPS` is exactly `1`.
+  - `katwork_server::transport::serve(tcp: TcpListener, router: Router) -> io::Result<()>` (and `serve_with_shutdown` for tests): HTTP/1 only, a header-read timeout of `header_timeout` (10 s) started before any byte arrives, an idle keep-alive connection closed after `idle_timeout` (60 s) without I/O, at most `max_connections` (256) open connections in total, and at most `max_connections_per_ip` (32) per peer bucket.
+  - `peer::ip_bucket(ip: IpAddr) -> IpAddr`: an IPv6 address is bucketed by its /64 and an IPv4-mapped address by its IPv4 address; every per-IP limit and cap uses the bucket.
   - `katwork_server::guards::apply(router: Router, config: &Config) -> Router`, applied by `build_router`:
     - a Host allowlist: the hostname of `public_url_or_default()` plus `localhost` (port ignored); any other or missing `Host` is 403 `host_not_allowed`
     - a request that is not GET or HEAD needs an `Origin` exactly equal to the public URL's origin, otherwise 403 `cross_site_request`; `Sec-Fetch-Site: cross-site` on such a request is also 403 `cross_site_request`
     - a mutation with a body must be `application/json`, otherwise 415 `json_required`
     - `DefaultBodyLimit::max(1_048_576)`
+    - a 30 s request timeout (408) and a global limit of 256 requests in flight. Task 9's SSE route is mounted outside these two layers, because a stream outlives both, but inside every other guard.
     - every response carries `X-Content-Type-Options: nosniff` and `Content-Security-Policy: default-src 'self'; frame-ancestors 'none'`
+  - Login buckets (`LoginLimiter` in `routes/auth.rs`; the reset route's are `ResetLimiter`), in memory per process: per IP 100 attempts per 15 minutes, per email+IP 10 per 15 minutes, and per email a backstop of 100 per hour, counted only for pairs the first two admit. The reset route limits per IP 20 and per email 3 per hour, and always answers 202. Every bucket uses `ip_bucket`, holds at most 10,000 keys with least-recently-used eviction, and is process-local: a restart or an eviction resets it, and replicas do not share it. Over a limit, login is 429 `rate_limited`.
+  - Migrations: `0002_email_unique.sql` adds a unique index on `lower(email)`; `0003_email_lowercase.sql` lowercases and trims stored emails and adds `CHECK (email = lower(email))`. Login, reset and every account path trim and lowercase an email before using it.
   - `password::hash(&str) -> Result<String, KatError>` and `password::verify(&str, &str) -> bool` (argon2id)
   - `katwork::auth::AuthUser { user_id: UserId }`
   - `session::create(pool, UserId) -> Result<SessionToken, KatError>`, `session::authenticate(pool, token: &str) -> Result<AuthUser, KatError>` and `session::revoke(pool, token: &str) -> Result<(), KatError>`, where `SessionToken(String)` is the raw token returned once and only its SHA-256 is stored
@@ -253,14 +296,16 @@ web/
   - `impl FromRequestParts<AppState> for AuthUser` in `crates/katwork-server/src/extract.rs` (allowed by the orphan rule because `AppState` is local); no valid session is 401 `unauthenticated`
 - Routes: `POST /api/auth/login`, `POST /api/auth/logout`, `POST /api/auth/reset/request`, `POST /api/auth/reset/confirm`, `GET /api/auth/me`.
 - Session cookie `kw_session` is `HttpOnly; SameSite=Lax; Path=/`, expiring after 14 days, and `Secure` only when `cookie_secure()`. On an `http://` public URL, `serve` logs a startup warning that the cookie is not `Secure`.
-- `seed-demo` creates `demo@katwork.local` and a demo workspace, idempotently. The password is `KATWORK_DEMO_PASSWORD` when set; otherwise it is random and printed when the user is first created. `seed-demo --reset-password` sets the password again (from `KATWORK_DEMO_PASSWORD`, or a new random one) and prints it.
+- `seed-demo` needs `KATWORK_DEMO=1` (`config_invalid` before connecting otherwise). It creates `demo@katwork.local` and a demo workspace, idempotently. The password is `KATWORK_DEMO_PASSWORD` when set; otherwise it is random and printed when the user is first created. `seed-demo --reset-password` sets the password again (from `KATWORK_DEMO_PASSWORD`, or a new random one) and prints it.
 
 - [ ] **Step 1: Write the failing guard tests** in `crates/katwork-server/tests/http_guards.rs`:
   - `cross_site_post_is_403`: `Origin: https://evil.example` gives 403 `cross_site_request`
   - `unrecognized_host_is_403`: `Host: evil.example` gives 403 `host_not_allowed`
   - `non_json_mutation_is_415`
   - `responses_carry_nosniff_and_csp`
-- [ ] **Step 2: Run** `cargo test -p katwork-server --test http_guards`. Expected: FAIL.
+  - `request_timeout_finishes_with_408_after_thirty_seconds` and `concurrent_request_limit_rejects_overload`
+  - in `tests/transport.rs`: `partial_header_connection_closes_at_ten_seconds`, `keep_alive_connection_closes_at_configured_idle_timeout`, `one_peer_cannot_hold_more_than_thirty_two_connections`
+- [ ] **Step 2: Run** `cargo test -p katwork-server --test http_guards --test transport`. Expected: FAIL.
 - [ ] **Step 3: Implement** `guards.rs` and apply it in `build_router`; `tests/health.rs` now sends `Host: localhost`. Run again. Expected: PASS.
 - [ ] **Step 4: Write the failing auth tests** in `crates/katwork-server/tests/auth.rs`:
   - `login_with_correct_password_sets_cookie`
@@ -275,22 +320,27 @@ web/
   - `cookie_not_secure_on_http_public_url`
   - `seed_demo_creates_demo_user_and_workspace`: idempotent; with `KATWORK_DEMO_PASSWORD` set, login works with that password
   - `seed_demo_reset_password_allows_login`
+  - `login_rate_limited_per_email_and_peer_ip`, `forwarded_ips_are_used_only_behind_trusted_proxies` (in `tests/security.rs`), `demo_on_https_requires_explicit_override` (in `crates/katwork/tests/config.rs`) and `migration_normalizes_existing_email_and_login_accepts_any_case`
 - [ ] **Step 5: Run** `cargo test -p katwork-server --test auth`. Expected: FAIL.
-- [ ] **Step 6: Implement** the modules and routes. Reset tokens are 32 random bytes in URL-safe base64, stored hashed, with `expires_at = now() + 30 min` and `used_at`; the emailed link is `{public_url}/reset?token=…`. Login is rate-limited to 10 attempts per 15 minutes per email+IP in memory. Delete `maintenance_commands_are_stubs` from `tests/cli.rs`.
+- [ ] **Step 6: Implement** the modules and routes. Reset tokens are 32 random bytes in URL-safe base64, stored hashed, with `expires_at = clock_timestamp() + interval '30 minutes'` and `used_at`; the emailed link is `{public_url}/reset?token=…`. Login and reset use the buckets above. Delete `maintenance_commands_are_stubs` from `tests/cli.rs`.
 - [ ] **Step 7: Run.** Expected: PASS.
 - [ ] **Step 8: Commit** with `feat: http guards, password auth, sessions, reset, demo seed`.
 
 ### Task 4: Workspaces, Spaces and tenant scoping
 
+**Status:** merged in PR #22. The interfaces below match its code.
+
 **Files:**
 - Create: `crates/katwork/src/tenancy/{mod,workspace,space}.rs`, `crates/katwork-server/src/routes/workspaces.rs`, `crates/katwork-server/tests/tenancy.rs`
-- Modify: `crates/katwork-server/src/{extract.rs,main.rs}`
+- Modify: `crates/katwork-server/src/{extract.rs,main.rs}`, `Cargo.toml` and `crates/katwork/Cargo.toml` (`unicode-properties`)
 
 **Interfaces:**
 - Consumes: `AuthUser`, `types::SpacePolicy`.
 - Produces:
-  - `katwork::tenancy::Tenant` with private fields and accessors `workspace_id() -> WorkspaceId`, `user_id() -> UserId`, `role() -> Role` and `require_admin()`; `Role::{Owner, Admin, Member}`
-  - `tenancy::resolve(pool, user_id: UserId, workspace_id: WorkspaceId) -> Result<Tenant, KatError>`: a non-member gets `NotFound`. The extractor uses it for the signed-in user, and the worker (Task 11) for a job's requester.
+  - `katwork::tenancy::Tenant`, sealed: its fields are private, and it exposes `workspace_id(&self) -> WorkspaceId`, `user_id(&self) -> UserId`, `role(&self) -> Role` and `require_admin(&self) -> Result<(), KatError>` (`Ok` for an owner or admin, otherwise `forbidden`). It is `Clone`, not `Copy`. Only `tenancy::resolve` constructs it, so the worker and every test get a `Tenant` from a real membership row. Later tasks read it only through these accessors.
+  - `Role::{Owner, Admin, Member}` (`Copy`, serde and `sqlx::Type` as `owner | admin | member`)
+  - `tenancy::resolve(pool, user_id: UserId, workspace_id: WorkspaceId) -> Result<Tenant, KatError>`: a non-member gets `NotFound`. The extractor uses it for the signed-in user, and the worker (Task 11) for a job's requester. It reads the membership on every request, so a removed or downgraded member loses access on the next request.
+  - `tenancy::validate_name(name: &str) -> Result<&str, KatError>` (crate-visible), used for workspace, Space, Dot and team names: a name containing any character of Unicode category Cc, Cf, Zl or Zp is rejected, then the name is trimmed, and an empty name or one over 120 Unicode scalar values is rejected; every rejection is 400 `request_invalid`. It returns the trimmed name, which is what gets stored.
   - `impl FromRequestParts<AppState> for Tenant` in `extract.rs`: reads `{workspace_id}`, requires `AuthUser`, calls `resolve`; a non-member gets 404 `not_found`
   - `workspace::create(pool, name: &str, owner: UserId) -> Result<WorkspaceId, KatError>`
   - `workspace::list_for(pool, user_id: UserId) -> Result<Vec<WorkspaceSummary>, KatError>` and `WorkspaceSummary { id: WorkspaceId, name: String, role: Role, paused: bool }`
@@ -302,6 +352,7 @@ web/
   - `GET/POST /api/workspaces`
   - `GET/POST /api/workspaces/{workspace_id}/spaces`. `POST` takes `{name, allow_external}`; without `allow_external` it returns 422 `space_policy_required`, because the admin chooses local-only or hosted-allowed for every Space (spec §11).
   - `PUT /api/workspaces/{workspace_id}/paused` with `{"paused": bool}`
+  - `POST …/spaces` and `PUT …/paused` call `require_admin()` before parsing the body (Global Constraints), so a member gets 403 even with an invalid body.
 - `seed-demo` creates the demo Space with `allow_external = true`.
 - Workspace and Space names use the shared name validator documented in Task 5; they require a letter or decimal digit, so emoji-only names are invalid.
 
@@ -312,15 +363,99 @@ web/
   - `create_space_without_policy_is_422`
   - `seed_demo_space_allows_external`
   - `member_cannot_pause_workspace_admin_can`
+  - `member_cannot_pause_workspace_with_invalid_body`: 403, not 400
+  - `removed_membership_denies_every_tenant_route_on_next_request` and `downgraded_admin_cannot_write_on_next_request`
+  - `empty_names_are_rejected`, `whitespace_only_names_are_rejected`, `names_over_120_characters_are_rejected`, `control_characters_in_names_are_rejected`, `format_characters_in_names_are_rejected`, `bidi_controls_in_names_are_rejected`, `line_and_paragraph_separators_in_names_are_rejected` and `names_are_trimmed_and_allow_120_unicode_characters`
 - [ ] **Step 2: Run** `cargo test -p katwork-server --test tenancy`. Expected: FAIL.
 - [ ] **Step 3: Implement.** Every repository function takes `&Tenant` and filters by `workspace_id` in SQL.
 - [ ] **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit** with `feat: workspaces, spaces, tenant scoping`.
 
-### Task 5: Dots, Teams and the default roster
+### Task 3b: Operator accounts and first-run convenience
+
+This task comes after Task 4 and lands as its own PR, a small full-stack task: the backend plus one web page. It can be written in parallel with Task 5, but merges after PR #24, because its migration `0005_invite_tokens.sql` must follow Task 5's `0004`, and after PR #27 (Task 13a), which creates `web/`. It needs Task 4's `Role` and `tenancy::validate_name`, changes Task 3's code, and uses Task 13a's web shell. Accounts then work both ways: with SMTP through mail, and without SMTP through a link the operator prints (ADR-0004). Task 13b builds the admin Members page on it.
 
 **Files:**
-- Create: `crates/katwork/src/team/{mod,dot,team,roles}.rs`, `crates/katwork-server/src/routes/{dots,teams}.rs`, `crates/katwork-server/tests/team.rs`
+- Create: `crates/katwork/src/auth/{accounts.rs,invite.rs}`, `crates/katwork/migrations/0005_invite_tokens.sql`, `web/src/pages/InviteAccept.tsx`, `web/src/pages/InviteAccept.test.tsx`
+- Modify: `crates/katwork/src/{config.rs,error.rs,auth/mod.rs,auth/reset.rs,auth/mailer.rs}`, `crates/katwork-server/src/{main.rs,error.rs,guards.rs,transport.rs,routes/auth.rs}`, `crates/katwork/tests/config.rs`, `crates/katwork-server/tests/{cli.rs,http_guards.rs,auth.rs,transport.rs,mailer.rs}`, `web/src/{router.tsx,api.ts}`, `web/src/i18n/{en,th}.json`, `.env.example`
+
+**Interfaces:**
+- Consumes: `Config`, `password`, `reset`, `Mail`, `Mailer`, `LoginLimiter` (Task 3); `Role`, `tenancy::validate_name` (Task 4); `types::{Locale, SpacePolicy}` (Task 2); `router.tsx`, `api.ts`, `i18n` and the `ResetConfirm` page (Task 13a, PR #27).
+- Produces:
+  - `KatError::ConfigInvalid { var: &'static str }` replaces the unit variant. `code()` stays `config_invalid`, and the line the CLI prints is `config_invalid (VAR)`. The variable's value never appears in the error, its causes or any log. Every `Config::from_lookup` failure names the variable that failed, and `seed-demo` without demo mode names `KATWORK_DEMO`.
+  - `KatError::RateLimited { retry_after_secs: u64 }` replaces the unit variant; `ApiError` sends it as 429 `rate_limited` with a `Retry-After: <retry_after_secs>` header.
+  - New codes `user_exists` (`KatError::UserExists`), `workspace_ambiguous` (`KatError::WorkspaceAmbiguous`) and `invite_token_invalid` (`KatError::InviteTokenInvalid`, 400).
+  - `reset::issue(conn: &mut PgConnection, user_id: UserId) -> Result<String, KatError>`: inserts one `password_resets` row with Task 3's mechanics (32 random bytes in URL-safe base64, stored as its SHA-256, `expires_at = clock_timestamp() + interval '30 minutes'`, single use) and returns the raw token. `reset::request` calls it after its three-pending-tokens check and `reset-link` calls it directly, so that cap applies only to the public request route.
+  - `reset::link(link_base: &str, token: &str) -> String`: `{link_base without a trailing /}/reset?token={token}`; the reset mail uses it too. `reset-link` prints a reset link: the person opens it and chooses a password through `POST /api/auth/reset/confirm`, and every reset rule applies (single use, 30 minutes, the account's sessions and other pending tokens ended).
+  - `reset::confirm(pool, token: &str, new_password: &str) -> Result<String, KatError>`: now returns the account's stored (lowercase) email, so the route can clear that email's login buckets.
+  - Invite tokens are their own kind, so a reset token and an invite token can never stand in for each other:
+    - migration `0005_invite_tokens.sql`: `ALTER TABLE password_resets ADD COLUMN kind TEXT NOT NULL DEFAULT 'reset' CHECK (kind IN ('reset', 'invite'))`; every existing row and every token from Task 3 is `reset`
+    - `reset::request`, `reset::issue` and `reset::confirm` write and accept only `kind = 'reset'`, and the three-pending cap counts only reset tokens
+    - `invite::issue(conn: &mut PgConnection, user_id: UserId) -> Result<String, KatError>`: one `kind = 'invite'` row with the reset token format (32 random bytes in URL-safe base64, stored as its SHA-256), `expires_at = clock_timestamp() + interval '72 hours'`, single use
+    - `invite::link(link_base: &str, token: &str) -> String`: `{link_base without a trailing /}/invite?token={token}`
+    - `invite::accept(pool, token: &str, new_password: &str) -> Result<String, KatError>`: for an unused, unexpired `invite` token only, it sets the password, marks the token used, ends the account's sessions and its other pending tokens of both kinds, and returns the account's email; any other token is 400 `invite_token_invalid`. `reset::confirm` likewise ends pending tokens of both kinds.
+    - route `POST /api/auth/invite/accept` with `{token, new_password}` → 204, under reset confirm's body, password and rate rules; on success it calls `LoginLimiter::clear_email` with the returned email.
+    - `InviteAccept.tsx` at `/invite`, built like Task 13a's `ResetConfirm`: it takes the token from the link, removes it from the address bar, asks for the new password twice, and posts to `POST /api/auth/invite/accept`; `invite_token_invalid` shows a localized message that suggests asking for a new invite or using password reset. Its strings live in `web/src/i18n/{en,th}.json`.
+  - `accounts::normalize_email(email: &str) -> Result<String, KatError>`: trims and lowercases; more than 254 bytes, or anything but exactly one `@` with text on both sides, is `request_invalid`.
+  - `accounts::EnsuredUser { user_id: UserId, created: bool }` and `accounts::ensure_user(conn: &mut PgConnection, email: &str) -> Result<EnsuredUser, KatError>`: returns the account for the normalized email, or inserts one with `display_name` = the part before `@`, `locale = 'en'` and the Argon2id hash of 32 random bytes that nobody ever sees, so the account has no usable password until its link is used. It runs `INSERT … ON CONFLICT DO NOTHING RETURNING` and then selects the committed row, so concurrent calls for one email create one account.
+  - `accounts::WorkspaceRef::{Id(WorkspaceId), Name(String)}` and `WorkspaceRef::parse(s: &str) -> WorkspaceRef`: a string that parses as a UUID is an id; anything else is a name.
+  - `accounts::create_user(pool, email: &str, workspace: &WorkspaceRef, role: Role, space_policy: Option<SpacePolicy>, link_base: &str) -> Result<String, KatError>`, in one transaction:
+    - an email that already has an account is `user_exists` and nothing changes; `reset-link` serves existing accounts
+    - an `Id` must name a workspace, otherwise `not_found`
+    - a `Name` matching exactly one workspace joins it; more than one is `workspace_ambiguous`; none creates a workspace with that validated name when `role` is `Owner`, otherwise `not_found`. A new workspace also gets its first Space, named `General`, with `space_policy`; without one, the command fails with `ConfigInvalid { var: "--space-policy" }` and nothing is created. `space_policy` is ignored when the workspace already exists. The new `General` Space gets its default team in the Task 5 follow-up (Step 9), once Task 5 is on main; until then it has none.
+    - then `ensure_user`, the membership with `role`, and `invite::issue`; it returns `invite::link(link_base, &token)`, an invite link, because the person it is for often opens it much later
+  - `accounts::reset_link(pool, email: &str, link_base: &str) -> Result<String, KatError>`: an unknown email is `not_found`; otherwise `reset::issue` and its link
+  - CLI subcommands `katwork-server create-user --email <e> --workspace <name|id> --role <owner|admin|member> [--space-policy <local|hosted>]` and `katwork-server reset-link --email <e>`. `--space-policy` is required when `create-user` creates the workspace (`local` gives `allow_external = false`, `hosted` gives `true`) and is ignored otherwise. Each flag appears at most once, in any order; a missing required flag other than `--space-policy`, a repeated or unknown flag, any other role and any other space policy are `command_invalid`. They load `Config` like `migrate`, use `public_url_or_default()` as the link base, and need neither SMTP nor demo mode. On success the command writes only the link and a newline to stdout; the link never goes through `tracing`. `create-user` prints an invite link, valid 72 hours; `reset-link` prints a reset link, valid 30 minutes; each works once.
+  - `LoginLimiter::reserve(&self, email: &str, ip: IpAddr) -> Result<LoginAttempt, KatError>`: counts the attempt in all three login buckets, or returns `RateLimited { retry_after_secs }` when one is full, where `retry_after_secs` is the time until the last full bucket's window ends, rounded up and at least 1. `LoginAttempt::succeeded(self)` gives the attempt back to the IP and email buckets and clears the email+IP bucket. A `LoginAttempt` dropped after a failure stays counted, so only failed attempts count, and concurrent attempts can never pass a limit. `LoginLimiter::clear_email(&self, email: &str)` removes every bucket of that email (each email+IP bucket and the backstop) and never an IP bucket.
+  - `mailer::reset_mail(to: String, locale: Locale, link: &str) -> Mail`: a bilingual mail in the user's locale order. The subject is `ตั้งรหัสผ่าน KatWork ใหม่ / Reset your KatWork password` for `th`, and the two halves swapped for `en`. The body is the paragraph in the user's locale, then the other one, then the link alone on the last line. Thai: `ใช้ลิงก์นี้ภายใน 30 นาทีเพื่อตั้งรหัสผ่านใหม่ หากคุณไม่ได้ขอเปลี่ยนรหัสผ่าน ให้ละเว้นอีเมลนี้`. English: `Use this link within 30 minutes to set a new password. If you did not ask for this, ignore this email.`
+
+- [ ] **Step 1: Write the failing operator-command tests** in `crates/katwork-server/tests/cli.rs`:
+  - `create_user_prints_a_single_use_set_password_link`: stdout is one `/invite` link; its token sets a password through `POST /api/auth/invite/accept`, login then works, and a second accept is 400 `invite_token_invalid`
+  - `create_user_creates_a_new_workspace_only_for_an_owner`: an unknown name with `--role owner --space-policy local` creates the workspace with the account as its owner and one Space `General` with `allow_external = false`, and `--space-policy hosted` gives `allow_external = true`; with `--role admin` it is `not_found` and nothing is created
+  - `create_user_new_workspace_requires_space_policy`: an unknown name with `--role owner` and no `--space-policy` fails with `config_invalid (--space-policy)`, and no account, workspace or Space is created; joining an existing workspace without the flag succeeds
+  - `create_user_joins_an_existing_workspace_by_id_or_name`
+  - `create_user_rejects_an_ambiguous_workspace_name`: `workspace_ambiguous`
+  - `create_user_rejects_an_existing_email`: `user_exists`; the account and its password are unchanged
+  - `create_user_link_lasts_72_hours_and_reset_link_30_minutes`: the stored `expires_at` values are 72 hours and 30 minutes after issue, and each link fails once the test moves its `expires_at` into the past in SQL
+  - `reset_link_prints_a_link_for_an_existing_account`: confirming it sets the new password and ends the account's sessions
+  - `reset_link_for_an_unknown_email_is_not_found`
+  - `operator_commands_need_no_smtp_or_demo_mode`
+  - `operator_commands_reject_bad_arguments`: a missing or repeated flag, an unknown flag and `--role guest` are each `command_invalid`
+  - `operator_links_never_reach_logs`: with all tracing output captured, the printed token appears nowhere in it
+  - in `tests/auth.rs`: `invite_and_reset_tokens_cannot_be_swapped`: an invite token at `POST /api/auth/reset/confirm` is 400 `reset_token_invalid`, and a reset token at `POST /api/auth/invite/accept` is 400 `invite_token_invalid`
+  - in `web/src/pages/InviteAccept.test.tsx` (Vitest, mocked `fetch`): `invite_accept_sets_a_password_and_hides_the_token`, and `invite_accept_explains_an_invalid_or_used_link` in both locales
+- [ ] **Step 2: Run** `cargo test -p katwork-server --test cli --test auth && (cd web && npm test)`. Expected: FAIL.
+- [ ] **Step 3: Implement** `accounts.rs`, `invite.rs` with migration `0005_invite_tokens.sql` and the accept route, the `kind` filter in `reset.rs`, `reset::issue`, `reset::link`, the two subcommands, and `InviteAccept.tsx` with its route in `router.tsx`. Run again. Expected: PASS.
+- [ ] **Step 4: Loopback hosts.** Write `loopback_ip_hosts_are_allowed` in `tests/http_guards.rs`: `Host: 127.0.0.1:3000` and `Host: [::1]:3000` pass the Host check, and `Host: 127.0.0.2` is 403 `host_not_allowed`. Run it (FAIL). Make the allowlist accept `localhost`, `127.0.0.1` and `[::1]`, any port, beside the public URL's hostname. Run it (PASS).
+- [ ] **Step 5: `/healthz` skips the Host check.** Write `healthz_skips_the_host_check`: `GET /healthz` with `Host: katwork:3000` (a container health probe) is 200 and still carries the security headers, while `GET /api/auth/me` with that Host is 403 `host_not_allowed`. Run it (FAIL). Exempt only `GET` and `HEAD` on `/healthz`. Run it (PASS).
+- [ ] **Step 6: An Origin that matches the allowed Host.** Write `origin_matching_the_allowed_host_is_accepted`: a `POST` with `Host: 127.0.0.1:3000` and `Origin: http://127.0.0.1:3000` passes the Origin check, while `Origin: http://127.0.0.1:4000` and `Origin: https://127.0.0.1:3000` are 403 `cross_site_request`. Run it (FAIL). Accept an `Origin` that equals the public URL's origin, or equals `<the public URL's scheme>://<the request's Host header>` once that Host has passed the allowlist; `Sec-Fetch-Site: cross-site` stays 403. Run it (PASS).
+- [ ] **Step 7: Log Host and Origin rejections.** Write `host_and_origin_rejections_log_the_rejected_value`: with tracing captured, `Host: evil.example` logs `host_not_allowed` with `host = "evil.example"`, a cross-site `POST` logs `cross_site_request` with `origin = "https://evil.example"`, and a 1,000-byte Host value is logged cut to 256 bytes. Run it (FAIL). Emit one `warn` event per rejection, with the rejected value as a Debug-escaped structured field cut to 256 bytes on a UTF-8 boundary, and no other header. Run it (PASS).
+- [ ] **Step 8: `config_invalid` names its variable.** Write `serve_config_error_names_the_variable_not_its_value` in `tests/cli.rs`: with `KATWORK_PUBLIC_URL=ftp://private-marker.example`, stderr contains `config_invalid (KATWORK_PUBLIC_URL)` and never `private-marker`. Run it (FAIL). Implement `ConfigInvalid { var }` through `Config::from_lookup` and update every match on the old variant, Task 7's base-URL check included (whichever of PR #21 and this PR merges second adapts). Run it (PASS).
+- [ ] **Step 9: Login lockout counts only failures.** Write in `tests/auth.rs`:
+  - `successful_logins_never_lock_out`: 30 correct logins from one IP within 15 minutes all succeed
+  - `a_successful_login_clears_the_failure_count`: 9 failures, 1 success, then 10 more failures all get 401, and the 11th gets 429
+  - `reset_confirm_clears_login_lockout`: after 10 failures the correct password gets 429; after a reset confirm, login with the new password succeeds
+  - `login_429_sends_retry_after`: `Retry-After` is an integer from 1 to 900
+
+  Run them (FAIL). Implement `reserve`, `LoginAttempt::succeeded` and `clear_email`: the login route calls `succeeded` only after the password verifies, and the reset confirm route calls `clear_email` with the email `reset::confirm` returns. Run them (PASS).
+- [ ] **Step 10: Trusted proxies and dropped connections.** Write:
+  - `trusted_proxies_accept_bare_ips_and_cidrs` in `crates/katwork/tests/config.rs`: `10.0.0.2` means `10.0.0.2/32`, `fd00::2` means `fd00::2/128`, `10.0.0.0/8` still works, and `10.0.0.2/33` is `config_invalid (KATWORK_TRUSTED_PROXIES)`
+  - `trusted_proxy_is_exempt_from_the_per_peer_cap` in `tests/transport.rs`: 40 connections from a trusted peer all stay open while an untrusted peer's 33rd is closed; both still count toward the global cap of 256
+  - `dropped_connections_are_logged`: a connection refused by the per-peer cap logs `connection_dropped` at `warn` with `reason = "per_peer_cap"` and the peer bucket, at most once per bucket per 60 s
+
+  Run them (FAIL). Implement in `config.rs` and `transport.rs`, and describe both forms in the `KATWORK_TRUSTED_PROXIES` comment of `.env.example`. Run them (PASS).
+- [ ] **Step 11: `seed-demo` applies a changed `KATWORK_DEMO_PASSWORD`.** Write `seed_demo_applies_changed_demo_password` in `tests/cli.rs`: after a seed with one value, a run with another makes the new password work and the old one fail, and ends the demo user's sessions; a run with the same value changes nothing and keeps the sessions. Run it (FAIL). When `KATWORK_DEMO_PASSWORD` is set and does not verify against the stored hash, `seed-demo` stores its hash and calls `reset::revoke_credentials` (Task 3's helper that ends the account's sessions and pending reset tokens), printing nothing, because the operator chose the value. Run it (PASS).
+- [ ] **Step 12: Bilingual reset mail.** Write `reset_mail_is_bilingual_in_the_users_locale_order` in `tests/mailer.rs`: for a `th` user the Thai subject half and paragraph come first, for an `en` user the English ones; each body holds the link exactly once, on its last line. Run it (FAIL). Implement `mailer::reset_mail` and use it in `reset::request` with the account's `locale`. Run it (PASS).
+- [ ] **Step 13: SMTP needs a public URL.** Write `smtp_without_public_url_is_config_invalid` in `crates/katwork/tests/config.rs`: `SMTP_HOST` set with `KATWORK_PUBLIC_URL` unset is `ConfigInvalid { var: "KATWORK_PUBLIC_URL" }`, so a mailed link can never point at `localhost`. Run it (FAIL). Implement it in `Config::from_lookup` and set `KATWORK_PUBLIC_URL` in the existing tests that configure SMTP. Run it (PASS).
+- [ ] **Step 14: Run** `cargo test --workspace --locked && (cd web && npm test && npm run build)`. Expected: PASS.
+- [ ] **Step 15: Commit** with `feat: operator accounts and first-run convenience`.
+
+### Task 5: Dots, Teams and the default roster
+
+**Status:** in review as PR #24. The interfaces below include its review rulings. A follow-up PR (Steps 6–10) comes after it and Task 3b merge.
+
+**Files:**
+- Create: `crates/katwork/src/team/{mod,dot,team,roles}.rs`, `crates/katwork/migrations/0004_team_membership.sql`, `crates/katwork-server/src/routes/{dots,teams}.rs`, `crates/katwork-server/tests/team.rs`
 - Modify: `crates/katwork-server/src/main.rs` (`seed-demo`)
 
 **Interfaces:**
@@ -331,24 +466,28 @@ web/
   - `DotRole::{Lead, Researcher, Writer, Analyst, Scheduler, Reviewer, Custom(String)}` and `Autonomy::{AskFirst, Standard}`
   - `Appearance { avatar: String, accent: String }`, stored in `dots.appearance`
   - `NewDot { name, role, persona, instructions, tool_allowlist, model_tier, autonomy, appearance }`
-  - `DotPatch { name, persona, instructions, tool_allowlist, model_tier, autonomy, status, appearance, max_concurrency, daily_token_budget }`, every field an `Option`. `daily_token_budget: Option<Option<i64>>` carries `#[serde(default, deserialize_with = "double_option")]`, where `double_option` is a small local deserializer: an omitted field stays `None` (no change), JSON `null` becomes `Some(None)` (remove the cap), and a number becomes `Some(Some(n))`. So `{"daily_token_budget": null}` clears the cap.
+  - `DotPatch { name, persona, instructions, tool_allowlist, model_tier, autonomy, status, appearance, max_concurrency, daily_token_budget }`, every field an `Option`. `daily_token_budget: Option<Option<i64>>` carries `#[serde(default, deserialize_with = "double_option")]`, where `double_option` is a small local deserializer: an omitted field stays `None` (no change), JSON `null` becomes `Some(None)` (remove the cap), and a number becomes `Some(Some(n))`. So `{"daily_token_budget": null}` clears the cap. `DotPatch` has no `default_space_id` and rejects unknown fields, so a `PATCH` that sets `default_space_id` is 400 `request_invalid`: a Dot's default Space never changes after hire.
+  - Free-text limits (initial defaults): `persona` at most 4,000 Unicode scalar values, `instructions` at most 8,000, and each `appearance` field (`avatar`, `accent`) at most 200. All of them reject NUL and every other Cc control character, except that `persona` and `instructions` keep tab, line feed and carriage return. A violation is 400 `request_invalid`.
+  - `tool_allowlist` entries must match `^[a-z][a-z0-9_.]{0,63}$`, otherwise 400 `request_invalid`; the list is stored sorted and deduplicated, so `config_hash` and the `policy_version` comparison always see one canonical form.
   - `HireDot { name: String, role: DotRole, persona: String }`, the hire request
   - `roles::template(role: &DotRole, locale: Locale) -> NewDot`: the defaults a hire starts from: the role's instructions, `tool_allowlist = ["ask_user", "read_thread"]`, `model_tier = Standard`, `autonomy = AskFirst`, and the role's avatar (a neutral avatar for `Custom`); the request's name and persona replace the template's
   - Who may change what: any member may hire a Dot, edit its `name`, `persona` and `appearance`, create teams and change team membership. Only an owner or admin may change execution-affecting settings (`instructions`, `tool_allowlist`, `model_tier`, `autonomy`, `status`, `max_concurrency`, `daily_token_budget`) and grants; a member gets 403 `forbidden`.
-  - Dot names are unique within a team, compared by NFKC_Casefold with the Thai mark ordering described below; `team::create`, `team::add_member` and a rename through `dot::update` return 422 `dot_name_conflict` otherwise.
+  - Dot names are unique among a team's active members, compared by their Unicode `NFKC_Casefold` mapping with the Thai mark ordering and whitespace normalization described below, so `Writer`, `writer` and the fullwidth `Ｗｒｉｔｅｒ` collide; `team::create`, `team::add_member` and a rename through `dot::update` return 422 `dot_name_conflict` otherwise. Dot and team names pass `tenancy::validate_name` (Task 4), must contain at least one letter or decimal digit (Unicode category L or Nd), and must not contain a `Default_Ignorable_Code_Point` (an invisible code point such as U+200B or U+3164); otherwise 400 `request_invalid`.
   - `Team { id: TeamId, space_id: SpaceId, name: String }` and `TeamView { team: Team, members: Vec<Dot> }`, with the lead first
   - `roles::default_roster(locale: Locale) -> Vec<NewDot>`: 6 Dots with English and Thai display names, for example Lead/หัวหน้าทีม, Researcher/นักวิจัย, Writer/นักเขียน, Analyst/นักวิเคราะห์, Scheduler/เลขา, Reviewer/ผู้ตรวจ. Each role gets a distinct avatar, and every Dot gets `tool_allowlist = ["ask_user", "read_thread"]`.
   - `dot::hire(pool, &Tenant, SpaceId, NewDot) -> Result<DotId, KatError>`: the Space becomes the Dot's default and its first grant
   - `dot::list(pool, &Tenant, SpaceId) -> Result<Vec<Dot>, KatError>`: the Dots granted to that Space
   - `dot::get(pool, &Tenant, DotId) -> Result<Dot, KatError>`
   - `dot::update(pool, &Tenant, DotId, DotPatch) -> Result<Dot, KatError>`
-  - `dot::grant_space(pool, &Tenant, DotId, SpaceId) -> Result<(), KatError>` and `dot::revoke_space(pool, &Tenant, DotId, SpaceId) -> Result<(), KatError>`; revoking the default Space is 422 `default_space_required`
-  - An effective change to `tool_allowlist`, `status`, grants, `autonomy` or `model_tier` increments `policy_version` atomically with the change.
+  - `dot::grant_space(pool, &Tenant, DotId, SpaceId) -> Result<(), KatError>` and `dot::revoke_space(pool, &Tenant, DotId, SpaceId) -> Result<(), KatError>`; revoking the default Space is 422 `default_space_required`, and revoking a Space while the Dot is an active member of a team in that Space is 422 `grant_in_use`
+  - `policy_version` changes only for authority or safety. An effective change (a new value that differs from the stored one) to `tool_allowlist`, `status`, `autonomy` or `model_tier` (which can change residency), or a Space grant added or revoked, increments it once, in the same transaction. `max_concurrency`, `daily_token_budget`, `persona`, `instructions`, `name` and `appearance` never bump it: an edit to them applies from the Dot's next run, so it never aborts queued or running work.
+  - Team membership is never deleted: `team::remove_member` sets `team_members.active = false`, every reader (`team::get`, the name checks, `eligible_members`, routing) filters on `active`, and `team::add_member` for an inactive row reactivates it.
+  - Migration `0004_team_membership.sql`: `team_members.active BOOLEAN NOT NULL DEFAULT true`; the one-lead index becomes `UNIQUE (team_id) WHERE is_lead AND active`; `teams.is_default BOOLEAN NOT NULL DEFAULT false` with `UNIQUE (workspace_id, space_id) WHERE is_default`, which makes `team::create_default` idempotent per Space; `CHECK (daily_token_budget >= 0)` and `CHECK (max_concurrency <= 65535)`.
   - `team::create_default(pool, &Tenant, SpaceId, Locale) -> Result<TeamId, KatError>` and `team::get(pool, &Tenant, TeamId) -> Result<TeamView, KatError>`
   - `NewTeam { name: String, lead: DotId, members: Vec<DotId> }`, `team::create(pool, &Tenant, SpaceId, NewTeam) -> Result<TeamId, KatError>` and `team::list(pool, &Tenant, SpaceId) -> Result<Vec<Team>, KatError>`
   - `team::add_member(pool, &Tenant, TeamId, DotId, is_lead: bool) -> Result<(), KatError>`: a second lead is 422 `team_lead_conflict`; a Dot not granted to the team's Space is 422 `dot_not_in_space`
   - `team::remove_member(pool, &Tenant, TeamId, DotId) -> Result<(), KatError>`: removing the lead is 422 `team_lead_required`
-  - Transaction readers: `dot::get_on(executor, &Tenant, DotId)`, `dot::is_granted(&mut PgConnection, &Tenant, DotId, SpaceId) -> Result<bool, KatError>`, `dot::is_eligible(&mut PgConnection, &Tenant, DotId, SpaceId) -> Result<bool, KatError>`, and `team::eligible_members(&mut PgConnection, &Tenant, TeamId) -> Result<Vec<Dot>, KatError>`. `is_granted` checks the grant regardless of status, so Task 8 can distinguish `DotPaused` from `PolicyChanged`. `is_eligible` additionally requires an active Dot; team eligibility also requires active membership. Every reader scopes by the resolved tenant's workspace. Unknown or foreign grants return false; unknown or foreign teams return `not_found`.
+  - Transaction readers: `dot::get_on(executor, &Tenant, DotId)`, `dot::is_granted(&mut PgConnection, &Tenant, DotId, SpaceId) -> Result<bool, KatError>`, `dot::is_eligible(&mut PgConnection, &Tenant, DotId, SpaceId) -> Result<bool, KatError>`, and `team::eligible_members(&mut PgConnection, &Tenant, TeamId) -> Result<Vec<Dot>, KatError>`. `is_granted` checks the grant regardless of status, so Task 8 can distinguish `DotPaused` from `PolicyChanged`. `is_eligible` additionally requires an active Dot; team eligibility also requires active membership and a grant to the team's Space, with the Lead first, then by `position`. These readers take no locks. Every reader scopes by the resolved tenant's workspace. Unknown or foreign grants return false; unknown or foreign teams return `not_found`.
 - Routes:
   - Bodies are the serde JSON of the named structs, with snake_case fields.
   - `GET /api/workspaces/{workspace_id}/spaces/{space_id}/dots` → 200 `[Dot]`; `POST` ("hire") with `HireDot` → 201 `Dot`
@@ -379,10 +518,28 @@ web/
   - `team_persisted_server_side_and_returned_in_order`: the lead comes first
   - `default_roster_avatars_are_distinct`
   - `granting_and_revoking_space_bumps_policy_version`
+  - `authority_edits_bump_policy_version_once`: changing `tool_allowlist`, `status`, `autonomy` or `model_tier` bumps it by exactly 1; re-sending the stored value bumps nothing
+  - `capacity_budget_and_text_edits_do_not_bump_policy_version`: `max_concurrency`, `daily_token_budget`, `persona`, `instructions`, `name` and `appearance` edits leave it unchanged
+  - `patch_cannot_change_default_space`: 400 `request_invalid`
+  - `free_text_fields_reject_controls_and_overlong_values`: a NUL in `persona`, a 4,001-character `persona`, an 8,001-character `instructions` and a 201-character `appearance.accent` are each 400; `instructions` with line feeds and tabs is accepted
+  - `tool_allowlist_entries_are_validated_sorted_and_deduplicated`: `["read_thread", "ask_user", "read_thread"]` is stored as `["ask_user", "read_thread"]`; `"Read_Thread"` and a 65-character entry are 400
+  - `revoking_a_grant_in_use_is_422`: `grant_in_use` while the Dot is an active member of a team in that Space, allowed after `remove_member`
+  - `name_uniqueness_uses_nfkc_casefold`: `Writer` and fullwidth `Ｗｒｉｔｅｒ` in one team give 422 `dot_name_conflict`
+  - `names_need_a_letter_or_digit_and_no_invisible_code_points`: `"---"` and `"Writer\u{200B}"` are 400
+  - `removed_member_is_soft_deleted_and_hidden`: the row stays with `active = false`, `team::get` omits it, and re-adding reactivates it
+  - `malformed_path_ids_use_json_errors_and_execution_keys_check_role_first`
 - [ ] **Step 2: Run** `cargo test -p katwork-server --test team`. Expected: FAIL.
 - [ ] **Step 3: Implement.** `seed-demo` also creates the default team in the demo Space.
 - [ ] **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit** with `feat: dots, teams, default roster`.
+
+**Follow-up PR, after PR #24 and Task 3b merge** (no migration):
+
+- [ ] **Step 6: Lead concurrency default.** Write `lead_defaults_to_three_concurrent_tasks_specialists_to_one` in `tests/team.rs`: the default roster's Lead has `max_concurrency = 3` and each specialist 1, and a hired `Custom` Dot has 1. Run it (FAIL). `NewDot` gains `max_concurrency: u16`; `roles::template` sets 3 for `DotRole::Lead` and 1 for every other role (initial defaults); `dot::hire` and `team::create_default` store it. `HireDot` cannot set it; an admin changes it with `PATCH`. Run it (PASS).
+- [ ] **Step 7: Reply in the person's language.** Write `role_templates_tell_dots_to_reply_in_the_persons_language`: every role template's `instructions`, `Custom` included, end with `Reply in the language of the person's latest message.` for `Locale::En` and `ตอบเป็นภาษาเดียวกับข้อความล่าสุดของคนที่คุยด้วย` for `Locale::Th`. Run it (FAIL), add the line to `roles.rs`, run it (PASS). Existing Dots keep their instructions.
+- [ ] **Step 8: Thai demo seed.** Write `seed_demo_creates_a_thai_workspace_with_the_thai_roster` in `tests/cli.rs`: `seed-demo` also gives the demo user a second workspace `เดโม`, with one Space `พื้นที่ทดลอง` (`allow_external = true`) and the default team from `roles::default_roster(Locale::Th)`, where หัวหน้าทีม comes first and the five specialists have Thai names; a second run creates nothing. Run it (FAIL), implement, run it (PASS).
+- [ ] **Step 9: A default team for `create-user`'s new workspace.** Write `create_user_new_workspace_has_default_team` in `tests/cli.rs`: a workspace that `create-user` creates has its `General` Space with a default team, the Lead first and the five specialists from `roles::default_roster(Locale::En)` (the new account's locale), so the owner can start a thread at once; joining an existing workspace creates no team. Run it (FAIL). Add `team::create_default_on(conn: &mut PgConnection, &Tenant, SpaceId, Locale) -> Result<TeamId, KatError>`, the body of `team::create_default` on the caller's transaction, which `team::create_default` now wraps. Let `tenancy::resolve` take any `sqlx::PgExecutor` instead of `&PgPool`, so it can read a membership its own transaction inserted; it stays the only constructor of `Tenant`. `accounts::create_user` then resolves the new owner's `Tenant` on its transaction and calls `team::create_default_on` for `General` before it issues the invite, so the account, workspace, Space and team commit together. Run it (PASS).
+- [ ] **Step 10: Commit** with `feat: lead concurrency default, reply-language line, thai demo seed, default team for new workspaces`.
 
 ### Task 6: Threads and messages (web channel)
 
@@ -419,6 +576,8 @@ web/
 
 ### Task 7: Model gateway, FakeProvider and Rig adapter
 
+**Status:** merged in PR #21. The interfaces below match its code; Task 7b adds the local provider.
+
 **Files:**
 - Create: `crates/katwork/src/models/{mod,provider,registry,guard,fake,rig_adapter}.rs`, `crates/katwork/tests/{models.rs,rig_fixtures.rs}`, `crates/katwork/tests/fixtures/models/` (recorded provider bytes)
 - Modify: `Cargo.toml`, `Cargo.lock`, `crates/katwork/src/{runtime.rs,config.rs}`, `crates/katwork-server/src/main.rs`
@@ -434,11 +593,11 @@ web/
   - `ToolCall { id: String, name: String, args_json: String }`
   - `ProviderReplay { provider_id: String, version: u32, data: serde_json::Value }`: opaque, versioned provider state, passed back only to the same provider in the same workspace and thread
   - `ToolSpec { name: String, description: String, parameters: serde_json::Value }`, where `parameters` is JSON Schema
-  - `ChatChunk::{TextDelta(String), Progress, ToolCall(ToolCall), Usage(Usage), Done { stop: StopKind, turn: AssistantTurn }}`. `Progress` is content the loop does not use: a part starting or ending, a reasoning delta, or a non-empty tool-argument delta. The adapter emits it so the stall timers see that content. Text deltas are provisional. `ToolCall` chunks are emitted only after the whole turn is accepted. `turn` is the canonical final turn, never joined deltas.
+  - `ChatChunk::{TextDelta(String), Progress, ToolCall(ToolCall), Usage(Usage), Done { stop: StopKind, turn: AssistantTurn }}`. `Progress` is content the loop does not use: a part starting or ending, a reasoning delta, or a non-empty tool-argument delta. The adapter emits it so the stall timers see that content, and `guard_stream` forwards it, so the caller knows content has started. Once any content chunk (a non-empty `TextDelta`, `Progress`, `ToolCall` or `Done`) has reached the caller, the attempt is not retryable: Task 7 never retries (Rig's retries and the HTTP client's are off), and Task 8 owns every retry. Text deltas are provisional. `ToolCall` chunks are emitted only after the whole turn is accepted. `turn` is the canonical final turn, never joined deltas.
   - `AssistantTurn { content: String, tool_calls: Vec<ToolCall>, replay: Option<ProviderReplay> }`
   - `StopKind::{EndTurn, ToolUse, MaxTokens, Refusal, Other(String)}`
   - `Usage { input: Option<u64>, cache_read: Option<u64>, cache_write: Option<u64>, output: Option<u64>, complete: bool }`. Cache counters are subsets of `input`, not extra. A missing count is `None`, never 0.
-  - `ModelError::{ProviderUnavailable, ResidencyDenied, Timeout { phase: TimeoutPhase }, RateLimited { retry_after_secs: Option<u64> }, QuotaExceeded { resets_at: Option<DateTime<Utc>> }, AuthFailed, Protocol(String), Other(String)}` and `TimeoutPhase::{FirstChunk, Idle}`. `Protocol` and `Other` hold private diagnostics only; the provider's raw error body never reaches a tenant.
+  - `ModelError::{ProviderUnavailable, ResidencyDenied, Timeout { phase: TimeoutPhase }, RateLimited { retry_after_secs: Option<u64> }, QuotaExceeded { resets_at: Option<DateTime<Utc>> }, AuthFailed, Protocol(String), Other(String)}` and `TimeoutPhase::{FirstChunk, Idle}`. `Protocol` and `Other` hold private diagnostics only; the provider's raw error body never reaches a tenant, and never reaches a log at any level. `ModelError`'s `Display` is its stable code (`model_protocol_error`, never the diagnostic string), and `ModelError::reason_code(&self) -> ReasonCode` gives each variant one stable `ReasonCode`. The adapter's only log line for a provider error is `model_provider_error`, with `error_kind` (that code), `status`, `provider_request_id` and `error_body_bytes`.
   - `StreamTimeouts { first_chunk: Duration, idle: Duration }`, default 30 s each: `first_chunk` is the time to the first content chunk, and `idle` the longest gap between content chunks
   - `guard::guard_stream(inner: BoxStream<'static, Result<ChatChunk, ModelError>>, t: StreamTimeouts) -> BoxStream<'static, Result<ChatChunk, ModelError>>`. It times the actual stream polling, not only the opener: a stall yields `Timeout { phase }`. **Only content counts as progress:** a non-empty `TextDelta`, `Progress`, `ToolCall` or `Done`. Raw HTTP bytes, SSE comments, blank lines, empty deltas, unknown events, Anthropic `ping` and `message_start`, and usage-only frames (`Usage`) never reset either timer, so a stream that keeps the connection alive without content still times out. A stream that ends without `Done` yields `Protocol`, and so does `Done { stop: ToolUse }` with no tool call.
   - `Capabilities { tools: bool, residency: Residency, synthetic: bool }` and `Residency::{Local, External}`
@@ -466,11 +625,12 @@ web/
   - all HTTP goes through KatWork's `BoundedHttp`, injected through Rig's HTTP client interface (the trait Rig's own reqwest transport implements). reqwest supplies the connect and read timeouts and the no-redirect policy. `BoundedHttp` reads every body chunk by chunk and applies the byte caps before buffering or decoding: an over-cap response is `Protocol("response_too_large")`; an error body is cut at its cap before Rig reads it; an SSE frame that passes its cap without a terminating blank line is `Protocol("sse_frame_too_large")`. If the pinned Rig release has no injectable HTTP client interface, stop and revise this task; never fall back to an unbounded client.
   - provider bytes are decoded with an incremental UTF-8 decoder, never `String::from_utf8` per network chunk
   - Anthropic's opening and closing usage snapshots are merged, never summed
+  - Anthropic spend-cap and credit errors map to `QuotaExceeded { resets_at: None }`, not `RateLimited`: a 429 `rate_limit_error` whose `details.error_code` is `enforced_spend_limit_reached`, a 400 `invalid_request_error` whose message starts with the organization usage-limit, workspace usage-limit or low-credit-balance text, and the codes `insufficient_quota`, `quota_exceeded`, `billing_error` and `credit_balance_too_low`. Every other error keeps its own mapping; an authentication error (401, 403, `authentication_error`, `permission_error`, `invalid_api_key`) is checked first and stays `AuthFailed`.
   - a provider tool call with no id gets `kw_call_{index}`; a duplicate id within one turn is `Protocol`
   - the OpenAI Responses route sends `store: false`, so the provider keeps no stored copy of the conversation
   - on both OpenAI routes, a `ChatMsg::Tool` with `is_error: true` is sent with the text prefix `Error: `, because neither the Chat nor the Responses encoder has an error field
 
-- [ ] **Step 1: Pin dependencies.** Pin `rig-core = "=0.45.0"` with `default-features = false` and explicit reqwest and rustls features. Pin it explicitly: under resolver 3, which honours `rust-version`, an unpinned add silently resolves to 0.42.0, the newest release that fits the 1.94.0 floor. rig-core 0.45.0 and its sub-crates need Rust 1.97.1, so the same commit raises `rust-version` in `Cargo.toml` and the CI `msrv` job's toolchain to 1.97.1. If the release moves its reqwest transport into a separate crate, pin that crate to the same exact version. Add `reqwest` with the same version requirement that transport declares (for example `0.13`), never a different line, so `Cargo.lock` resolves one reqwest. Then re-run the `msrv` check on the new locked graph at 1.97.1. Add `async-trait`, `futures` and `tracing-subscriber`. In `katwork-server`, initialize tracing from `RUST_LOG`, defaulting to `info,rig=info`, because Rig's `rig::completions` TRACE level logs full prompts.
+- [ ] **Step 1: Pin dependencies.** Pin `rig-core = "=0.45.0"` with `default-features = false` and explicit reqwest and rustls features. Pin it explicitly: under resolver 3, which honours `rust-version`, an unpinned add silently resolves to 0.42.0, the newest release that fits the 1.94.0 floor. rig-core 0.45.0 and its sub-crates need Rust 1.97.1, so the same commit raises `rust-version` in `Cargo.toml` and the CI `msrv` job's toolchain to 1.97.1. If the release moves its reqwest transport into a separate crate, pin that crate to the same exact version. Add `reqwest` with the same version requirement that transport declares (for example `0.13`), never a different line, so `Cargo.lock` resolves one reqwest. Then re-run the `msrv` check on the new locked graph at 1.97.1. Add `async-trait`, `futures` and `tracing-subscriber`. In `katwork-server`, initialize tracing from `RUST_LOG`, defaulting to `info,rig=info`, and add the `filter_fn` layer `dependency_log_allowed`, which drops every event whose target starts with `rig` (and with `sqlx`) whatever `RUST_LOG` says: Rig logs full prompts at TRACE and provider messages even at WARN (Global Constraints). Test `rig_trace_prompts_are_blocked_even_with_explicit_trace_directives` (a unit test in `main.rs`): with `RUST_LOG=trace,rig::completions=trace`, events on `rig::completions`, `rig_core::completions`, `rig_core::providers` and `rig::providers` produce no output.
 - [ ] **Step 2: Write the failing tests** in `crates/katwork/tests/models.rs`:
   - `registry_refuses_external_provider_for_local_only_space`: returns `ModelError::ResidencyDenied`
   - `invalid_provider_base_url_is_config_invalid`
@@ -507,18 +667,63 @@ web/
   - `oversized_response_is_rejected_before_decoding`
   - `oversized_error_body_is_capped_before_rig_reads_it`
   - `unterminated_sse_frame_over_cap_is_rejected`
+  - `content_then_connection_failure_is_not_retried_or_double_charged` and `tool_progress_then_provider_failure_is_not_retried_or_double_charged`: the adapter makes one HTTP request and yields the content, then the error
+  - `anthropic_spend_cap_maps_to_quota`, `anthropic_organization_spend_limit_maps_to_quota`, `anthropic_workspace_spend_limit_maps_to_quota`, `anthropic_credit_balance_maps_to_quota` and `anthropic_quota_matching_preserves_other_errors`
   - `live_openai_chat_smoke` (`#[ignore]`): runs only when `OPENAI_API_KEY` is set, never in CI
 - [ ] **Step 4: Run** `cargo test -p katwork --test models --test rig_fixtures`. Expected: FAIL.
 - [ ] **Step 5: Implement.**
 - [ ] **Step 6: Run.** Expected: PASS.
 - [ ] **Step 7: Commit** with `feat: model gateway with residency policy, fake and rig providers`.
 
+### Task 7b: Local model provider
+
+A small follow-up PR to PR #21 (merged); it must merge before Task 8, which reads the per-entry timeouts. It lets an operator run every tier on one local OpenAI-compatible server, so a local-only Space works outside demo mode (ADR-0005). It adds no migration.
+
+**Files:**
+- Modify: `crates/katwork/src/config.rs`, `crates/katwork/src/models/{registry.rs,rig_adapter.rs,guard.rs}` (`HttpLimits.first_byte`, the per-entry `BoundedHttp`), `crates/katwork-server/src/main.rs`, `crates/katwork/tests/{config.rs,models.rs,rig_fixtures.rs}`, `crates/katwork/tests/fixtures/models/` (a local chat fixture), `.env.example`, `docker-compose.yml`
+
+**Interfaces:**
+- Consumes: `Registry`, `ModelEntry`, `Capabilities`, `Residency`, `RigProvider`, `OpenAiApi`, `BoundedHttp`, `StreamTimeouts` (Task 7); `Config` (Task 1).
+- Produces:
+  - `LocalEnv { base_url: String, model: String, api_key: Option<String> }` and `Config.local: Option<LocalEnv>`, read from `KATWORK_LOCAL_BASE_URL`, `KATWORK_LOCAL_MODEL` and the optional `KATWORK_LOCAL_API_KEY`. The base URL and model come together: either one without the other is `config_invalid` naming the missing variable (Task 3b's `ConfigInvalid { var }`; whichever PR merges second adapts). The base URL must parse as an `http` or `https` URL with a host, for example `http://local-llm:8000/v1`. `Debug` shows only the URL's origin and prints `[redacted]` for the key.
+  - `ModelEntry` gains `timeouts: ModelTimeouts`, with `ModelTimeouts { first_chunk: Duration, idle: Duration, run_wall_clock: Duration }` and `ModelTimeouts::stream(&self) -> StreamTimeouts` (the first two, for `guard_stream`). Hosted and demo entries use `ModelTimeouts::HOSTED` (30 s, 30 s, 90 s); local entries use `ModelTimeouts::LOCAL` (120 s, 60 s, 300 s). All are initial defaults.
+  - Each entry's timeouts reach the transport. `HttpLimits` gains `first_byte: Duration` (default 30 s), and `HttpLimits::for_entry(t: &ModelTimeouts) -> HttpLimits` gives `first_byte = t.first_chunk` and `read = max(t.first_chunk, t.idle)`, with the default connect timeout and byte caps: 120 s and 120 s for a local entry, 30 s and 30 s for a hosted one. The transport is only a safety net. `BoundedHttp` never enforces a content rule: it bounds only raw socket silence, waiting at most `first_byte` for the response headers and at most `read` between any two body chunks (comments and pings included), and reqwest's own `read_timeout` is set to `read`. Each of these bounds is at least every content deadline of the entry, so the HTTP layer never cuts a stream that `guard_stream`'s content-based first-chunk and idle deadlines would still allow. The provider constructors gain a `limits: HttpLimits` argument, `RigProvider::openai(env, model, api, limits)` and `RigProvider::anthropic(env, model, limits)`, and `from_config` builds a `BoundedHttp` for each entry from `HttpLimits::for_entry(&entry.timeouts)`. A local entry therefore never inherits the hosted 30 s read timeout.
+  - `RigProvider::local(env: &LocalEnv, limits: HttpLimits) -> Result<RigProvider, ModelError>`: Rig's OpenAI Chat Completions client (`OpenAiApi::Chat`) pointed at `env.base_url`, through that `BoundedHttp` like the hosted adapters, with every Task 7 adapter rule. Its provider id is `local`. Without `api_key`, requests carry no `Authorization` header.
+  - Registry rules:
+    - `from_config` registers the local provider after the hosted ones: one entry per tier, each with `model = KATWORK_LOCAL_MODEL`, `Capabilities { tools: true, residency: Residency::Local, synthetic: false }`, the tier's `max_output_tokens`, `temperature: None`, `price: None` and `ModelTimeouts::LOCAL`.
+    - `for_tier` already returns the first registered entry the Space's policy allows. So a Space with `allow_external = true` gets the hosted entry when one is configured, and the local entry otherwise; a local-only Space always gets the local entry.
+    - A configured local provider counts as a provider: the demo fallback applies only when OpenAI, Anthropic and local are all unset.
+    - A local constructor error is logged once as `provider_init_failed` with `provider_id = "local"` only, and the local entries are left out.
+    - Residency comes from the variable that configured the provider, never from the URL. KatWork does not check that `KATWORK_LOCAL_BASE_URL` points inside the install's network; the operator declares it (ADR-0005).
+  - `Registry::log_tiers(&self)`: one `info` event `model_tier` per tier, with `tier`, `hosted_allowed` (the `provider_id/model` a Space with `allow_external = true` gets, or `none`) and `local_only` (the same for a local-only Space), and never a key or URL. `serve` calls it once, after building `Core`.
+  - Task 8 takes each attempt's stream timeouts from `selected.entry.timeouts.stream()`, capped by the run's remaining time like every call, and the run's wall clock from the `timeouts.run_wall_clock` of the entry its first attempt selects.
+- `.env.example` documents the three variables; `docker-compose.yml` passes them to the `katwork` service.
+
+- [ ] **Step 1: Write the failing tests:**
+  - in `crates/katwork/tests/config.rs`: `local_base_url_and_model_must_be_set_together`, `local_base_url_must_be_http_or_https`, `local_api_key_is_redacted_in_debug`
+  - in `crates/katwork/tests/models.rs`:
+    - `local_only_space_uses_local_provider_without_demo`: only `KATWORK_LOCAL_*` set, demo off; `for_tier` on a local-only Space gives the `local` entry for every tier
+    - `hosted_allowed_space_prefers_hosted_entry_over_local`: OpenAI and local both set; a Space with `allow_external = true` gets `openai`, a local-only Space gets `local`
+    - `local_provider_disables_demo_fallback`: local set and `KATWORK_DEMO=1`; no tier maps to the demo provider
+    - `local_entries_carry_local_timeouts`: 120 s, 60 s and a 300 s run wall clock on local entries; 30 s, 30 s and 90 s on hosted and demo ones
+    - `local_init_failure_resolves_to_provider_unavailable`
+    - `startup_logs_one_line_per_tier`: three `model_tier` events naming the serving entries, with no key or URL in the captured output
+  - in `crates/katwork/tests/rig_fixtures.rs`, each through a real local HTTP fixture server:
+    - `local_provider_streams_from_an_openai_compatible_server` and `local_provider_without_key_sends_no_authorization_header` (the fixture server checks the request headers)
+    - `local_entry_http_read_timeout_is_not_30s`: paused tokio clock; the server sends its response headers after 45 s, and in a second case sends text, stays silent for 45 s, then sends the rest. Through a local entry's `BoundedHttp`, both streams complete; through a hosted entry's limits, the same server gives `Timeout`
+    - `transport_gap_never_preempts_first_content_deadline`: paused tokio clock; on a local entry, the server sends its response headers and an SSE comment at 0 s and the first text at 90 s; the stream succeeds, because comments are not content and 90 s is inside both the 120 s first-content deadline and the 120 s transport gap
+    - `http_limits_follow_the_entry_timeouts`: `HttpLimits::for_entry(&ModelTimeouts::LOCAL)` gives a 120 s first byte, a 120 s read, the 10 s connect and the default byte caps; `HttpLimits::for_entry(&ModelTimeouts::HOSTED)` gives 30 s and 30 s, and for every entry `read >= max(first_chunk, idle)`
+- [ ] **Step 2: Run** `cargo test -p katwork --test config --test models --test rig_fixtures`. Expected: FAIL.
+- [ ] **Step 3: Implement**, including the `.env.example` and `docker-compose.yml` changes.
+- [ ] **Step 4: Run** `cargo test --workspace --locked`. Expected: PASS.
+- [ ] **Step 5: Commit** with `feat: local openai-compatible model provider`.
+
 ### Task 9: Event log, hub and AG-UI SSE
 
 This task comes before Task 8, because the agent loop emits through `EventSink`.
 
 **Files:**
-- Create: `crates/katwork/src/events/{mod,agui,log,hub,sink,coalesce}.rs`, `crates/katwork/tests/events.rs`, `crates/katwork/tests/fixtures/agui/`, `crates/katwork-server/src/routes/events.rs`, `crates/katwork-server/tests/events.rs`, `crates/katwork-server/tests/fixtures/sse/thai_emoji.sse`
+- Create: `crates/katwork/src/events/{mod,agui,log,hub,sink,coalesce}.rs`, `crates/katwork/tests/events.rs`, `crates/katwork/tests/fixtures/agui/`, `crates/katwork-server/src/routes/events.rs`, `crates/katwork-server/tests/events.rs`, `crates/katwork-server/tests/fixtures/sse/thai_emoji.sse` (a byte-for-byte copy of Task 13a's `web/src/testing/fixtures/thai_emoji.sse`)
 - Modify: `crates/katwork/src/runtime.rs`, `Cargo.toml` (`unicode-segmentation`)
 
 **Interfaces:**
@@ -533,9 +738,9 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
     - `katwork.tool_status`: `ToolStatusEvent { tool_call_id: ToolCallRecordId, ok: bool, code: Option<String> }`
     - `katwork.usage`: `UsageEvent { run_id: RunId, dot_id: DotId, model_call_id: ModelCallId, input: Option<u64>, output: Option<u64>, complete: bool }`
     - `katwork.message_stored`: `MessageStoredEvent { message_id: MessageId, author: Author, body: String, synthetic: bool, question: Option<Question> }`, emitted once a message is committed
-    - `katwork.run_started`: `RunStartedEvent { run_id: RunId, dot_id: DotId, reply_message_id: MessageId }`, emitted right after `RUN_STARTED`, so the client knows which provisional message belongs to which run
+    - `katwork.run_started`: `RunStartedEvent { run_id: RunId, job_id: JobId, dot_id: DotId, reply_message_id: MessageId }`, emitted right after `RUN_STARTED`, so the client knows which provisional message belongs to which run, and which job's run has started (the chat clears that job's queue position, Task 13b). Task 13a's reducer ignores fields it does not use, so adding `jobId` needs no 13a change.
     - `katwork.run_closed`: `RunClosedEvent { run_id: RunId, end: RunEnd }`, appended in the same transaction right after every `RUN_FINISHED` or `RUN_ERROR`, because AG-UI's `RUN_ERROR` carries no run id
-  - Client folding rules, which Task 13 implements: a `TEXT_MESSAGE_START` for a `messageId` starts that message's provisional text over; `TEXT_MESSAGE_CONTENT` appends to it; `katwork.message_stored` is authoritative and replaces whatever the client holds for that `messageId`, with the stored body, `synthetic` flag and question. On `katwork.run_closed {runId}`, the client drops that run's provisional message (the `replyMessageId` from `katwork.run_started`) unless `katwork.message_stored` confirmed it. It never infers the run from `RUN_ERROR`, which carries no run id, so concurrent runs in one thread stay apart, so text from a run that lost its lease or failed never stays beside the stored transcript. The rules fold the event log deterministically, so a reconnect that replays from any seq ends at the same transcript.
+  - Client folding rules, which Task 13a implements: a `TEXT_MESSAGE_START` for a `messageId` starts that message's provisional text over; `TEXT_MESSAGE_CONTENT` appends to it; `katwork.message_stored` is authoritative and replaces whatever the client holds for that `messageId`, with the stored body, `synthetic` flag and question. On `katwork.run_closed {runId}`, the client drops that run's provisional message (the `replyMessageId` from `katwork.run_started`) unless `katwork.message_stored` confirmed it. It never infers the run from `RUN_ERROR`, which carries no run id, so concurrent runs in one thread stay apart, so text from a run that lost its lease or failed never stays beside the stored transcript. The rules fold the event log deterministically, so a reconnect that replays from any seq ends at the same transcript.
   - `DotState::for_tool(SideEffect) -> DotState`: `Read`, `WorkspaceRead` and `Navigate` give `Researching`; every other effect gives `Working`. Only the harness emits `dot_state`: `Working` while the model streams, `NeedsApproval` on an approval stop, `Waiting` on a question, `Error` on a run error, `Paused` for a paused Dot, `Idle` otherwise.
   - `log::append(tx: &mut Transaction<'_, Postgres>, workspace_id: WorkspaceId, thread_id: ThreadId, run_id: Option<RunId>, e: &AgUiEvent) -> Result<EventSeq, KatError>`: runs `UPDATE threads SET last_event_seq = last_event_seq + 1 WHERE id = $1 RETURNING last_event_seq` and then the insert, inside the caller's transaction, so appenders serialize per thread. The `UPDATE` takes the thread lock; a caller that also needs job or task locks has taken them already, and one that needs the Dot row takes it afterwards (global lock order).
   - `log::since(pool, &Tenant, ThreadId, after: EventSeq) -> Result<Vec<(EventSeq, AgUiEvent)>, KatError>`
@@ -545,7 +750,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `PgEventSink::new(pool: PgPool, hub: EventHub, workspace_id: WorkspaceId, thread_id: ThreadId, run_id: Option<RunId>, fence: Option<Fence>) -> PgEventSink`: each `emit` runs, in its own transaction, `fence::check` (when `fence` is set; a shared task-row lock) and then `log::append` (the thread lock), in the global order, commits, and only then calls `hub.notify`. A failed check returns `lease_lost` and writes nothing, so a worker whose lease was reclaimed or cancelled cannot add events after the harness closed its run. `close_run` needs a `run_id` and a fence. In one transaction it runs `fence::check`; for each of the run's open calls (no `ended_at` in `tool_calls`) it appends `TOOL_CALL_RESULT` and `katwork.tool_status{ok: false, code}` and marks the call `outcome_unknown`; it appends `RUN_ERROR{code}` and `katwork.run_closed {end}`, and sets the run's `state` to `end` with `ended_at = now()`. The terminal event and the run's closure therefore commit together or not at all.
   - `DeltaCoalescer::new() -> DeltaCoalescer`, `push(&mut self, delta: &str, now: Instant) -> Option<String>` and `finish(&mut self) -> Option<String>`: it buffers text deltas and releases them at ≥100 ms or ≥512 bytes, cut only at a grapheme-cluster boundary (`unicode-segmentation`)
   - `Core` gains `events: EventHub`, built in `Core::new`
-  - Route `GET /api/workspaces/{workspace_id}/threads/{thread_id}/events`: SSE with `id:` set to the per-thread `EventSeq`. It subscribes to the hub first, then replays `since(Last-Event-ID or 0)`, then on each wake-up reads `since(last sent)` from the log. It drops any event with `seq ≤` the last one sent, re-reads from the log when the receiver lags, and sends a `:` comment keep-alive every 15 s.
+  - Route `GET /api/workspaces/{workspace_id}/threads/{thread_id}/events`: SSE with `id:` set to the per-thread `EventSeq`. It subscribes to the hub first, then replays `since(Last-Event-ID or 0)`, then on each wake-up reads `since(last sent)` from the log. It drops any event with `seq ≤` the last one sent, re-reads from the log when the receiver lags, and sends a `:` comment keep-alive every 15 s. The route is mounted outside Task 3's 30 s request-timeout and 256-request concurrency layers, which would cut every stream and let open streams starve other requests, and inside every other guard (Host, Origin, security headers, authentication). The transport's idle timeout does not close it, because the keep-alive writes every 15 s.
 
 - [ ] **Step 1: Write the failing tests** in `crates/katwork/tests/events.rs`:
   - `events_serialize_as_agui_json`: `TextMessageContent` → `{"type":"TEXT_MESSAGE_CONTENT","messageId":"…","delta":"…"}`
@@ -558,10 +763,14 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `reconnect_with_last_event_id_has_no_gap_or_duplicate`: Review Focus 3
   - `replay_to_live_gap_loses_nothing`: an event appended between replay and the live phase arrives once
   - `lagged_subscriber_recovers_from_log`
-  - `sse_thai_and_emoji_event_parses_at_every_byte_split`: uses `tests/fixtures/sse/thai_emoji.sse`, which Task 13 reuses
+  - `sse_thai_and_emoji_event_parses_at_every_byte_split`: uses `tests/fixtures/sse/thai_emoji.sse`
+  - `sse_fixture_matches_the_web_fixture`: `tests/fixtures/sse/thai_emoji.sse` is byte-for-byte equal to Task 13a's `web/src/testing/fixtures/thai_emoji.sse`, so the server and the browser parse the same bytes
   - `sse_crlf_framing_and_comment_keepalives_parse`
   - `duplicate_replay_is_dropped`
   - `other_workspace_cannot_subscribe`: 404
+  - `sse_stream_outlives_the_request_timeout`: paused tokio clock; a stream stays open and keeps delivering past 30 s
+  - `open_streams_do_not_count_against_the_request_limit`: with 257 streams open through the router (as every HTTP-level test runs, without the transport), an ordinary request still succeeds
+  - `sse_route_keeps_host_and_origin_guards`: `Host: evil.example` is still 403 `host_not_allowed`
 - [ ] **Step 3: Run** `cargo test -p katwork --test events && cargo test -p katwork-server --test events`. Expected: FAIL.
 - [ ] **Step 4: Implement.**
 - [ ] **Step 5: Run.** Expected: PASS.
@@ -574,7 +783,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 - Modify: `Cargo.toml` (`tokio-util`)
 
 **Interfaces:**
-- Consumes: `fence::{Fence, check, lock}`, `types::Question` (Task 2); `Registry`, `Selected`, `ModelProvider`, `ChatRequest`, `ChatMsg`, `ChatChunk`, `ToolSpec`, `ModelError`, `StreamTimeouts`, `guard_stream` (Task 7); `EventSink`, `RunEnd`, `AgUiEvent`, `KatworkEvent`, `DotState`, `DeltaCoalescer` (Task 9); `Dot`, `Dot::config_hash` (Task 5); `Tenant` (Task 4); ids and `types::{SideEffect, SpacePolicy}` (Task 2).
+- Consumes: `fence::{Fence, check, lock}`, `types::Question` (Task 2); `Registry`, `Selected`, `ModelProvider`, `ChatRequest`, `ChatMsg`, `ChatChunk`, `ToolSpec`, `ModelError`, `StreamTimeouts`, `guard_stream` (Task 7); `ModelEntry.timeouts` (Task 7b); `EventSink`, `RunEnd`, `AgUiEvent`, `KatworkEvent`, `DotState`, `DeltaCoalescer` (Task 9); `Dot`, `Dot::config_hash`, `dot::get_on`, `dot::is_granted` (Task 5); `Tenant` (Task 4); ids and `types::{SideEffect, SpacePolicy}` (Task 2).
 - Produces:
   - `#[async_trait] trait Tool: Send + Sync { fn spec(&self) -> ToolSpec; fn side_effect(&self) -> SideEffect; async fn call(&self, ctx: &ToolCtx, args: serde_json::Value) -> Result<ToolOutput, ToolError>; }`
   - `ToolOutput::{Text(String), Ask(Question)}`: `Text` goes back to the model as the tool result; `Ask` ends the run with that question
@@ -598,9 +807,9 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `RunFacts::not_run(stop: StopReason) -> RunFacts`: no run id, a fresh `reply_message_id`, everything else empty; used when the harness decides without a run (Tasks 11 and 12)
   - `ToolCallRecord { id: ToolCallRecordId, step: u32, tool_call_id: String, name: String, side_effect: Option<SideEffect>, state: ToolCallState }` and `ToolCallState::{Started, Succeeded, Failed, TimedOut, OutcomeUnknown, Refused}`
   - `PendingCall { record_id: ToolCallRecordId, tool_call_id: String, name: String, args_canonical: String, args_sha256: String }`, stored as `tasks.pending_tool_call`
-  - `StopReason::{ProviderUnavailable, ProviderRateLimited, ProviderQuota, ProviderAuthFailed, ModelProtocol, StepLimit, LoopDetected, NeedsApproval, TokenBudget, OutputTruncated, TimeLimit, PolicyChanged, ResidencyDenied, QuotaExceeded, WorkspacePaused, DotPaused, NoEligibleDot, Interrupted, OutcomeUnknown, Cancelled}`
-  - `Limits { max_steps: u32, tool_timeout: Duration, result_max_chars: usize, repeat_limit: u32, repeat_window: (u32, u32), max_total_tokens: u64, run_wall_clock: Duration, task_deadline: Duration, job_deadline: Duration, model_retries: u32, stream: StreamTimeouts }`. `Limits::default()` holds the initial defaults: 24, 60 s, 8,000, 3, (5, 10), 200,000, 90 s, 5 min, 10 min, 1, and 30 s / 30 s. The run deadline is separate from the lease TTL.
-  - `guards::authorize(conn: &mut PgConnection, fence: &Fence, dot_id: DotId, space_id: SpaceId, policy_version: i64) -> Result<Option<StopReason>, KatError>`: runs `fence::check`, then reads the Dot and its workspace. A paused workspace gives `WorkspacePaused`, a paused Dot `DotPaused`, and a missing grant to `space_id` or a `policy_version` other than `input.policy_version` gives `PolicyChanged`. Status, grant, allowlist, autonomy and model-tier changes all increment `policy_version` (Task 5), so a change made while the task was queued is caught on the first check.
+  - `StopReason::{ProviderUnavailable, ProviderRateLimited, ProviderQuota, ProviderAuthFailed, ModelProtocol, StepLimit, LoopDetected, NeedsApproval, TokenBudget, OutputTruncated, TimeLimit, PolicyChanged, ResidencyDenied, QuotaExceeded, TooManyRequests, WorkspacePaused, DotPaused, NoEligibleDot, Interrupted, OutcomeUnknown, Cancelled}`. `TooManyRequests` is the per-sender throttle at intake (Task 12), kept apart from `QuotaExceeded`, the daily token budget.
+  - `Limits { max_steps: u32, tool_timeout: Duration, result_max_chars: usize, repeat_limit: u32, repeat_window: (u32, u32), max_total_tokens: u64, task_deadline: Duration, job_deadline: Duration, model_retries: u32 }`. `Limits::default()` holds the initial defaults: 24, 60 s, 8,000, 3, (5, 10), 200,000, 5 min, 10 min and 1. Stream timeouts and the run wall clock are not fixed limits: each model entry carries its own (`ModelEntry.timeouts`, Task 7b). The run deadline is separate from the lease TTL.
+  - `guards::authorize(conn: &mut PgConnection, tenant: &Tenant, fence: &Fence, dot_id: DotId, space_id: SpaceId, policy_version: i64) -> Result<Option<StopReason>, KatError>`: runs `fence::check`, then reads the Dot with `dot::get_on`, its grant with `dot::is_granted`, and its workspace. A paused workspace gives `WorkspacePaused`, a paused Dot `DotPaused`, and a missing grant to `space_id` or a `policy_version` other than `input.policy_version` gives `PolicyChanged`. Allowlist, status, grant, autonomy and model-tier changes all increment `policy_version` (Task 5), so a change made while the task was queued is caught on the first check; an edit to `max_concurrency`, `daily_token_budget`, `persona`, `instructions`, `name` or `appearance` never stops a run and applies from the next one.
   - `guards::canonical_args(args: &serde_json::Value) -> String`: object keys sorted and whitespace normalized; array order and values kept
   - `guards::RepeatKey { tool_name: String, canonical_args: String, target_revision: Option<String> }`, where `target_revision` is always `None` in SP1 (SP2 fills it so a render after each edit is not a loop), and `guards::RepeatGuard::new(limit: u32, window: (u32, u32))` with `check(&mut self, key: &RepeatKey) -> bool`, false meaning stop before this call. The provider's call id is never part of the key.
   - `guards::truncate_result(text: &str, max_scalars: usize) -> String`: at most `max_scalars` Unicode scalar values, the marker `"…[truncated]"` included. A JSON result over the cap becomes a plain-string preview prefixed `"[JSON truncated] "`, never cut inside its structure.
@@ -612,13 +821,15 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - Fencing: every run-scoped write (the `runs` row, each ledger function, each event through the fenced `PgEventSink`, each tool write) runs `fence::check` in the same transaction as the write, and `lease_lost` aborts it. Before each model attempt the loop also runs `guards::authorize`, which includes `fence::check`, so a reclaimed or cancelled worker makes no further model calls. On `lease_lost` the loop stops at once, writes nothing further and returns `Err(RunAbort::LeaseLost)`.
 - Loop rules:
   - **Steps.** A step is one model attempt, retries included. An answer on attempt 24 is accepted; a tool batch that would need attempt 25 is not executed (`StepLimit`).
-  - **Model attempts.** Each attempt calls `models.for_tier(dot.model_tier, &input.space_policy)`, so a provider change re-checks residency, and wraps the stream in `guard_stream`, raced against `input.deadline` (`TimeLimit`); no attempt starts once `input.deadline` has passed. It retries only before the first chunk, at most `model_retries` times. Every attempt gets one `model_calls` row and one `katwork.usage` event. Each request uses `max_output_tokens = min(entry.max_output_tokens, the run's remaining token budget)` and `temperature = entry.temperature`; with less than 256 tokens of budget left, the run stops `TokenBudget` before the attempt.
-  - **Provider errors.** Every `ModelError` has exactly one outcome. Provider text stays in private, redacted logs, never in events, messages or the job reason.
+  - **Model attempts.** Each attempt calls `models.for_tier(dot.model_tier, &input.space_policy)`, so a provider change re-checks residency, and wraps the stream in `guard_stream` with `selected.entry.timeouts.stream()`, each timeout capped by the run's remaining time, raced against the run deadline (`TimeLimit`); no attempt starts once the run deadline has passed.
+  - **Run deadline.** `input.deadline` is the task and job bound (Task 11). When the first attempt selects its entry, the run deadline becomes `min(input.deadline, run_started + selected.entry.timeouts.run_wall_clock)`, where `run_started` is the `tokio::time::Instant` at which `execute` began; an attempt on another entry later in the run never extends it. A run whose `input.deadline` has already passed stops `TimeLimit` before it selects an entry.
+  - **Retries.** A model attempt may be retried only before the first content chunk (a non-empty `TextDelta`, `Progress`, `ToolCall` or `Done`), at most `model_retries` times. Once content has started, a failure ends the attempt with its mapped `StopReason` and is never retried. Record one `model_calls` row per attempt and charge each attempt once. Every attempt also gets one `katwork.usage` event. Task 7's adapters never retry, so this is the only retry. Each request uses `max_output_tokens = min(entry.max_output_tokens, the run's remaining token budget)` and `temperature = entry.temperature`; with less than 256 tokens of budget left, the run stops `TokenBudget` before the attempt.
+  - **Provider errors.** Every `ModelError` has exactly one outcome. Provider text never reaches an event, a message, the job reason or any log. The loop logs a failed attempt only with the stop reason's stable code, the attempt number and the `model_calls` id; the provider's own details are already in Task 7's `model_provider_error` line (error kind, HTTP status, provider request id, byte count) and nowhere else.
 
-    | `ModelError` | retried before the first chunk | outcome when it persists |
+    | `ModelError` | retried before the first content chunk | outcome when it persists, or at once after content started |
     |---|---|---|
     | `ProviderUnavailable`, `Other(_)`, `Timeout { phase: FirstChunk }` | yes, up to `model_retries` | stop `ProviderUnavailable`, `executor_unavailable = true` |
-    | `Timeout { phase: Idle }` | no, a chunk already arrived | stop `ProviderUnavailable`, `executor_unavailable = true` |
+    | `Timeout { phase: Idle }` | no, content already arrived | stop `ProviderUnavailable`, `executor_unavailable = true` |
     | `RateLimited { retry_after_secs }` | once, only if the wait fits in the run's remaining time | stop `ProviderRateLimited` |
     | `QuotaExceeded { .. }` | no | stop `ProviderQuota` |
     | `AuthFailed` | no | stop `ProviderAuthFailed` |
@@ -636,7 +847,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - **Ledger.** Every dispatched call goes through `start_tool_call`, then `end_tool_call` with `succeeded`, `failed`, `timed_out` or `outcome_unknown`. Every call that is not dispatched goes through `record_refused`, so a refused outward call never marks effects as started. A failed ledger write aborts the run before the tool is called.
   - **Result pairing.** An unknown tool name, a validation failure, a timeout and a refusal each become exactly one `ChatMsg::Tool { is_error: true }` with the original call id and name, and the loop continues unless a stop rule above applies. The text given to the model is `truncate_result(…, result_max_chars)`, and that exact text is stored in `tool_calls.result`.
   - **Prompt hygiene.** The system text is the Dot's persona and instructions plus a capability preamble generated from the effective tool set, never hand-written into `instructions`. Tool results, history and retrieved text never use the system role. Prompts never say "never ask".
-  - **Events.** `RUN_STARTED`, `katwork.run_started {runId, dotId, replyMessageId}`, `dot_state working`, then `TEXT_MESSAGE_START` with `messageId = reply_message_id`, the text through `DeltaCoalescer` as `TEXT_MESSAGE_CONTENT`, and `TEXT_MESSAGE_END`. Every model turn of the run streams under the same `reply_message_id` and opens with its own `TEXT_MESSAGE_START`, so text a turn wrote before calling tools is replaced, not kept; the stored reply arrives as `katwork.message_stored` (Task 10). Tool-call events follow only once the turn is accepted; `TOOL_CALL_RESULT` and `katwork.tool_status` follow execution. On cancel, the loop calls `sink.close_run(RunEnd::Cancelled, "cancelled")`, which closes every open call, emits `RUN_ERROR{code: "cancelled"}` and closes the run row in one transaction, then returns with `stop = Cancelled` and `run_closed = true`. A stop the loop finds itself, including `guards::authorize` returning `WorkspacePaused`, `DotPaused` or `PolicyChanged` between attempts, is not a cancellation: the loop emits no `RUN_ERROR`, leaves `run_closed = false`, and `job::conclude` ends the run with `RUN_FINISHED`. Each run therefore gets exactly one terminal event, and one owner for it. The loop never emits `RUN_FINISHED`; `job::conclude` does (Task 10).
+  - **Events.** `RUN_STARTED`, `katwork.run_started {runId, jobId, dotId, replyMessageId}` with `jobId = input.job_id`, `dot_state working`, then `TEXT_MESSAGE_START` with `messageId = reply_message_id`, the text through `DeltaCoalescer` as `TEXT_MESSAGE_CONTENT`, and `TEXT_MESSAGE_END`. Every model turn of the run streams under the same `reply_message_id` and opens with its own `TEXT_MESSAGE_START`, so text a turn wrote before calling tools is replaced, not kept; the stored reply arrives as `katwork.message_stored` (Task 10). Tool-call events follow only once the turn is accepted; `TOOL_CALL_RESULT` and `katwork.tool_status` follow execution. On cancel, the loop calls `sink.close_run(RunEnd::Cancelled, "cancelled")`, which closes every open call, emits `RUN_ERROR{code: "cancelled"}` and closes the run row in one transaction, then returns with `stop = Cancelled` and `run_closed = true`. A stop the loop finds itself, including `guards::authorize` returning `WorkspacePaused`, `DotPaused` or `PolicyChanged` between attempts, is not a cancellation: the loop emits no `RUN_ERROR`, leaves `run_closed = false`, and `job::conclude` ends the run with `RUN_FINISHED`. Each run therefore gets exactly one terminal event, and one owner for it. The loop never emits `RUN_FINISHED`; `job::conclude` does (Task 10).
 
 - [ ] **Step 1: Write the failing tests** in `crates/katwork/tests/agent.rs` (FakeProvider scripted; test-only tools registered per test):
   - `plain_text_reply_sets_final_text`
@@ -656,7 +867,9 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `unknown_outcome_write_stops_for_review_before_model_retries_it`: a `WorkspaceWrite` test tool commits and then times out; the model is scripted to request the same write again under a new call id; the second request is never dispatched, `stop = OutcomeUnknown`, and the ledger holds one `outcome_unknown` row
   - `answer_on_step_24_accepted_tool_batch_needing_25_stops`
   - `token_budget_200k_stops_before_next_attempt`
-  - `run_wall_clock_90s_stops_time_limit`: paused tokio clock
+  - `hosted_run_wall_clock_90s_stops_time_limit`: paused tokio clock
+  - `local_run_wall_clock_is_300s`: paused tokio clock; a run on a `Local` entry is still going at 90 s and stops `TimeLimit` at 300 s
+  - `run_deadline_never_exceeds_input_deadline`: with `input.deadline` 10 s away, a run on a `Local` entry stops `TimeLimit` at 10 s
   - `tool_result_truncated_to_8000_scalars_including_marker_thai`: includes a long single-line Thai string
   - `tool_timeout_60s_returns_error_result`: paused tokio clock
   - `timed_out_tool_cannot_write_afterwards`
@@ -677,7 +890,11 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `tool_output_never_enters_system_role`
   - `capability_preamble_lists_effective_tools`
   - `usage_recorded_once_per_attempt`
+  - `no_retry_after_content_or_progress`: a scripted `TextDelta`, and in a second case only a `Progress`, followed by `ProviderUnavailable`; the provider receives exactly one request, the run stops `ProviderUnavailable`, and one `model_calls` row is charged once
+  - `retry_before_first_content_gets_its_own_row`: a first attempt that fails before any content is retried once; two `model_calls` rows, each charged once
+  - `attempt_uses_its_entrys_stream_timeouts`: paused tokio clock; an entry with 120 s / 60 s timeouts does not time out at 30 s, and its wait is still capped by the run's remaining time
   - `every_model_error_maps_to_a_stable_stop_reason`: table-driven over the table above; no provider text reaches an event or message
+  - `provider_error_text_never_reaches_logs`: a scripted `Protocol` and `Other` error whose diagnostic carries a unique prompt marker; with all tracing output captured at `TRACE`, the marker appears in no log line, event or message
   - `max_output_tokens_capped_by_remaining_budget`
   - `missing_usage_is_charged_conservatively_and_stored_null`
   - `duplicate_call_ids_stay_distinguishable`: the same provider id in two steps gives two ledger rows and two `toolCallId`s
@@ -692,10 +909,12 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 
 **Files:**
 - Create: `crates/katwork/src/jobs/{mod,job,task}.rs`, `crates/katwork/src/policy.rs`, `crates/katwork/tests/{jobs.rs,policy.rs}`
+- Modify: `web/src/i18n/{en,th}.json` (`reason.too_many_requests`)
 
 **Interfaces:**
 - Consumes: `RunFacts`, `StopReason`, `Initiator` (Task 8); `ChatMsg` (Task 7); `log::append`, `EventHub`, `AgUiEvent`, `KatworkEvent`, `DotState` (Task 9); `message::append`, `NewMessage` (Task 6); `Tenant`; `types::{ReasonCode, JobStatus}`.
 - Produces:
+  - `ReasonCode` gains `TooManyRequests` (wire `too_many_requests`), added to `ReasonCode::ALL`, for the per-sender throttle (Task 12); it is never `quota_exceeded`. The same PR adds `reason.too_many_requests` to `web/src/i18n/{en,th}.json`, because Task 13a's `reason_codes_have_en_and_th_messages` checks every code
   - `NextStep::{RunCheapChecks, AskUser, HandToLead, SaveDraftWithReport, Retry, RestartJob}`
   - `Thresholds { version: u32 }` and `Thresholds::SP1` (`version: 1`)
   - `Verdict { status: JobStatus, reason: Option<ReasonCode>, next: Option<NextStep> }`; `status` is never `Cancelled` or `Error`
@@ -710,6 +929,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
     |---|---|---|---|
     | `ProviderUnavailable` / `ProviderRateLimited` / `ModelProtocol` / `TimeLimit` | `stopped` | `provider_unavailable` / `provider_rate_limited` / `model_protocol_error` / `time_limit` | `Retry` |
     | `ProviderQuota` / `QuotaExceeded` / `WorkspacePaused` | `stopped` | `provider_quota` / `quota_exceeded` / `workspace_paused` | `Retry` (after the reset or unpause) |
+    | `TooManyRequests` | `stopped` | `too_many_requests` | `Retry` (after a minute) |
     | `ProviderAuthFailed` / `DotPaused` / `ResidencyDenied` / `NoEligibleDot` | `stopped` | `provider_auth_failed` / `dot_paused` / `residency_denied` / `no_eligible_dot` | `AskUser` (an admin) |
     | `StepLimit` / `TokenBudget` / `OutputTruncated` | `stopped` | `step_limit` / `token_budget` / `output_truncated` | `SaveDraftWithReport` |
     | `LoopDetected` | `stopped` | `loop_detected` | `HandToLead` |
@@ -719,7 +939,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
     | `Cancelled` | `stopped` | `cancelled` | `Retry`; never reached in practice, because cancelled jobs end through the harness |
 
   - `policy::decision_event(job_id: JobId, facts: &RunFacts, v: &Verdict, t: &Thresholds) -> KatworkEvent`: builds `katwork.decision`. `inputs` is `{"stop": the stop reason's wire name or null, "executorUnavailable", "hasFinalText", "pendingQuestion", "artifactsCreated", "toolCalls": count, "synthetic"}`; `verdict` is `{"status", "reason", "next"}` as wire strings; `thresholds` is `Thresholds` as JSON; `policyVersion` is `Thresholds.version`.
-  - `job::create(conn: &mut PgConnection, &Tenant, ThreadId, MessageId) -> Result<JobId, KatError>`: a running job (`status` NULL) with `requested_by = tenant.user_id`
+  - `job::create(conn: &mut PgConnection, &Tenant, ThreadId, MessageId) -> Result<JobId, KatError>`: a running job (`status` NULL) with `requested_by = tenant.user_id()`
   - `job::create_follow_up(conn: &mut PgConnection, &Tenant, parent: JobId, MessageId) -> Result<JobId, KatError>`: `parent` must be `needs_input` in the same thread, otherwise `job_not_awaiting_input`; sets `parent_job_id` (ADR-0002)
   - `JobSummary { id: JobId, status: Option<JobStatus> }` and `job::latest_in_thread(conn: &mut PgConnection, &Tenant, ThreadId) -> Result<Option<JobSummary>, KatError>`
   - `job::finish_by_policy(tx: &mut Transaction<'_, Postgres>, job_id: JobId, v: &Verdict, decision_seq: EventSeq) -> Result<EventSeq, KatError>`: sets `status`, `reason`, `decided_by = 'policy'` and `decision_seq`, then appends `katwork.job_status` and returns its seq. The caller has already appended `katwork.decision`.
@@ -749,39 +969,42 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 ### Task 11: Leases, worker pool and restart recovery
 
 **Files:**
-- Create: `crates/katwork/src/jobs/{lease,worker}.rs`, `crates/katwork/tests/leases.rs`
+- Create: `crates/katwork/src/jobs/{lease,worker}.rs`, `crates/katwork/migrations/0006_task_first_claim.sql` (`ALTER TABLE tasks ADD COLUMN first_claimed_at TIMESTAMPTZ NULL`), `crates/katwork/tests/leases.rs`
 
 **Interfaces:**
 - Consumes: `fence::{Fence, check, lock}` (Task 2); `TaskInput`, `job::{conclude, finish_by_harness}` (Task 10); `run::execute`, `RunAbort`, `RunEnv`, `RunInput`, `RunFacts`, `RunFacts::not_run`, `RunKind`, `Limits`, `StopReason`, `ToolRegistry::builtin` (Task 8); `PgEventSink`, `log::append` (Task 9); `dot::get` (Task 5); `thread::get` (Task 6); `space::get`, `tenancy::resolve` (Task 4); `Core`.
 - Produces:
-  - `lease::claim(core: &Core, worker_id: &str, ttl: Duration, limits: &Limits) -> Result<Option<ClaimedTask>, KatError>`. Candidates are tasks with `state = 'queued'`, or `state = 'leased'` with an expired lease, **whose job is still running** (`jobs.status IS NULL`), selected with `FOR NO KEY UPDATE OF tasks, jobs SKIP LOCKED`; every time comes from Postgres, and lease expiry is compared with `clock_timestamp()`. Each candidate is handled in its own transaction. A branch that ends without a run commits and claim moves on to the next candidate (at most 16 per call); the first candidate that gets a lease is returned. Each candidate's transaction takes all its locks before any write, in the global order: the job and task rows from the `SKIP LOCKED` select (never waiting), then the thread row (`SELECT … FROM threads WHERE id = $1 FOR NO KEY UPDATE`), then the Dot row (`SELECT … FROM dots WHERE id = $1 FOR NO KEY UPDATE`), all held until commit. Every branch below, including the ones that only emit an event (recovery closing, `dot_busy`, `workspace_paused`), runs after those locks. Then, in order:
+  - `lease::claim(core: &Core, worker_id: &str, ttl: Duration, limits: &Limits) -> Result<Option<ClaimedTask>, KatError>`. Candidates are tasks with `state = 'queued'`, or `state = 'leased'` with an expired lease, **whose job is still running** (`jobs.status IS NULL`), selected oldest first, in `(tasks.created_at, tasks.id)` order, with `FOR NO KEY UPDATE OF tasks, jobs SKIP LOCKED`; every time comes from Postgres, and lease expiry is compared with `clock_timestamp()`. That select joins `task_leases` without locking it, so its expiry test may be stale: a renewal committed after the select's snapshot but before it locked the task row changes no task row, so Postgres does not re-check it. Once the task row is locked, claim therefore re-reads the task and its lease in a separate statement (Global Constraints: lock first, then check) and goes on only if the task is still `queued`, or still `leased` with `expires_at <= clock_timestamp()`; otherwise it rolls that candidate back and moves to the next. Each candidate is handled in its own transaction. Oldest-first is best effort: because the select skips locked rows, a task may be overtaken only while an older one is locked by another worker (for example, one waiting for that task's thread lock). Claim never locks the Dot before a task, so it cannot enforce a strict per-Dot queue without breaking the global lock order. A branch that ends without a run commits and claim moves on to the next candidate (at most 16 per call); the first candidate that gets a lease is returned. Each candidate's transaction takes all its locks before any write, in the global order: the job and task rows from the `SKIP LOCKED` select (never waiting), then the thread row (`SELECT … FROM threads WHERE id = $1 FOR NO KEY UPDATE`), then the Dot row (`SELECT … FROM dots WHERE id = $1 FOR NO KEY UPDATE`), all held until commit. Every branch below, including the ones that only emit an event (recovery closing, `dot_busy`, `workspace_paused`), runs after those locks. Then, in order:
     - **closing an expired lease, once:** only a run of this task in state `running` is closed. For each of its open calls (started in `tool_calls` with no end) claim emits `TOOL_CALL_RESULT` and `katwork.tool_status{ok: false}` and marks the call `outcome_unknown`; it marks the run `interrupted`, emits `RUN_ERROR{code: "lease_lost"}` and `katwork.run_closed {end: interrupted}` before any later `RUN_STARTED`, and deletes the expired lease row. When no effect started (`effects_started_at IS NULL`), the task goes back to `queued` in the same transaction. A later poll then finds a queued task with no running run, so a task held by the branches below is never closed twice. A run leaves `running` only together with its terminal event, so this predicate finds exactly the runs that have none, including a run whose worker died after `execute` returned but before `lease::complete` committed.
-    - **deadline:** a task past `created_at + task_deadline`, or whose job is past `created_at + job_deadline`, becomes `failed`, its lease row is deleted, and the job ends with `job::conclude` on `RunFacts::not_run(StopReason::TimeLimit)`
+    - **deadline:** a task whose `first_claimed_at` is set and is past `first_claimed_at + task_deadline`, or whose job is past `jobs.created_at + job_deadline`, both compared with `clock_timestamp()`, becomes `failed`. Time a task waits in the queue before its first claim never counts against its task deadline, only against its job's. The task's lease row is deleted, its lease row is deleted, and the job ends with `job::conclude` on `RunFacts::not_run(StopReason::TimeLimit)`
     - **retries exhausted:** at `attempts >= max_attempts` (3), the task becomes `failed`, its lease row is deleted, and the job ends with `finish_by_harness(tx, Error { code: RetriesExhausted })`
     - **effects started:** a task whose expired lease was just closed and whose `effects_started_at` is set becomes `interrupted` and ends the job with `job::conclude` on `RunFacts::not_run(StopReason::Interrupted)`
     - skips a task of a paused workspace and sets `hold_reason = 'workspace_paused'`
     - **eligibility,** against the values stored on the task: the Dot must be `active`, still granted to the thread's Space, and at `policy_version = tasks.dot_policy_version`. A paused Dot ends the job with `job::conclude` on `RunFacts::not_run(StopReason::DotPaused)`; a revoked grant or any other policy change ends it on `RunFacts::not_run(StopReason::PolicyChanged)`. Either way the task becomes `failed` and its lease row is deleted, so queued history never reaches a model after the Dot lost its authority.
     - **concurrency:** counts the Dot's **other** tasks with a live lease (`state = 'leased'`, lease `expires_at > clock_timestamp()`, a different task id); expired leases never count. At `max_concurrency` or more it skips the candidate and sets `hold_reason = 'dot_busy'`. Because the Dot row is held, a second claimer for the same Dot waits on it and then sees the first lease.
     - emits `katwork.job_status {status: null, holdReason}` when it first sets a hold reason
-    - otherwise claims it: attempts + 1 (a `Recovery` run when `attempts > 0`, which covers a task re-queued by the closing above or by `lease::abandon`), increments `tasks.lease_epoch`, writes the lease with the same epoch, and clears `hold_reason`
+    - otherwise claims it: attempts + 1 (a `Recovery` run when `attempts > 0`, which covers a task re-queued by the closing above or by `lease::abandon`), increments `tasks.lease_epoch`, writes the lease with the same epoch, clears `hold_reason`, and sets `first_claimed_at = COALESCE(first_claimed_at, clock_timestamp())`, so the task deadline starts at the first claim and a recovery claim keeps it
 
     Because each no-run branch moves the task to a terminal state and finishes its job in the same transaction, a repeated poll never finishes the same job twice.
-  - `ClaimedTask { task_id: TaskId, job_id: JobId, dot_id: DotId, workspace_id: WorkspaceId, thread_id: ThreadId, requested_by: UserId, input: TaskInput, attempts: i32, lease_epoch: LeaseEpoch, policy_version: i64, kind: RunKind, remaining: Duration }`. `policy_version` is the task's stored `dot_policy_version`. `remaining` comes from the claim transaction's last statement, `SELECT GREATEST(0, (EXTRACT(EPOCH FROM LEAST(t.created_at + $1 * INTERVAL '1 microsecond', j.created_at + $2 * INTERVAL '1 microsecond') - clock_timestamp()) * 1000000)::bigint) AS remaining_micros`, with the task and job deadlines bound as `i64` microseconds. It is decoded as `i64` and converted with `Duration::from_micros(u64::try_from(remaining_micros).unwrap_or(0))`. Because the statement runs last, the time spent acquiring the claim is already subtracted, and the worker's wall clock is never consulted. The deadline branch above uses the same bound microsecond values.
+  - `ClaimedTask { task_id: TaskId, job_id: JobId, dot_id: DotId, workspace_id: WorkspaceId, thread_id: ThreadId, requested_by: UserId, input: TaskInput, attempts: i32, lease_epoch: LeaseEpoch, policy_version: i64, kind: RunKind, remaining: Duration }`. `policy_version` is the task's stored `dot_policy_version`. `remaining` comes from the claim transaction's last statement, `SELECT GREATEST(0, (EXTRACT(EPOCH FROM LEAST(t.first_claimed_at + $1 * INTERVAL '1 microsecond', j.created_at + $2 * INTERVAL '1 microsecond') - clock_timestamp()) * 1000000)::bigint) AS remaining_micros`, with the task and job deadlines bound as `i64` microseconds; it runs after the claim's update, so `first_claimed_at` is always set. It is decoded as `i64` and converted with `Duration::from_micros(u64::try_from(remaining_micros).unwrap_or(0))`. Because the statement runs last, the time spent acquiring the claim is already subtracted, and the worker's wall clock is never consulted. The deadline branch above uses the same bound microsecond values.
   - `HeartbeatStatus::{Continue, Stop(StopReason)}` and `lease::heartbeat(pool, task_id: TaskId, worker_id: &str, epoch: LeaseEpoch, ttl: Duration) -> Result<HeartbeatStatus, KatError>`: takes `fence::check` (the task row, shared) and then updates the lease row, in the global order; it renews `expires_at = now() + ttl` only while the check passes, so an expired lease is never revived; `Stop(WorkspacePaused)` once the workspace is paused. A task that is no longer leased under this epoch (reclaimed, cancelled or finished by the harness) is `lease_lost`.
   - `lease::complete(core: &Core, task_id: TaskId, worker_id: &str, epoch: LeaseEpoch, facts: RunFacts) -> Result<(), KatError>`: its transaction first reads the task's `job_id` and `thread_id` without locking, then takes, in the global order and before any write, the job row (`FOR NO KEY UPDATE`), the task row with `fence::lock`, and the thread row (`FOR NO KEY UPDATE`). A task that is no longer leased under this epoch is `lease_lost`, and the worker drops its facts, because whoever ended the lease (reclaim or cancel) already closed the run. Otherwise, in one transaction: `job::conclude` (with `idem_key` = the task id); the task state (`done`, or `interrupted` for `WorkspacePaused`) and `pending_tool_call`; the lease release. Then it commits and notifies the hub.
   - `worker::spawn_pool(core: Arc<Core>, n: usize, ttl: Duration) -> JoinSet<()>`. Each worker:
     - polls `claim` (every 1 s when idle)
     - builds the `Tenant` with `tenancy::resolve(&core.pool, requested_by, workspace_id)`, loads the Dot and the thread's Space policy, passes `policy_version` from the claim, and creates a `PgEventSink` for a new `RunId` with `fence = Some(Fence { task_id, epoch })`
-    - runs `run::execute` with `Limits::default()`, `ToolRegistry::builtin()`, `core.registry`, `reply_message_id = MessageId::new()` and `deadline = worker::run_deadline(claimed_at, remaining, run_wall_clock)`, where `claimed_at = tokio::time::Instant::now()` is sampled as soon as `claim` returns
+    - runs `run::execute` with `Limits::default()`, `ToolRegistry::builtin()`, `core.registry`, `reply_message_id = MessageId::new()` and `deadline = worker::run_deadline(claimed_at, remaining)`, where `claimed_at = tokio::time::Instant::now()` is sampled as soon as `claim` returns
     - heartbeats every `ttl / 3`; on `Stop(reason)` it cancels the run and sets `facts.stop = Some(reason)`. It cancels the run and drops its facts on `lease_lost`, on a failed renewal, or as soon as the last successful renewal is older than `ttl`.
     - on `Ok(facts)` finishes with `lease::complete`; on `Err(RunAbort::LeaseLost)` drops the run, because the reclaim or cancel path already closed it; on `Err(RunAbort::Infrastructure { .. })` calls `lease::abandon`
-  - `worker::run_deadline(claimed_at: tokio::time::Instant, remaining: Duration, run_wall_clock: Duration) -> tokio::time::Instant`: `claimed_at + min(run_wall_clock, remaining)`. A zero `remaining` gives `claimed_at`, so the run stops `TimeLimit` before its first model attempt. Only the monotonic clock and the database-derived duration are used, so a skewed worker clock cannot move the deadline.
+  - `worker::run_deadline(claimed_at: tokio::time::Instant, remaining: Duration) -> tokio::time::Instant`: `claimed_at + remaining`, the task and job bound; Task 8 shortens it to the selected entry's run wall clock. A zero `remaining` gives `claimed_at`, so the run stops `TimeLimit` before its first model attempt. Only the monotonic clock and the database-derived duration are used, so a skewed worker clock cannot move the deadline.
   - `lease::abandon(core: &Core, task_id: TaskId, worker_id: &str, epoch: LeaseEpoch) -> Result<(), KatError>`: in a transaction that takes only `fence::lock` (the task row, then its lease row), increments `tasks.lease_epoch` and sets the lease's `expires_at = clock_timestamp()`, so the next `claim` applies the normal reclaim rules (re-queue when no effect started, otherwise `interrupted`, and `retries_exhausted` after the third attempt). An infrastructure failure is never turned into a policy verdict. If `abandon` fails as well, the lease simply expires.
   - TTL defaults to 60 s, with a heartbeat every 20 s.
 
 - [ ] **Step 1: Write the failing tests** in `crates/katwork/tests/leases.rs`:
   - `two_workers_never_claim_same_task`: 50 tasks, 2 workers in parallel, each task claimed once
   - `expired_lease_is_reclaimed_once`: worker A claims and stops heartbeating; after the TTL, worker B claims it with a higher epoch; A's late `heartbeat` and `complete` are rejected with `lease_lost`
+  - `renewal_committed_between_snapshot_and_lock_is_not_reclaimed`: a lease within 50 ms of expiry is renewed by its worker's `heartbeat` while another worker's `claim` starts, both released from a `tokio::sync::Barrier`, 200 times over. Whenever the renewal commits, the task is not reclaimed: its epoch is unchanged, it has one `runs` row, and the first worker's next `heartbeat` and `lease::complete` succeed
+  - `claims_follow_queue_order`: with no other worker holding a task, a Dot's queued tasks are claimed in `(created_at, id)` order
+  - `older_task_locked_by_another_worker_may_be_overtaken`: a second connection holds the oldest queued task's row `FOR NO KEY UPDATE`; claim skips it and leases the next task; once the lock is released, the next claim takes the oldest
   - `expired_lease_after_side_effect_is_interrupted_not_rerun`
   - `reclaim_does_not_duplicate_reply`
   - `reclaimed_run_closes_open_calls_before_new_run_started`
@@ -791,7 +1014,8 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `cancelled_job_task_is_never_claimed`: a job cancelled while its task is queued is never claimed, and no model call happens
   - `deadline_branch_finishes_once_across_repeated_polls`: the task ends `failed` with no lease row, and one job status is written however often workers poll
   - `retries_exhausted_branch_finishes_once_across_repeated_polls`
-  - `one_dot_runs_one_task_at_a_time`
+  - `one_dot_runs_one_task_at_a_time`: a Dot with `max_concurrency = 1`
+  - `lead_runs_three_tasks_at_once_specialists_one`: with the default roster's values (Task 5 follow-up), three tasks for the Lead are leased together and a fourth gets `dot_busy`, while a specialist's second task gets `dot_busy`
   - `expired_claim_racing_paused_dot_claim_does_not_deadlock`: one worker claims an expired task (whose recovery closing emits events) while another claims a fresh task of the same paused Dot in the same thread. The two calls start together from a `tokio::sync::Barrier`, 50 times over; both always finish, and no error carries SQLSTATE `40P01`
   - `simultaneous_claims_for_one_dot_dispatch_once`: two workers claim two different tasks of one Dot (`max_concurrency = 1`) at the same moment behind a barrier; exactly one lease is granted and the other task gets `dot_busy`
   - `expired_lease_does_not_block_reclaim_at_max_concurrency_one`: the Dot's only task has an expired lease; it is reclaimed rather than held as `dot_busy`
@@ -804,9 +1028,10 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `heartbeat_pause_has_one_terminal_run_event`: the heartbeat sees the pause and cancels the run mid-stream; the log holds exactly one terminal event for it, `RUN_ERROR{cancelled}`, and no `RUN_FINISHED`
   - `pausing_workspace_interrupts_running_task`: the task ends `interrupted` and the job `stopped/workspace_paused`
   - `task_past_deadline_finishes_time_limit`
-  - `run_deadline_clamps_to_the_shorter_limit`: `remaining` of 10 s with a 90 s wall clock gives `claimed_at + 10 s`; zero gives `claimed_at`
+  - `run_deadline_is_claimed_at_plus_remaining`: `remaining` of 10 s gives `claimed_at + 10 s`; zero gives `claimed_at`
   - `remaining_micros_from_sql_for_future_and_expired_deadlines`: runs the real claim query; a deadline 10 s ahead decodes to a `remaining` between 9 and 10 s, and a passed deadline decodes to zero
-  - `deadline_comes_from_database_time`: a task whose `created_at` is 4 min 50 s in the past by Postgres time is claimed with `remaining` of about 10 s, whatever the worker's clock says
+  - `deadline_comes_from_database_time`: a recovery claim of a task whose `first_claimed_at` is 4 min 50 s in the past by Postgres time gets `remaining` of about 10 s, whatever the worker's clock says
+  - `task_deadline_starts_at_first_claim`: a task created 3 minutes ago by Postgres time and never claimed gets `remaining` between 4 min 59 s and 5 min at its first claim, which sets `first_claimed_at`; a later recovery claim keeps that value
   - `zero_remaining_makes_no_model_call`: a run started with `remaining = 0` stops `TimeLimit` and the provider receives no request
 - [ ] **Step 2: Run** `cargo test -p katwork --test leases`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
@@ -816,8 +1041,8 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 ### Task 12: Message → job pipeline (SP1 routing)
 
 **Files:**
-- Create: `crates/katwork/src/pipeline.rs`, `crates/katwork/src/jobs/quota.rs`, `crates/katwork-server/src/routes/jobs.rs`, `crates/katwork-server/tests/pipeline.rs`
-- Modify: `crates/katwork/src/jobs/job.rs` (`job::cancel`), `crates/katwork-server/src/routes/threads.rs` (`POST` messages calls `pipeline::submit` and returns its `job_id`), `crates/katwork-server/src/main.rs` (`serve` spawns the worker pool)
+- Create: `crates/katwork/src/pipeline.rs`, `crates/katwork/src/jobs/quota.rs`, `crates/katwork/migrations/0007_scheduler_indexes.sql`, `crates/katwork-server/src/routes/jobs.rs`, `crates/katwork-server/tests/pipeline.rs`
+- Modify: `crates/katwork/src/jobs/job.rs` (`job::cancel`, `job::view`), `crates/katwork/tests/schema.rs` (EXPLAIN tests), `crates/katwork-server/src/routes/threads.rs` (`POST` messages calls `pipeline::submit` and returns its `job_id`), `crates/katwork-server/src/main.rs` (`serve` spawns the worker pool)
 
 **Interfaces:**
 - Consumes: Tasks 4–11.
@@ -830,19 +1055,19 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
     4. `task::enqueue`, or `job::conclude` for a job that ends at intake, plus the notices, each written with `job_id` set to the job
   - `pipeline::submit(core: &Core, tenant: &Tenant, thread_id: ThreadId, post: UserPost) -> Result<Submitted, KatError>`: begins a transaction, runs `intake`, commits, then notifies the hub. A crash at any point before the commit leaves no message, job or task, so the client's retry with the same `client_msg_id` starts clean; a concurrent retry waits on the thread lock, then finds the first post's message and returns its ids. The route answers 201 when `created`, otherwise 200.
   - Intake rules inside `intake`:
-    - SP1 routing (spec §6.2 Stage 0 subset; Laya arrives in SP4). The eligible set is the thread team's Dots that are `active` and granted to the thread's Space. Mentions from `mentions::parse` are matched, in text order, against the team's Dot names (NFKC_Casefold plus Task 5 Thai mark ordering; names are unique within a team):
+    - SP1 routing (spec §6.2 Stage 0 subset; Laya arrives in SP4). The eligible set is `team::eligible_members(conn, tenant, thread.team_id)` (Task 5): the thread team's active members whose Dot is `active` and granted to the thread's Space, lead first, then by `position`. Mentions from `mentions::parse` are matched, in text order, against the names of the team's active members, by the same `NFKC_Casefold` key, Thai mark ordering and whitespace normalization as Task 5's uniqueness check (names are unique within a team):
       1. the first mention that names an eligible Dot gets the task; later mentions are ignored in SP1 (team jobs arrive in SP4)
       2. a mention of a team Dot that is not eligible posts a `System` notice, `dot_paused` or `dot_not_in_space`, and matching moves on to the next mention
       3. with no eligible mention, the Lead gets the task if it is eligible, otherwise the first eligible Dot in team order (`team_members.position`)
       4. with no eligible Dot at all, the job ends with `job::conclude` on `RunFacts::not_run(StopReason::NoEligibleDot)`
-    - quotas before enqueue: `quota::check`; when exceeded, the job ends with `job::conclude` on `RunFacts::not_run(StopReason::QuotaExceeded)`, which posts a localized notice. Nothing is dropped silently.
+    - quotas before enqueue: `quota::check`; when it returns a stop reason (`QuotaExceeded` or `TooManyRequests`), the job ends with `job::conclude` on `RunFacts::not_run(that reason)`, which posts a localized notice. Nothing is dropped silently.
     - in a paused workspace the task is still enqueued and waits (Task 11), and the pipeline posts a `System` notice `workspace_paused`
     - every `job::conclude` call here uses the job id as `idem_key`, and each notice uses the idempotency key `"notice:{job_id}:{code}"`, so a retried post never doubles them
     - builds `TaskInput` with `build_history`, and calls `task::enqueue` with the routed Dot's `policy_version`, read after `quota::check` has locked the Dot row, and key `"job:{job_id}:dot:{dot_id}"`
   - `quota::check(conn: &mut PgConnection, dot: &Dot, sender: UserId) -> Result<Option<StopReason>, KatError>`, run inside intake's transaction:
     - it first locks the Dot row (`FOR NO KEY UPDATE`): the last lock intake takes, after the thread row and before any write
-    - the daily budget is `dot.daily_token_budget` (`None` means no cap), compared with the sum of `model_calls.charged_tokens` for that Dot over the last 24 hours, so missing usage counts at its conservative charge, never as zero
-    - the rate limit is at most 6 jobs per minute per (Dot, sender), counted from tasks routed to that Dot whose job that sender requested in the last 60 s
+    - the daily budget is `dot.daily_token_budget` (`None` means no cap), compared with the sum of `model_calls.charged_tokens` for that Dot with `created_at > statement_timestamp() - interval '24 hours'`, so missing usage counts at its conservative charge, never as zero. The sum runs as its own statement after the Dot lock, so its one cutoff is computed after any lock wait and the `(dot_id, created_at)` index bounds the scan (Global Constraints). Over budget returns `QuotaExceeded`.
+    - the per-sender throttle allows at most 6 jobs per minute per (Dot, sender), counted from tasks routed to that Dot whose job that sender requested with `jobs.created_at > statement_timestamp() - interval '60 seconds'`, also after the Dot lock. Over it returns `TooManyRequests` (`too_many_requests`), never `QuotaExceeded`.
     - intake's `task::enqueue` records the routing in the same transaction, so a concurrent submission for the same Dot waits on the Dot row and then counts it
   - `History { messages: Vec<ChatMsg>, cut: u32 }` and `pipeline::build_history(messages: &[Message], dot_id: DotId, names: &HashMap<Author, String>, budget_chars: usize) -> History`:
     - the newest messages up to `budget_chars` (24,000); the latest user message is always kept whole, and the number of cut messages is recorded
@@ -850,6 +1075,8 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
     - system notes become plain `User` notes, never the system role
   - `job::cancel(pool, hub: &EventHub, tenant: &Tenant, job_id: JobId) -> Result<(), KatError>`: another workspace's job is `NotFound`; a finished job is `job_already_finished`. In one transaction it locks the job row (`FOR NO KEY UPDATE`); if the job is already finished it returns `job_already_finished` at once, before taking any other lock. Otherwise it locks, before any write and in the global order, the job's task rows in ascending id, then the thread row, all `FOR NO KEY UPDATE`. Each queued or leased task becomes `cancelled` and its lease row is deleted. For a running run it closes the open calls (`TOOL_CALL_RESULT`, `katwork.tool_status{ok: false}`, ledger state `outcome_unknown`), marks the run `cancelled`, and emits `RUN_ERROR{code: "cancelled"}`, `katwork.run_closed {end: cancelled}` and `katwork.dot_state idle`. It then calls `finish_by_harness(tx, Cancelled)`, commits and notifies the hub. The old worker's next heartbeat or write finds the task no longer leased and gets `lease_lost`.
   - Route `POST /api/workspaces/{workspace_id}/jobs/{job_id}/cancel` returns 202, 404 across tenants, and 409 `job_already_finished`.
+  - `JobView { id: JobId, status: Option<JobStatus>, reason: Option<ReasonCode>, hold_reason: Option<HoldReason>, queue_position: Option<u32> }` and `job::view(pool, &Tenant, JobId) -> Result<JobView, KatError>`. `queue_position` is set only while the job's task is `queued`: 1 plus the number of the same Dot's `queued` tasks of running jobs with a smaller `(created_at, id)`, so 1 means first in line. Claim takes queued tasks oldest first on a best-effort basis (Task 11), so the position is a good estimate, not a guarantee. It is null for a leased task or a finished job. Route `GET /api/workspaces/{workspace_id}/jobs/{job_id}` → 200 `JobView`, 404 across tenants; the chat shows the position (Task 13b).
+  - Migration `0007_scheduler_indexes.sql`: `jobs_thread_created ON jobs (thread_id, created_at DESC)` for `job::latest_in_thread`, `jobs_requester_created ON jobs (requested_by, created_at, id)` for the per-sender throttle, and `tasks_job_dot ON tasks (job_id, dot_id)` for the throttle's join, `job::cancel` and `job::view`.
   - `serve` builds `Core` and runs `worker::spawn_pool(core, 4, Duration::from_secs(60))`.
   - Event order for an answered job: `RUN_STARTED`, `katwork.run_started`, `katwork.dot_state working`, `TEXT_MESSAGE_*`, `katwork.decision`, `katwork.message_stored`, `katwork.job_status answered`, `katwork.dot_state idle`, `RUN_FINISHED`, `katwork.run_closed`. `katwork.job_status` is the only success signal; cancelled, needs-input and interrupted outcomes are explicit job statuses, never an omitted one.
 
@@ -862,6 +1089,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `local_only_space_with_only_hosted_keys_stops_residency_denied`: through the full pipeline; the notice code is `residency_denied` and no request leaves the install
   - `demo_mode_reply_is_flagged_synthetic`: the reply from the messages API has `synthetic: true`
   - `full_event_sequence`: the order above
+  - `run_started_carries_the_job_id`: with two jobs in one thread, each run's `katwork.run_started` carries its own job's id
   - `stream_message_id_equals_stored_reply_id`
   - `stored_reply_snapshot_replaces_provisional_text`: the scripted deltas say "Draft" while the final turn says "Final"; `katwork.message_stored` and the stored message both carry "Final"
   - `restart_mid_run_posts_exactly_one_reply`
@@ -872,8 +1100,11 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `reply_to_needs_input_job_starts_linked_follow_up`
   - `history_budget_keeps_latest_user_message_whole`
   - `other_dots_messages_are_user_role_with_name`
-  - `seventh_message_in_a_minute_is_stopped_quota_exceeded`
-  - `two_simultaneous_submissions_with_five_recent_jobs_admit_one`: one is enqueued and the other ends `stopped/quota_exceeded`
+  - `seventh_message_in_a_minute_is_stopped_too_many_requests`: the notice code is `too_many_requests`, not `quota_exceeded`
+  - `two_simultaneous_submissions_with_five_recent_jobs_admit_one`: one is enqueued and the other ends `stopped/too_many_requests`
+  - `daily_budget_exceeded_is_stopped_quota_exceeded`
+  - `job_view_shows_queue_position_while_queued`: two jobs queued behind a busy Dot report positions 1 and 2; once the first is claimed, the second reports 1; a running or finished job reports null
+  - in `crates/katwork/tests/schema.rs`, each running `EXPLAIN` with `enable_seqscan = off` on the exact query the code runs: `latest_job_in_thread_uses_thread_index`, `sender_throttle_uses_requester_and_task_indexes`, `cancel_finds_tasks_by_job_index` and `daily_budget_index_cond_bounds_created_at`. Each asserts the index name and that the time column, where there is one, appears in the plan's `Index Cond`, not only in a `Filter`.
   - `daily_budget_counts_charged_tokens_when_usage_is_missing`
   - `first_eligible_mention_wins_among_several`
   - `paused_lead_routes_to_first_active_specialist`
@@ -884,25 +1115,27 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `quota_reject_racing_claim_does_not_deadlock`: an intake that ends `stopped/quota_exceeded` and a claim of another task of the same Dot in the same thread start together from a `tokio::sync::Barrier`, 50 times over; both always finish, and no error carries SQLSTATE `40P01`
   - `cancel_queued_job_terminalizes_its_task`: the task becomes `cancelled` with no lease row, and no worker ever claims it
   - `cancel_other_workspace_job_is_404`
-- [ ] **Step 2: Run** `cargo test -p katwork-server --test pipeline`. Expected: FAIL.
+- [ ] **Step 2: Run** `cargo test -p katwork-server --test pipeline && cargo test -p katwork --test schema`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit** with `feat: message to job pipeline with mention routing`.
 
-### Task 13: Web app (login, reset, team, chat)
+Task 13 is split in two PRs: 13a, the web shell, starts after Task 6 against mocked APIs; 13b adds the Team, Chat and Members pages against the real routes once Tasks 12 and 3b have merged.
+
+### Task 13a: Web shell (login, reset, transcript and event folding)
 
 **Files:**
-- Create: `web/` (Vite React TS), `web/index.html` (with a pre-paint theme script), `web/scripts/check-contrast.ts`, `web/src/{main.tsx,app.tsx,api.ts,sse.ts,theme.css}`, `web/src/i18n/{index.ts,en.json,th.json}`, `web/src/pages/{Login,ResetRequest,ResetConfirm,Team,Chat}.tsx` with `*.test.tsx`, `crates/katwork-server/src/static_files.rs`, `crates/katwork-server/tests/i18n.rs`
+- Create: `web/` (Vite React TS), `web/index.html` (with a pre-paint theme script), `web/scripts/check-contrast.ts`, `web/src/{main.tsx,app.tsx,router.tsx,api.ts,sse.ts,theme.css,theme.ts}`, `web/src/i18n/{index.ts,en.json,th.json}`, `web/src/components/{Layout,Preferences,Announce,Transcript,Composer}.tsx`, `web/src/pages/{Login,ResetRequest,ResetConfirm,Home}.tsx`, each with its `*.test.ts(x)`, `web/src/testing/fixtures/thai_emoji.sse` (the Thai and emoji SSE fixture, which Task 9 copies), `crates/katwork-server/src/static_files.rs`, `crates/katwork-server/tests/{i18n.rs,static_files.rs}`
 - Modify: `crates/katwork-server/src/app.rs` (serve `web/dist` at `/`, SPA fallback), `Dockerfile` (web stage `node:22-bookworm-slim`), `.github/workflows/ci.yml` (`node-version: 22`, `npm run check:contrast`)
 
 **Interfaces:**
-- Consumes: the auth, workspaces, teams, threads, events and jobs routes; `crates/katwork-server/tests/fixtures/sse/thai_emoji.sse` (Task 9); `ReasonCode::ALL` (Task 2).
+- Consumes: the auth routes (Task 3), mocked threads, events and jobs routes, and `ReasonCode::ALL` as it is on main. It depends on nothing from Tasks 9 or 10: it owns its SSE fixture, and it translates only the reason codes already on main.
 - Produces:
+  - `Transcript` and `Composer` components, which Task 13b's Chat page uses, and `Home`, the signed-in placeholder that 13b replaces with Team and Chat
   - `sse.ts`: `subscribe(url, onEvent): () => void`, using the browser `EventSource` (no Rust or SDK client) and its native `Last-Event-ID` resume. It keeps the last seq and drops duplicates after a reconnect, and folds text by `messageId` and tool arguments by `toolCallId`, never into "the last message". It follows Task 9's folding rules: `TEXT_MESSAGE_START` resets a message's provisional text, `katwork.message_stored` replaces it with the stored body, `synthetic` flag and any question with its options, and `katwork.run_closed` drops that run's unconfirmed provisional message.
   - `i18n.t(key, vars?)` with locales `en` and `th`; the locale switch persists in `localStorage`, and the locale is read with try/catch
   - `i18n.formatDate(date, { calendar: 'gregory' | 'buddhist' })`: Gregorian in the UI chrome, Buddhist Era where a template asks for it
-  - every `ReasonCode` has a `reason.<code>` key in both locales
-  - a Stop button in the chat that calls the cancel route while a job runs
+  - every `ReasonCode` on main has a `reason.<code>` key in both locales, checked against `ReasonCode::ALL` by `reason_codes_have_en_and_th_messages`. 13a does not add codes that are not on main yet; because that test runs on every PR, the PR that adds a code adds its two messages (Task 10 for `too_many_requests`)
   - CSS tokens in `theme.css`, redefined under `[data-theme=dark]`, and a pre-paint theme script in `index.html` that sets `data-theme` before first paint
   - `npm run check:contrast`: fails when any text/surface token pair has contrast below 4.5:1
   - copy calls the coworkers "Dots" in both locales; Thai copy describes them as ผู้ช่วย AI and never says พนักงาน AI
@@ -910,9 +1143,8 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 - [ ] **Step 1: Write the failing tests** (Vitest + Testing Library, and one Rust test):
   - `login_shows_localized_error_on_401`, in both `en` and `th`
   - `reset_request_shows_same_message_regardless_of_email`
-  - `team_page_lists_lead_first_with_thai_names`
   - `chat_streams_deltas_into_one_bubble`: a mocked EventSource with 3 deltas gives 1 bubble with the concatenated text
-  - `chat_streams_thai_and_emoji_split_at_every_byte`: a mocked EventSource fed from the Task 9 fixture
+  - `chat_streams_thai_and_emoji_split_at_every_byte`: a mocked EventSource fed from `web/src/testing/fixtures/thai_emoji.sse`
   - `sse_folds_by_id_and_drops_duplicates_after_reconnect`
   - `provisional_text_dropped_after_lease_loss_and_recovery`: text from the first run, its `RUN_ERROR{lease_lost}` and `katwork.run_closed`, then a recovery run with its stored reply; the final transcript equals the stored messages
   - `interleaved_runs_one_error_one_stored_reply`: two runs for different Dots stream into one thread at once; one ends with `RUN_ERROR` and `katwork.run_closed`, the other with a stored reply; the other run's live text is never removed early, and the final transcript equals the stored messages
@@ -921,7 +1153,6 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `new_turn_start_resets_provisional_text`
   - `ask_user_question_and_options_render_from_snapshot`
   - `synthetic_reply_shows_badge`: a message with `synthetic: true` shows a visible "Demo / ตัวอย่าง" badge; the same text with `synthetic: false` shows none
-  - `stop_button_cancels_running_job`
   - `replayed_run_error_cleared_by_later_success`
   - `interrupt_does_not_clear_run_error`
   - `composer_enter_during_ime_composition_does_not_send`
@@ -929,16 +1160,74 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `format_date_buddhist_era_in_thai`
   - `every_key_exists_in_both_locales`: `en.json` and `th.json` have identical key sets
   - Rust, in `crates/katwork-server/tests/i18n.rs`: `reason_codes_have_en_and_th_messages`
+  - Rust, in `crates/katwork-server/tests/static_files.rs`: `spa_routes_fall_back_to_index`, `api_paths_never_fall_back`, `missing_asset_is_404_not_index`, `static_responses_carry_security_headers`
 - [ ] **Step 2: Run** `cd web && npm test`. Expected: FAIL.
-- [ ] **Step 3: Implement** the pages, plain CSS with tokens, and keyboard-reachable controls. Serve `dist/` from Axum with SPA fallback; `/api/*` never falls back.
+- [ ] **Step 3: Implement** the pages and components, plain CSS with tokens, and keyboard-reachable controls. Serve `dist/` from Axum with SPA fallback; `/api/*` never falls back.
 - [ ] **Step 4: Run** `npm test && npm run check:contrast && npm run build && cargo test -p katwork-server --locked`. Expected: PASS.
-- [ ] **Step 5: Commit** with `feat: web app for login, reset, team and streaming chat`.
+- [ ] **Step 5: Commit** with `feat: web shell for login, reset and streaming transcript`.
 
-### Task 14: Compose smoke, backup before migrate, HTTPS profile
+### Task 13b: Team, Chat and Members pages
+
+This task comes after Tasks 12 and 3b and builds on Task 13a. It adds no migration.
 
 **Files:**
-- Create: `scripts/smoke.sh`, `scripts/compose-backup.sh`, `Caddyfile`, `docker-compose.smoke.yml`, `crates/katwork-server/tests/e2e_compose.rs` (`#[ignore]`, run in a CI job)
-- Modify: `docker-compose.yml`, `Dockerfile` (build argument `CARGO_FEATURES`), `crates/katwork/{Cargo.toml,src/models/fake.rs,src/models/registry.rs}` (the `smoke-fixtures` feature), `.env.example` (`KATWORK_HTTPS_HOST`), `.github/workflows/ci.yml` (`e2e` and `upgrade_from_previous_release` jobs), `README.md` (a "Try it" section, HTTPS, backups and upgrades)
+- Create: `web/src/pages/{Team,Chat,Members}.tsx` with their `*.test.tsx`, `crates/katwork/src/tenancy/members.rs`, `crates/katwork-server/src/routes/members.rs`, `crates/katwork-server/tests/members.rs`
+- Modify: `web/src/{router.tsx,api.ts}`, `web/src/components/Layout.tsx`, `web/src/i18n/{en,th}.json`, `crates/katwork/src/{tenancy/mod.rs,auth/mailer.rs,error.rs}`, `crates/katwork-server/src/{app.rs,error.rs}`
+
+**Interfaces:**
+- Consumes: the workspaces, dots, teams, threads, events and jobs routes (Tasks 4–12); `JobView` and `GET …/jobs/{job_id}` (Task 12); `accounts::normalize_email`, `accounts::ensure_user`, `invite::issue`, `invite::link`, `Mailer`, `MailKind` (Tasks 3 and 3b); `Tenant`, `Role`, `WorkspaceSummary.role` (Task 4); `Transcript`, `Composer`, `sse.ts`, `api.ts`, `i18n` (Task 13a).
+- Produces:
+  - `Team.tsx`: the thread's team from `GET …/teams/{team_id}`, lead first, names in the stored script (Thai names shown as stored)
+  - `Chat.tsx`: posts with a fresh `client_msg_id`, subscribes to the thread's events through `sse.ts`, and renders `Transcript` and `Composer`. While a job runs it shows a Stop button that calls the cancel route. When a job's latest `katwork.job_status` has `holdReason: "dot_busy"`, it fetches `GET …/jobs/{job_id}` and shows `chat.queue_position` (`Waiting in line: {position}` / `รอคิว ลำดับที่ {position}`), refreshing every 5 s until that job's next `katwork.job_status` or the first `katwork.run_started` whose `jobId` is that job.
+  - `Member { user_id: UserId, email: String, display_name: String, role: Role }` and `members::list(pool, &Tenant) -> Result<Vec<Member>, KatError>`: owner or admin only, ordered by email
+  - `InviteDelivery::{Email, Link}` (serde `email | link`), `Invite { email: String, role: Role, delivery: InviteDelivery }` and `InviteResult { user_id: UserId, created: bool, link: Option<String> }`
+  - `members::invite(pool, config: &Config, mailer: &dyn Mailer, &Tenant, Invite) -> Result<InviteResult, KatError>`, in one transaction that first locks the workspace row (`FOR NO KEY UPDATE`, the first class of the global lock order):
+    - owner or admin only; only an owner may invite with `role = Owner`, otherwise `forbidden`
+    - `delivery = Email` with SMTP unconfigured is 422 `smtp_unconfigured`, before anything is written; the demo console mailer prints only the demo account's mail, so it never counts as configured
+    - `accounts::ensure_user` on `accounts::normalize_email(&invite.email)`; an account that is already a member is 409 `member_exists`
+    - an existing account (`created = false`) gets the membership and nothing else: never a link, never a mail, so an admin can never take over an account that another workspace or the operator created (ADR-0004)
+    - a new account gets the membership and `invite::issue`. `Link` returns `invite::link(config.public_url_or_default(), &token)` in `link`. `Email` returns `link: None` and, after the commit, sends `mailer::invite_mail` without delaying the response; a failed delivery is logged with the mail kind and outcome only, and the invite stands (the person can still use password reset).
+  - `members::set_role(pool, &Tenant, UserId, Role) -> Result<(), KatError>`, in one transaction that first locks the workspace row: owner or admin only; only an owner may grant `Owner` or change an owner's role; demoting the workspace's last owner is 422 `last_owner_required`; a user who is not a member is 404 `not_found`. It applies on that user's next request, because `tenancy::resolve` reads the membership every time.
+  - `MailKind::Invite` and `mailer::invite_mail(to: String, locale: Locale, link: &str, workspace: &str) -> Mail`: bilingual in the invitee's locale order, like the reset mail. Subject `คำเชิญเข้าร่วม KatWork / You're invited to KatWork` (halves swapped for `en`). Thai: `คุณได้รับเชิญเข้าร่วม {workspace} บน KatWork ใช้ลิงก์นี้ภายใน 72 ชั่วโมงเพื่อตั้งรหัสผ่าน`. English: `You have been invited to {workspace} on KatWork. Use this link within 72 hours to set your password.` The link stands alone on the last line.
+  - New codes: `member_exists` (409), `last_owner_required` (422) and `smtp_unconfigured` (422), each with an `error.<code>` message in both locales
+  - Routes, each calling `require_admin()` before parsing any body:
+    - `GET /api/workspaces/{workspace_id}/members` → 200 `[Member]`
+    - `POST /api/workspaces/{workspace_id}/members` with `Invite` → 201 `InviteResult`
+    - `PUT /api/workspaces/{workspace_id}/members/{user_id}/role` with `{"role": Role}` → 204
+  - `Members.tsx`, linked from `Layout` only when the signed-in user's role in the workspace (`WorkspaceSummary.role`) is owner or admin: the member list with a role select per member; an invite form with email, role, and a choice between "send by email" and "copy a link"; a returned link is shown once with a copy button and is gone once the person leaves the page; `smtp_unconfigured` shows a message that suggests the link option.
+
+- [ ] **Step 1: Write the failing Team and Chat tests** (Vitest + Testing Library, mocked `fetch` and `EventSource`):
+  - `team_page_lists_lead_first_with_thai_names`
+  - `chat_posts_with_client_msg_id_and_streams_the_reply`
+  - `stop_button_cancels_running_job`
+  - `chat_shows_queue_position_while_the_dot_is_busy`: a `katwork.job_status {holdReason: "dot_busy"}` makes the chat fetch the job and show its `queue_position` in both locales; the line goes away at the first `katwork.run_started` whose `jobId` is that job, and another queued job's line in the same thread stays
+- [ ] **Step 2: Run** `cd web && npm test`. Expected: FAIL.
+- [ ] **Step 3: Implement** `Team.tsx` and `Chat.tsx`, replacing `Home`'s placeholders. Run again. Expected: PASS.
+- [ ] **Step 4: Members page and routes.** Write the failing tests:
+  - in `crates/katwork-server/tests/members.rs`:
+    - `member_cannot_list_invite_or_change_roles`: 403, with a valid and with an invalid body
+    - `invite_new_email_by_link_returns_a_single_use_link`: the `/invite` link sets a password once through `POST /api/auth/invite/accept`, and a second accept is 400 `invite_token_invalid`; the new account then lists the workspace with the invited role
+    - `invite_by_email_sends_a_bilingual_invite_mail`: with `CapturingMailer`; the response has no link
+    - `invite_by_email_without_smtp_is_422_and_writes_nothing`
+    - `invite_of_an_existing_account_adds_membership_without_a_link`: Review Focus 4; `link` is null, no mail is sent, and the account's password and sessions are unchanged
+    - `invite_of_an_existing_member_is_409`
+    - `only_an_owner_can_invite_or_promote_an_owner`
+    - `last_owner_cannot_be_demoted`
+    - `role_change_applies_on_the_next_request`
+    - `concurrent_invites_for_one_email_create_one_account`
+    - `members_routes_hide_other_workspaces`: 404
+    - `invite_tokens_never_reach_logs`
+  - in `web/src/pages/Members.test.tsx`: `members_page_is_offered_only_to_owners_and_admins`, `members_page_invites_by_link_and_shows_it_once`, `members_page_explains_email_invites_without_smtp`, `members_page_changes_a_role`
+
+  Run `cargo test -p katwork-server --test members && (cd web && npm test)`. Expected: FAIL. Implement `tenancy/members.rs`, `routes/members.rs`, `MailKind::Invite` with `mailer::invite_mail`, the new codes and `Members.tsx`. Run again. Expected: PASS.
+- [ ] **Step 5: Run** `npm test && npm run check:contrast && npm run build && cargo test --workspace --locked`. Expected: PASS.
+- [ ] **Step 6: Commit** with `feat: team, chat and members pages`.
+
+### Task 14: Compose smoke, backup before migrate, first-run scripts, HTTPS and demo profiles
+
+**Files:**
+- Create: `scripts/smoke.sh`, `scripts/compose-backup.sh`, `scripts/init-env.sh`, `scripts/demo.sh`, `Caddyfile`, `docker-compose.smoke.yml`, `docker-compose.https.yml`, `docker-compose.demo.yml`, `crates/katwork-server/tests/e2e_compose.rs` (`#[ignore]`, run in a CI job)
+- Modify: `docker-compose.yml`, `Dockerfile` (build argument `CARGO_FEATURES`), `crates/katwork/{Cargo.toml,src/models/fake.rs,src/models/registry.rs}` (the `smoke-fixtures` feature), `.env.example` (`KATWORK_HTTPS_HOST`), `.github/workflows/ci.yml` (`e2e` and `upgrade_from_previous_release` jobs), `README.md` (a "Try it" section, first run, HTTPS, the offline demo, backups and upgrades)
 
 **Interfaces:**
 - Consumes: everything above.
@@ -949,37 +1238,52 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 - Produces, for the restart scenario, a deterministic in-flight run:
   - the `katwork` crate gets a Cargo feature `smoke-fixtures`, off by default and never enabled in release images. With it, `FakeProvider::demo_held(hold: Duration) -> FakeProvider` behaves like `demo()`, except that each run's first attempt waits `hold` before its first chunk; `Registry::from_config` selects it when `KATWORK_SMOKE_HOLD_SECS` is set. Without the feature the variable is ignored.
   - the `Dockerfile` takes a build argument `CARGO_FEATURES` (empty by default) and passes it to `cargo build --features`
-  - `docker-compose.smoke.yml` builds with `CARGO_FEATURES=katwork/smoke-fixtures`, sets `KATWORK_SMOKE_HOLD_SECS=20` (under the 30 s first-chunk timeout) and `KATWORK_DEMO=1`, and sets `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` to empty strings, so demo mode selects the fake even when the host has provider keys
-- An optional `https` profile adds a `caddy:2` service that publishes ports 80 and 443 and proxies `KATWORK_HTTPS_HOST` to `katwork:3000`. With it, `KATWORK_PUBLIC_URL=https://<host>`, so the session cookie is `Secure`.
+  - `docker-compose.smoke.yml` builds with `CARGO_FEATURES=katwork/smoke-fixtures`, sets `KATWORK_SMOKE_HOLD_SECS=20` (under the demo entry's 30 s first-chunk timeout) and `KATWORK_DEMO=1`, sets `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `KATWORK_LOCAL_BASE_URL` and `KATWORK_LOCAL_MODEL` to empty strings, so demo mode selects the fake even when the host has provider keys, and sets `RUST_LOG=debug,rig=trace`, so a broken `dependency_log_allowed` filter would show up in the logs
+- HTTPS and the offline demo are Compose override files, `docker-compose.https.yml` (the Caddy profile) and `docker-compose.demo.yml` (Steps 5 and 6), not Compose `profiles:` entries, because a profile cannot change another service's environment.
 
 - [ ] **Step 1: Write `scripts/smoke.sh`.** It must:
-  1. Export `COMPOSE_FILE=docker-compose.yml:docker-compose.smoke.yml` once, at the top, so that every `docker compose` command in the script, restarts included, uses the override. Then run `docker compose up -d --build` with `KATWORK_DEMO_PASSWORD` set, and assert the effective configuration: `docker inspect` on the `katwork` container shows `KATWORK_SMOKE_HOLD_SECS=20`, `KATWORK_DEMO=1`, and empty `OPENAI_API_KEY` and `ANTHROPIC_API_KEY`.
-  2. Wait for `/healthz`.
-  3. Run `seed-demo`.
-  4. Log in as demo and post `"สวัสดี ช่วยแนะนำทีมหน่อย"` with `Origin: $KATWORK_PUBLIC_URL` and a `client_msg_id`.
-  5. Read SSE until `katwork.job_status`.
-  6. Assert status `answered`, and that the Dot reply from the messages API has `synthetic: true`.
-  7. In a second scenario, post again, then poll Postgres (`docker compose exec -T postgres psql …`) until the task is `leased` and its `runs` row is `running`. Only then run `docker compose kill katwork` and `docker compose up -d katwork`, and assert the same effective configuration on the new container. After recovery, assert that:
+  1. Before starting anything, check the first-run pieces (Steps 3–6):
+     - `KATWORK_ENV_FILE=<temp dir>/.env scripts/init-env.sh` creates the file with mode `600`, a `KATWORK_SECRET` of at least 32 bytes and a `DATABASE_URL` that holds the generated `POSTGRES_PASSWORD`; a second run exits 1 and leaves the file unchanged
+     - `docker compose --env-file /dev/null config -q` fails, and its message names `KATWORK_SECRET` and `scripts/init-env.sh`
+     - `docker compose -f docker-compose.yml -f docker-compose.https.yml config` with `KATWORK_HTTPS_HOST=smoke.example` gives the `katwork` service `KATWORK_TRUSTED_PROXIES=172.31.250.2` and `KATWORK_PUBLIC_URL=https://smoke.example`
+     - `docker compose -f docker-compose.yml -f docker-compose.demo.yml config` gives it `KATWORK_DEMO=1` and empty `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `KATWORK_LOCAL_BASE_URL` and `SMTP_HOST`
+  2. Export `COMPOSE_FILE=docker-compose.yml:docker-compose.smoke.yml` once, so that every later `docker compose` command in the script, restarts included, uses the override. Then run `docker compose up -d --build` with `KATWORK_DEMO_PASSWORD` set, and assert the effective configuration: `docker inspect` on the `katwork` container shows `KATWORK_SMOKE_HOLD_SECS=20`, `KATWORK_DEMO=1`, `RUST_LOG=debug,rig=trace`, and empty `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `KATWORK_LOCAL_BASE_URL` and `KATWORK_LOCAL_MODEL`.
+  3. Wait for `/healthz`.
+  4. Run `seed-demo`.
+  5. Log in as demo and post `"สวัสดี ช่วยแนะนำทีมหน่อย"` with `Origin: $KATWORK_PUBLIC_URL` and a `client_msg_id`.
+  6. Read SSE until `katwork.job_status`.
+  7. Assert status `answered`, and that the Dot reply from the messages API has `synthetic: true`. Assert that `docker compose logs katwork` has no line whose target starts with `rig` (Global Constraints).
+  8. In a second scenario, post again, then poll Postgres (`docker compose exec -T postgres psql …`) until the task is `leased` and its `runs` row is `running`. Only then run `docker compose kill katwork` and `docker compose up -d katwork`, and assert the same effective configuration on the new container. After recovery, assert that:
      - a second `runs` row with `kind = 'recovery'` exists for the task, so a recovery attempt really happened
      - the job has exactly one Dot reply message
      - the job has exactly one `katwork.decision` event and one terminal `katwork.job_status`, and its status is `answered`
-  8. In a third scenario, run `docker compose up -d` again on the existing volume and assert that a new dump appeared in `./backups`.
-  9. Print `SMOKE OK`.
-- [ ] **Step 2: Run** `scripts/smoke.sh`. Expected: FAIL before wiring, PASS after.
-- [ ] **Step 3: Implement** the `backup` and `migrate` services, `scripts/compose-backup.sh`, the `https` profile and `Caddyfile`, and any glue the smoke test exposes. Document HTTPS, backups and restore in `README.md`.
-- [ ] **Step 4: Add the CI jobs.** `e2e` runs `scripts/smoke.sh`. `upgrade_from_previous_release` is skipped while no release tag exists; after the first tag, it starts the previous release's image, seeds demo data, then runs this build's `migrate` and the smoke test.
-- [ ] **Step 5: Run** `scripts/smoke.sh`. Expected: `SMOKE OK`.
-- [ ] **Step 6: Commit** with `test: compose smoke, backup before migrate, https profile`.
+  9. In a third scenario, run `docker compose up -d` again on the existing volume and assert that a new dump appeared in `./backups`.
+  10. Print `SMOKE OK`.
+- [ ] **Step 2: Run** `scripts/smoke.sh`. Expected: FAIL.
+- [ ] **Step 3: Write `scripts/init-env.sh [--https <host>]`.** It writes `.env` beside `docker-compose.yml`, or at `$KATWORK_ENV_FILE` when that is set, from `.env.example`: `KATWORK_SECRET` from `openssl rand -base64 48`, `POSTGRES_PASSWORD` from `openssl rand -hex 24` (hex, so it needs no escaping in a URL), and `DATABASE_URL=postgres://katwork:<that password>@postgres:5432/katwork`; every other variable keeps its `.env.example` value. It creates the file with mode `600` and refuses to overwrite an existing file (exit 1). With `--https <host>` it also writes `KATWORK_HTTPS_HOST=<host>` and `COMPOSE_FILE=docker-compose.yml:docker-compose.https.yml`. It prints only the path it wrote, never a secret.
+- [ ] **Step 4: Compose required-value checks.** In `docker-compose.yml`, `DATABASE_URL`, `KATWORK_SECRET` and `POSTGRES_PASSWORD` (on both the `postgres` and `katwork` services) change from `${VAR:-}` to `${VAR:?set VAR in .env, or run scripts/init-env.sh}`, with the variable's own name in each message, so `docker compose` stops before starting anything when one is missing. Every optional variable keeps `${VAR:-}`. The CI job that runs `docker compose config -q` and `docker compose build` first creates its `.env` with `scripts/init-env.sh`.
+- [ ] **Step 5: The Caddy profile, `docker-compose.https.yml`.** It adds a `caddy:2` service that publishes ports 80 and 443 and proxies `${KATWORK_HTTPS_HOST:?set KATWORK_HTTPS_HOST in .env}` to `katwork:3000` (`Caddyfile`), on a new network `edge` with subnet `172.31.250.0/29`, where caddy has the fixed address `172.31.250.2`. It joins the `katwork` service to `edge` and sets its `KATWORK_TRUSTED_PROXIES: 172.31.250.2` (a bare IP, Task 3b) and `KATWORK_PUBLIC_URL: https://${KATWORK_HTTPS_HOST}`, so the client IP behind Caddy is the real one and the session cookie is `Secure`. Start it with `scripts/init-env.sh --https <host>`, then `docker compose up -d`.
+- [ ] **Step 6: The offline demo profile, `docker-compose.demo.yml` and `scripts/demo.sh`.** The override sets `KATWORK_DEMO: "1"` and empty `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `KATWORK_LOCAL_BASE_URL`, `KATWORK_LOCAL_MODEL` and `SMTP_HOST`, so no request leaves the host. `scripts/demo.sh` is the one command: it runs `scripts/init-env.sh` when `.env` is missing, runs `docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d`, waits for `/healthz`, runs `seed-demo` the way `scripts/smoke.sh` does, and prints `http://localhost:3000`, `demo@katwork.local` and the password `seed-demo` printed (or a note to use `KATWORK_DEMO_PASSWORD` when that is set). Once the images are built, it needs no network.
+- [ ] **Step 7: Implement** the `backup` and `migrate` services, `scripts/compose-backup.sh`, and any glue the smoke test exposes. Document in `README.md`: first run (`scripts/init-env.sh`, then `create-user` for the first owner), and that `reset-link` can take over any account, so only operators may run commands on the host (ADR-0004); the local model variables, and that `KATWORK_LOCAL_BASE_URL` must point inside the install's network, because residency is what the operator declares (ADR-0005); HTTPS; the offline demo; backups and restore.
+- [ ] **Step 8: Add the CI jobs.** `e2e` runs `scripts/smoke.sh`. `upgrade_from_previous_release` is skipped while no release tag exists; after the first tag, it starts the previous release's image, seeds demo data, then runs this build's `migrate` and the smoke test.
+- [ ] **Step 9: Run** `scripts/smoke.sh`. Expected: `SMOKE OK`.
+- [ ] **Step 10: Commit** with `test: compose smoke, backup before migrate, first-run scripts, https and demo profiles`.
 
 ---
 
 ## Dependency order and parallelism
 
 ```
-1 → 2 → 3 → 4 → 5 → 6 → 9 → 8 → 10 → 11 → 12 → 13 → 14
-    2 → 7 ─────────────────────↗ (7 must merge before 8)
+1 → 2 → 3 → 4 → 5 → 6 → 9 → 8 → 10 → 11 → 12 → 13b → 14
+              4 → 3b ──────────────────────────↗   (3b before 13b)
+    2 → 7 → 7b ──────────↗                         (7b before 8)
+                    6 → 13a ───────────────────↗   (13a before 13b)
 ```
 
-- Task 7 (model gateway) depends only on Task 2: it takes `ModelTier` and `SpacePolicy` from `crate::types` and `Config` from Task 1. It can run in parallel with Tasks 3–6 and 9, and must merge before Task 8. Tasks 7 and 9 each add one field to `Core` in `runtime.rs`; whichever merges second rebases.
+- Task 7 (model gateway) depends only on Task 2: it takes `ModelTier` and `SpacePolicy` from `crate::types` and `Config` from Task 1. It can run in parallel with Tasks 3–6 and 9. Tasks 7 and 9 each add one field to `Core` in `runtime.rs`; whichever merges second rebases.
+- Task 7b (local model provider) is a small PR after PR #21 (merged), and must merge before Task 8, which reads `ModelEntry.timeouts`.
+- Task 3b (operator accounts and first-run convenience) comes after Task 4, can be written in parallel with Task 5, merges after PR #24 (its migration 0005 follows Task 5's 0004) and PR #27 (Task 13a, whose `web/` its invite page joins), lands as its own PR, and must merge before Task 13b, whose Members page uses its account functions. Tasks 3b and 7b both edit `config.rs`; whichever merges second adopts `ConfigInvalid { var }`.
+- Task 5's follow-up PR (Steps 6–10: Lead concurrency default, reply-language line, Thai demo seed, default team for `create-user`'s new workspace) merges after PR #24 and Task 3b and before Task 11, whose `lead_runs_three_tasks_at_once_specialists_one` uses the Lead default.
 - Task 9 comes before Task 8 because the agent loop emits through `EventSink`.
-- Task 13 can start its UI against mocked APIs after Task 6 and integrate after Task 12.
+- Task 13a (PR #27) starts against mocked APIs after Task 6 and needs nothing from Tasks 9 or 10. Task 9 merges after it, because Task 9's SSE fixture is a copy of 13a's, and Task 10 adds its new reason code's messages to 13a's i18n files. Task 13b needs Tasks 12, 3b and 13a.
+- Migration numbers follow this order (Global Constraints): 0004 (Task 5), 0005 (Task 3b), 0006 (Task 11), 0007 (Task 12).

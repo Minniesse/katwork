@@ -28,7 +28,7 @@ KatWork lets anyone in an organization hire a team of named AI coworkers ("Dots"
 6. Deterministic approvals for anything outward or destructive.
 7. Four views: 3D office, live agent graph, chat, and a tasks-and-files board.
 8. Six showcase templates (§8): four chosen, plus two from the use-case research.
-9. Login with password reset and demo accounts, so a live demo never depends on an external login.
+9. Login with password reset and demo accounts, so a live demo never depends on an external login. Accounts work with or without email (§13).
 
 ### 1.2 Non-goals for the alpha
 
@@ -88,7 +88,7 @@ KatWork lets anyone in an organization hire a team of named AI coworkers ("Dots"
 | **Team** | A lead Dot plus specialists. The team saved on the server **decides who does the work**; it is not decoration. |
 | **Thread** | A conversation between people and Dots in any channel. Each thread is mapped to one KatWork thread id. |
 | **Job** | One request, from intake to final status. It owns the plan, the runs, the evidence and the verdict. |
-| **Task** | A bounded piece of a job assigned to one Dot: inputs, acceptance conditions, a lease and retry limits. A job's tasks form a DAG of at most 5 tasks and 3 levels. A Dot runs one task at a time by default (admin-set `max_concurrency`); parallel work inside one Dot waits for Computer fork (§14 #3). |
+| **Task** | A bounded piece of a job assigned to one Dot: inputs, acceptance conditions, a lease and retry limits. A job's tasks form a DAG of at most 5 tasks and 3 levels. By default the lead Dot runs up to 3 tasks at once and each specialist 1 (initial defaults; admin-set `max_concurrency`). Queued tasks wait their turn per Dot, oldest first (best effort), and a queued job shows its estimated place in line. A task's deadline starts when it is first picked up, not while it waits. Parallel work inside one Dot's Computer waits for Computer fork (§14 #3). |
 | **Run** | One Dot executing one task: steps, tool calls, tokens, cost and an event stream. |
 | **Computer** | A Dot's sandbox: an agentOS workspace, an optional browser profile, and app access (§9). |
 | **Artifact** | A versioned output file or page. Originals are immutable and every new version is written atomically. |
@@ -414,7 +414,8 @@ All four views read **one event model** from the core over AG-UI SSE: job and ta
   - The gateway keeps a registry of each model's capabilities and data-residency.
   - Each workspace sets which providers may see which Spaces. For example, university evidence goes to a local model only.
   - Quotas and usage are tracked per Dot and per job.
-  - A local model (mistral.rs, or any OpenAI-compatible server) is qualified on Thai office tasks before it is offered.
+  - An operator can point KatWork at one local OpenAI-compatible server (mistral.rs or any other). It is registered as a local provider for every tier, so a local-only Space works without hosted keys or demo mode; where hosted providers are also configured, they serve the Spaces that allow them. Each model entry carries its own timeouts, and local entries get longer ones, including the run's wall clock (300 s against 90 s for hosted entries, initial defaults). The server logs at startup which entry serves each tier. Residency is what the operator declared, never inferred from the URL (`docs/adr/0005-local-model-provider.md`).
+  - KatWork recommends a local model only after it is qualified on Thai office tasks.
   - Hosted APIs use organization keys. KatWork never routes several people's work through one person's consumer subscription. In the alpha, a provider rate or plan limit stops the job with a named reason.
 
 ## 12. Federation (after the alpha)
@@ -441,6 +442,7 @@ All four views read **one event model** from the core over AG-UI SSE: job and ta
 - **Isolation.** Each Dot has its own sandbox and browser profiles. Untrusted code never sees the control plane, and tool credentials are scoped per Dot. In the alpha, agentOS runs a Dot's JavaScript, Python (Pyodide) and WASM inside a sidecar process, not a hardware VM; the sidecar runs unprivileged in its own container. Per-Dot microVMs come with the in-house agentOS (§1.2).
 - **Treating inputs as untrusted.** The harness never runs model output through a shell, in the core or in checks; checks run as argv arrays. Tool ids are matched against a registry. Commands inside a Dot's sandbox run only through the agentOS exec API, as a per-Dot capability that is off by default, bounded, gated like any tool call, and recorded. Content from web pages, files and peers is treated as untrusted (prompt injection).
 - **Data residency.** Each Space declares which providers may see its data. Documents and evidence stay on the install.
+- **Accounts.** People get accounts with or without email (SMTP). The operator runs `create-user` or `reset-link` on the server, or a workspace admin invites from the Members page, by email or with a link to copy. Each gives a single-use set-password link. `create-user` and admin invites give an invite link, valid 72 hours, because the person often opens it much later; `reset-link` and the reset mail give a reset link, valid 30 minutes. The two are separate token kinds, so neither works in place of the other. A workspace that `create-user` creates gets a first Space, `General`, whose policy the operator picks with `--space-policy local|hosted`, and the default team, so it can chat at once. The web never issues a link for an account that already exists, so an admin of one workspace cannot take over an account from another. Admins also change members' roles there (`docs/adr/0004-operator-accounts-without-smtp.md`).
 - **Audit.** Logs record every proposal, approval, tool call and verdict. Enterprise adds export and retention policies.
 - **Telemetry.** No product telemetry leaves the install unless an admin turns it on; opt-in telemetry uses a closed event schema with no content, ids or keys.
 - **Licences.** Third-party notices are kept, with no GPL or AGPL in the core. Craft apps follow their NOTICE and branding rules (§9).
@@ -523,8 +525,9 @@ This spec covers the whole alpha. Implementation planning splits it into sub-pro
 
 1. **Core runtime.**
    - The Compose skeleton.
-   - Auth with password reset and demo accounts.
+   - Auth with password reset and demo accounts, operator-created accounts and admin invites (§13).
    - Workspaces, Spaces, Dots and Teams.
+   - A local OpenAI-compatible model provider (§11).
    - The scheduler with leases, the agent loop over a Rig provider, and the model gateway.
    - The AG-UI event stream and web chat.
 2. **Computers, documents and memory.**
