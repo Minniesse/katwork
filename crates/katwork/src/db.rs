@@ -30,6 +30,12 @@ impl GuardedConnection {
 
 /// Run database work with close-on-cancellation and rollback-on-normal-return semantics.
 /// Keep external I/O outside this scope; a dropped operation must release its backend.
+///
+/// The rollback on a normal return, including an error return, is the pool's release hook
+/// (`recycle`), not this function, so the pool must come from [`connect`], as every production
+/// pool does. A pool built any other way can take back a connection whose transaction is still
+/// open, such as one from a raw `BEGIN`. sqlx does not expose a pool's hooks, so this cannot
+/// assert that the hook is installed.
 pub async fn guarded<T>(
     pool: &PgPool,
     operation: impl AsyncFnOnce(&mut PgConnection) -> Result<T, KatError>,
@@ -76,6 +82,16 @@ async fn recycle(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+/// Pool settings for every production pool.
+///
+/// `client_connection_check_interval` makes the server end a running statement whose client
+/// went away, such as a connection [`guarded`] closed when its request was dropped. The check
+/// runs every 2 seconds, so a closed connection's backend can outlive it by about 2 seconds,
+/// and for that window the server can hold more backends than the pool's size. The check relies
+/// on the kernel reporting the disconnect, on operating systems where PostgreSQL supports it; it
+/// does not detect every network blackhole, and configured lock timeouts stay the backstop for
+/// lock waits. See
+/// <https://www.postgresql.org/docs/17/runtime-config-connection.html#GUC-CLIENT-CONNECTION-CHECK-INTERVAL>.
 fn pool_options() -> PgPoolOptions {
     PgPoolOptions::new()
         .after_connect(|conn, _| {
