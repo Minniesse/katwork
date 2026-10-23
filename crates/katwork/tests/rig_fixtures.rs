@@ -1762,6 +1762,7 @@ async fn local_oversized_error_is_capped_and_not_logged() {
         .with_ansi(false)
         .with_writer(move || writer.clone())
         .finish();
+    let _idle = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let _guard = tracing::subscriber::set_default(subscriber);
     let server = Server::new(body.into_bytes(), 429, None, false).await;
     assert_eq!(

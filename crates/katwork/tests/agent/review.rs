@@ -3,6 +3,8 @@ use super::*;
 #[derive(Clone, Copy)]
 enum Interruption {
     ModelPause,
+    ModelDeadline,
+    ModelCancel,
     Deadline,
     Cancel,
     ToolPause,
@@ -18,9 +20,17 @@ impl EventSink for InterruptSink<'_> {
     async fn emit(&self, event: AgUiEvent) -> Result<EventSeq, KatError> {
         let model_pause = matches!(self.interruption, Interruption::ModelPause)
             && matches!(event, AgUiEvent::TextMessageStart { .. });
+        let model_start = matches!(event, AgUiEvent::TextMessageStart { .. });
         let tool_end = matches!(event, AgUiEvent::ToolCallEnd { .. })
             && self.seen.fetch_add(1, Ordering::SeqCst) == self.tool_end;
         let seq = self.h.sink.emit(event).await?;
+        if model_start {
+            match self.interruption {
+                Interruption::ModelDeadline => tokio::time::advance(Duration::from_secs(91)).await,
+                Interruption::ModelCancel => self.h.input.cancel.cancel(),
+                _ => {}
+            }
+        }
         if model_pause || (tool_end && matches!(self.interruption, Interruption::ToolPause)) {
             kat::update(
                 &self.h.pool,
@@ -38,7 +48,10 @@ impl EventSink for InterruptSink<'_> {
             match self.interruption {
                 Interruption::Deadline => tokio::time::advance(Duration::from_secs(91)).await,
                 Interruption::Cancel => self.h.input.cancel.cancel(),
-                Interruption::ModelPause | Interruption::ToolPause => {}
+                Interruption::ModelPause
+                | Interruption::ModelDeadline
+                | Interruption::ModelCancel
+                | Interruption::ToolPause => {}
             }
         }
         Ok(seq)
@@ -77,6 +90,51 @@ async fn revocation_during_model_start_event_prevents_request(pool: PgPool) {
         "provider received a request after committed pause"
     );
     assert_eq!(facts.stop, Some(StopReason::KatPaused));
+    assert_unsent_model(&h, &facts).await;
+}
+async fn assert_unsent_model(h: &Harness, facts: &RunFacts) {
+    assert!(h.fake.received().is_empty());
+    assert!(
+        h.usage().await.is_empty(),
+        "an unsent request must not consume a model attempt or budget"
+    );
+    assert!(facts.usage.is_empty());
+    let events = h.sink.events.lock().unwrap();
+    assert!(!events.iter().any(|e| e.kind() == "katwork.usage"));
+    let starts: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgUiEvent::TextMessageStart { message_id, .. } => Some(message_id),
+            _ => None,
+        })
+        .collect();
+    let ends: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgUiEvent::TextMessageEnd { message_id } => Some(message_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        starts, ends,
+        "every unsent attempt must close its opened text message"
+    );
+}
+#[sqlx::test]
+async fn deadline_before_model_request_is_not_charged(pool: PgPool) {
+    let h = Harness::new(pool, vec![turn("not sent", vec![])]).await;
+    let _clock = Clock::pause();
+    let facts = interrupted_run(&h, Interruption::ModelDeadline, 0).await;
+    assert_eq!(facts.stop, Some(StopReason::TimeLimit));
+    assert_unsent_model(&h, &facts).await;
+}
+#[sqlx::test]
+async fn cancel_before_model_request_is_not_charged(pool: PgPool) {
+    let h = Harness::new(pool, vec![turn("not sent", vec![])]).await;
+    let facts = interrupted_run(&h, Interruption::ModelCancel, 0).await;
+    assert_eq!(facts.stop, Some(StopReason::Cancelled));
+    assert!(facts.run_closed);
+    assert_unsent_model(&h, &facts).await;
 }
 async fn before_tool_poll(
     pool: PgPool,
@@ -116,6 +174,40 @@ async fn before_tool_poll(
     );
     assert_eq!(h.effects().await, prior_effect);
     assert_eq!(rows.len(), 2 + usize::from(prior_effect));
+    assert_tool_closed(&h, facts.tool_calls[usize::from(prior_effect)].id, reason).await;
+}
+async fn assert_tool_closed(h: &Harness, id: ToolCallRecordId, reason: StopReason) {
+    let events: Vec<Value> =
+        sqlx::query_scalar("SELECT payload FROM events WHERE run_id=$1 ORDER BY seq")
+            .bind(h.input.run_id)
+            .fetch_all(&h.pool)
+            .await
+            .unwrap();
+    let id = id.to_string();
+    let call_events: Vec<_> = events
+        .iter()
+        .filter(|e| e["toolCallId"] == id || e["value"]["toolCallId"] == id)
+        .collect();
+    assert_eq!(
+        call_events
+            .iter()
+            .map(|e| e["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "TOOL_CALL_START",
+            "TOOL_CALL_ARGS",
+            "TOOL_CALL_END",
+            "TOOL_CALL_RESULT",
+            "CUSTOM"
+        ]
+    );
+    assert_eq!(call_events[3]["content"], reason.wire());
+    assert_eq!(call_events[4]["name"], "katwork.tool_status");
+    assert_eq!(call_events[4]["value"]["ok"], false);
+    assert_eq!(call_events[4]["value"]["code"], reason.wire());
+    if reason == StopReason::Cancelled {
+        assert_eq!(events.last().unwrap()["type"], "RUN_ERROR");
+    }
 }
 #[sqlx::test]
 async fn deadline_before_tool_poll_closes_started_row(pool: PgPool) {
@@ -390,12 +482,23 @@ async fn workspace_pause_waits_for_authorized_write(pool: PgPool) {
     assert_eq!(n.load(Ordering::SeqCst), 0);
 }
 
-async fn retry_interruption(pool: PgPool, interruption: Interruption, reason: StopReason) {
+async fn retry_interruption(
+    pool: PgPool,
+    interruption: Interruption,
+    reason: StopReason,
+    timed_out: bool,
+) {
     let mut h = Harness::new(pool, vec![turn("", vec![call("a", "probe", json!({}))])]).await;
-    let n = h.add(
-        Probe::new("probe", SideEffect::Read)
-            .action(|_, _| async { Err(ToolError::OutcomeUnknown) }.boxed()),
-    );
+    let n = h.add(Probe::new("probe", SideEffect::Read).action(move |_, _| {
+        async move {
+            Err(if timed_out {
+                ToolError::Timeout
+            } else {
+                ToolError::OutcomeUnknown
+            })
+        }
+        .boxed()
+    }));
     sqlx::raw_sql("CREATE FUNCTION block_retry() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
         IF NEW.attempts=2 THEN PERFORM pg_advisory_xact_lock(38); END IF; RETURN NEW; END $$;
         CREATE TRIGGER block_retry BEFORE UPDATE ON tool_calls FOR EACH ROW EXECUTE FUNCTION block_retry();")
@@ -430,7 +533,9 @@ async fn retry_interruption(pool: PgPool, interruption: Interruption, reason: St
                 .await
                 .unwrap();
             }
-            Interruption::ModelPause => unreachable!(),
+            Interruption::ModelPause | Interruption::ModelDeadline | Interruption::ModelCancel => {
+                unreachable!()
+            }
         }
         blocker.rollback().await.unwrap();
     };
@@ -441,27 +546,32 @@ async fn retry_interruption(pool: PgPool, interruption: Interruption, reason: St
     let rows = h.rows().await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<i32, _>("attempts"), 2);
-    assert_eq!(rows[0].get::<String, _>("state"), "refused");
+    assert_eq!(rows[0].get::<String, _>("state"), "outcome_unknown");
     assert_eq!(rows[0].get::<String, _>("result"), reason.wire());
     assert!(
         rows[0]
             .get::<Option<chrono::DateTime<chrono::Utc>>, _>("ended_at")
             .is_some()
     );
-    assert_eq!(facts.tool_calls[0].state, ToolCallState::Refused);
+    assert_eq!(facts.tool_calls[0].state, ToolCallState::OutcomeUnknown);
     assert!(!h.effects().await);
+    assert_tool_closed(&h, facts.tool_calls[0].id, reason).await;
 }
 #[sqlx::test]
 async fn deadline_during_read_retry_closes_row(pool: PgPool) {
-    retry_interruption(pool, Interruption::Deadline, StopReason::TimeLimit).await;
+    retry_interruption(pool, Interruption::Deadline, StopReason::TimeLimit, false).await;
 }
 #[sqlx::test]
-async fn cancel_during_read_retry_refuses_retry(pool: PgPool) {
-    retry_interruption(pool, Interruption::Cancel, StopReason::Cancelled).await;
+async fn cancel_during_read_retry_preserves_unknown_outcome(pool: PgPool) {
+    retry_interruption(pool, Interruption::Cancel, StopReason::Cancelled, false).await;
 }
 #[sqlx::test]
-async fn pause_during_read_retry_refuses_retry(pool: PgPool) {
-    retry_interruption(pool, Interruption::ToolPause, StopReason::KatPaused).await;
+async fn pause_during_read_retry_preserves_unknown_outcome(pool: PgPool) {
+    retry_interruption(pool, Interruption::ToolPause, StopReason::KatPaused, false).await;
+}
+#[sqlx::test]
+async fn cancelled_read_retry_after_timeout_preserves_unknown_outcome(pool: PgPool) {
+    retry_interruption(pool, Interruption::Cancel, StopReason::Cancelled, true).await;
 }
 
 async fn configured_timeout_child(test: &str, pool: &PgPool) -> bool {

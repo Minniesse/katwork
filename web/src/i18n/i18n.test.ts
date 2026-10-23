@@ -39,6 +39,7 @@ const REASON_CODES = [
 const API_CODES = [
   'unauthenticated',
   'reset_token_invalid',
+  'invite_token_invalid',
   'password_invalid',
   'rate_limited',
   'request_invalid',

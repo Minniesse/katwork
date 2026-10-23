@@ -827,6 +827,7 @@ fn startup_logs_one_line_per_tier() {
         .with_ansi(false)
         .with_writer(move || writer.clone())
         .finish();
+    let _idle = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     tracing::subscriber::with_default(subscriber, || Registry::from_config(&cfg).log_tiers());
     let logged = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
     assert_eq!(logged.lines().count(), 3, "{logged}");

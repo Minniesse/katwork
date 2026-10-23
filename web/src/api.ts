@@ -83,4 +83,9 @@ export const api = {
       method: 'POST',
       body: { token, new_password: newPassword },
     }).then(() => undefined),
+  acceptInvite: (token: string, newPassword: string) =>
+    apiFetch<unknown>('/api/auth/invite/accept', {
+      method: 'POST',
+      body: { token, new_password: newPassword },
+    }).then(() => undefined),
 };

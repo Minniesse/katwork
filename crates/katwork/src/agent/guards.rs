@@ -31,6 +31,8 @@ pub async fn authorize(
         .fetch_optional(&mut *conn)
         .await?
         .ok_or(KatError::NotFound)?;
+    // The task share lock is still held, but the lease can expire during the Kat lock wait.
+    fence::check(conn, fence).await?;
     policy(conn, tenant, kat_id, space_id, policy_version).await
 }
 pub(crate) async fn scoped_task(

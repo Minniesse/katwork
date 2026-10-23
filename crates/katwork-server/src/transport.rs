@@ -16,6 +16,8 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use katwork::config::TransportConfig;
+
+use crate::log_throttle::LogThrottle;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
@@ -66,6 +68,7 @@ async fn serve_connections(
     let mut peers: HashMap<IpAddr, Weak<Semaphore>> = HashMap::new();
     let mut last_accept_warning = None;
     let mut last_socket_warning = None;
+    let mut drops = LogThrottle::default();
     let (stop, _) = watch::channel(());
     tokio::pin!(shutdown);
     let result = loop {
@@ -90,7 +93,8 @@ async fn serve_connections(
                 if let Err(error) = configure_socket(&stream) {
                     warn_transport_error(&mut last_socket_warning, "socket tuning", &error);
                 }
-                // A trusted proxy carries many browsers; its connections still count globally.
+                // Headers do not exist at accept time. A trusted proxy carries every client behind
+                // it, so it skips the per-peer cap; it still counts toward the global one.
                 let permit = if config.trusts_proxy(addr.ip()) {
                     None
                 } else {
@@ -101,7 +105,12 @@ async fn serve_connections(
                         peers.insert(ip, Arc::downgrade(&slots));
                         slots
                     });
-                    let Ok(permit) = slots.try_acquire_owned() else { continue; };
+                    let Ok(permit) = slots.try_acquire_owned() else {
+                        if drops.should_log(ip, Instant::now()) {
+                            tracing::warn!(reason = "per_peer_cap", peer = %ip, "connection_dropped");
+                        }
+                        continue;
+                    };
                     Some(permit)
                 };
                 let app = router.clone().layer(Extension(ConnectInfo(addr)));

@@ -77,6 +77,7 @@ struct Runner<'a, 'b> {
     repeat: RepeatGuard,
 }
 struct Attempt {
+    dispatched: bool,
     content_started: bool,
     usage: Usage,
     ending: Result<(StopKind, AssistantTurn), AttemptFailure>,
@@ -271,11 +272,13 @@ impl Runner<'_, '_> {
                 break;
             }
             let request = self.request(&selected);
-            self.step += 1;
             let attempt_started = Instant::now();
             let attempt = self.attempt(&selected, request.clone()).await?;
-            self.record_attempt(&selected, &request, &attempt, attempt_started)
-                .await?;
+            if attempt.dispatched {
+                self.step += 1;
+                self.record_attempt(&selected, &request, &attempt, attempt_started)
+                    .await?;
+            }
             let (stop, turn) = match attempt.ending {
                 Ok(turn) => {
                     retries = 0;
@@ -373,26 +376,34 @@ impl Runner<'_, '_> {
         })
         .await?;
         let mut result = Attempt {
+            dispatched: false,
             content_started: false,
             usage: Usage::default(),
             ending: Err(AttemptFailure::Model(ModelError::Protocol(
                 "stream_without_done".into(),
             ))),
         };
-        if let Some(reason) = self.authority().await? {
-            result.ending = Err(AttemptFailure::Stop(reason));
-            return Ok(result);
-        }
+        let reason = match self.interrupted() {
+            Some(reason) => Some(reason),
+            None => self.authority().await?.or_else(|| self.interrupted()),
+        };
         let first_deadline =
             (Instant::now() + selected.entry.timeouts.first_chunk).min(self.deadline);
-        let stream = tokio::select! {biased;
-            ()=self.input.cancel.cancelled()=>{result.ending=Err(AttemptFailure::Stop(StopReason::Cancelled));return Ok(result);},
-            ()=sleep_until(self.deadline)=>{result.ending=Err(AttemptFailure::Stop(StopReason::TimeLimit));return Ok(result);},
-            stream=timeout_at(first_deadline,selected.provider.stream(request))=>stream.unwrap_or(Err(ModelError::Timeout{phase:TimeoutPhase::FirstChunk}))
+        let stream = if let Some(reason) = reason {
+            Err(AttemptFailure::Stop(reason))
+        } else {
+            tokio::select! {biased;
+                ()=self.input.cancel.cancelled()=>Err(AttemptFailure::Stop(StopReason::Cancelled)),
+                ()=sleep_until(self.deadline)=>Err(AttemptFailure::Stop(StopReason::TimeLimit)),
+                stream=timeout_at(first_deadline, async {
+                    result.dispatched = true;
+                    selected.provider.stream(request).await
+                })=>stream.unwrap_or(Err(ModelError::Timeout{phase:TimeoutPhase::FirstChunk})).map_err(AttemptFailure::Model)
+            }
         };
         let mut coalescer = DeltaCoalescer::new();
         match stream {
-            Err(error) => result.ending = Err(AttemptFailure::Model(error)),
+            Err(error) => result.ending = Err(error),
             Ok(stream) => {
                 let mut timeouts = selected.entry.timeouts.stream();
                 timeouts.first_chunk = first_deadline.saturating_duration_since(Instant::now());
@@ -437,7 +448,7 @@ impl Runner<'_, '_> {
                 }
             }
         }
-        if !self.input.cancel.is_cancelled() {
+        if !self.input.cancel.is_cancelled() || !result.dispatched {
             if let Some(delta) = coalescer.finish() {
                 self.emit(AgUiEvent::TextMessageContent {
                     message_id: self.input.reply_message_id.to_string(),
@@ -763,7 +774,7 @@ impl Runner<'_, '_> {
                     None => self.authority().await?.or_else(|| self.interrupted()),
                 };
                 if let Some(reason) = reason {
-                    self.refuse_started(id, reason).await?;
+                    self.stop_before_poll(id, reason, retry).await?;
                     self.stop(reason);
                     break;
                 }
@@ -778,7 +789,8 @@ impl Runner<'_, '_> {
                 };
                 let Some(result) = result else {
                     if !dispatched {
-                        self.refuse_started(id, StopReason::Cancelled).await?;
+                        self.stop_before_poll(id, StopReason::Cancelled, retry)
+                            .await?;
                     }
                     self.stop(StopReason::Cancelled);
                     break;
@@ -869,24 +881,28 @@ impl Runner<'_, '_> {
         }
         Ok(())
     }
-    async fn refuse_started(
+    async fn stop_before_poll(
         &mut self,
         id: ToolCallRecordId,
         reason: StopReason,
+        retry: bool,
     ) -> Result<(), RunAbort> {
-        ledger::refuse_started(self.env.pool, &self.fence(), id, reason.wire())
-            .await
-            .map_err(|e| self.abort(e))?;
-        self.facts
-            .tool_calls
-            .last_mut()
-            .expect("started call")
-            .state = ToolCallState::Refused;
-        if reason != StopReason::Cancelled {
-            self.result_events(id, reason.wire(), Some(reason.wire()))
+        if retry {
+            // The first Read attempt ran; only the retry was refused.
+            self.end(id, ToolCallState::OutcomeUnknown, Some(reason.wire()))
                 .await?;
+        } else {
+            ledger::refuse_started(self.env.pool, &self.fence(), id, reason.wire())
+                .await
+                .map_err(|e| self.abort(e))?;
+            self.facts
+                .tool_calls
+                .last_mut()
+                .expect("started call")
+                .state = ToolCallState::Refused;
         }
-        Ok(())
+        self.result_events(id, reason.wire(), Some(reason.wire()))
+            .await
     }
     async fn end(
         &mut self,
