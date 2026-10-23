@@ -1,24 +1,47 @@
-use std::time::Duration;
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use axum::{
     Router,
     body::{Body, Bytes, HttpBody},
     error_handling::HandleErrorLayer,
-    extract::{DefaultBodyLimit, FromRequest, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, uri::Authority},
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
 use katwork::{config::Config, error::KatError};
+use tokio::time::Instant;
 use url::Url;
 
-use crate::error::ApiError;
+use crate::{error::ApiError, log_throttle::LogThrottle, peer::ip_bucket};
 
 #[derive(Clone)]
 struct GuardConfig {
     host: Option<String>,
     origin: Option<String>,
+    scheme: Option<String>,
+    /// One rejection line per kind and peer bucket per minute.
+    rejections: Arc<Mutex<RejectionLogs>>,
 }
+
+type RejectionLogs = LogThrottle<(Rejection, Option<IpAddr>)>;
+
+/// The rejection a log line is about.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Rejection {
+    HostNotAllowed,
+    CrossSiteRequest,
+}
+
+/// Hosts a local browser or a port-forward reaches the server by, on any port.
+const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "[::1]"];
+
+/// Logged header values are cut to this many bytes.
+const LOGGED_VALUE_BYTES: usize = 256;
 
 pub fn apply(router: Router, config: &Config) -> Router {
     secure(bounded(router), config)
@@ -46,7 +69,9 @@ pub(crate) fn secure(router: Router, config: &Config) -> Router {
         host: url
             .as_ref()
             .and_then(|url| url.host_str().map(str::to_owned)),
+        scheme: url.as_ref().map(|url| url.scheme().to_owned()),
         origin: url.map(|url| url.origin().ascii_serialization()),
+        rejections: Arc::default(),
     };
     router
         .layer(DefaultBodyLimit::max(1_048_576))
@@ -59,7 +84,44 @@ fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     values.next().is_none().then_some(value)
 }
 
+/// Every value of the header, lossily decoded and cut to [`LOGGED_VALUE_BYTES`] on a
+/// character boundary, for a rejection log. Its Debug form escapes control characters.
+fn logged_value(headers: &HeaderMap, name: &str) -> String {
+    let mut value = headers
+        .get_all(name)
+        .iter()
+        .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if value.len() > LOGGED_VALUE_BYTES {
+        let mut end = LOGGED_VALUE_BYTES;
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value.truncate(end);
+    }
+    value
+}
+
+/// Whether this rejection's line is due: the first for its kind and the socket peer's bucket
+/// in the last minute. Behind a proxy every client shares the proxy's bucket.
+fn log_due(request: &Request, config: &GuardConfig, kind: Rejection) -> bool {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| ip_bucket(addr.ip()));
+    config
+        .rejections
+        .lock()
+        .is_ok_and(|mut throttle| throttle.should_log((kind, peer), Instant::now()))
+}
+
 fn check(request: &Request, config: &GuardConfig) -> Result<(), KatError> {
+    let safe = matches!(*request.method(), Method::GET | Method::HEAD);
+    // A container health probe addresses the server by its service name.
+    if safe && request.uri().path() == "/healthz" {
+        return Ok(());
+    }
     let host = single_header(request.headers(), "host")
         .and_then(|value| value.parse::<Authority>().ok())
         .filter(|authority| !authority.as_str().contains('@'))
@@ -74,24 +136,47 @@ fn check(request: &Request, config: &GuardConfig) -> Result<(), KatError> {
                             .is_some_and(|port| port.parse::<u16>().is_ok())
                 })
         })
-        .ok_or(KatError::HostNotAllowed)?;
-    if !host.host().eq_ignore_ascii_case("localhost")
-        && !config
-            .host
-            .as_ref()
-            .is_some_and(|allowed| host.host().eq_ignore_ascii_case(allowed))
-    {
+        .filter(|authority| {
+            let host = authority.host();
+            LOOPBACK_HOSTS
+                .iter()
+                .any(|allowed| host.eq_ignore_ascii_case(allowed))
+                || config
+                    .host
+                    .as_ref()
+                    .is_some_and(|allowed| host.eq_ignore_ascii_case(allowed))
+        });
+    let Some(host) = host else {
+        if log_due(request, config, Rejection::HostNotAllowed) {
+            tracing::warn!(
+                host = ?logged_value(request.headers(), "host"),
+                "host_not_allowed"
+            );
+        }
         return Err(KatError::HostNotAllowed);
-    }
-    if !matches!(*request.method(), Method::GET | Method::HEAD) {
-        if config.origin.is_none()
-            || single_header(request.headers(), "origin") != config.origin.as_deref()
+    };
+    if !safe {
+        let origin = single_header(request.headers(), "origin");
+        // The public URL's origin, or the one the allowed Host names under the public URL's scheme.
+        let same_origin = origin.is_some_and(|origin| {
+            config.origin.as_deref() == Some(origin)
+                || config.scheme.as_ref().is_some_and(|scheme| {
+                    origin.eq_ignore_ascii_case(&format!("{scheme}://{}", host.as_str()))
+                })
+        });
+        if !same_origin
             || request
                 .headers()
                 .get_all("sec-fetch-site")
                 .iter()
                 .any(|value| value == "cross-site")
         {
+            if log_due(request, config, Rejection::CrossSiteRequest) {
+                tracing::warn!(
+                    origin = ?logged_value(request.headers(), "origin"),
+                    "cross_site_request"
+                );
+            }
             return Err(KatError::CrossSiteRequest);
         }
         if !request.body().is_end_stream()

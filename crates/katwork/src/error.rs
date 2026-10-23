@@ -44,10 +44,16 @@ pub enum KatError {
     Unauthenticated,
     #[error("reset_token_invalid")]
     ResetTokenInvalid,
+    #[error("invite_token_invalid")]
+    InviteTokenInvalid,
+    #[error("user_exists")]
+    UserExists,
+    #[error("workspace_ambiguous")]
+    WorkspaceAmbiguous,
     #[error("password_invalid")]
     PasswordInvalid,
     #[error("rate_limited")]
-    RateLimited,
+    RateLimited { retry_after_secs: u64 },
     #[error("request_invalid")]
     RequestInvalid,
     #[error("body_too_large")]
@@ -65,10 +71,15 @@ pub enum KatError {
     CrossSiteRequest,
     #[error("json_required")]
     JsonRequired,
-    #[error("config_invalid")]
+    /// Names the variable (or flag) that failed, never its value.
+    #[error("config_invalid ({var})")]
     ConfigInvalid { var: &'static str },
     #[error("command_invalid")]
     CommandInvalid,
+    #[error("migration_required")]
+    MigrationRequired,
+    #[error("link_not_printed")]
+    LinkNotPrinted,
     #[error("database_unavailable")]
     DatabaseUnavailable(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("database_error")]
@@ -122,8 +133,11 @@ impl KatError {
             Self::SpacePolicyRequired => "space_policy_required",
             Self::Unauthenticated => "unauthenticated",
             Self::ResetTokenInvalid => "reset_token_invalid",
+            Self::InviteTokenInvalid => "invite_token_invalid",
+            Self::UserExists => "user_exists",
+            Self::WorkspaceAmbiguous => "workspace_ambiguous",
             Self::PasswordInvalid => "password_invalid",
-            Self::RateLimited => "rate_limited",
+            Self::RateLimited { .. } => "rate_limited",
             Self::RequestInvalid => "request_invalid",
             Self::BodyTooLarge => "body_too_large",
             Self::AuthBusy => "auth_busy",
@@ -135,6 +149,8 @@ impl KatError {
             Self::JsonRequired => "json_required",
             Self::ConfigInvalid { .. } => "config_invalid",
             Self::CommandInvalid => "command_invalid",
+            Self::MigrationRequired => "migration_required",
+            Self::LinkNotPrinted => "link_not_printed",
             Self::DatabaseUnavailable(_) => "database_unavailable",
             Self::Database(_) => "database_error",
             Self::Migration(_) => "migration_failed",

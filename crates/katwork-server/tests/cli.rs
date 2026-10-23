@@ -134,7 +134,7 @@ fn serve_config_error_does_not_print_database_password() {
     assert!(!output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        "config_invalid { var: KATWORK_SECRET }\n"
+        "config_invalid (KATWORK_SECRET)\n"
     );
 }
 
@@ -174,7 +174,7 @@ fn migrate_rejects_missing_configuration() {
     assert!(!output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        "config_invalid { var: DATABASE_URL }\n"
+        "config_invalid (DATABASE_URL)\n"
     );
 }
 
@@ -288,7 +288,7 @@ fn seed_demo_requires_demo_mode_before_connecting() {
     assert!(!output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        "config_invalid { var: KATWORK_DEMO }\n"
+        "config_invalid (KATWORK_DEMO)\n"
     );
 }
 
@@ -303,4 +303,904 @@ async fn demo_login(app: &axum::Router, password: &str) -> axum::response::Respo
         None,
     )
     .await
+}
+
+fn operator(pool: &sqlx::PgPool, args: &[&str]) -> std::process::Output {
+    server()
+        .args(args)
+        .env("DATABASE_URL", database_url(pool))
+        .output()
+        .unwrap()
+}
+
+/// The only line on a successful operator command's stdout.
+fn printed_link(output: &std::process::Output) -> String {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+    let link = stdout.strip_suffix('\n').expect("link ends with a newline");
+    assert!(!link.contains('\n'), "{stdout}");
+    link.to_owned()
+}
+
+fn link_token(link: &str) -> String {
+    let (_, token) = link.split_once("?token=").unwrap();
+    assert_eq!(token.len(), 43, "{link}");
+    token.to_owned()
+}
+
+fn assert_failed(output: &std::process::Output, stderr: &str) {
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(String::from_utf8_lossy(&output.stderr), stderr);
+}
+
+async fn accept_invite(
+    app: &axum::Router,
+    token: &str,
+    password: &str,
+) -> axum::response::Response {
+    support::request(
+        app,
+        "POST",
+        "/api/auth/invite/accept",
+        Some(serde_json::json!({"token": token, "new_password": password})),
+        None,
+    )
+    .await
+}
+
+async fn confirm_reset(
+    app: &axum::Router,
+    token: &str,
+    password: &str,
+) -> axum::response::Response {
+    support::request(
+        app,
+        "POST",
+        "/api/auth/reset/confirm",
+        Some(serde_json::json!({"token": token, "new_password": password})),
+        None,
+    )
+    .await
+}
+
+async fn count(pool: &sqlx::PgPool, sql: &'static str) -> i64 {
+    sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn create_user_prints_a_single_use_set_password_link(pool: sqlx::PgPool) {
+    let output = operator(
+        &pool,
+        &[
+            "create-user",
+            "--email",
+            " Person@Example.test ",
+            "--workspace",
+            "Acme",
+            "--role",
+            "owner",
+            "--space-policy",
+            "local",
+        ],
+    );
+    let link = printed_link(&output);
+    assert!(
+        link.starts_with("http://localhost:3000/invite?token="),
+        "{link}"
+    );
+    let token = link_token(&link);
+    let app = support::app(&pool, None);
+    let password = uuid::Uuid::now_v7().to_string();
+    let accepted = accept_invite(&app, &token, &password).await;
+    assert_eq!(accepted.status(), 204);
+    assert_eq!(support::login(&app, &password).await.status(), 200);
+    support::assert_code(
+        accept_invite(&app, &token, &uuid::Uuid::now_v7().to_string()).await,
+        400,
+        "invite_token_invalid",
+    )
+    .await;
+    assert_eq!(support::login(&app, &password).await.status(), 200);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn create_user_creates_a_new_workspace_only_for_an_owner(pool: sqlx::PgPool) {
+    for (email, workspace, policy, allow_external) in [
+        ("local@example.test", "Local Co", "local", false),
+        ("hosted@example.test", "Hosted Co", "hosted", true),
+    ] {
+        printed_link(&operator(
+            &pool,
+            &[
+                "create-user",
+                "--space-policy",
+                policy,
+                "--role",
+                "owner",
+                "--workspace",
+                workspace,
+                "--email",
+                email,
+            ],
+        ));
+        let (role, spaces): (String, Vec<(String, bool)>) = (
+            sqlx::query_scalar("SELECT m.role FROM memberships m JOIN users u ON u.id = m.user_id JOIN workspaces w ON w.id = m.workspace_id WHERE u.email = $1 AND w.name = $2")
+                .bind(email).bind(workspace).fetch_one(&pool).await.unwrap(),
+            sqlx::query_as("SELECT s.name, s.allow_external FROM spaces s JOIN workspaces w ON w.id = s.workspace_id WHERE w.name = $1")
+                .bind(workspace).fetch_all(&pool).await.unwrap(),
+        );
+        assert_eq!(role, "owner");
+        assert_eq!(spaces, vec![("General".to_owned(), allow_external)]);
+    }
+    for policy in [None, Some("local")] {
+        let mut args = vec![
+            "create-user",
+            "--email",
+            "admin@example.test",
+            "--workspace",
+            "New Co",
+            "--role",
+            "admin",
+        ];
+        args.extend(
+            policy
+                .map(|policy| ["--space-policy", policy])
+                .into_iter()
+                .flatten(),
+        );
+        assert_failed(&operator(&pool, &args), "not_found\n");
+    }
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM users WHERE email = 'admin@example.test'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM workspaces WHERE name = 'New Co'"
+        )
+        .await,
+        0
+    );
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn create_user_new_workspace_requires_space_policy(pool: sqlx::PgPool) {
+    assert_failed(
+        &operator(
+            &pool,
+            &[
+                "create-user",
+                "--email",
+                "owner@example.test",
+                "--workspace",
+                "Acme",
+                "--role",
+                "owner",
+            ],
+        ),
+        "config_invalid (--space-policy)\n",
+    );
+    for sql in [
+        "SELECT count(*) FROM users",
+        "SELECT count(*) FROM workspaces",
+        "SELECT count(*) FROM spaces",
+        "SELECT count(*) FROM memberships",
+        "SELECT count(*) FROM password_resets",
+    ] {
+        assert_eq!(count(&pool, sql).await, 0, "{sql}");
+    }
+    printed_link(&operator(
+        &pool,
+        &[
+            "create-user",
+            "--email",
+            "owner@example.test",
+            "--workspace",
+            "Acme",
+            "--role",
+            "owner",
+            "--space-policy",
+            "hosted",
+        ],
+    ));
+    // Joining an existing workspace needs no policy, and ignores one that is given.
+    for (email, role, policy) in [
+        ("member@example.test", "member", None),
+        ("other-owner@example.test", "owner", Some("local")),
+    ] {
+        let mut args = vec![
+            "create-user",
+            "--email",
+            email,
+            "--workspace",
+            "Acme",
+            "--role",
+            role,
+        ];
+        args.extend(
+            policy
+                .map(|policy| ["--space-policy", policy])
+                .into_iter()
+                .flatten(),
+        );
+        printed_link(&operator(&pool, &args));
+    }
+    assert_eq!(count(&pool, "SELECT count(*) FROM workspaces").await, 1);
+    let spaces: Vec<(String, bool)> = sqlx::query_as("SELECT name, allow_external FROM spaces")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(spaces, vec![("General".to_owned(), true)]);
+    assert_eq!(count(&pool, "SELECT count(*) FROM memberships").await, 3);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn create_user_joins_an_existing_workspace_by_id_or_name(pool: sqlx::PgPool) {
+    let workspace = uuid::Uuid::now_v7();
+    sqlx::query("INSERT INTO workspaces (id, name) VALUES ($1, 'Acme')")
+        .bind(workspace)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let id = workspace.to_string();
+    for (email, reference, role) in [
+        ("admin@example.test", id.as_str(), "admin"),
+        ("member@example.test", "Acme", "member"),
+    ] {
+        printed_link(&operator(
+            &pool,
+            &[
+                "create-user",
+                "--email",
+                email,
+                "--workspace",
+                reference,
+                "--role",
+                role,
+            ],
+        ));
+        let stored: String = sqlx::query_scalar("SELECT m.role FROM memberships m JOIN users u ON u.id = m.user_id WHERE u.email = $1 AND m.workspace_id = $2")
+            .bind(email).bind(workspace).fetch_one(&pool).await.unwrap();
+        assert_eq!(stored, role);
+    }
+    assert_eq!(count(&pool, "SELECT count(*) FROM workspaces").await, 1);
+    assert_eq!(count(&pool, "SELECT count(*) FROM spaces").await, 0);
+    // An id names a workspace or nothing; it never creates one.
+    let unknown = uuid::Uuid::now_v7().to_string();
+    assert_failed(
+        &operator(
+            &pool,
+            &[
+                "create-user",
+                "--email",
+                "owner@example.test",
+                "--workspace",
+                &unknown,
+                "--role",
+                "owner",
+                "--space-policy",
+                "local",
+            ],
+        ),
+        "not_found\n",
+    );
+    assert_eq!(count(&pool, "SELECT count(*) FROM workspaces").await, 1);
+    assert_eq!(count(&pool, "SELECT count(*) FROM users").await, 2);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn create_user_rejects_an_ambiguous_workspace_name(pool: sqlx::PgPool) {
+    for _ in 0..2 {
+        sqlx::query("INSERT INTO workspaces (id, name) VALUES ($1, 'Twin')")
+            .bind(uuid::Uuid::now_v7())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    for role in ["member", "owner"] {
+        assert_failed(
+            &operator(
+                &pool,
+                &[
+                    "create-user",
+                    "--email",
+                    "person@example.test",
+                    "--workspace",
+                    "Twin",
+                    "--role",
+                    role,
+                    "--space-policy",
+                    "local",
+                ],
+            ),
+            "workspace_ambiguous\n",
+        );
+    }
+    assert_eq!(count(&pool, "SELECT count(*) FROM users").await, 0);
+    assert_eq!(count(&pool, "SELECT count(*) FROM workspaces").await, 2);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn create_user_rejects_an_existing_email(pool: sqlx::PgPool) {
+    let (id, password) = support::user(&pool).await;
+    sqlx::query("INSERT INTO workspaces (id, name) VALUES ($1, 'Acme')")
+        .bind(uuid::Uuid::now_v7())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let hash: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    for email in ["person@example.test", " PERSON@Example.TEST "] {
+        assert_failed(
+            &operator(
+                &pool,
+                &[
+                    "create-user",
+                    "--email",
+                    email,
+                    "--workspace",
+                    "Acme",
+                    "--role",
+                    "admin",
+                ],
+            ),
+            "user_exists\n",
+        );
+    }
+    let after: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(after, hash);
+    for sql in [
+        "SELECT count(*) FROM memberships",
+        "SELECT count(*) FROM password_resets",
+    ] {
+        assert_eq!(count(&pool, sql).await, 0, "{sql}");
+    }
+    let app = support::app(&pool, None);
+    assert_eq!(support::login(&app, &password).await.status(), 200);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn create_user_link_lasts_72_hours_and_reset_link_30_minutes(pool: sqlx::PgPool) {
+    let invite = link_token(&printed_link(&operator(
+        &pool,
+        &[
+            "create-user",
+            "--email",
+            "person@example.test",
+            "--workspace",
+            "Acme",
+            "--role",
+            "owner",
+            "--space-policy",
+            "local",
+        ],
+    )));
+    let reset = link_token(&printed_link(&operator(
+        &pool,
+        &["reset-link", "--email", "person@example.test"],
+    )));
+    for (token, kind, lifetime) in [
+        (&invite, "invite", "72 hours"),
+        (&reset, "reset", "30 minutes"),
+    ] {
+        let within: bool = sqlx::query_scalar("SELECT expires_at BETWEEN clock_timestamp() + $3::interval - interval '1 minute' AND clock_timestamp() + $3::interval FROM password_resets WHERE token_sha256 = $1 AND kind = $2")
+            .bind(format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(token.as_bytes())))
+            .bind(kind)
+            .bind(lifetime)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(within, "{kind}");
+    }
+    sqlx::query("UPDATE password_resets SET expires_at = clock_timestamp() - interval '1 second'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let app = support::app(&pool, None);
+    let password = uuid::Uuid::now_v7().to_string();
+    support::assert_code(
+        accept_invite(&app, &invite, &password).await,
+        400,
+        "invite_token_invalid",
+    )
+    .await;
+    support::assert_code(
+        confirm_reset(&app, &reset, &password).await,
+        400,
+        "reset_token_invalid",
+    )
+    .await;
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn reset_link_prints_a_link_for_an_existing_account(pool: sqlx::PgPool) {
+    let (_, password) = support::user(&pool).await;
+    let app = support::app(&pool, None);
+    let session = support::cookie(&support::login(&app, &password).await);
+    let link = printed_link(&operator(
+        &pool,
+        &["reset-link", "--email", " Person@Example.test "],
+    ));
+    assert!(
+        link.starts_with("http://localhost:3000/reset?token="),
+        "{link}"
+    );
+    let new_password = uuid::Uuid::now_v7().to_string();
+    assert_eq!(
+        confirm_reset(&app, &link_token(&link), &new_password)
+            .await
+            .status(),
+        200
+    );
+    support::assert_code(
+        support::request(&app, "GET", "/api/auth/me", None, Some(&session)).await,
+        401,
+        "unauthenticated",
+    )
+    .await;
+    support::assert_code(
+        support::login(&app, &password).await,
+        401,
+        "unauthenticated",
+    )
+    .await;
+    assert_eq!(support::login(&app, &new_password).await.status(), 200);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn reset_link_for_an_unknown_email_is_not_found(pool: sqlx::PgPool) {
+    support::user(&pool).await;
+    assert_failed(
+        &operator(&pool, &["reset-link", "--email", "unknown@example.test"]),
+        "not_found\n",
+    );
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM password_resets").await,
+        0
+    );
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn operator_commands_need_no_smtp_or_demo_mode(pool: sqlx::PgPool) {
+    // `server()` clears the environment: no SMTP_* variables, no KATWORK_DEMO, no public URL.
+    let command = server();
+    for name in ["SMTP_HOST", "KATWORK_DEMO", "KATWORK_PUBLIC_URL"] {
+        assert!(
+            !command
+                .get_envs()
+                .any(|(key, value)| key == name && value.is_some()),
+            "{name}"
+        );
+    }
+    printed_link(&operator(
+        &pool,
+        &[
+            "create-user",
+            "--email",
+            "person@example.test",
+            "--workspace",
+            "Acme",
+            "--role",
+            "owner",
+            "--space-policy",
+            "local",
+        ],
+    ));
+    printed_link(&operator(
+        &pool,
+        &["reset-link", "--email", "person@example.test"],
+    ));
+    let output = server()
+        .args(["reset-link", "--email", "person@example.test"])
+        .env("DATABASE_URL", database_url(&pool))
+        .env("KATWORK_DEMO", "0")
+        .output()
+        .unwrap();
+    printed_link(&output);
+}
+
+#[test]
+fn operator_commands_reject_bad_arguments() {
+    let create = |rest: &[&'static str]| {
+        let mut args = vec!["create-user"];
+        args.extend_from_slice(rest);
+        args
+    };
+    for args in [
+        create(&["--workspace", "Acme", "--role", "owner"]),
+        create(&["--email", "a@example.test", "--role", "owner"]),
+        create(&["--email", "a@example.test", "--workspace", "Acme"]),
+        create(&[
+            "--email",
+            "a@example.test",
+            "--email",
+            "b@example.test",
+            "--workspace",
+            "Acme",
+            "--role",
+            "owner",
+        ]),
+        create(&[
+            "--email",
+            "a@example.test",
+            "--workspace",
+            "Acme",
+            "--role",
+            "owner",
+            "--space-policy",
+            "local",
+            "--space-policy",
+            "local",
+        ]),
+        create(&[
+            "--email",
+            "a@example.test",
+            "--workspace",
+            "Acme",
+            "--role",
+            "owner",
+            "--name",
+            "x",
+        ]),
+        create(&[
+            "--email",
+            "a@example.test",
+            "--workspace",
+            "Acme",
+            "--role",
+            "guest",
+        ]),
+        create(&[
+            "--email",
+            "a@example.test",
+            "--workspace",
+            "Acme",
+            "--role",
+            "Owner",
+        ]),
+        create(&[
+            "--email",
+            "a@example.test",
+            "--workspace",
+            "Acme",
+            "--role",
+            "owner",
+            "--space-policy",
+            "cloud",
+        ]),
+        create(&["--email", "a@example.test", "--workspace", "Acme", "--role"]),
+        create(&[
+            "--email",
+            "a@example.test",
+            "--workspace",
+            "Acme",
+            "--role",
+            "owner",
+            "extra",
+        ]),
+        vec!["reset-link"],
+        vec!["reset-link", "--email"],
+        vec![
+            "reset-link",
+            "--email",
+            "a@example.test",
+            "--email",
+            "b@example.test",
+        ],
+        vec!["reset-link", "--email", "a@example.test", "--role", "owner"],
+        vec!["reset-link", "a@example.test"],
+    ] {
+        // The default DATABASE_URL points nowhere: arguments are checked before connecting.
+        let output = server().args(&args).output().unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("command_invalid\n{USAGE}"),
+            "{args:?}"
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn operator_links_never_reach_logs(pool: sqlx::PgPool) {
+    for args in [
+        &[
+            "create-user",
+            "--email",
+            "person@example.test",
+            "--workspace",
+            "Acme",
+            "--role",
+            "owner",
+            "--space-policy",
+            "local",
+        ][..],
+        &["reset-link", "--email", "person@example.test"][..],
+    ] {
+        let output = server()
+            .args(args)
+            .env("DATABASE_URL", database_url(&pool))
+            .env("RUST_LOG", "trace")
+            .output()
+            .unwrap();
+        let token = link_token(&printed_link(&output));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains(&token), "{stderr}");
+        assert!(!stderr.contains("token="), "{stderr}");
+    }
+}
+
+#[test]
+fn serve_config_error_names_the_variable_not_its_value() {
+    let output = server()
+        .arg("serve")
+        .env("KATWORK_PUBLIC_URL", "ftp://private-marker.example")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("config_invalid (KATWORK_PUBLIC_URL)"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("private-marker"), "{stderr}");
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn seed_demo_applies_changed_demo_password(pool: sqlx::PgPool) {
+    let seed = |password: &str| {
+        let output = server()
+            .arg("seed-demo")
+            .env("KATWORK_DEMO", "1")
+            .env("DATABASE_URL", database_url(&pool))
+            .env("KATWORK_DEMO_PASSWORD", password)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // The operator chose the value, so the command never prints it.
+        assert!(output.stdout.is_empty());
+    };
+    let first = uuid::Uuid::now_v7().to_string();
+    seed(&first);
+    let app = support::app(&pool, None);
+    let session = support::cookie(&demo_login(&app, &first).await);
+    seed(&first);
+    assert_eq!(
+        support::request(&app, "GET", "/api/auth/me", None, Some(&session))
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(demo_login(&app, &first).await.status(), 200);
+    let second = uuid::Uuid::now_v7().to_string();
+    seed(&second);
+    assert_eq!(demo_login(&app, &second).await.status(), 200);
+    support::assert_code(demo_login(&app, &first).await, 401, "unauthenticated").await;
+    support::assert_code(
+        support::request(&app, "GET", "/api/auth/me", None, Some(&session)).await,
+        401,
+        "unauthenticated",
+    )
+    .await;
+}
+
+const USAGE: &str = "\
+usage: katwork-server [serve]
+       katwork-server migrate
+       katwork-server seed-demo [--reset-password]
+       katwork-server create-user --email <email> --workspace <name|id> --role <owner|admin|member> [--space-policy <local|hosted>]
+       katwork-server reset-link --email <email>
+";
+
+#[test]
+fn help_prints_usage() {
+    for args in [
+        vec!["--help"],
+        vec!["-h"],
+        vec!["help"],
+        vec!["create-user", "--help"],
+        vec!["reset-link", "--email", "a@example.test", "-h"],
+    ] {
+        let output = server().args(&args).output().unwrap();
+        assert!(output.status.success(), "{args:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), USAGE, "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn operator_commands_ask_for_migrate_on_an_unmigrated_database(pool: sqlx::PgPool) {
+    let expected = "migration_required\n  run `katwork-server migrate` first, then try again\n";
+    let create = [
+        "create-user",
+        "--email",
+        "person@example.test",
+        "--workspace",
+        "Acme",
+        "--role",
+        "owner",
+        "--space-policy",
+        "local",
+    ];
+    let reset = ["reset-link", "--email", "person@example.test"];
+    for args in [&create[..], &reset[..]] {
+        assert_failed(&operator(&pool, args), expected);
+    }
+    // Part of the schema is no better: every migration this binary carries must be applied.
+    let mut old = sqlx::migrate!("../katwork/migrations");
+    old.migrations = old
+        .iter()
+        .filter(|migration| migration.version <= 5)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into();
+    old.run(&pool).await.unwrap();
+    for args in [&create[..], &reset[..]] {
+        assert_failed(&operator(&pool, args), expected);
+    }
+    assert_eq!(count(&pool, "SELECT count(*) FROM users").await, 0);
+    assert_eq!(count(&pool, "SELECT count(*) FROM workspaces").await, 0);
+}
+
+#[test]
+fn serve_warns_when_a_lan_bind_has_no_public_url() {
+    let warning = "KATWORK_BIND exposes KatWork beyond this host";
+    for (bind, public_url, warns) in [
+        (Some("0.0.0.0"), None, true),
+        (Some("192.168.1.20"), Some("http://localhost:3000"), true),
+        (Some("0.0.0.0"), Some("http://127.0.0.1:3000"), true),
+        (Some("0.0.0.0"), Some("http://192.168.1.20:3000"), false),
+        (Some("127.0.0.1"), None, false),
+        (Some("::1"), None, false),
+        (None, None, false),
+    ] {
+        let mut command = server();
+        // An unparsable sslmode stops serve right after its startup checks, without a wait.
+        command.arg("serve").env(
+            "DATABASE_URL",
+            "postgres://localhost/katwork?sslmode=unparsable",
+        );
+        if let Some(bind) = bind {
+            command.env("KATWORK_BIND", bind);
+        }
+        if let Some(url) = public_url {
+            command.env("KATWORK_PUBLIC_URL", url);
+        }
+        let output = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success());
+        assert_eq!(
+            stderr.contains(warning),
+            warns,
+            "{bind:?} {public_url:?}: {stderr}"
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn a_closed_stdout_fails_cleanly_and_keeps_the_link_off_stderr(pool: sqlx::PgPool) {
+    for args in [
+        &[
+            "create-user",
+            "--email",
+            "person@example.test",
+            "--workspace",
+            "Acme",
+            "--role",
+            "owner",
+            "--space-policy",
+            "local",
+        ][..],
+        &["reset-link", "--email", "person@example.test"][..],
+    ] {
+        let mut child = server()
+            .args(args)
+            .env("DATABASE_URL", database_url(&pool))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Close the reading end before the command gets to print.
+        drop(child.stdout.take());
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{stderr}");
+        assert_eq!(
+            stderr,
+            "link_not_printed\n  the account change was saved, but its link could not be written to stdout\n  run `katwork-server reset-link --email <email>` for a new link\n"
+        );
+    }
+    // The account was created before the print failed; reset-link recovers it.
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM users WHERE email = 'person@example.test'"
+        )
+        .await,
+        1
+    );
+    printed_link(&operator(
+        &pool,
+        &["reset-link", "--email", "person@example.test"],
+    ));
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn create_user_rejects_a_malformed_email(pool: sqlx::PgPool) {
+    sqlx::query("INSERT INTO workspaces (id, name) VALUES ($1, 'Acme')")
+        .bind(uuid::Uuid::now_v7())
+        .execute(&pool)
+        .await
+        .unwrap();
+    // 255 bytes: one over the limit.
+    let long = format!("{}@example.test", "a".repeat(242));
+    assert_eq!(long.len(), 255);
+    for email in [
+        "nobody",
+        "a@b@example.test",
+        "@example.test",
+        "person@",
+        "@",
+        "   ",
+        "",
+        long.as_str(),
+    ] {
+        for args in [
+            &[
+                "create-user",
+                "--email",
+                email,
+                "--workspace",
+                "Acme",
+                "--role",
+                "member",
+            ][..],
+            &["reset-link", "--email", email][..],
+        ] {
+            assert_failed(&operator(&pool, args), "request_invalid\n");
+        }
+    }
+    for sql in [
+        "SELECT count(*) FROM users",
+        "SELECT count(*) FROM memberships",
+        "SELECT count(*) FROM password_resets",
+    ] {
+        assert_eq!(count(&pool, sql).await, 0, "{sql}");
+    }
+    // 254 bytes is still an address.
+    let longest = format!("{}@example.test", "a".repeat(241));
+    printed_link(&operator(
+        &pool,
+        &[
+            "create-user",
+            "--email",
+            &longest,
+            "--workspace",
+            "Acme",
+            "--role",
+            "member",
+        ],
+    ));
 }

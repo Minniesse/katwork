@@ -8,7 +8,7 @@ use katwork::{
     config::Config,
     runtime::Core,
 };
-use katwork_server::app::{AppState, build_router};
+use katwork_server::app::{AppState, ResetWork, build_router, build_router_with};
 use serde_json::json;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::{sync::Arc, time::Duration};
@@ -247,9 +247,13 @@ async fn reset_limits_apply_before_lookup_and_always_return_202(pool: PgPool) {
     let capture = Arc::new(CapturingMailer::default());
     let mut core = Core::new(pool.clone(), Arc::new(support::config(None)));
     core.mailer = capture.clone();
-    let app = build_router(AppState {
-        core: Arc::new(core),
-    });
+    let work = ResetWork::default();
+    let app = build_router_with(
+        AppState {
+            core: Arc::new(core),
+        },
+        work.clone(),
+    );
     for i in 1..=3 {
         let response = support::request(
             &app,
@@ -260,13 +264,8 @@ async fn reset_limits_apply_before_lookup_and_always_return_202(pool: PgPool) {
         )
         .await;
         assert_eq!(response.status(), 202);
-        timeout(Duration::from_secs(2), async {
-            while capture.sent().len() != i {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        work.drained().await;
+        assert_eq!(capture.sent().len(), i);
         sqlx::query("UPDATE password_resets SET used_at = clock_timestamp() WHERE user_id = $1")
             .bind(id)
             .execute(&pool)
@@ -302,7 +301,7 @@ async fn reset_limits_apply_before_lookup_and_always_return_202(pool: PgPool) {
         );
     }
     // Let the accepted background lookups finish before the account becomes known.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    work.drained().await;
     sqlx::query("INSERT INTO users (id, email, password_hash, display_name, locale) VALUES ($1, 'unknown@example.test', 'hash', 'Unknown', 'en')")
         .bind(uuid::Uuid::now_v7()).execute(&pool).await.unwrap();
     assert_eq!(
@@ -317,7 +316,7 @@ async fn reset_limits_apply_before_lookup_and_always_return_202(pool: PgPool) {
         .status(),
         202
     );
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    work.drained().await;
     assert_eq!(capture.sent().len(), 3);
 
     // A fresh IP gets twenty total requests, including unknown addresses.
@@ -349,7 +348,7 @@ async fn reset_limits_apply_before_lookup_and_always_return_202(pool: PgPool) {
         .status(),
         202
     );
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    work.drained().await;
     assert_eq!(capture.sent().len(), 3);
 }
 
@@ -412,4 +411,29 @@ async fn ten_thousand_sprayed_emails_do_not_block_another_users_login(pool: PgPo
     )
     .await;
     assert_eq!(response.status(), 200);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn database_errors_never_lock_out_login(pool: PgPool) {
+    let (_, password) = support::user(&pool).await;
+    let single = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_millis(100))
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let app = support::app(&single, None);
+    let held = single.acquire().await.unwrap();
+    // The account lookup cannot get a connection, so no password is ever checked.
+    for _ in 0..11 {
+        support::assert_code(
+            support::login(&app, &password).await,
+            503,
+            "database_unavailable",
+        )
+        .await;
+    }
+    drop(held);
+    assert_eq!(support::login(&app, &password).await.status(), 200);
+    single.close().await;
 }

@@ -5,6 +5,7 @@ import { App } from './app';
 import { setLocale } from './i18n';
 import en from './i18n/en.json';
 import th from './i18n/th.json';
+import { navigate } from './router';
 import { stubFetch } from './testing/fetch';
 
 beforeEach(() => window.history.replaceState(null, '', '/'));
@@ -89,6 +90,7 @@ test('reset_link_opens_confirm_and_hides_token_from_address_bar', async () => {
   ).toBeVisible();
   expect(window.location.search).toBe('');
   expect(window.location.pathname).toBe('/reset');
+  expect(window.history.state).toBeNull();
 });
 
 test('request_again_link_from_a_used_reset_link_opens_the_request_form', async () => {
@@ -127,6 +129,95 @@ test('reset_while_signed_in_rechecks_the_session_before_sign_in', async () => {
     '/api/auth/reset/confirm',
     '/api/auth/me',
   ]);
+});
+
+test('invite_link_opens_accept_page_and_hides_token_from_address_bar', async () => {
+  window.history.replaceState(null, '', '/invite?token=invite-token');
+  const fetchMock = stubFetch([401, { code: 'unauthenticated' }], [204], [401, { code: 'unauthenticated' }]);
+  const user = userEvent.setup({ delay: null });
+  render(<App />);
+  expect(
+    await screen.findByRole('heading', { level: 1, name: en['invite.title'] }),
+  ).toBeVisible();
+  // Signed out, the invite page stays: it is not sent to sign in.
+  expect(window.location.pathname).toBe('/invite');
+  expect(window.location.search).toBe('');
+  await user.type(screen.getByLabelText(en['invite.password']), 'a new long password');
+  await user.type(screen.getByLabelText(en['invite.again']), 'a new long password');
+  await user.click(screen.getByRole('button', { name: en['invite.submit'] }));
+  await user.click(await screen.findByRole('link', { name: en['reset.back_to_login'] }));
+  expect(await screen.findByRole('heading', { level: 1, name: en['login.title'] })).toBeVisible();
+  expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+    '/api/auth/me',
+    '/api/auth/invite/accept',
+    '/api/auth/me',
+  ]);
+});
+
+/** Goes back one history entry and waits until the page has handled it. */
+async function goBack() {
+  await act(async () => {
+    const popped = new Promise((resolve) =>
+      window.addEventListener('popstate', resolve, { once: true }),
+    );
+    window.history.back();
+    await popped;
+  });
+}
+
+test('invite_token_is_gone_after_leaving_and_coming_back', async () => {
+  window.history.replaceState(null, '', '/invite?token=invite-token');
+  const fetchMock = stubFetch([401, { code: 'unauthenticated' }]);
+  render(<App />);
+  await screen.findByRole('heading', { level: 1, name: en['invite.title'] });
+  expect(window.location.href).not.toContain('invite-token');
+  expect(window.history.state).toBeNull();
+
+  act(() => navigate('/login'));
+  await screen.findByRole('heading', { level: 1, name: en['login.title'] });
+  await goBack();
+  expect(window.location.pathname).toBe('/invite');
+  expect(window.location.href).not.toContain('invite-token');
+  expect(window.history.state).toBeNull();
+  expect(await screen.findByRole('alert')).toHaveTextContent(en['invite.no_token']);
+  expect(screen.queryByLabelText(en['invite.password'])).toBeNull();
+  expect(fetchMock.mock.calls.map(([url]) => url)).not.toContain('/api/auth/invite/accept');
+});
+
+test('reset_token_is_gone_after_leaving_and_coming_back', async () => {
+  window.history.replaceState(null, '', '/reset?token=reset-token');
+  stubFetch([401, { code: 'unauthenticated' }]);
+  render(<App />);
+  await screen.findByRole('heading', { level: 1, name: en['reset.confirm.title'] });
+  expect(window.history.state).toBeNull();
+
+  act(() => navigate('/login'));
+  await screen.findByRole('heading', { level: 1, name: en['login.title'] });
+  await goBack();
+  expect(window.location.pathname).toBe('/reset');
+  expect(window.location.href).not.toContain('reset-token');
+  expect(window.history.state).toBeNull();
+  // Without its token the page is the request form, not the confirm form.
+  expect(
+    await screen.findByRole('heading', { level: 1, name: en['reset.request.title'] }),
+  ).toBeVisible();
+});
+
+test.each([
+  ['pagehide', false],
+  ['pageshow', true],
+] as const)('reset_token_is_dropped_on_%s', async (type, persisted) => {
+  window.history.replaceState(null, '', '/reset?token=reset-token');
+  stubFetch([401, { code: 'unauthenticated' }]);
+  render(<App />);
+  await screen.findByRole('heading', { level: 1, name: en['reset.confirm.title'] });
+  act(() => {
+    window.dispatchEvent(new PageTransitionEvent(type, { persisted }));
+  });
+  expect(
+    await screen.findByRole('heading', { level: 1, name: en['reset.request.title'] }),
+  ).toBeVisible();
+  expect(screen.queryByLabelText(en['reset.confirm.password'])).toBeNull();
 });
 
 test('reset_without_token_opens_the_request_form', async () => {
