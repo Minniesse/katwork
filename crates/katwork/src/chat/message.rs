@@ -4,7 +4,7 @@ use super::{Appended, Author, Message, MessagePage, NewMessage};
 use crate::{
     error::KatError,
     ids::{EventSeq, JobId, MessageId, ThreadId},
-    tenancy::Tenant,
+    tenancy::{self, Tenant},
 };
 
 const SELECT: &str = include_str!("message_select.sql");
@@ -52,13 +52,19 @@ pub async fn append(
         .await?
         .ok_or(KatError::NotFound)?;
     let (kind, user, kat) = match new.author {
-        Author::User(id) => ("user", Some(id), None),
+        Author::User(id) => {
+            if id != tenant.user_id() {
+                return Err(KatError::NotFound);
+            }
+            ("user", Some(id), None)
+        }
         Author::Kat(id) => ("kat", None, Some(id)),
         Author::System => ("system", None, None),
     };
     let inserted: Option<MessageId> = sqlx::query_scalar("INSERT INTO messages
         (id,workspace_id,thread_id,author_kind,author_user_id,author_kat_id,body,client_msg_id,idempotency_key,synthetic,stopped,question,meta,job_id)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+        SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14
+        WHERE $4<>'user' OR EXISTS (SELECT 1 FROM memberships WHERE workspace_id=$2 AND user_id=$5)
         ON CONFLICT DO NOTHING RETURNING id")
         .bind(new.id.unwrap_or_default()).bind(tenant.workspace_id()).bind(thread).bind(kind).bind(user).bind(kat)
         .bind(&new.body).bind(&new.client_msg_id).bind(&new.idempotency_key).bind(new.synthetic).bind(new.stopped)
@@ -74,6 +80,10 @@ pub async fn append(
             .fetch_one(&mut *conn)
             .await?
     } else {
+        // A removed member cannot insert or retrieve a retry through a stale Tenant.
+        if let Some(user) = user {
+            tenancy::resolve(&mut *conn, user, tenant.workspace_id()).await?;
+        }
         // A new statement sees a concurrent winner that INSERT's snapshot could not see.
         QueryBuilder::<Postgres>::new(SELECT)
             .push(" AND ((m.author_user_id=$3 AND m.client_msg_id=$4) OR m.idempotency_key=$5)")
