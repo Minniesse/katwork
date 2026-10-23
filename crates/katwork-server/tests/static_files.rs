@@ -180,26 +180,25 @@ async fn unknown_host_is_refused_before_static_files() {
     assert_eq!(response.status(), 403);
 }
 
+/// The `Cache-Control` of a successful response.
+async fn cache_control(app: &Router, path: &str) -> String {
+    let request = Request::builder()
+        .uri(path)
+        .header("host", "localhost")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), 200, "{path}");
+    response.headers()["cache-control"]
+        .to_str()
+        .unwrap()
+        .to_owned()
+}
+
 #[tokio::test]
 async fn app_pages_are_never_stored() {
     let web = WebDir::new();
     let app = app(&web);
-    let cache_control = |path: &'static str| {
-        let app = app.clone();
-        async move {
-            let request = Request::builder()
-                .uri(path)
-                .header("host", "localhost")
-                .body(axum::body::Body::empty())
-                .unwrap();
-            let response = app.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), 200, "{path}");
-            response.headers()["cache-control"]
-                .to_str()
-                .unwrap()
-                .to_owned()
-        }
-    };
     // A page holding a link's token must not be kept by an HTTP cache or the back-forward cache.
     for path in [
         "/invite?token=AAAA",
@@ -209,12 +208,42 @@ async fn app_pages_are_never_stored() {
         "/login",
         "/",
     ] {
-        assert_eq!(cache_control(path).await, "no-store", "{path}");
+        assert_eq!(cache_control(&app, path).await, "no-store", "{path}");
     }
     // Other files keep their revalidating or immutable caching.
-    assert_eq!(cache_control("/theme-init.js").await, "no-cache");
+    assert_eq!(cache_control(&app, "/theme-init.js").await, "no-cache");
     assert_eq!(
-        cache_control("/assets/app-1234.js").await,
+        cache_control(&app, "/assets/app-1234.js").await,
+        "public, max-age=31536000, immutable"
+    );
+}
+
+#[tokio::test]
+async fn direct_index_html_is_never_stored() {
+    let web = WebDir::new();
+    let app = app(&web);
+    let (_, content_type, body) = get(&app, "/index.html").await;
+    assert!(content_type.starts_with("text/html"), "{content_type}");
+    assert!(body.contains("<title>KatWork</title>"));
+    assert_eq!(cache_control(&app, "/index.html").await, "no-store");
+}
+
+#[tokio::test]
+async fn extensionless_html_under_assets_is_never_stored() {
+    let web = WebDir::new();
+    let app = app(&web);
+    for path in ["/assets/page", "/assets/page?token=AAAA"] {
+        let (_, content_type, body) = get(&app, path).await;
+        assert!(
+            content_type.starts_with("text/html"),
+            "{path}: {content_type}"
+        );
+        assert!(body.contains("<title>KatWork</title>"), "{path}");
+        assert_eq!(cache_control(&app, path).await, "no-store", "{path}");
+    }
+    // The hashed files beside it keep their immutable caching.
+    assert_eq!(
+        cache_control(&app, "/assets/app-1234.js").await,
         "public, max-age=31536000, immutable"
     );
 }

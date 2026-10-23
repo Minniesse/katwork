@@ -9,7 +9,10 @@ use axum::{
     Json,
     body::Body,
     extract::Request,
-    http::{HeaderValue, StatusCode, header::CACHE_CONTROL},
+    http::{
+        HeaderValue, StatusCode,
+        header::{CACHE_CONTROL, CONTENT_TYPE},
+    },
     response::{IntoResponse, Response},
 };
 use serde_json::json;
@@ -60,12 +63,21 @@ async fn respond(dir: &Path, request: Request) -> Response {
         Ok(response) => response.map(Body::new),
         Err(never) => match never {},
     };
-    let cache = if hashed_asset && response.status().is_success() {
-        "public, max-age=31536000, immutable"
-    } else if client_route {
+    let html = client_route
+        || response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("text/html"));
+    let cache = if html {
         // The app's HTML is never stored, so neither an HTTP cache nor the browser's
-        // back-forward cache keeps a page that held an invite or reset token in memory.
+        // back-forward cache keeps a page that held an invite or reset token in memory. That
+        // covers a direct `/index.html` and an extensionless path under `/assets`, which serves
+        // `index.html` too; only the hashed files beside it are immutable.
         "no-store"
+    } else if hashed_asset && response.status().is_success() {
+        "public, max-age=31536000, immutable"
     } else {
         "no-cache"
     };
