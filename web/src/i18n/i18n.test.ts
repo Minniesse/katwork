@@ -119,7 +119,17 @@ describe('catalogues', () => {
       expect((th as Record<string, string>)[key], key).toContain('โปรด');
     }
     expect(th['reason.thread_title_invalid']).not.toContain('อักขระควบคุม');
+    expect(th['workspace.no_space']).toContain('เพื่อเพิ่มพื้นที่');
+    expect(th['team.none']).toContain('เพื่อตั้งทีม');
+    expect(th['chat.untitled_at']).toContain('เริ่มเมื่อ {time}');
     expect(en['reason.thread_title_invalid']).not.toMatch(/control character/i);
+  });
+
+  test('lost_link_hint_says_a_reset_link_lasts_30_minutes', () => {
+    // `reset-link` prints a reset link (30 minutes), not an invite link (72 hours).
+    expect(en['members.invite.link_lost']).toContain('30 minutes');
+    expect(en['members.invite.link_lost']).not.toContain('72');
+    expect(th['members.invite.link_lost']).toContain('30 นาที');
   });
 
   test('copy_calls_coworkers_kats_and_thai_never_says_ai_employee', () => {
