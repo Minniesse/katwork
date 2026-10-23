@@ -261,20 +261,22 @@ async fn claim_locked(
                 Some(StopReason::KatPaused)
             } else {
                 let kat = kat::get_on(&mut **tx, &tenant, c.kat_id).await?;
+                // Read capacity before usage so a finishing run cannot free a slot after a stale budget check.
+                let live: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM tasks t JOIN task_leases l ON l.task_id=t.id
+                 WHERE t.workspace_id=$1 AND t.kat_id=$2 AND t.id<>$3
+                 AND t.state='leased' AND l.expires_at>clock_timestamp()",
+                )
+                .bind(c.workspace_id)
+                .bind(c.kat_id)
+                .bind(c.id)
+                .fetch_one(&mut **tx)
+                .await?;
                 if kat.policy_version != c.kat_policy_version {
                     Some(StopReason::PolicyChanged)
+                } else if super::quota::daily_exhausted(tx, c.workspace_id, c.kat_id).await? {
+                    Some(StopReason::QuotaExceeded)
                 } else {
-                    // Serialized by the Kat lock; expired leases never consume a slot.
-                    let live: i64 = sqlx::query_scalar(
-                        "SELECT count(*) FROM tasks t JOIN task_leases l ON l.task_id=t.id
-                     WHERE t.workspace_id=$1 AND t.kat_id=$2 AND t.id<>$3
-                     AND t.state='leased' AND l.expires_at>clock_timestamp()",
-                    )
-                    .bind(c.workspace_id)
-                    .bind(c.kat_id)
-                    .bind(c.id)
-                    .fetch_one(&mut **tx)
-                    .await?;
                     if live >= i64::from(kat.max_concurrency) {
                         if let Some(s) = hold(tx, c, HoldReason::KatBusy).await? {
                             seq = Some(s);

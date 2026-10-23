@@ -76,6 +76,8 @@
   "reason.quota_exceeded": "This workspace has reached its usage limit for today. Try again tomorrow or ask your admin.",
   "reason.workspace_paused": "Your admin has paused the Kats in this workspace. The work waits until they're resumed.",
   "reason.workspace_paused_stopped": "Stopped because the Kats in this workspace were paused. Send the request again after they resume.",
+  "reason.mention_needs_space": "Add a space after @{name} to mention this Kat.",
+  "reason.extra_mention_ignored": "One Kat handles each request. These additional mentions were skipped; send them a separate request.",
   "reason.kat_paused_stopped": "Stopped because this Kat was paused. Send the request again after it resumes, or ask another Kat.",
   "reason.step_limit": "The Kat took too many steps without finishing. Try splitting the request into smaller parts.",
   "reason.token_budget": "The Kat used up its budget for this request. Try a shorter request.",

@@ -136,7 +136,7 @@ async fn post_and_list_messages_in_order(pool: PgPool) {
         assert_eq!(f.post(json!({"body": text})).await.status(), 201);
     }
     let page = f.page("").await;
-    assert_eq!(page["event_seq"], 0);
+    assert_eq!(page["event_seq"], 4);
     assert_eq!(page["messages"][0]["body"], "  hello  ");
     assert_eq!(page["messages"][1]["body"], "ช่วยสรุป 👩‍💻");
     assert_eq!(page["messages"][0]["synthetic"], false);

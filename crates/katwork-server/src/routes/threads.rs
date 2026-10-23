@@ -7,9 +7,10 @@ use axum::{
     http::StatusCode,
 };
 use katwork::{
-    chat::{Author, MessagePage, NewMessage, Thread, UserPost, message, thread},
+    chat::{MessagePage, Thread, UserPost, message, thread},
     error::KatError,
     ids::{JobId, MessageId, SpaceId, TeamId, ThreadId},
+    pipeline,
     tenancy::Tenant,
 };
 use serde::{Deserialize, Serialize};
@@ -123,7 +124,7 @@ pub(crate) async fn messages(
 #[derive(Serialize)]
 pub(crate) struct Posted {
     message_id: MessageId,
-    job_id: Option<JobId>,
+    job_id: JobId,
 }
 
 pub(crate) async fn post_message(
@@ -133,25 +134,7 @@ pub(crate) async fn post_message(
     ApiJson(post): ApiJson<UserPost>,
 ) -> Result<(StatusCode, Json<Posted>), ApiError> {
     let thread = route_path(path)?.thread_id;
-    message::validate_user_post(&post.body, post.client_msg_id.as_deref())?;
-    let appended = message::append(
-        &mut *state.core.pool.acquire().await.map_err(KatError::from)?,
-        &tenant,
-        thread,
-        NewMessage {
-            id: None,
-            author: Author::User(tenant.user_id()),
-            body: post.body,
-            client_msg_id: post.client_msg_id,
-            idempotency_key: None,
-            synthetic: false,
-            stopped: false,
-            question: None,
-            meta: None,
-            job_id: None,
-        },
-    )
-    .await?;
+    let appended = pipeline::submit(&state.core, &tenant, thread, post).await?;
     Ok((
         if appended.created {
             StatusCode::CREATED
@@ -159,8 +142,8 @@ pub(crate) async fn post_message(
             StatusCode::OK
         },
         Json(Posted {
-            message_id: appended.message.id,
-            job_id: appended.message.job_id,
+            message_id: appended.message_id,
+            job_id: appended.job_id,
         }),
     ))
 }

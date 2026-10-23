@@ -4,6 +4,37 @@ use sqlx::{Connection, PgConnection, PgPool, Row, migrate::Migrator, postgres::P
 
 use crate::error::KatError;
 
+/// A cancelled SQL future must never return a possibly open transaction to the pool.
+pub(crate) struct GuardedConnection {
+    connection: sqlx::pool::PoolConnection<sqlx::Postgres>,
+    complete: bool,
+}
+
+impl GuardedConnection {
+    pub(crate) async fn acquire(pool: &PgPool) -> Result<Self, KatError> {
+        Ok(Self {
+            connection: pool.acquire().await?,
+            complete: false,
+        })
+    }
+
+    pub(crate) fn connection(&mut self) -> &mut PgConnection {
+        &mut self.connection
+    }
+
+    pub(crate) fn release(mut self) {
+        self.complete = true;
+    }
+}
+
+impl Drop for GuardedConnection {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.connection.close_on_drop();
+        }
+    }
+}
+
 pub async fn set_lock_timeout(conn: &mut PgConnection, timeout: Duration) -> Result<(), KatError> {
     sqlx::query("SELECT set_config('lock_timeout', $1, true)")
         .bind(format!("{}ms", timeout.as_millis().max(1)))

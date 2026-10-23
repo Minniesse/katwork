@@ -136,35 +136,7 @@ pub(crate) async fn close_locked_run(
     code: &str,
 ) -> Result<EventSeq, KatError> {
     let code = code.replace('\0', "\u{fffd}");
-    for call in calls {
-        log::append(
-            tx,
-            workspace,
-            thread,
-            Some(run),
-            &AgUiEvent::ToolCallResult {
-                message_id: MessageId::new().to_string(),
-                tool_call_id: call.to_string(),
-                content: code.clone(),
-            },
-        )
-        .await?;
-        log::append(
-            tx,
-            workspace,
-            thread,
-            Some(run),
-            &KatworkEvent::ToolStatus(ToolStatusEvent {
-                tool_call_id: *call,
-                ok: false,
-                code: Some(code.clone()),
-            })
-            .into(),
-        )
-        .await?;
-        sqlx::query("UPDATE tool_calls SET state='outcome_unknown', result=$3, ended_at=now() WHERE workspace_id=$1 AND id=$2")
-                .bind(workspace).bind(*call).bind(&code).execute(&mut **tx).await?;
-    }
+    close_locked_calls(tx, workspace, thread, run, calls, &code).await?;
     log::append(
         tx,
         workspace,
@@ -196,4 +168,46 @@ pub(crate) async fn close_locked_run(
         .execute(&mut **tx)
         .await?;
     Ok(seq)
+}
+
+/// Caller has locked the task, run, calls, and thread in global order.
+pub(crate) async fn close_locked_calls(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace: WorkspaceId,
+    thread: ThreadId,
+    run: RunId,
+    calls: &[ToolCallRecordId],
+    code: &str,
+) -> Result<(), KatError> {
+    let code = code.replace('\0', "\u{fffd}");
+    for call in calls {
+        log::append(
+            tx,
+            workspace,
+            thread,
+            Some(run),
+            &AgUiEvent::ToolCallResult {
+                message_id: MessageId::new().to_string(),
+                tool_call_id: call.to_string(),
+                content: code.clone(),
+            },
+        )
+        .await?;
+        log::append(
+            tx,
+            workspace,
+            thread,
+            Some(run),
+            &KatworkEvent::ToolStatus(ToolStatusEvent {
+                tool_call_id: *call,
+                ok: false,
+                code: Some(code.clone()),
+            })
+            .into(),
+        )
+        .await?;
+        sqlx::query("UPDATE tool_calls SET state='outcome_unknown', result=$3, ended_at=now() WHERE workspace_id=$1 AND id=$2")
+                .bind(workspace).bind(*call).bind(&code).execute(&mut **tx).await?;
+    }
+    Ok(())
 }

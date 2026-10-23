@@ -54,7 +54,7 @@ function MessageItem({ message, katName }: { message: ChatMessage; katName: Prop
   const kind = message.author?.kind ?? 'kat';
   // A system notice's body is a reason code (plan Task 10).
   const noticeKey = `reason.${message.body}`;
-  const body = kind === 'system' && hasMessage(noticeKey) ? t(noticeKey) : message.body;
+  const body = kind === 'system' && hasMessage(noticeKey) ? t(noticeKey, { name: message.meta?.kats.map((kat) => kat.name).join(', ') ?? '' }) : message.body;
   return (
     <li className={`message message-${kind}`} data-provisional={message.provisional || undefined}>
       <p className="message-meta">

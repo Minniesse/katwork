@@ -9,6 +9,7 @@ pub mod fence;
 pub mod ids;
 pub mod jobs;
 pub mod models;
+pub mod pipeline;
 pub mod policy;
 pub mod runtime;
 pub mod team;
