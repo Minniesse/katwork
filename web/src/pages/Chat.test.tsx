@@ -103,7 +103,10 @@ async function pingFor(source: FakeEventSource, ms: number) {
   }
 }
 
-const log = () => screen.getByRole('log', { name: en['chat.transcript'] });
+// The conversation as a list in message-id order; the log announces only new arrivals.
+const list = () => screen.getByRole('list', { name: en['chat.transcript'] });
+const log = () => screen.getByRole('log', { name: en['chat.new_messages'] });
+const announced = () => [...log().children].map((node) => node.textContent);
 // Every bubble on screen: the live log, and the older pages listed above it.
 const bodies = () =>
   [...document.querySelectorAll('.transcript .message-body')].map((node) => node.textContent);
@@ -160,8 +163,13 @@ describe('posting and streaming', () => {
       ev.runFinished('run-1'),
     ]);
     expect(bodies()).toEqual(['สวัสดีครับ', 'สวัสดีค่ะ 👋🏽 มีอะไรให้ช่วยไหมคะ']);
-    expect(within(log()).getAllByRole('listitem')).toHaveLength(2);
+    expect(within(list()).getAllByRole('listitem')).toHaveLength(2);
     expect(screen.queryByRole('button', { name: en['chat.stop'] })).toBeNull();
+    // The person's own post and the finished reply are each announced once.
+    expect(announced()).toEqual([
+      `${en['chat.author.you']}: สวัสดีครับ`,
+      'หัวหน้าทีม: สวัสดีค่ะ 👋🏽 มีอะไรให้ช่วยไหมคะ',
+    ]);
   });
 
   test('optimistic_bubble_rekeys_on_message_stored_before_post_returns', async () => {
@@ -219,7 +227,7 @@ describe('posting and streaming', () => {
       ev.jobStatus('job-1', null),
       ev.userStored(SECOND, 'From my other tab', { userId: ME, authorName: 'Pat', jobId: 'job-2' }),
     ]);
-    const [theirs, mine] = within(log()).getAllByRole('listitem');
+    const [theirs, mine] = within(list()).getAllByRole('listitem');
     expect(within(theirs!).getByText('สมชาย')).toBeVisible();
     expect(within(mine!).getByText(en['chat.author.you'])).toBeVisible();
     // Another member's job is shown as work in progress, without Stop.
@@ -858,7 +866,7 @@ describe('questions', () => {
     expect(posts[0]!.body).toEqual({ body: 'Word', client_msg_id: expect.stringMatching(UUID_V4) });
     for (const option of within(group).getAllByRole('button')) expect(option).toBeDisabled();
     // The answer shows as the person's message.
-    const answer = within(log())
+    const answer = within(list())
       .getAllByText('Word')
       .map((node) => node.closest('li')!)
       .at(-1)!;
@@ -914,7 +922,11 @@ describe('Kat status', () => {
       ev.textStart(REPLY),
       ev.text(REPLY, 'A sample'),
     ]);
-    const bubble = () => screen.getByText(/A sample/).closest('li')!;
+    // Found by its place in the list, which keeps working after the locale switch.
+    const bubble = () =>
+      [...document.querySelectorAll('.transcript-list .message-body')]
+        .find((node) => /A sample/.test(node.textContent ?? ''))!
+        .closest('li')!;
     expect(within(bubble()).getByText(en['chat.synthetic_badge'])).toBeInTheDocument();
     act(() => setLocale('th'));
     expect(within(bubble()).getByText(th['chat.synthetic_badge'])).toBeInTheDocument();
@@ -932,7 +944,7 @@ describe('Kat status', () => {
       ev.text(NOTICE, 'A real reply'),
     ]);
     expect(
-      within(screen.getByText('A real reply').closest('li')!).queryByText(
+      within(within(list()).getByText('A real reply').closest('li')!).queryByText(
         en['chat.synthetic_badge'],
       ),
     ).toBeNull();
@@ -1070,13 +1082,9 @@ describe('Kat status', () => {
     ]);
     const streaming = screen.getByText('Streaming words').closest('li')!;
     expect(streaming).toHaveAttribute('aria-hidden', 'true');
-    expect(
-      within(log())
-        .getAllByRole('listitem')
-        .map((item) => item.textContent),
-    ).toEqual([expect.stringContaining('Hello')]);
+    expect(announced()).toEqual([`${en['chat.author.you']}: Hello`]);
     stream(source, 5, [ev.stored(REPLY, 'Stored words', { author: { kind: 'kat', id: LEAD } })]);
-    expect(within(log()).getAllByRole('listitem')).toHaveLength(2);
+    expect(announced()).toEqual([`${en['chat.author.you']}: Hello`, 'หัวหน้าทีม: Stored words']);
   });
 
   test('typing_status_role_status', async () => {
@@ -1154,7 +1162,7 @@ describe('history', () => {
     expect(bodies()).toHaveLength(50);
 
     // jsdom has no layout: give the scroller a height that grows with its messages.
-    const scroller = log().closest('.transcript-content')!.parentElement!;
+    const scroller = list().closest('.transcript-content')!.parentElement!;
     let top = 120;
     Object.defineProperty(scroller, 'scrollHeight', {
       configurable: true,
@@ -1172,19 +1180,17 @@ describe('history', () => {
     await waitFor(() => expect(bodies()).toHaveLength(100));
     expect(calls.callsTo(MESSAGES).at(-1)!.path).toContain(`before=${id(51)}`);
     expect(bodies()[0]).toBe('message 1');
-    // The older page sits above the live log, so a screen reader is not read 50 messages; one
-    // line says what arrived.
-    expect(within(log()).getAllByRole('listitem')).toHaveLength(50);
-    expect(within(log()).queryByText('message 1')).toBeNull();
-    const older = screen.getByRole('list', { name: en['chat.earlier_list'] });
-    expect(older.closest('[aria-live]')).toBeNull();
-    expect(within(older).getAllByRole('listitem')).toHaveLength(50);
+    // One list in id order, outside any live region: a screen reader is not read 50 old
+    // messages; one line says what arrived.
+    expect(within(list()).getAllByRole('listitem')).toHaveLength(100);
+    expect(list().closest('[aria-live]')).toBeNull();
+    expect(announced()).toEqual([]);
     expect(
-      screen.getByText(en['chat.earlier_loaded'].replace('{count}', '50')),
+      screen.getByText(en['chat.earlier_loaded.other'].replace('{count}', '50')),
     ).toBeInTheDocument();
     act(() => setLocale('th'));
     expect(
-      screen.getByText(th['chat.earlier_loaded'].replace('{count}', '50')),
+      screen.getByText(th['chat.earlier_loaded.other'].replace('{count}', '50')),
     ).toBeInTheDocument();
     act(() => setLocale('en'));
     // The message that was in view stays in view: 880 px from the bottom, before and after.
@@ -1238,6 +1244,91 @@ describe('history', () => {
     // The older page never overwrites what the stream said since: no stale body, no Stop.
     expect(screen.queryByText('Draft answer')).toBeNull();
     expect(screen.queryByRole('button', { name: en['chat.stop'] })).toBeNull();
+  });
+
+  // A slow run's reply 25 was minted before the first page (51-100) and stored late, so the
+  // REST page of older messages may or may not hold it.
+  const withoutReply = () => messages(1, 50).filter((message) => message.id !== id(25));
+  const lateReply = () =>
+    ev.stored(id(25), 'Late reply', {
+      author: { kind: 'kat', id: LEAD },
+      authorName: 'หัวหน้าทีม',
+    });
+
+  test('a_reply_stored_after_an_older_page_keeps_message_id_order', async () => {
+    const calls = api();
+    calls.route(MESSAGES, ({ path }) => {
+      const before = new URL(path, 'http://localhost').searchParams.get('before');
+      return before === null ? page(messages(51, 100), 3) : page(withoutReply(), 3);
+    });
+    const user = userEvent.setup({ delay: null });
+    const { source } = await openThread();
+    await user.click(screen.getByRole('button', { name: en['chat.earlier'] }));
+    await waitFor(() => expect(bodies()).toHaveLength(99));
+    expect(announced()).toEqual([]);
+
+    stream(source, 4, [lateReply()]);
+    expect(bodies().slice(23, 26)).toEqual(['message 24', 'Late reply', 'message 26']);
+    expect(bodies()).toHaveLength(100);
+    // Only the new arrival is announced, never the history around it.
+    expect(announced()).toEqual(['หัวหน้าทีม: Late reply']);
+  });
+
+  test('a_reply_stored_during_an_older_page_request_keeps_message_id_order', async () => {
+    const held = deferred<Reply>();
+    const calls = api();
+    calls.route(MESSAGES, ({ path }) => {
+      const before = new URL(path, 'http://localhost').searchParams.get('before');
+      return before === null ? page(messages(51, 100), 3) : held.promise;
+    });
+    const user = userEvent.setup({ delay: null });
+    const { source } = await openThread();
+    await user.click(screen.getByRole('button', { name: en['chat.earlier'] }));
+    // The page was read before the reply was stored, so it lacks it.
+    stream(source, 4, [lateReply()]);
+    expect(announced()).toEqual(['หัวหน้าทีม: Late reply']);
+    await act(async () => held.resolve(page(withoutReply(), 3)));
+    await waitFor(() => expect(bodies()).toHaveLength(100));
+    expect(bodies().slice(23, 26)).toEqual(['message 24', 'Late reply', 'message 26']);
+    expect(announced()).toEqual(['หัวหน้าทีม: Late reply']);
+  });
+
+  test('every_full_older_page_is_announced', async () => {
+    const held = deferred<Reply>();
+    const calls = api();
+    calls.route(MESSAGES, ({ path }) => {
+      const before = new URL(path, 'http://localhost').searchParams.get('before');
+      if (before === null) return page(messages(101, 150), 3);
+      if (before === id(101)) return page(messages(51, 100), 3);
+      return held.promise;
+    });
+    const user = userEvent.setup({ delay: null });
+    await openThread();
+    const loaded = en['chat.earlier_loaded.other'].replace('{count}', '50');
+    const status = () => screen.getByTestId('earlier-status');
+    await user.click(screen.getByRole('button', { name: en['chat.earlier'] }));
+    await waitFor(() => expect(status()).toHaveTextContent(loaded));
+
+    // The same count again must still change the status, or a screen reader stays silent.
+    await user.click(screen.getByRole('button', { name: en['chat.earlier'] }));
+    expect(status()).toHaveTextContent('');
+    await act(async () => held.resolve(page(messages(1, 50), 3)));
+    await waitFor(() => expect(status()).toHaveTextContent(loaded));
+    expect(bodies()).toHaveLength(150);
+  });
+
+  test('a_single_earlier_message_is_announced_in_the_singular', async () => {
+    const calls = api();
+    calls.route(MESSAGES, ({ path }) => {
+      const before = new URL(path, 'http://localhost').searchParams.get('before');
+      return before === null ? page(messages(2, 51), 3) : page(messages(1, 1), 3);
+    });
+    const user = userEvent.setup({ delay: null });
+    await openThread();
+    await user.click(screen.getByRole('button', { name: en['chat.earlier'] }));
+    expect(await screen.findByText('1 earlier message loaded')).toBeInTheDocument();
+    act(() => setLocale('th'));
+    expect(screen.getByText('โหลดข้อความก่อนหน้าแล้ว 1 ข้อความ')).toBeInTheDocument();
   });
 
   test('a_short_conversation_offers_no_earlier_messages', async () => {

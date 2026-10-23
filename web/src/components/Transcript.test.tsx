@@ -13,6 +13,17 @@ const messagesFrom = (events: Parameters<typeof numbered>[0]) =>
   transcriptMessages(numbered(events).reduce(foldEvent, emptyTranscript()));
 
 test('transcript_is_live_region', () => {
+  const first = messagesFrom([ev.userStored('u1', 'Hello')]);
+  const { rerender } = render(<Transcript messages={first} />);
+  // The conversation is a list in message-id order; the log announces new arrivals only.
+  const list = screen.getByRole('list', { name: en['chat.transcript'] });
+  const log = screen.getByRole('log', { name: en['chat.new_messages'] });
+  expect(log).toHaveAttribute('aria-live', 'polite');
+  expect(log).toHaveAttribute('aria-relevant', 'additions');
+  expect(list.closest('[aria-live]')).toBeNull();
+  // What was there when the page loaded is not announced.
+  expect(log).toBeEmptyDOMElement();
+
   const streaming = messagesFrom([
     ev.userStored('u1', 'Hello'),
     ev.runStarted('r1'),
@@ -20,21 +31,15 @@ test('transcript_is_live_region', () => {
     ev.textStart('u2'),
     ev.text('u2', 'Hi'),
   ]);
-  const { rerender } = render(<Transcript messages={streaming} />);
-  const log = screen.getByRole('log', { name: en['chat.transcript'] });
-  expect(log).toHaveAttribute('aria-live', 'polite');
-  expect(log).toHaveAttribute('aria-relevant', 'additions');
-  // Streaming text is hidden from assistive tech; the stored message is announced once.
-  expect(within(log).getAllByRole('listitem')).toHaveLength(1);
-  const streamingNode = within(log).getByText('Hi').closest('li')!;
-  expect(streamingNode).toHaveAttribute('aria-hidden', 'true');
+  rerender(<Transcript messages={streaming} />);
+  // Streaming text is hidden from assistive tech and never announced.
+  expect(within(list).getByText('Hi').closest('li')).toHaveAttribute('aria-hidden', 'true');
+  expect(log).toBeEmptyDOMElement();
 
   const done = messagesFrom([ev.userStored('u1', 'Hello'), ev.stored('u2', 'Hi there')]);
   rerender(<Transcript messages={done} />);
-  expect(within(log).getAllByRole('listitem')).toHaveLength(2);
-  const storedNode = within(log).getByText('Hi there').closest('li')!;
-  expect(storedNode).not.toBe(streamingNode);
-  expect(storedNode).not.toHaveAttribute('aria-hidden');
+  expect([...log.children].map((node) => node.textContent)).toEqual(['Kat: Hi there']);
+  expect(within(list).getAllByRole('listitem')).toHaveLength(2);
 });
 
 test('synthetic_reply_shows_badge', () => {
@@ -49,9 +54,11 @@ test('synthetic_reply_shows_badge', () => {
 
   const real = messagesFrom([ev.stored('m1', 'Here is a sample reply.', { synthetic: false })]);
   rerender(<Transcript messages={real} />);
-  expect(within(screen.getByText('Here is a sample reply.').closest('li')!).queryByText(
-    th['chat.synthetic_badge'],
-  )).toBeNull();
+  expect(
+    within(screen.getByText('Here is a sample reply.').closest('li')!).queryByText(
+      th['chat.synthetic_badge'],
+    ),
+  ).toBeNull();
 });
 
 test('system_notice_shows_localized_reason', () => {
@@ -69,21 +76,55 @@ test('pause_notices_distinguish_stopped_work_from_queued_work_in_both_locales', 
     ev.notice('approval', 'approval_pending'),
   ]);
   render(<Transcript messages={messages} />);
-  expect(screen.getByText("Your admin has paused the Kats in this workspace. The work waits until they're resumed.")).toBeVisible();
-  expect(screen.getByText('Stopped because the Kats in this workspace were paused. Send the request again after they resume.')).toBeVisible();
-  expect(screen.getByText('Stopped because this Kat was paused. Send the request again after it resumes, or ask another Kat.')).toBeVisible();
-  expect(screen.getByText('This action needs approval. Approving actions is not available yet, so this request has ended.')).toBeVisible();
+  expect(
+    screen.getByText(
+      "Your admin has paused the Kats in this workspace. The work waits until they're resumed.",
+    ),
+  ).toBeVisible();
+  expect(
+    screen.getByText(
+      'Stopped because the Kats in this workspace were paused. Send the request again after they resume.',
+    ),
+  ).toBeVisible();
+  expect(
+    screen.getByText(
+      'Stopped because this Kat was paused. Send the request again after it resumes, or ask another Kat.',
+    ),
+  ).toBeVisible();
+  expect(
+    screen.getByText(
+      'This action needs approval. Approving actions is not available yet, so this request has ended.',
+    ),
+  ).toBeVisible();
 
   act(() => setLocale('th'));
-  expect(screen.getByText('ผู้ดูแลระบบหยุด Kats ในเวิร์กสเปซนี้ไว้ชั่วคราว งานจะรอจนกว่าจะเปิดใช้อีกครั้ง')).toBeVisible();
-  expect(screen.getByText('งานหยุดแล้ว เพราะ Kats ในเวิร์กสเปซนี้ถูกหยุดไว้ชั่วคราว โปรดส่งคำขออีกครั้งเมื่อเปิดใช้แล้ว')).toBeVisible();
-  expect(screen.getByText('งานหยุดแล้ว เพราะ Kat ที่รับงานนี้ถูกหยุดไว้ชั่วคราว โปรดส่งคำขออีกครั้งเมื่อเปิดใช้แล้ว หรือขอให้ Kat อื่นช่วยแทน')).toBeVisible();
-  expect(screen.getByText('ขั้นตอนนี้ต้องได้รับอนุมัติ แต่ยังไม่มีระบบอนุมัติ คำขอนี้จึงจบแล้ว')).toBeVisible();
+  expect(
+    screen.getByText(
+      'ผู้ดูแลระบบหยุด Kats ในเวิร์กสเปซนี้ไว้ชั่วคราว งานจะรอจนกว่าจะเปิดใช้อีกครั้ง',
+    ),
+  ).toBeVisible();
+  expect(
+    screen.getByText(
+      'งานหยุดแล้ว เพราะ Kats ในเวิร์กสเปซนี้ถูกหยุดไว้ชั่วคราว โปรดส่งคำขออีกครั้งเมื่อเปิดใช้แล้ว',
+    ),
+  ).toBeVisible();
+  expect(
+    screen.getByText(
+      'งานหยุดแล้ว เพราะ Kat ที่รับงานนี้ถูกหยุดไว้ชั่วคราว โปรดส่งคำขออีกครั้งเมื่อเปิดใช้แล้ว หรือขอให้ Kat อื่นช่วยแทน',
+    ),
+  ).toBeVisible();
+  expect(
+    screen.getByText('ขั้นตอนนี้ต้องได้รับอนุมัติ แต่ยังไม่มีระบบอนุมัติ คำขอนี้จึงจบแล้ว'),
+  ).toBeVisible();
 });
 
 test('kat_messages_use_the_given_kat_name', () => {
-  const messages = messagesFrom([ev.stored('m1', 'Done.', { author: { kind: 'kat', id: 'kat-a' } })]);
-  render(<Transcript messages={messages} katName={(id) => (id === 'kat-a' ? 'Mali' : undefined)} />);
+  const messages = messagesFrom([
+    ev.stored('m1', 'Done.', { author: { kind: 'kat', id: 'kat-a' } }),
+  ]);
+  render(
+    <Transcript messages={messages} katName={(id) => (id === 'kat-a' ? 'Mali' : undefined)} />,
+  );
   expect(screen.getByText('Mali')).toBeInTheDocument();
 });
 
@@ -107,7 +148,9 @@ test('people_are_named_and_the_signed_in_person_is_you', () => {
     ev.userStored('m2', 'Theirs', { userId: 'user-2', authorName: 'สมชาย' }),
   ]);
   render(<Transcript messages={messages} me="user-1" />);
-  expect(within(screen.getByText('Mine').closest('li')!).getByText(en['chat.author.you'])).toBeVisible();
+  expect(
+    within(screen.getByText('Mine').closest('li')!).getByText(en['chat.author.you']),
+  ).toBeVisible();
   expect(within(screen.getByText('Theirs').closest('li')!).getByText('สมชาย')).toBeVisible();
 });
 
@@ -134,5 +177,9 @@ test('question_options_are_buttons_only_for_the_active_question', () => {
   expect(within(first!).queryAllByRole('button')).toHaveLength(0);
   expect(within(first!).getByText('PDF')).toBeVisible();
   const group = within(second!).getByRole('group', { name: en['chat.question_options'] });
-  expect(within(group).getAllByRole('button').map((button) => button.textContent)).toEqual(['PDF', 'Word']);
+  expect(
+    within(group)
+      .getAllByRole('button')
+      .map((button) => button.textContent),
+  ).toEqual(['PDF', 'Word']);
 });

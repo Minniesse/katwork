@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import en from './en.json';
 import th from './th.json';
-import { formatDate, getLocale, initialLocale, setLocale, t } from './index';
+import { formatDate, getLocale, initialLocale, setLocale, t, tPlural } from './index';
 
 // Mirrors katwork::types::ReasonCode::ALL; the Rust test in
 // crates/katwork-server/tests/i18n.rs checks the same keys against the enum itself.
@@ -153,6 +153,16 @@ describe('t', () => {
 
   test('unknown_key_returns_the_key', () => {
     expect(t('no.such.key')).toBe('no.such.key');
+  });
+});
+
+describe('plural', () => {
+  test('english_counts_one_and_other_and_thai_has_one_form', () => {
+    expect(tPlural('chat.earlier_loaded', 1)).toBe('1 earlier message loaded');
+    expect(tPlural('chat.earlier_loaded', 50)).toBe('50 earlier messages loaded');
+    setLocale('th');
+    expect(tPlural('chat.earlier_loaded', 1)).toBe('โหลดข้อความก่อนหน้าแล้ว 1 ข้อความ');
+    expect(tPlural('chat.earlier_loaded', 50)).toBe('โหลดข้อความก่อนหน้าแล้ว 50 ข้อความ');
   });
 });
 

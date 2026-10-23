@@ -62,6 +62,17 @@ export function t(key: string, vars?: Vars): string {
   );
 }
 
+/**
+ * A message that depends on a count: `{key}.{plural category}` (`one`, `other`, …) for the
+ * current locale, falling back to `{key}.other`, with `{count}` filled. English says "1 earlier
+ * message", Thai has one form.
+ */
+export function tPlural(key: string, count: number, vars?: Vars): string {
+  const category = new Intl.PluralRules(current === 'th' ? 'th-TH' : 'en-GB').select(count);
+  const variant = `${key}.${category}`;
+  return t(hasMessage(variant) ? variant : `${key}.other`, { ...vars, count });
+}
+
 /** Gregorian by default (UI chrome); pass `calendar: 'buddhist'` where a template asks for the Buddhist Era. */
 export function formatDate(
   date: Date | string | number,

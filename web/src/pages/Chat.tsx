@@ -288,9 +288,9 @@ function Conversation({
   // pages move it; a live reply minted long ago (an id older than the first page) must not, or
   // the history between them would never load.
   const historyCursor = useRef<string | null>(null);
-  // Messages that came from older pages: listed above the live log, so a screen reader is not
-  // read a whole page; `earlierLoaded` announces how many arrived instead.
-  const [older, setOlder] = useState<ReadonlySet<string>>(new Set());
+  // Ids from history, the snapshot and older pages: listed in id order like the rest, but never
+  // announced as new; `earlierLoaded` says how many each older page brought instead.
+  const [history, setHistory] = useState<ReadonlySet<string>>(new Set());
   const [earlierLoaded, setEarlierLoaded] = useState<number | null>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
   const cancelling = useRef(new Set<string>());
@@ -310,7 +310,7 @@ function Conversation({
         dispatch({ type: 'snapshot', page });
         setEarlier(page.messages.length >= MESSAGE_PAGE ? 'more' : 'none');
         historyCursor.current = page.messages[0]?.id ?? null;
-        setOlder(new Set());
+        setHistory(new Set(page.messages.map((message) => message.id)));
         setEarlierLoaded(null);
         setSnapshots((n) => n + 1);
       },
@@ -493,11 +493,14 @@ function Conversation({
     const before = historyCursor.current;
     if (!before || earlier !== 'more') return;
     setEarlier('loading');
+    // Cleared now and set when the page lands, so a second page of the same size still changes
+    // the status line and is announced.
+    setEarlierLoaded(null);
     try {
       const page = await api.messages(workspaceId, threadId, before);
       dispatch({ type: 'earlier', messages: page.messages });
       historyCursor.current = page.messages[0]?.id ?? before;
-      setOlder((ids) => new Set([...ids, ...page.messages.map((message) => message.id)]));
+      setHistory((ids) => new Set([...ids, ...page.messages.map((message) => message.id)]));
       setEarlierLoaded(page.messages.length);
       setEarlier(page.messages.length >= MESSAGE_PAGE ? 'more' : 'start');
     } catch (error) {
@@ -574,7 +577,7 @@ function Conversation({
         onOption={answer}
         onRetry={retry}
         earlier={earlier}
-        older={older}
+        history={history}
         earlierLoaded={earlierLoaded}
         onEarlier={loadEarlier}
       />

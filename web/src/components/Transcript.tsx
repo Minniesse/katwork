@@ -1,9 +1,10 @@
 import { useEffect, useLayoutEffect, useRef } from 'react';
 import { StickToBottom, useStickToBottomContext } from 'use-stick-to-bottom';
-import { formatTime, hasMessage, t, useLocale } from '../i18n';
+import { formatTime, hasMessage, t, tPlural, useLocale } from '../i18n';
 import type { ChatMessage } from '../sse';
 
-const NONE: ReadonlySet<string> = new Set();
+/** How many recent arrivals the announcer keeps; older lines can go, removals are silent. */
+const ANNOUNCED = 20;
 
 /** The person's own post before the server confirmed it, keyed by its `client_msg_id`. */
 export interface PendingMessage {
@@ -33,17 +34,22 @@ interface Props {
   onRetry?: (clientMsgId: string) => void;
   earlier?: Earlier;
   onEarlier?: () => void | Promise<void>;
-  /** Ids loaded by "Show earlier messages": listed above the live log, outside it. */
-  older?: ReadonlySet<string>;
-  /** How many messages the last older page brought, announced once. */
+  /**
+   * Ids that came from history (the page's first load and "Show earlier messages"): shown in
+   * the list but never announced. Defaults to the ids of the first render.
+   */
+  history?: ReadonlySet<string>;
+  /** How many messages the last older page brought, announced once per page. */
   earlierLoaded?: number | null;
 }
 
 /**
- * The conversation. The `log` region holds stored messages only: text still streaming sits in
- * the same list, in id order, but hidden from assistive tech, and the stored message replaces
- * it as a new node, so a screen reader hears each finished message once. Scrolling follows new
- * content until the person scrolls up.
+ * The conversation: one list in message-id order, history and live arrivals alike, so a reply
+ * stored late still sits between its neighbours. The list itself is not a live region. A
+ * separate, visually hidden `log` announces each genuinely new stored message once ("author:
+ * text"), and never history, so loading older pages reads nothing out but one count line.
+ * Text still streaming is hidden from assistive tech. Scrolling follows new content until the
+ * person scrolls up.
  */
 export function Transcript({
   messages,
@@ -56,10 +62,16 @@ export function Transcript({
   onRetry,
   earlier = 'none',
   onEarlier,
-  older = NONE,
+  history,
   earlierLoaded = null,
 }: Props) {
   useLocale();
+  const firstRender = useRef<ReadonlySet<string> | null>(null);
+  firstRender.current ??= new Set(messages.map((message) => message.id));
+  const known = history ?? firstRender.current;
+  const arrivals = messages
+    .filter((message) => !message.provisional && !known.has(message.id))
+    .slice(-ANNOUNCED);
   const empty = messages.length === 0 && pending.length === 0;
   const item = (message: ChatMessage) => (
     <MessageItem
@@ -74,38 +86,37 @@ export function Transcript({
       }
     />
   );
-  const history = messages.filter((message) => older.has(message.id));
-  const live = messages.filter((message) => !older.has(message.id));
   return (
     <StickToBottom className="transcript" initial="instant" resize="smooth">
       <StickToBottom.Content className="transcript-content">
         <EarlierMessages earlier={earlier} onEarlier={onEarlier} count={messages.length} />
-        <p className="sr-only" role="status">
+        <p className="sr-only" role="status" data-testid="earlier-status">
           {earlierLoaded !== null &&
             earlierLoaded > 0 &&
-            t('chat.earlier_loaded', { count: earlierLoaded })}
+            tPlural('chat.earlier_loaded', earlierLoaded)}
         </p>
-        {history.length > 0 && (
-          <ol className="transcript-list transcript-older" aria-label={t('chat.earlier_list')}>
-            {history.map(item)}
+        {empty ? (
+          <p className="transcript-empty">{t('chat.empty')}</p>
+        ) : (
+          <ol className="transcript-list" aria-label={t('chat.transcript')}>
+            {messages.map(item)}
+            {pending.map((post) => (
+              <PendingItem key={post.clientMsgId} post={post} onRetry={onRetry} />
+            ))}
           </ol>
         )}
         <div
+          className="sr-only"
           role="log"
           aria-live="polite"
           aria-relevant="additions"
-          aria-label={t('chat.transcript')}
+          aria-label={t('chat.new_messages')}
         >
-          {empty ? (
-            <p className="transcript-empty">{t('chat.empty')}</p>
-          ) : (
-            <ol className="transcript-list">
-              {live.map(item)}
-              {pending.map((post) => (
-                <PendingItem key={post.clientMsgId} post={post} onRetry={onRetry} />
-              ))}
-            </ol>
-          )}
+          {arrivals.map((message) => (
+            <p key={message.id}>
+              {authorName(message, me, katName)}: {messageText(message)}
+            </p>
+          ))}
         </div>
       </StickToBottom.Content>
       <JumpToLatest />
@@ -204,6 +215,10 @@ function noticeText(message: ChatMessage): string {
   return hasMessage(key) ? t(key) : message.body;
 }
 
+function messageText(message: ChatMessage): string {
+  return message.author?.kind === 'system' ? noticeText(message) : message.body;
+}
+
 function MessageItem({
   message,
   me,
@@ -238,7 +253,7 @@ function MessageItem({
           </time>
         )}
       </p>
-      <p className="message-body">{kind === 'system' ? noticeText(message) : message.body}</p>
+      <p className="message-body">{messageText(message)}</p>
       {kind === 'system' && kats.length > 0 && (
         <p className="message-about">
           {t('chat.notice_about', { names: kats.map((kat) => kat.name).join(', ') })}
