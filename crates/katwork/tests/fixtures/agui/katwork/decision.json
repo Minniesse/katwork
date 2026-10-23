@@ -1,0 +1,14 @@
+{
+  "name": "katwork.decision",
+  "value": {
+    "jobId": "00000000-0000-0000-0000-000000000001",
+    "inputs": {
+      "synthetic": true
+    },
+    "verdict": {
+      "status": "answered"
+    },
+    "policyVersion": 1,
+    "thresholds": {}
+  }
+}

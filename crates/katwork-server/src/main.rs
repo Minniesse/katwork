@@ -79,9 +79,12 @@ async fn run() -> Result<(), KatError> {
             let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
             katwork_server::transport::serve_with_shutdown(
                 listener,
-                build_router(AppState { core }),
+                build_router(AppState { core: core.clone() }),
                 transport,
-                shutdown_signal(),
+                async move {
+                    shutdown_signal().await;
+                    core.shutdown.cancel();
+                },
             )
             .await?;
             Ok(())

@@ -612,10 +612,7 @@ async fn fence_locks_last_until_commit_and_allow_foreign_keys(pool: PgPool) {
         .unwrap();
     sqlx::query("INSERT INTO runs (id, workspace_id, job_id, task_id, kat_id, kind, lease_epoch, kat_config_hash, state) VALUES ($1, $2, $3, $4, $5, 'recovery', 1, 'hash', 'running')").bind(Uuid::now_v7()).bind(f.workspace).bind(f.job).bind(f.task).bind(f.kat).execute(&mut *blocked).await.unwrap();
     let error = fence::check(&mut blocked, &fence).await.unwrap_err();
-    let katwork::error::KatError::Database(error) = error else {
-        panic!("expected database lock timeout")
-    };
-    sqlstate(error, "55P03");
+    assert!(matches!(error, katwork::error::KatError::Busy));
     blocked.rollback().await.unwrap();
     sqlx::query("UPDATE tasks SET state = 'done' WHERE id = $1")
         .bind(f.task)

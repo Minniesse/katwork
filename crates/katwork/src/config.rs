@@ -6,11 +6,11 @@ use url::Url;
 use crate::error::KatError;
 
 pub struct Config {
+    pub lock_timeout: Duration,
     pub database_url: String,
     pub secret: String,
     pub demo: bool,
     pub transport: TransportConfig,
-    pub trusted_proxies: Vec<(IpAddr, u8)>,
     pub public_url: Option<String>,
     pub demo_password: Option<String>,
     pub smtp: Option<SmtpConfig>,
@@ -24,6 +24,8 @@ pub struct TransportConfig {
     pub idle_timeout: Duration,
     pub max_connections: usize,
     pub max_connections_per_ip: usize,
+    /// Trusted proxy socket peers share the global budget, not a per-peer budget.
+    pub trusted_proxies: Vec<(IpAddr, u8)>,
 }
 
 impl Default for TransportConfig {
@@ -33,7 +35,26 @@ impl Default for TransportConfig {
             idle_timeout: Duration::from_secs(60),
             max_connections: 256,
             max_connections_per_ip: 32,
+            trusted_proxies: Vec::new(),
         }
+    }
+}
+
+impl TransportConfig {
+    pub fn trusts_proxy(&self, ip: IpAddr) -> bool {
+        self.trusted_proxies
+            .iter()
+            .any(|(network, prefix)| match (network, ip) {
+                (IpAddr::V4(network), IpAddr::V4(ip)) => {
+                    let shift = 32 - u32::from(*prefix);
+                    u32::from(*network).checked_shr(shift) == u32::from(ip).checked_shr(shift)
+                }
+                (IpAddr::V6(network), IpAddr::V6(ip)) => {
+                    let shift = 128 - u32::from(*prefix);
+                    u128::from(*network).checked_shr(shift) == u128::from(ip).checked_shr(shift)
+                }
+                _ => false,
+            })
     }
 }
 
@@ -232,19 +253,7 @@ impl Config {
     }
 
     pub fn trusts_proxy(&self, ip: IpAddr) -> bool {
-        self.trusted_proxies
-            .iter()
-            .any(|(network, prefix)| match (network, ip) {
-                (IpAddr::V4(network), IpAddr::V4(ip)) => {
-                    let shift = 32 - u32::from(*prefix);
-                    u32::from(*network).checked_shr(shift) == u32::from(ip).checked_shr(shift)
-                }
-                (IpAddr::V6(network), IpAddr::V6(ip)) => {
-                    let shift = 128 - u32::from(*prefix);
-                    u128::from(*network).checked_shr(shift) == u128::from(ip).checked_shr(shift)
-                }
-                _ => false,
-            })
+        self.transport.trusts_proxy(ip)
     }
 
     pub fn cookie_secure(&self) -> bool {
@@ -358,6 +367,20 @@ impl Config {
             idle_timeout: Duration::from_secs(positive("KATWORK_IDLE_TIMEOUT_SECONDS", 60)?.into()),
             max_connections: positive("KATWORK_MAX_CONNECTIONS", 256)? as usize,
             max_connections_per_ip: positive("KATWORK_MAX_CONNECTIONS_PER_IP", 32)? as usize,
+            trusted_proxies,
+        };
+        let lock_timeout = match lookup("KATWORK_LOCK_TIMEOUT_MS") {
+            None => Duration::from_millis(5000),
+            Some(value) => {
+                if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(KatError::ConfigInvalid);
+                }
+                let millis: u32 = value.parse().map_err(|_| KatError::ConfigInvalid)?;
+                if millis == 0 || millis > i32::MAX as u32 {
+                    return Err(KatError::ConfigInvalid);
+                }
+                Duration::from_millis(millis.into())
+            }
         };
         let smtp = if let Some(host) = optional("SMTP_HOST") {
             if host.contains('@') {
@@ -380,11 +403,11 @@ impl Config {
             None
         };
         Ok(Self {
+            lock_timeout,
             database_url,
             secret,
             demo,
             transport,
-            trusted_proxies,
             public_url,
             demo_password: optional("KATWORK_DEMO_PASSWORD"),
             smtp,

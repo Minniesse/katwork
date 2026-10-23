@@ -24,6 +24,8 @@ use tokio::{
     time::{Instant, Sleep},
 };
 
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
 pub async fn serve(tcp: TcpListener, router: Router) -> io::Result<()> {
     serve_with_shutdown(
         tcp,
@@ -55,15 +57,20 @@ pub async fn serve_with_shutdown(
                     Err(error) if matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted) => continue,
                     Err(error) => break Err(error),
                 };
-                // Headers do not exist at accept time; proxies share this socket-peer budget.
-                let ip = crate::peer::ip_bucket(addr.ip());
-                peers.retain(|_, slots| slots.strong_count() > 0);
-                let slots = peers.get(&ip).and_then(Weak::upgrade).unwrap_or_else(|| {
-                    let slots = Arc::new(Semaphore::new(config.max_connections_per_ip));
-                    peers.insert(ip, Arc::downgrade(&slots));
-                    slots
-                });
-                let Ok(permit) = slots.try_acquire_owned() else { continue; };
+                // A trusted proxy carries many browsers; its connections still count globally.
+                let permit = if config.trusts_proxy(addr.ip()) {
+                    None
+                } else {
+                    let ip = crate::peer::ip_bucket(addr.ip());
+                    peers.retain(|_, slots| slots.strong_count() > 0);
+                    let slots = peers.get(&ip).and_then(Weak::upgrade).unwrap_or_else(|| {
+                        let slots = Arc::new(Semaphore::new(config.max_connections_per_ip));
+                        peers.insert(ip, Arc::downgrade(&slots));
+                        slots
+                    });
+                    let Ok(permit) = slots.try_acquire_owned() else { continue; };
+                    Some(permit)
+                };
                 let app = router.clone().layer(Extension(ConnectInfo(addr)));
                 let config = config.clone();
                 let mut stopping = stop.subscribe();
@@ -92,7 +99,15 @@ pub async fn serve_with_shutdown(
     };
     drop(tcp);
     drop(stop);
-    while connections.join_next().await.is_some() {}
+    if tokio::time::timeout(SHUTDOWN_GRACE, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
+    }
     result
 }
 

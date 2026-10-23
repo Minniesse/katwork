@@ -1,0 +1,19 @@
+{
+  "name": "katwork.message_stored",
+  "value": {
+    "messageId": "00000000-0000-0000-0000-000000000001",
+    "author": {
+      "kind": "kat",
+      "id": "00000000-0000-0000-0000-000000000001"
+    },
+    "authorName": "นักวิจัย",
+    "body": "สวัสดี 👋🏽",
+    "synthetic": true,
+    "stopped": false,
+    "question": null,
+    "meta": null,
+    "jobId": "00000000-0000-0000-0000-000000000001",
+    "clientMsgId": null,
+    "createdAt": "2026-10-23T00:00:00Z"
+  }
+}
