@@ -74,7 +74,7 @@ pub struct ToolSpec {
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatChunk {
-    /// Provider activity without user-visible content; consumed by `guard_stream`.
+    /// Non-text content (part boundaries, reasoning or tool arguments); consumed by `guard_stream`.
     Progress,
     TextDelta(String),
     ToolCall(ToolCall),

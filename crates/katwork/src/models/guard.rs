@@ -22,9 +22,9 @@ pub fn guard_stream(
 ) -> BoxStream<'static, Result<ChatChunk, ModelError>> {
     Box::pin(async_stream::stream! {
         let mut first = true;
+        let mut deadline = tokio::time::Instant::now() + t.first_chunk;
         loop {
-            let timeout = if first { t.first_chunk } else { t.idle };
-            let chunk = match tokio::time::timeout(timeout, inner.next()).await {
+            let chunk = match tokio::time::timeout_at(deadline, inner.next()).await {
                 Err(_) => {
                     yield Err(ModelError::Timeout {
                         phase: if first {
@@ -41,7 +41,15 @@ pub fn guard_stream(
                 }
                 Ok(Some(chunk)) => chunk,
             };
-            first = false;
+            let content = match &chunk {
+                Ok(ChatChunk::Usage(_)) | Err(_) => false,
+                Ok(ChatChunk::TextDelta(text)) => !text.is_empty(),
+                Ok(_) => true,
+            };
+            if content {
+                first = false;
+                deadline = tokio::time::Instant::now() + t.idle;
+            }
             match chunk {
                 Ok(ChatChunk::Progress) => continue,
                 Ok(ChatChunk::Done {

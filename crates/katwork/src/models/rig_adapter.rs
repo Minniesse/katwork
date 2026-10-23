@@ -18,42 +18,6 @@ use rig_core::{
     streaming::{Item, StreamEvent},
 };
 use std::{collections::HashSet, sync::Arc, time::Duration};
-use tokio::sync::Notify;
-
-/// Rig may consume provider frames without emitting an item (for example, ping).
-#[derive(Clone)]
-struct ProgressHttp<H> {
-    inner: H,
-    activity: Arc<Notify>,
-}
-impl<H: HttpClientExt> HttpClientExt for ProgressHttp<H> {
-    fn send<T: Into<Bytes> + Send, U: From<Bytes> + Send + 'static>(
-        &self,
-        req: Request<T>,
-    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static {
-        self.inner.send(req)
-    }
-    fn send_multipart<U: From<Bytes> + Send + 'static>(
-        &self,
-        req: Request<MultipartForm>,
-    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + Send + 'static {
-        self.inner.send_multipart(req)
-    }
-    async fn send_streaming<T: Into<Bytes> + Send>(
-        &self,
-        req: Request<T>,
-    ) -> http_client::Result<StreamingResponse> {
-        let response = self.inner.send_streaming(req).await?;
-        let activity = self.activity.clone();
-        Ok(response.map(|body| {
-            Box::pin(body.inspect(move |chunk| {
-                if chunk.as_ref().is_ok_and(|bytes| !bytes.is_empty()) {
-                    activity.notify_one();
-                }
-            })) as http_client::BoxedStream
-        }))
-    }
-}
 
 #[derive(Debug, Clone, Copy)]
 pub struct HttpLimits {
@@ -322,11 +286,6 @@ impl RigProvider {
         req: ChatRequest,
         http: H,
     ) -> Result<BoxStream<'static, Result<ChatChunk, ModelError>>, ModelError> {
-        let activity = Arc::new(Notify::new());
-        let http = ProgressHttp {
-            inner: http,
-            activity: activity.clone(),
-        };
         let mut request = to_rig(req, self.id())?;
         if matches!(self.backend, Backend::OpenAi(_, OpenAiApi::Responses)) {
             request = request.provider_option(
@@ -363,21 +322,11 @@ impl RigProvider {
         let provider_id = self.id().to_owned();
         Ok(Box::pin(async_stream::try_stream! {
             let mut phase = TimeoutPhase::FirstChunk;
-            loop {
-                let item = tokio::select! {
-                    item = stream.next() => match item {
-                        Some(item) => item,
-                        None => break,
-                    },
-                    _ = activity.notified() => {
-                        phase = TimeoutPhase::Idle;
-                        yield ChatChunk::Progress;
-                        continue;
-                    }
+            while let Some(item) = stream.next().await {
+                let Item::Event(event) = item.map_err(|error| model_error(error, phase))? else {
+                    continue;
                 };
-                if let Item::Event(StreamEvent::Text { text, .. }) =
-                    item.map_err(|error| model_error(error, phase))?
-                {
+                if let StreamEvent::Text { text, .. } = event {
                     yield ChatChunk::TextDelta(text);
                 } else {
                     yield ChatChunk::Progress;
@@ -460,7 +409,7 @@ fn to_rig(req: ChatRequest, provider_id: &str) -> Result<CompletionRequest, Mode
                 if tool_call_id.is_empty() {
                     return Err(ModelError::Protocol("empty_tool_call_id".into()));
                 }
-                let content = if is_error && provider_id == "openai:chat" {
+                let content = if is_error && provider_id.starts_with("openai:") {
                     format!("Error: {content}")
                 } else {
                     content
@@ -706,7 +655,7 @@ mod tests {
 
     #[derive(Clone)]
     struct TimedHttp {
-        body: &'static str,
+        frames: Vec<(Duration, &'static str)>,
         attempts: Arc<AtomicUsize>,
     }
     impl HttpClientExt for TimedHttp {
@@ -733,10 +682,10 @@ mod tests {
             _: Request<T>,
         ) -> http_client::Result<StreamingResponse> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
-            let body = self.body;
+            let frames = self.frames.clone();
             let frames: http_client::BoxedStream = Box::pin(async_stream::stream! {
-                for frame in body.split_inclusive("\n\n") {
-                    tokio::time::sleep(Duration::from_secs(20)).await;
+                for (delay, frame) in frames {
+                    tokio::time::sleep(delay).await;
                     yield Ok(Bytes::from_static(frame.as_bytes()));
                 }
             });
@@ -747,10 +696,13 @@ mod tests {
         }
     }
 
-    async fn timed_fixture(
-        body: &'static str,
+    fn timed_stream(
+        frames: Vec<(Duration, &'static str)>,
         api: Option<OpenAiApi>,
-    ) -> Vec<Result<ChatChunk, ModelError>> {
+    ) -> (
+        BoxStream<'static, Result<ChatChunk, ModelError>>,
+        Arc<AtomicUsize>,
+    ) {
         let env = ProviderEnv {
             api_key: uuid::Uuid::now_v7().to_string(),
             base_url: None,
@@ -775,19 +727,26 @@ mod tests {
             .stream_with_http(
                 request,
                 TimedHttp {
-                    body,
+                    frames,
                     attempts: attempts.clone(),
                 },
             )
             .unwrap();
+        (stream, attempts)
+    }
+
+    async fn timed_fixture(
+        frames: Vec<(Duration, &'static str)>,
+        api: Option<OpenAiApi>,
+    ) -> Vec<Result<ChatChunk, ModelError>> {
+        let (stream, attempts) = timed_stream(frames, api);
         let start = tokio::time::Instant::now();
         let chunks = guard_stream(stream, StreamTimeouts::default())
             .collect::<Vec<_>>()
             .await;
         assert!(
             matches!(chunks.last(), Some(Ok(ChatChunk::Done { .. }))),
-            "{api:?} first frame {:?}: {chunks:?}",
-            body.lines().next()
+            "{api:?}: {chunks:?}"
         );
         assert!(start.elapsed() > Duration::from_secs(30));
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
@@ -809,7 +768,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn argument_only_stream_keeps_first_and_idle_timers_alive() {
         let chunks = timed_fixture(
-            include_str!("../../tests/fixtures/models/chat_arguments.sse"),
+            include_str!("../../tests/fixtures/models/chat_arguments.sse")
+                .split_inclusive("\n\n")
+                .map(|frame| (Duration::from_secs(20), frame))
+                .collect(),
             Some(OpenAiApi::Chat),
         )
         .await;
@@ -829,27 +791,106 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn reasoning_usage_and_unknown_events_keep_streams_alive() {
-        for (api, body) in [
-            (
-                None,
-                include_str!("../../tests/fixtures/models/anthropic_replay.sse"),
-            ),
-            (
-                None,
-                include_str!("../../tests/fixtures/models/anthropic_usage.sse"),
-            ),
-            (
-                Some(OpenAiApi::Responses),
-                include_str!("../../tests/fixtures/models/responses_final.sse"),
-            ),
-            (
-                Some(OpenAiApi::Chat),
-                include_str!("../../tests/fixtures/models/chat_unknown.sse"),
-            ),
-        ] {
-            timed_fixture(body, api).await;
+    async fn reasoning_content_keeps_stream_alive() {
+        let mut frames: Vec<_> = include_str!("../../tests/fixtures/models/anthropic_replay.sse")
+            .split_inclusive("\n\n")
+            .enumerate()
+            .map(|(i, frame)| {
+                // Empty starts and signature-only frames emit no Rig content event.
+                let delay = if matches!(i, 2 | 4 | 6 | 7) { 20 } else { 0 };
+                (Duration::from_secs(delay), frame)
+            })
+            .collect();
+        frames.insert(3, frames[2]);
+        timed_fixture(frames, None).await;
+    }
+
+    async fn assert_keepalive_timeout(
+        frame: &'static str,
+        api: Option<OpenAiApi>,
+        after_text: bool,
+    ) {
+        let mut frames = Vec::new();
+        if after_text {
+            frames.push((Duration::from_secs(10), "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"hello\"}}\n\n"));
         }
+        frames.extend(std::iter::repeat_n((Duration::from_secs(10), frame), 12));
+        let (stream, _) = timed_stream(frames, api);
+        let start = tokio::time::Instant::now();
+        let chunks = guard_stream(stream, StreamTimeouts::default())
+            .collect::<Vec<_>>()
+            .await;
+        let phase = if after_text {
+            TimeoutPhase::Idle
+        } else {
+            TimeoutPhase::FirstChunk
+        };
+        assert_eq!(
+            chunks.last(),
+            Some(&Err(ModelError::Timeout { phase })),
+            "{chunks:?}"
+        );
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(if after_text { 40 } else { 30 })
+        );
+        if after_text {
+            assert!(chunks.contains(&Ok(ChatChunk::TextDelta("hello".into()))));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ping_only_times_out_at_first_chunk() {
+        assert_keepalive_timeout("event: ping\ndata: {\"type\":\"ping\"}\n\n", None, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn comment_only_times_out_at_first_chunk() {
+        assert_keepalive_timeout(": keepalive\n\n", Some(OpenAiApi::Chat), false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bare_newline_only_times_out_at_first_chunk() {
+        assert_keepalive_timeout("\n", Some(OpenAiApi::Chat), false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_delta_chat_times_out_at_first_chunk() {
+        assert_keepalive_timeout("data: {\"id\":\"chat_test\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}]}\n\n", Some(OpenAiApi::Chat), false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unknown_chat_events_time_out_at_first_chunk() {
+        assert_keepalive_timeout(
+            "data: {\"type\":\"future_event\",\"extra\":\"ignored\"}\n\n",
+            Some(OpenAiApi::Chat),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unknown_responses_events_time_out_at_first_chunk() {
+        assert_keepalive_timeout("event: response.future_event\ndata: {\"type\":\"response.future_event\",\"extra\":\"ignored\"}\n\n", Some(OpenAiApi::Responses), false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn message_start_only_times_out_at_first_chunk() {
+        let frame = include_str!("../../tests/fixtures/models/anthropic_replay.sse")
+            .split_inclusive("\n\n")
+            .next()
+            .unwrap();
+        assert_keepalive_timeout(frame, None, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn usage_only_times_out_at_first_chunk() {
+        assert_keepalive_timeout("data: {\"id\":\"chat_test\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":7,\"total_tokens\":12}}\n\n", Some(OpenAiApi::Chat), false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pings_after_text_time_out_at_idle() {
+        assert_keepalive_timeout("event: ping\ndata: {\"type\":\"ping\"}\n\n", None, true).await;
     }
 
     #[test]

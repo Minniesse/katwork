@@ -399,6 +399,54 @@ async fn replay_round_trips_to_the_same_provider() {
     assert_eq!(captured["messages"][0]["role"], "system");
 }
 #[tokio::test]
+async fn openai_tool_errors_keep_error_prefix_on_both_routes() {
+    for (api, response) in [
+        (OpenAiApi::Chat, "chat_thai.sse"),
+        (OpenAiApi::Responses, "responses_final.sse"),
+    ] {
+        for (is_error, expected) in [(true, "Error: result"), (false, "result")] {
+            let server = Server::new(fixture(response), 200, None, false).await;
+            let mut req = request();
+            req.messages.push(ChatMsg::Assistant {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "a".into(),
+                    name: "first".into(),
+                    args_json: "{}".into(),
+                }],
+                replay: None,
+            });
+            req.messages.push(ChatMsg::Tool {
+                tool_call_id: "a".into(),
+                name: "first".into(),
+                content: "result".into(),
+                is_error,
+            });
+            let chunks = server
+                .provider(Some(api))
+                .stream(req)
+                .await
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await;
+            turn(&chunks);
+            let captured = server.request.lock().await.clone().unwrap();
+            match api {
+                OpenAiApi::Chat => assert_eq!(captured["messages"][3]["content"], expected),
+                OpenAiApi::Responses => {
+                    let result = captured["input"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|item| item["type"] == "function_call_output")
+                        .unwrap();
+                    assert_eq!(result["output"], expected);
+                }
+            }
+        }
+    }
+}
+#[tokio::test]
 async fn oversized_response_is_rejected_before_decoding() {
     let server = Server::new(fixture("oversized_response.sse"), 200, Some(32), false).await;
     let p = server.provider(Some(OpenAiApi::Chat)).with_http(

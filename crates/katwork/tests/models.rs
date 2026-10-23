@@ -196,6 +196,42 @@ async fn stream_stall_returns_model_timeout() {
         assert_eq!(chunks.last(), Some(&Err(ModelError::Timeout { phase })));
     }
 }
+#[tokio::test(start_paused = true)]
+async fn usage_and_empty_text_do_not_reset_content_deadlines() {
+    for non_content in [
+        ChatChunk::Usage(Usage::default()),
+        ChatChunk::TextDelta(String::new()),
+    ] {
+        for after_text in [false, true] {
+            let non_content = non_content.clone();
+            let stream = async_stream::stream! {
+                if after_text {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    yield Ok(ChatChunk::TextDelta("hello".into()));
+                }
+                for _ in 0..12 {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    yield Ok(non_content.clone());
+                }
+                std::future::pending::<()>().await;
+            };
+            let start = tokio::time::Instant::now();
+            let chunks = guard_stream(Box::pin(stream), StreamTimeouts::default())
+                .collect::<Vec<_>>()
+                .await;
+            let phase = if after_text {
+                TimeoutPhase::Idle
+            } else {
+                TimeoutPhase::FirstChunk
+            };
+            assert_eq!(chunks.last(), Some(&Err(ModelError::Timeout { phase })));
+            assert_eq!(
+                start.elapsed(),
+                Duration::from_secs(if after_text { 40 } else { 30 })
+            );
+        }
+    }
+}
 #[tokio::test]
 async fn stream_without_done_is_protocol_error() {
     let provider = FakeProvider::scripted(vec![FakeTurn::Chunks(vec![])]);
