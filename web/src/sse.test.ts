@@ -419,6 +419,55 @@ describe('foldEvent', () => {
     );
     expect(shown(state)).toEqual(stored(['u1', 'Earlier question'], ['m1', 'Reply']));
   });
+
+  test('mid_run_snapshot_then_interleaved_lease_loss_ends_with_stored_messages', () => {
+    const log = numbered([
+      ev.userStored('u1', '@Researcher @Writer please help'),
+      ev.runStarted('rA'),
+      ev.kwRunStarted('rA', 'dot-a', 'mA'),
+      ev.runStarted('rB'),
+      ev.kwRunStarted('rB', 'dot-b', 'mB'),
+      ev.textStart('mA'),
+      ev.textStart('mB'),
+      ev.text('mA', 'Researching'),
+      ev.text('mB', 'Writing'),
+      ev.text('mA', ' further'),
+      ev.runError('lease_lost'),
+      ev.kwRunClosed('rA', 'interrupted'),
+      ev.text('mB', ' more'),
+      ev.stored('mB', 'The Writer’s stored reply', { author: { kind: 'dot', id: 'dot-b' } }),
+      ev.jobStatus('jB', 'answered'),
+      ev.runFinished('rB'),
+      ev.kwRunClosed('rB', 'finished'),
+    ]);
+    // The messages API returns what is stored at some seq; the stream then replays from 0.
+    const snapshotAt = (seq: number) =>
+      transcriptFromSnapshot(
+        transcriptMessages(fold(log.slice(0, seq)))
+          .filter((message) => !message.provisional)
+          .map(({ id, author, body, synthetic, question }) => ({
+            id,
+            author: author!,
+            body,
+            synthetic,
+            question,
+          })),
+        seq,
+      );
+
+    // Taken after both runs started: text that streams later still belongs to its run.
+    const live = fold(log.slice(0, 10), snapshotAt(5));
+    expect(live.messages['mA']).toMatchObject({ runId: 'rA', author: { kind: 'dot', id: 'dot-a' } });
+    expect(live.messages['mB']).toMatchObject({ runId: 'rB', author: { kind: 'dot', id: 'dot-b' } });
+
+    const final = stored(
+      ['u1', '@Researcher @Writer please help'],
+      ['mB', 'The Writer’s stored reply'],
+    );
+    for (let seq = 0; seq <= log.length; seq += 1) {
+      expect(shown(fold(log, snapshotAt(seq))), `snapshot at seq ${seq}`).toEqual(final);
+    }
+  });
 });
 
 test('parse_author_accepts_tagged_and_serde_default_shapes', () => {

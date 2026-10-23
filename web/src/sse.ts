@@ -76,6 +76,11 @@ export interface JobInfo {
 
 export interface Transcript {
   lastSeq: number;
+  /**
+   * Run bookkeeping is folded up to here. It trails `lastSeq` after a snapshot, until the
+   * replayed events the snapshot covers have arrived.
+   */
+  runsSeq: number;
   order: string[];
   messages: Record<string, ChatMessage>;
   runs: Record<string, RunInfo>;
@@ -198,6 +203,7 @@ export function subscribe(url: string, onEvent: (event: SeqEvent) => void): () =
 export function emptyTranscript(): Transcript {
   return {
     lastSeq: 0,
+    runsSeq: 0,
     order: [],
     messages: {},
     runs: {},
@@ -208,7 +214,12 @@ export function emptyTranscript(): Transcript {
   };
 }
 
-/** Starts from the messages API's snapshot; events up to and including `lastSeq` are skipped. */
+/**
+ * Starts from the messages API's snapshot. Events up to and including `lastSeq` are skipped,
+ * except that their `katwork.run_started` and `katwork.run_closed` still record which runs
+ * are open: the snapshot holds stored messages only, and text a run streams after it must
+ * still be dropped when that run closes.
+ */
 export function transcriptFromSnapshot(messages: StoredMessage[], lastSeq: number): Transcript {
   return messages.reduce(
     (state, message) => putMessage(state, { ...message, provisional: false, runId: null }),
@@ -222,11 +233,23 @@ export function transcriptMessages(state: Transcript): ChatMessage[] {
 
 /**
  * Folds one event into the transcript. Pure and deterministic: replaying the log from any
- * seq ends at the same state, because an event at or below `lastSeq` is a no-op.
+ * seq ends at the same state, because an event at or below `runsSeq` is a no-op and one at
+ * or below `lastSeq` only does run bookkeeping.
  */
 export function foldEvent(state: Transcript, { seq, event }: SeqEvent): Transcript {
-  if (!(seq > state.lastSeq)) return state;
-  return { ...apply(state, event), lastSeq: seq };
+  if (seq > state.lastSeq) return { ...apply(state, event), lastSeq: seq, runsSeq: seq };
+  if (seq > state.runsSeq) return { ...applyRunBookkeeping(state, event), runsSeq: seq };
+  return state;
+}
+
+/**
+ * A replayed event the snapshot already covers. Only run starts and closes count; the
+ * transcript holds no provisional text yet, so they change nothing but `runs`.
+ */
+function applyRunBookkeeping(state: Transcript, event: AgUiEvent): Transcript {
+  if (event.type !== 'CUSTOM') return state;
+  if (event.name !== 'katwork.run_started' && event.name !== 'katwork.run_closed') return state;
+  return applyCustom(state, event.name, fields(event.value) ?? {});
 }
 
 function apply(state: Transcript, event: AgUiEvent): Transcript {
