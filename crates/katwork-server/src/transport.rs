@@ -16,6 +16,8 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use katwork::config::TransportConfig;
+
+use crate::log_throttle::LogThrottle;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
@@ -42,6 +44,7 @@ pub async fn serve_with_shutdown(
 ) -> io::Result<()> {
     let mut connections = JoinSet::new();
     let mut peers: HashMap<IpAddr, Weak<Semaphore>> = HashMap::new();
+    let mut drops = LogThrottle::default();
     let (stop, _) = watch::channel(());
     tokio::pin!(shutdown);
     let result = loop {
@@ -55,15 +58,26 @@ pub async fn serve_with_shutdown(
                     Err(error) if matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted) => continue,
                     Err(error) => break Err(error),
                 };
-                // Headers do not exist at accept time; proxies share this socket-peer budget.
-                let ip = crate::peer::ip_bucket(addr.ip());
-                peers.retain(|_, slots| slots.strong_count() > 0);
-                let slots = peers.get(&ip).and_then(Weak::upgrade).unwrap_or_else(|| {
-                    let slots = Arc::new(Semaphore::new(config.max_connections_per_ip));
-                    peers.insert(ip, Arc::downgrade(&slots));
-                    slots
-                });
-                let Ok(permit) = slots.try_acquire_owned() else { continue; };
+                // Headers do not exist at accept time. A trusted proxy carries every client behind
+                // it, so it skips the per-peer cap; it still counts toward the global one.
+                let permit = if config.trusts_proxy(addr.ip()) {
+                    None
+                } else {
+                    let ip = crate::peer::ip_bucket(addr.ip());
+                    peers.retain(|_, slots| slots.strong_count() > 0);
+                    let slots = peers.get(&ip).and_then(Weak::upgrade).unwrap_or_else(|| {
+                        let slots = Arc::new(Semaphore::new(config.max_connections_per_ip));
+                        peers.insert(ip, Arc::downgrade(&slots));
+                        slots
+                    });
+                    let Ok(permit) = slots.try_acquire_owned() else {
+                        if drops.should_log(ip, Instant::now()) {
+                            tracing::warn!(reason = "per_peer_cap", peer = %ip, "connection_dropped");
+                        }
+                        continue;
+                    };
+                    Some(permit)
+                };
                 let app = router.clone().layer(Extension(ConnectInfo(addr)));
                 let config = config.clone();
                 let mut stopping = stop.subscribe();

@@ -154,7 +154,7 @@ async fn static_responses_carry_security_headers() {
         .body(axum::body::Body::empty())
         .unwrap();
     let response = app.clone().oneshot(index).await.unwrap();
-    assert_eq!(response.headers()["cache-control"], "no-cache");
+    assert_eq!(response.headers()["cache-control"], "no-store");
     let asset = Request::builder()
         .uri("/assets/app-1234.js")
         .header("host", "localhost")
@@ -178,4 +178,43 @@ async fn unknown_host_is_refused_before_static_files() {
         .unwrap();
     let response = app.oneshot(request).await.unwrap();
     assert_eq!(response.status(), 403);
+}
+
+#[tokio::test]
+async fn app_pages_are_never_stored() {
+    let web = WebDir::new();
+    let app = app(&web);
+    let cache_control = |path: &'static str| {
+        let app = app.clone();
+        async move {
+            let request = Request::builder()
+                .uri(path)
+                .header("host", "localhost")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), 200, "{path}");
+            response.headers()["cache-control"]
+                .to_str()
+                .unwrap()
+                .to_owned()
+        }
+    };
+    // A page holding a link's token must not be kept by an HTTP cache or the back-forward cache.
+    for path in [
+        "/invite?token=AAAA",
+        "/reset?token=AAAA",
+        "/invite",
+        "/reset",
+        "/login",
+        "/",
+    ] {
+        assert_eq!(cache_control(path).await, "no-store", "{path}");
+    }
+    // Other files keep their revalidating or immutable caching.
+    assert_eq!(cache_control("/theme-init.js").await, "no-cache");
+    assert_eq!(
+        cache_control("/assets/app-1234.js").await,
+        "public, max-age=31536000, immutable"
+    );
 }

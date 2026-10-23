@@ -1,7 +1,20 @@
-use std::{error::Error, process::ExitCode, sync::Arc};
+use std::{
+    collections::HashMap, error::Error, io::Write, net::IpAddr, process::ExitCode, sync::Arc,
+};
 use tracing_subscriber::prelude::*;
+use url::Url;
 
-use katwork::{auth, db, error::KatError, runtime::Core};
+use katwork::{
+    auth::{
+        self,
+        accounts::{self, WorkspaceRef},
+    },
+    db,
+    error::KatError,
+    runtime::Core,
+    tenancy::Role,
+    types::SpacePolicy,
+};
 use katwork_server::{
     app::{AppState, build_router},
     config::{Config, redact_database_secrets},
@@ -37,9 +50,22 @@ async fn main() -> ExitCode {
 }
 
 fn error_report(error: &KatError, config: Option<&Config>, database_url: Option<&str>) -> String {
-    let mut lines = vec![error.code().to_owned()];
-    if let KatError::ConfigInvalid { var } = error {
-        lines[0] = format!("config_invalid {{ var: {var} }}");
+    // The code, plus the variable for `config_invalid (VAR)`; never a value.
+    let mut lines = vec![match error {
+        KatError::ConfigInvalid { .. } => error.to_string(),
+        _ => error.code().to_owned(),
+    }];
+    // What the operator does next; none of these lines carries a value or a link.
+    match error {
+        KatError::CommandInvalid => lines.push(USAGE.trim_end().to_owned()),
+        KatError::MigrationRequired => {
+            lines.push("  run `katwork-server migrate` first, then try again".into())
+        }
+        KatError::LinkNotPrinted => lines.extend([
+            "  the account change was saved, but its link could not be written to stdout".into(),
+            "  run `katwork-server reset-link --email <email>` for a new link".into(),
+        ]),
+        _ => {}
     }
     let mut source = error.source();
     while let Some(cause) = source {
@@ -59,22 +85,132 @@ fn dependency_log_allowed(metadata: &tracing::Metadata<'_>) -> bool {
     !metadata.target().starts_with("sqlx") && !metadata.target().starts_with("rig")
 }
 
-async fn run() -> Result<(), KatError> {
-    let mut args = std::env::args().skip(1);
-    let command = args.next().unwrap_or_else(|| "serve".into());
-    let reset_password = match args.next().as_deref() {
-        None => false,
-        Some("--reset-password") if command == "seed-demo" => true,
-        Some(_) => return Err(KatError::CommandInvalid),
-    };
-    if args.next().is_some() {
-        return Err(KatError::CommandInvalid);
+const USAGE: &str = "\
+usage: katwork-server [serve]
+       katwork-server migrate
+       katwork-server seed-demo [--reset-password]
+       katwork-server create-user --email <email> --workspace <name|id> --role <owner|admin|member> [--space-policy <local|hosted>]
+       katwork-server reset-link --email <email>
+";
+
+/// `--name value` pairs, each name from `allowed` and given at most once.
+fn flags(
+    args: &[String],
+    allowed: &[&'static str],
+) -> Result<HashMap<&'static str, String>, KatError> {
+    let mut flags = HashMap::new();
+    let mut args = args.iter();
+    while let Some(name) = args.next() {
+        let name = allowed
+            .iter()
+            .find(|allowed| **allowed == name)
+            .ok_or(KatError::CommandInvalid)?;
+        let value = args.next().ok_or(KatError::CommandInvalid)?;
+        if flags.insert(*name, value.clone()).is_some() {
+            return Err(KatError::CommandInvalid);
+        }
     }
-    match command.as_str() {
-        "serve" => {
+    Ok(flags)
+}
+
+enum Command {
+    Help,
+    Serve,
+    Migrate,
+    SeedDemo {
+        reset_password: bool,
+    },
+    CreateUser {
+        email: String,
+        workspace: WorkspaceRef,
+        role: Role,
+        space_policy: Option<SpacePolicy>,
+    },
+    ResetLink {
+        email: String,
+    },
+}
+
+fn parse(args: &[String]) -> Result<Command, KatError> {
+    let (command, rest) = match args.split_first() {
+        Some((command, rest)) => (command.as_str(), rest),
+        None => ("serve", &[][..]),
+    };
+    if command == "help"
+        || args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        return Ok(Command::Help);
+    }
+    let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+    Ok(match (command, rest.as_slice()) {
+        ("serve", []) => Command::Serve,
+        ("migrate", []) => Command::Migrate,
+        ("seed-demo", []) => Command::SeedDemo {
+            reset_password: false,
+        },
+        ("seed-demo", ["--reset-password"]) => Command::SeedDemo {
+            reset_password: true,
+        },
+        ("create-user", _) => {
+            let mut flags = flags(
+                &args[1..],
+                &["--email", "--workspace", "--role", "--space-policy"],
+            )?;
+            let mut required = |name| flags.remove(name).ok_or(KatError::CommandInvalid);
+            let email = required("--email")?;
+            let workspace = WorkspaceRef::parse(&required("--workspace")?);
+            let role = match required("--role")?.as_str() {
+                "owner" => Role::Owner,
+                "admin" => Role::Admin,
+                "member" => Role::Member,
+                _ => return Err(KatError::CommandInvalid),
+            };
+            let space_policy = match flags.remove("--space-policy").as_deref() {
+                None => None,
+                Some("local") => Some(SpacePolicy {
+                    allow_external: false,
+                }),
+                Some("hosted") => Some(SpacePolicy {
+                    allow_external: true,
+                }),
+                Some(_) => return Err(KatError::CommandInvalid),
+            };
+            Command::CreateUser {
+                email,
+                workspace,
+                role,
+                space_policy,
+            }
+        }
+        ("reset-link", _) => Command::ResetLink {
+            email: flags(&args[1..], &["--email"])?
+                .remove("--email")
+                .ok_or(KatError::CommandInvalid)?,
+        },
+        _ => return Err(KatError::CommandInvalid),
+    })
+}
+
+async fn run() -> Result<(), KatError> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match parse(&args)? {
+        Command::Help => {
+            // Nothing to recover if stdout is gone.
+            let _ = std::io::stdout().lock().write_all(USAGE.as_bytes());
+            Ok(())
+        }
+        Command::Serve => {
             let config = Arc::new(Config::from_env()?);
             if !config.cookie_secure() {
                 tracing::warn!("session cookie is not Secure on an HTTP public URL");
+            }
+            let bind = std::env::var("KATWORK_BIND").ok();
+            if lan_bind_without_public_url(bind.as_deref(), &config) {
+                tracing::warn!(
+                    "KATWORK_BIND exposes KatWork beyond this host, but KATWORK_PUBLIC_URL is unset or names this machine: other machines get host_not_allowed and printed links point at it; set KATWORK_PUBLIC_URL to the address people open"
+                );
             }
             let pool = db::connect(&config.database_url).await?;
             let transport = config.transport.clone();
@@ -90,12 +226,12 @@ async fn run() -> Result<(), KatError> {
             .await?;
             Ok(())
         }
-        "migrate" => {
+        Command::Migrate => {
             let config = Config::from_env()?;
             let pool = db::connect(&config.database_url).await?;
             db::migrate(&pool).await
         }
-        "seed-demo" => {
+        Command::SeedDemo { reset_password } => {
             let config = Config::from_env()?;
             if !config.demo {
                 return Err(KatError::ConfigInvalid {
@@ -108,8 +244,66 @@ async fn run() -> Result<(), KatError> {
             }
             Ok(())
         }
-        _ => Err(KatError::CommandInvalid),
+        // The operator commands print the link only to stdout; it never goes through tracing.
+        Command::CreateUser {
+            email,
+            workspace,
+            role,
+            space_policy,
+        } => {
+            let config = Config::from_env()?;
+            let pool = db::connect(&config.database_url).await?;
+            db::require_migrated(&pool).await?;
+            let link = accounts::create_user(
+                &pool,
+                &email,
+                &workspace,
+                role,
+                space_policy,
+                config.public_url_or_default(),
+            )
+            .await?;
+            print_link(&link)
+        }
+        Command::ResetLink { email } => {
+            let config = Config::from_env()?;
+            let pool = db::connect(&config.database_url).await?;
+            db::require_migrated(&pool).await?;
+            let link = accounts::reset_link(&pool, &email, config.public_url_or_default()).await?;
+            print_link(&link)
+        }
     }
+}
+
+/// Writes an operator command's link, the only thing it prints. A closed or failing stdout is
+/// `link_not_printed`, never a panic, and the link never goes to stderr.
+fn print_link(link: &str) -> Result<(), KatError> {
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{link}")
+        .and_then(|()| stdout.flush())
+        .map_err(|_| KatError::LinkNotPrinted)
+}
+
+/// Compose publishes port 3000 on `KATWORK_BIND`. Past loopback, people on other machines open
+/// KatWork by this host's address, which a localhost public URL neither allows as a Host nor
+/// puts in printed links.
+fn lan_bind_without_public_url(bind: Option<&str>, config: &Config) -> bool {
+    let local = |host: &str| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    };
+    let exposed = bind
+        .map(str::trim)
+        .is_some_and(|bind| !bind.is_empty() && !local(bind));
+    let public_is_local = Url::parse(config.public_url_or_default())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_none_or(|host| local(&host));
+    exposed && public_is_local
 }
 
 async fn shutdown_signal() {
@@ -392,7 +586,7 @@ mod tests {
         };
         assert_eq!(
             error_report(&error, None, None),
-            "config_invalid { var: KATWORK_LOCAL_BASE_URL }"
+            "config_invalid (KATWORK_LOCAL_BASE_URL)"
         );
     }
 

@@ -270,10 +270,13 @@ async fn reset_link_uses_configured_origin_instead_of_host(pool: PgPool) {
     })
     .await
     .unwrap();
+    let body = &capture.sent()[0].body;
     assert!(
-        capture.sent()[0]
-            .body
-            .starts_with("https://katwork.example/reset?token=")
+        body.lines()
+            .last()
+            .unwrap()
+            .starts_with("https://katwork.example/reset?token="),
+        "{body}"
     );
 }
 
@@ -306,4 +309,63 @@ async fn smtp_timeout_logs_failed_without_reset_content() {
     assert_eq!(result.unwrap_err().code(), "mail_delivery_failed");
     assert!(logs.text().contains("failed"));
     assert!(!logs.text().contains("private-reset-token"));
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn reset_mail_is_bilingual_in_the_users_locale_order(pool: PgPool) {
+    use katwork::types::Locale;
+    const TH_SUBJECT: &str = "ตั้งรหัสผ่าน KatWork ใหม่";
+    const EN_SUBJECT: &str = "Reset your KatWork password";
+    const TH_BODY: &str = "ใช้ลิงก์นี้ภายใน 30 นาทีเพื่อตั้งรหัสผ่านใหม่ หากคุณไม่ได้ขอเปลี่ยนรหัสผ่าน ให้ละเว้นอีเมลนี้";
+    const EN_BODY: &str = "Use this link within 30 minutes to set a new password. If you did not ask for this, ignore this email.";
+    let link = format!("https://katwork.example/reset?token={}", Uuid::now_v7());
+    for (locale, subject, first, second) in [
+        (
+            Locale::Th,
+            format!("{TH_SUBJECT} / {EN_SUBJECT}"),
+            TH_BODY,
+            EN_BODY,
+        ),
+        (
+            Locale::En,
+            format!("{EN_SUBJECT} / {TH_SUBJECT}"),
+            EN_BODY,
+            TH_BODY,
+        ),
+    ] {
+        let mail = mailer::reset_mail("person@example.test".into(), locale, &link);
+        assert!(matches!(mail.kind, MailKind::PasswordReset));
+        assert_eq!(mail.to, "person@example.test");
+        assert_eq!(mail.subject, subject);
+        assert_eq!(mail.body.matches(&link).count(), 1, "{}", mail.body);
+        assert_eq!(mail.body.lines().last(), Some(link.as_str()));
+        let first_at = mail.body.find(first).unwrap();
+        let second_at = mail.body.find(second).unwrap();
+        assert!(first_at < second_at, "{}", mail.body);
+    }
+    // The reset route mails in the account's own locale.
+    let (user_id, _) = support::user(&pool).await;
+    sqlx::query("UPDATE users SET locale = 'th' WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let capture = CapturingMailer::default();
+    reset::request(
+        &pool,
+        &capture,
+        "person@example.test",
+        "https://katwork.example/",
+    )
+    .await
+    .unwrap();
+    let sent = capture.sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].subject, format!("{TH_SUBJECT} / {EN_SUBJECT}"));
+    assert!(sent[0].body.starts_with(TH_BODY), "{}", sent[0].body);
+    let last = sent[0].body.lines().last().unwrap();
+    assert!(
+        last.starts_with("https://katwork.example/reset?token="),
+        "{last}"
+    );
 }

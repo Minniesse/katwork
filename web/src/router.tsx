@@ -1,4 +1,10 @@
-import { useSyncExternalStore, type AnchorHTMLAttributes, type MouseEvent } from 'react';
+import {
+  useEffect,
+  useState,
+  useSyncExternalStore,
+  type AnchorHTMLAttributes,
+  type MouseEvent,
+} from 'react';
 
 // A small history-API router; the server answers every non-API path with index.html.
 
@@ -41,6 +47,49 @@ export function navigate(
 export function useLocation(): URL {
   const current = useSyncExternalStore(subscribe, snapshot);
   return new URL(current.slice(current.indexOf(' ') + 1), window.location.origin);
+}
+
+/**
+ * The `?token=` of the emailed or printed link this page was opened with, for a page at
+ * `path`. It is read once into memory and removed from the address bar with a replace that
+ * leaves no history state, so neither the URL nor `history.state` holds it. It is dropped on
+ * the next in-app navigation, and when the document is hidden or comes back from the
+ * back-forward cache, so Back to this entry, or a reload, finds no token. The server also sends
+ * this page with `Cache-Control: no-store`, which keeps it out of most back-forward caches.
+ * The browser's global history can still list the original link; single use and expiry bound that.
+ */
+export function useLinkToken(path: string): string | null {
+  const [link, setLink] = useState(() => {
+    if (window.location.pathname !== path) return null;
+    const token = new URLSearchParams(window.location.search).get('token');
+    return token ? { token, opened: navigations } : null;
+  });
+  const count = useSyncExternalStore(subscribe, navigationCount);
+  useEffect(() => {
+    // Only while the token is still in the address bar, so a repeated effect never navigates twice.
+    if (window.location.pathname === path && new URLSearchParams(window.location.search).has('token')) {
+      navigate(path, { replace: true });
+    }
+  }, [path]);
+  useEffect(() => {
+    // A full-document navigation fires no popstate: the page is hidden, and may come back
+    // whole from the back-forward cache.
+    const drop = (event: PageTransitionEvent) => {
+      if (event.type === 'pagehide' || event.persisted) setLink(null);
+    };
+    window.addEventListener('pagehide', drop);
+    window.addEventListener('pageshow', drop);
+    return () => {
+      window.removeEventListener('pagehide', drop);
+      window.removeEventListener('pageshow', drop);
+    };
+  }, []);
+  // Removing the token is one navigation; any later one leaves the page the link opened.
+  const current = link !== null && count <= link.opened + 1;
+  useEffect(() => {
+    if (link !== null && !current) setLink(null);
+  }, [link, current]);
+  return current ? link.token : null;
 }
 
 export function Link({
