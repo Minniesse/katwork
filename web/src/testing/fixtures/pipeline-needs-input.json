@@ -1,0 +1,259 @@
+[
+  {
+    "seq": 1,
+    "event": {
+      "name": "katwork.message_stored",
+      "type": "CUSTOM",
+      "value": {
+        "body": "Please ask me",
+        "meta": null,
+        "jobId": "00000000-0000-7000-8000-000000000002",
+        "author": {
+          "id": "00000000-0000-7000-8000-000000000001",
+          "kind": "user"
+        },
+        "stopped": false,
+        "question": null,
+        "createdAt": "2026-10-23T00:00:00Z",
+        "messageId": "00000000-0000-7000-8000-000000000003",
+        "synthetic": false,
+        "authorName": "Person",
+        "clientMsgId": null
+      }
+    }
+  },
+  {
+    "seq": 2,
+    "event": {
+      "name": "katwork.job_status",
+      "type": "CUSTOM",
+      "value": {
+        "jobId": "00000000-0000-7000-8000-000000000002",
+        "reason": null,
+        "status": null,
+        "holdReason": null
+      }
+    }
+  },
+  {
+    "seq": 3,
+    "event": {
+      "type": "RUN_STARTED",
+      "runId": "00000000-0000-7000-8000-000000000004",
+      "threadId": "00000000-0000-7000-8000-000000000005"
+    }
+  },
+  {
+    "seq": 4,
+    "event": {
+      "name": "katwork.run_started",
+      "type": "CUSTOM",
+      "value": {
+        "jobId": "00000000-0000-7000-8000-000000000002",
+        "katId": "00000000-0000-7000-8000-000000000006",
+        "runId": "00000000-0000-7000-8000-000000000004",
+        "synthetic": false,
+        "replyMessageId": "00000000-0000-7000-8000-000000000007"
+      }
+    }
+  },
+  {
+    "seq": 5,
+    "event": {
+      "name": "katwork.kat_state",
+      "type": "CUSTOM",
+      "value": {
+        "katId": "00000000-0000-7000-8000-000000000006",
+        "state": "working"
+      }
+    }
+  },
+  {
+    "seq": 6,
+    "event": {
+      "role": "assistant",
+      "type": "TEXT_MESSAGE_START",
+      "messageId": "00000000-0000-7000-8000-000000000007"
+    }
+  },
+  {
+    "seq": 7,
+    "event": {
+      "type": "TEXT_MESSAGE_END",
+      "messageId": "00000000-0000-7000-8000-000000000007"
+    }
+  },
+  {
+    "seq": 8,
+    "event": {
+      "name": "katwork.usage",
+      "type": "CUSTOM",
+      "value": {
+        "input": null,
+        "katId": "00000000-0000-7000-8000-000000000006",
+        "runId": "00000000-0000-7000-8000-000000000004",
+        "output": null,
+        "complete": false,
+        "modelCallId": "00000000-0000-7000-8000-000000000008"
+      }
+    }
+  },
+  {
+    "seq": 9,
+    "event": {
+      "type": "TOOL_CALL_START",
+      "toolCallId": "00000000-0000-7000-8000-000000000009",
+      "toolCallName": "ask_user",
+      "parentMessageId": "00000000-0000-7000-8000-000000000007"
+    }
+  },
+  {
+    "seq": 10,
+    "event": {
+      "type": "TOOL_CALL_ARGS",
+      "delta": "{\"options\":[\"One\",\"Two\"],\"question\":\"Which option?\"}",
+      "toolCallId": "00000000-0000-7000-8000-000000000009"
+    }
+  },
+  {
+    "seq": 11,
+    "event": {
+      "type": "TOOL_CALL_END",
+      "toolCallId": "00000000-0000-7000-8000-000000000009"
+    }
+  },
+  {
+    "seq": 12,
+    "event": {
+      "name": "katwork.kat_state",
+      "type": "CUSTOM",
+      "value": {
+        "katId": "00000000-0000-7000-8000-000000000006",
+        "state": "researching"
+      }
+    }
+  },
+  {
+    "seq": 13,
+    "event": {
+      "type": "TOOL_CALL_RESULT",
+      "content": "{\"question\":\"Which option?\",\"options\":[\"One\",\"Two\"]}",
+      "messageId": "00000000-0000-7000-8000-000000000010",
+      "toolCallId": "00000000-0000-7000-8000-000000000009"
+    }
+  },
+  {
+    "seq": 14,
+    "event": {
+      "name": "katwork.tool_status",
+      "type": "CUSTOM",
+      "value": {
+        "ok": true,
+        "code": null,
+        "toolCallId": "00000000-0000-7000-8000-000000000009"
+      }
+    }
+  },
+  {
+    "seq": 15,
+    "event": {
+      "name": "katwork.decision",
+      "type": "CUSTOM",
+      "value": {
+        "jobId": "00000000-0000-7000-8000-000000000002",
+        "inputs": {
+          "stop": null,
+          "synthetic": false,
+          "toolCalls": 1,
+          "hasFinalText": false,
+          "pendingQuestion": true,
+          "artifactsCreated": 0,
+          "effectsDispatched": false,
+          "executorUnavailable": false
+        },
+        "verdict": {
+          "next": "ask_user",
+          "reason": "question_pending",
+          "status": "needs_input"
+        },
+        "thresholds": {
+          "version": 1
+        },
+        "policyVersion": 1
+      }
+    }
+  },
+  {
+    "seq": 16,
+    "event": {
+      "name": "katwork.message_stored",
+      "type": "CUSTOM",
+      "value": {
+        "body": "Which option?",
+        "meta": null,
+        "jobId": "00000000-0000-7000-8000-000000000002",
+        "author": {
+          "id": "00000000-0000-7000-8000-000000000006",
+          "kind": "kat"
+        },
+        "stopped": false,
+        "question": {
+          "options": [
+            "One",
+            "Two"
+          ],
+          "question": "Which option?"
+        },
+        "createdAt": "2026-10-23T00:00:00Z",
+        "messageId": "00000000-0000-7000-8000-000000000007",
+        "synthetic": false,
+        "authorName": "Lead",
+        "clientMsgId": null
+      }
+    }
+  },
+  {
+    "seq": 17,
+    "event": {
+      "name": "katwork.job_status",
+      "type": "CUSTOM",
+      "value": {
+        "jobId": "00000000-0000-7000-8000-000000000002",
+        "reason": "question_pending",
+        "status": "needs_input",
+        "holdReason": null
+      }
+    }
+  },
+  {
+    "seq": 18,
+    "event": {
+      "name": "katwork.kat_state",
+      "type": "CUSTOM",
+      "value": {
+        "katId": "00000000-0000-7000-8000-000000000006",
+        "state": "waiting"
+      }
+    }
+  },
+  {
+    "seq": 19,
+    "event": {
+      "name": "katwork.run_closed",
+      "type": "CUSTOM",
+      "value": {
+        "end": "finished",
+        "code": "question_pending",
+        "runId": "00000000-0000-7000-8000-000000000004"
+      }
+    }
+  },
+  {
+    "seq": 20,
+    "event": {
+      "type": "RUN_FINISHED",
+      "runId": "00000000-0000-7000-8000-000000000004",
+      "threadId": "00000000-0000-7000-8000-000000000005"
+    }
+  }
+]

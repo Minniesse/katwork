@@ -569,3 +569,5 @@ async fn ungranted_mention_names_the_kat_and_routes_to_lead(pool: PgPool) {
         json!({"code":"kat_not_in_space","kats":[{"id":f.kats[2].id,"name":"Writer"}]})
     );
 }
+#[path = "pipeline/contracts.rs"]
+mod contracts;

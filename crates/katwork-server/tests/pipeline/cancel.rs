@@ -364,3 +364,121 @@ async fn cancel_closes_open_calls_before_terminal_events(pool: PgPool) {
     assert_eq!(events[result + 4]["type"], "RUN_ERROR");
     assert_eq!(events[result + 5]["name"], "katwork.job_status");
 }
+
+async fn colleague(f: &Fixture, role: &str) -> (Tenant, String) {
+    let user = UserId::new();
+    sqlx::query("INSERT INTO users(id,email,password_hash,display_name,locale) VALUES($1,$2,'unused','Colleague','en')")
+        .bind(user).bind(format!("{user}@example.test")).execute(&f.core.pool).await.unwrap();
+    sqlx::query("INSERT INTO memberships(workspace_id,user_id,role) VALUES($1,$2,$3)")
+        .bind(f.tenant.workspace_id())
+        .bind(user)
+        .bind(role)
+        .execute(&f.core.pool)
+        .await
+        .unwrap();
+    let tenant = tenancy::resolve(&f.core.pool, user, f.tenant.workspace_id())
+        .await
+        .unwrap();
+    let token = katwork::auth::session::create(&f.core.pool, user)
+        .await
+        .unwrap();
+    (tenant, format!("kw_session={}", token.0))
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn cancel_rejects_colleague_member_before_any_writes(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let (_, job) = f.submit("hello").await;
+    let (tenant, cookie) = colleague(&f, "member").await;
+    let before = f.events().await;
+    let response = request(
+        &f.app,
+        "POST",
+        &format!(
+            "/api/workspaces/{}/jobs/{job}/cancel",
+            f.tenant.workspace_id()
+        ),
+        None,
+        Some(&cookie),
+    )
+    .await;
+    support::assert_code(response, 403, "forbidden").await;
+    assert!(matches!(
+        katwork::jobs::job::cancel(&pool, &f.core.events, &tenant, job).await,
+        Err(katwork::error::KatError::Forbidden)
+    ));
+    assert_eq!(f.events().await, before);
+    assert_eq!(f.status(job).await.0, None);
+    let state: String = sqlx::query_scalar("SELECT state FROM tasks WHERE job_id=$1")
+        .bind(job)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "queued");
+    f.call("POST", &format!("jobs/{job}/cancel"), None).await;
+    let response = request(
+        &f.app,
+        "POST",
+        &format!(
+            "/api/workspaces/{}/jobs/{job}/cancel",
+            f.tenant.workspace_id()
+        ),
+        None,
+        Some(&cookie),
+    )
+    .await;
+    support::assert_code(response, 403, "forbidden").await;
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn cancel_allows_requester_and_workspace_admin_or_owner(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    sqlx::query("UPDATE memberships SET role='member' WHERE workspace_id=$1 AND user_id=$2")
+        .bind(f.tenant.workspace_id())
+        .bind(f.tenant.user_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (_, job) = f.submit("my job").await;
+    assert_eq!(
+        f.call("POST", &format!("jobs/{job}/cancel"), None)
+            .await
+            .status(),
+        202
+    );
+    for role in ["admin", "owner"] {
+        let (_, job) = f.submit("another job").await;
+        let (_, cookie) = colleague(&f, role).await;
+        let response = request(
+            &f.app,
+            "POST",
+            &format!(
+                "/api/workspaces/{}/jobs/{job}/cancel",
+                f.tenant.workspace_id()
+            ),
+            None,
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(response.status(), 202);
+        assert_eq!(f.status(job).await.0.as_deref(), Some("cancelled"));
+    }
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn cancel_rechecks_admin_role_after_job_lock(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let (_, job) = f.submit("hello").await;
+    let (admin, _) = colleague(&f, "admin").await;
+    sqlx::query("UPDATE memberships SET role='member' WHERE workspace_id=$1 AND user_id=$2")
+        .bind(f.tenant.workspace_id())
+        .bind(admin.user_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        katwork::jobs::job::cancel(&pool, &f.core.events, &admin, job).await,
+        Err(katwork::error::KatError::Forbidden)
+    ));
+    assert_eq!(f.status(job).await.0, None);
+}

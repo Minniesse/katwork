@@ -500,6 +500,16 @@ pub async fn cancel(
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(KatError::NotFound)?;
+    let requester: UserId =
+        sqlx::query_scalar("SELECT requested_by FROM jobs WHERE workspace_id=$1 AND id=$2")
+            .bind(workspace)
+            .bind(job_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    let current = crate::tenancy::resolve(&mut *tx, tenant.user_id(), workspace).await?;
+    if requester != current.user_id() {
+        current.require_admin()?;
+    }
     let job = owned_job(&mut tx, job_id).await?;
     let tasks: Vec<TaskId> = sqlx::query_scalar(include_str!("cancel_tasks.sql"))
         .bind(workspace)
