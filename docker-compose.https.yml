@@ -1,0 +1,41 @@
+services:
+  katwork:
+    networks: !override
+      backend:
+      edge:
+        ipv4_address: 172.31.250.3
+    ports: !reset []
+    environment:
+      KATWORK_TRUSTED_PROXIES: 172.31.250.2
+      KATWORK_PUBLIC_URL: https://${KATWORK_HTTPS_HOST:?set KATWORK_HTTPS_HOST in .env}
+  caddy:
+    image: caddy:2.11.7-alpine
+    init: true
+    restart: unless-stopped
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    networks:
+      default:
+      edge:
+        ipv4_address: 172.31.250.2
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      KATWORK_HTTPS_HOST: ${KATWORK_HTTPS_HOST:?set KATWORK_HTTPS_HOST in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      katwork:
+        condition: service_healthy
+networks:
+  edge:
+    ipam:
+      config:
+        - subnet: 172.31.250.0/29
+volumes:
+  caddy_data:
+  caddy_config:
