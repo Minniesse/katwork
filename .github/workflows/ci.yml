@@ -56,8 +56,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.0
-      - run: cargo +1.94.0 check --workspace --locked
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - run: cargo +1.97.1 check --workspace --locked
 
   deny:
     runs-on: ubuntu-latest
@@ -69,15 +69,17 @@ jobs:
 
   web:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
     steps:
       - uses: actions/checkout@v4
-      - id: web
-        run: |
-          if [ -d web ]; then echo "exists=true" >> "$GITHUB_OUTPUT"; fi
       - uses: actions/setup-node@v4
-        if: steps.web.outputs.exists == 'true'
         with:
-          node-version: 20
-      - run: npm ci && npm test && npm run build
-        if: steps.web.outputs.exists == 'true'
-        working-directory: web
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run check:contrast
+      - run: npm run build

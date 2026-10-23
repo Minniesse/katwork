@@ -1,0 +1,11 @@
+{
+  "type": "error",
+  "error": {
+    "type": "rate_limit_error",
+    "message": "Fixture monthly spend cap reached.",
+    "details": {
+      "error_code": "enforced_spend_limit_reached"
+    }
+  },
+  "request_id": "fixture-request"
+}

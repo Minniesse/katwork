@@ -304,12 +304,14 @@ fn config_and_provider_debug_show_only_url_origins() {
         ("not-a-url", "[redacted]"),
     ] {
         let mut config = Config::from_lookup(|name| match name {
-            "OPENAI_BASE_URL" | "ANTHROPIC_BASE_URL" => Some(url.into()),
-            "OPENAI_API_KEY" | "ANTHROPIC_API_KEY" => Some("test-api-key".into()),
+            "OPENAI_API_KEY" | "ANTHROPIC_API_KEY" => Some(uuid::Uuid::now_v7().to_string()),
             _ => lookup(name),
         })
         .unwrap();
+        // Debug must redact even malformed URLs supplied through direct construction.
         config.public_url = Some(url.into());
+        config.openai.as_mut().unwrap().base_url = Some(url.into());
+        config.anthropic.as_mut().unwrap().base_url = Some(url.into());
         let debug = format!("{config:?}");
         assert!(
             debug.contains(&format!("public_url: Some({expected:?})")),
@@ -832,4 +834,38 @@ fn smtp_and_enclosing_config_debug_redact_username_tokens() {
     let mut smtp = config.smtp.unwrap();
     smtp.username = None;
     assert!(format!("{smtp:?}").contains("username: None"));
+}
+
+#[test]
+fn error_redaction_scrubs_all_configured_credentials() {
+    let names = [
+        "KATWORK_SECRET",
+        "KATWORK_DEMO_PASSWORD",
+        "SMTP_PASSWORD",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+    ];
+    let secrets: Vec<_> = names
+        .iter()
+        .map(|_| uuid::Uuid::now_v7().to_string())
+        .collect();
+    let config = Config::from_lookup(|name| {
+        names
+            .iter()
+            .position(|key| *key == name)
+            .map(|i| secrets[i].clone())
+            .or_else(|| match name {
+                "SMTP_HOST" => Some("smtp.example.invalid".into()),
+                _ => lookup(name),
+            })
+    })
+    .unwrap();
+    let diagnostic = format!("provider diagnostic {} end", secrets.join(" "));
+    let redacted = config.redact_secrets(&diagnostic);
+    assert!(redacted.starts_with("provider diagnostic "));
+    assert!(redacted.ends_with(" end"));
+    for secret in secrets {
+        assert!(!redacted.contains(&secret));
+    }
+    assert_eq!(redacted.matches("[redacted]").count(), names.len());
 }
