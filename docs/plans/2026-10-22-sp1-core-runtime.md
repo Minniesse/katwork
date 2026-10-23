@@ -37,7 +37,7 @@
 - Agent loop limits, initial defaults:
   - at most 24 steps per run, where a step is one model attempt, retries included
   - run wall-clock 90 s; token budget per run 200,000 input+output tokens charged over attempts (a missing count is charged conservatively, Task 8); task deadline 5 minutes from the task's first claim, not its creation; job deadline 10 minutes from the job's creation. Every model or tool call's timeout is `min(its own, the run's remaining time)`
-  - tool timeout 60 s. Each model entry carries its own stream timeouts: a hosted entry gets 30 s to its first content chunk and at most 30 s between content chunks; a local entry gets 120 s and 60 s (Task 7b). At most 1 retry per model call, only while no content or `Progress` chunk has reached the loop
+  - tool timeout 60 s. Each model entry carries its own stream timeouts: a hosted entry gets 30 s to its first content chunk and at most 30 s between content chunks; a local entry gets 120 s and 60 s (Task 7b). At most 1 retry per model call, only before its first content chunk (a non-empty `TextDelta`, `Progress`, `ToolCall` or `Done`; Task 8)
   - loop detection: the same tool with the same canonical arguments 3 times in a row, **or** 5 times within the last 10 calls, stops the run before that call runs
   - tool results capped at 8,000 Unicode scalar values, the truncation marker included
   - the history passed to a run is the newest messages up to 24,000 characters
@@ -46,7 +46,8 @@
 - **Reply vs send.** A *reply* goes to the thread the request came from; the harness fills the target and it is not gated. A *send* goes to any other target, or is a proactive post; it is `Outward` and produces a Proposal (SP3). In SP1 the only write is the reply, written once by `job::conclude` (Task 10).
 - **Tenant isolation in the schema.** Every tenant-owned child row references its parent with a composite foreign key `(parent_id, workspace_id) REFERENCES parent (id, workspace_id)`, and each tenant-owned parent has `UNIQUE (id, workspace_id)` for it, so a row can never point into another workspace.
 - **Roles before bodies.** Every write route that needs an owner or admin calls `Tenant::require_admin()` before it parses the request body, so a member gets 403 `forbidden` whatever the body holds. The Dot `PATCH` (Task 5), whose required role depends on which keys the body sets, checks the role right after reading the keys and before validating any value.
-- **Time windows.** A quota or rate window uses one cutoff for the whole statement, `statement_timestamp() - interval '24 hours'` (or `'60 seconds'`), never a per-row `clock_timestamp()`: Postgres cannot bound an index scan with a volatile expression, so a per-row cutoff visits every historical row. Lease-expiry checks keep `clock_timestamp()`.
+- **Lock first, then check.** Never decide on time or lease validity inside a locking `SELECT`: lock the row first, then re-read it and check `lease_epoch`, state and `clock_timestamp()` expiry in a separate statement of the same transaction. A locking select evaluates its `WHERE` before it waits for the lock, and Postgres re-checks it after the wait only when the row changed, so a lease that expires during the wait, or one renewed after the snapshot, is misjudged. `fence::check`, `fence::lock` (Task 2) and `lease::claim` (Task 11) follow this rule.
+- **Time windows.** A quota or rate window uses one cutoff for the whole statement, `statement_timestamp() - interval '24 hours'` (or `'60 seconds'`), never a per-row `clock_timestamp()`: Postgres cannot bound an index scan with a volatile expression, so a per-row cutoff visits every historical row. The window's statement runs after the lock it depends on (the Dot row for quotas), so `statement_timestamp()` is sampled after any lock wait. Lease-expiry checks keep `clock_timestamp()`.
 - **Migrations.** A task that changes the schema adds the next numbered file in `crates/katwork/migrations/`: `0002_email_unique.sql` and `0003_email_lowercase.sql` (Task 3), `0004_team_membership.sql` (Task 5), `0005_task_first_claim.sql` (Task 11), `0006_scheduler_indexes.sql` (Task 12). Tasks 3b, 7b and 13b add none.
 - **Lock order.** Every transaction that waits for row locks takes them in one global order: workspace row → job row → task row, then its `task_leases`, `runs` and `tool_calls` rows → thread row (the row `log::append` updates for `last_event_seq`) → Dot row, then its `dot_spaces` rows. Within one class, rows are locked in ascending id. A path that needs a later lock takes every lock it needs at its start, in this order, with `SELECT … FOR NO KEY UPDATE` (`FOR SHARE` when it only reads the row), before any write. A transaction that will update a row locks it `FOR NO KEY UPDATE` from the start and never upgrades from `FOR SHARE`; a plain `UPDATE` that leaves the key unchanged takes the same lock. **No path uses `FOR UPDATE`, deletes a workspace, user, job, task, thread, Dot, message or run row, or changes any row's key.** The only deletes are `task_leases` rows and non-default `dot_spaces` grants, which no row references. Foreign-key checks on insert and update take `FOR KEY SHARE` on the parent row, which conflicts only with `FOR UPDATE`, a delete or a key change, so a foreign-key check never waits on a lock any path holds. Inserting a row whose parent sits earlier in the order, such as a follow-up job referencing its parent job or any tenant row referencing its workspace, is therefore safe after later locks. Rows a transaction inserts are invisible to others until commit, unique-index checks run under the thread or job lock that already serializes their writers (Task 12), and a `SKIP LOCKED` select never waits. Every remaining wait is for a lock later in the order than any lock already held, so no cycle of waits, and no deadlock, can form. Tasks 2, 4 and 8–12 name the locks each path takes.
 - Default team roles: Lead, Researcher, Writer, Analyst, Scheduler, Reviewer (spec §2). The Lead's default `max_concurrency` is 3 and each specialist's is 1 (initial defaults; Task 5 follow-up).
@@ -200,7 +201,7 @@ web/
   - `types::SideEffect::{Read, Navigate, WorkspaceRead, Draft, WorkspaceWrite, Exec, CredentialUse, Destructive, Outward(OutwardKind)}` and `types::OutwardKind::{Send, Publish, Pay, Share, ExternalApi}`, with `SideEffect::wire(&self) -> &'static str` giving `read, navigate, workspace_read, draft, workspace_write, exec, credential_use, destructive, outward_send, outward_publish, outward_pay, outward_share, outward_external_api`. `SideEffect` serializes as its single wire string (`"outward_send"`, never a nested object), and `SideEffect::from_wire(s: &str) -> Option<SideEffect>` reads it back.
   - `types::ReasonCode` with `wire(&self) -> &'static str` and `ReasonCode::ALL`: `provider_unavailable, provider_rate_limited, provider_quota, provider_auth_failed, model_protocol_error, time_limit, quota_exceeded, workspace_paused, step_limit, token_budget, output_truncated, residency_denied, loop_detected, policy_changed, approval_pending, question_pending, interrupted_review_required, dot_paused, retries_exhausted, cancelled, outcome_unknown, no_eligible_dot, dot_not_in_space, lease_lost`. Each value is a job `reason`, a notice body or a `RUN_ERROR` code, and has a message in both locales (Task 13a). Task 10 adds `too_many_requests`.
   - `db::connect(url: &str) -> Result<PgPool, KatError>` and `db::migrate(pool: &PgPool) -> Result<(), KatError>`
-  - `fence::Fence { task_id: TaskId, epoch: LeaseEpoch }` and `fence::check(conn: &mut PgConnection, f: &Fence) -> Result<(), KatError>`. Run inside the caller's write transaction, it runs two statements. The first locks the task row, `SELECT id FROM tasks WHERE id = $1 FOR SHARE`, and may wait for that lock. The second, in the same transaction, selects the task joined to its lease where `tasks.state = 'leased'`, `tasks.lease_epoch` and `task_leases.lease_epoch` both equal `f.epoch`, and `expires_at > clock_timestamp()`; no row is `lease_lost`. Checking in a second statement means a lease that expires while the first statement waits is rejected, even when the lock holder changed nothing and released its lock (issue #23, PR #25); a single locking select evaluates the expiry before the wait and never again. Every lease-expiry comparison uses `clock_timestamp()`, the time at that statement, never `now()`, which is fixed when the transaction starts and would keep a lease alive after a lock wait. Every path that ends a lease (complete, cancel, reclaim, abandon, and the deadline, retry and eligibility branches) changes `tasks.state` or increments `tasks.lease_epoch` in the same transaction, so the check can never pass for an ended lease. The share lock lasts until the write commits. Claim, cancel and every terminal transition take `FOR NO KEY UPDATE` on the task row, so they wait for an in-flight fenced write, and any write after them fails the check. `fence::lock(conn: &mut PgConnection, f: &Fence) -> Result<(), KatError>` is the same two statements with the first taking `FOR NO KEY UPDATE`, for a caller that will update the task row (`ledger::start_tool_call` for a non-Read call, `lease::complete`, `lease::abandon`), because a lock is never upgraded from `FOR SHARE`.
+  - `fence::Fence { task_id: TaskId, epoch: LeaseEpoch }` and `fence::check(conn: &mut PgConnection, f: &Fence) -> Result<(), KatError>`. Run inside the caller's write transaction, it runs two statements. The first locks the task row, `SELECT id FROM tasks WHERE id = $1 FOR SHARE`, and may wait for that lock. The second, in the same transaction, selects the task joined to its lease where `tasks.state = 'leased'`, `tasks.lease_epoch` and `task_leases.lease_epoch` both equal `f.epoch`, and `expires_at > clock_timestamp()`; no row is `lease_lost`. Checking in a second statement means a lease that expires while the first statement waits is rejected, even when the lock holder changed nothing and released its lock (issue #23, fixed in PR #25); a single locking select evaluates the expiry before the wait and never again. Every lease-expiry comparison uses `clock_timestamp()`, the time at that statement, never `now()`, which is fixed when the transaction starts and would keep a lease alive after a lock wait. Every path that ends a lease (complete, cancel, reclaim, abandon, and the deadline, retry and eligibility branches) changes `tasks.state` or increments `tasks.lease_epoch` in the same transaction, so the check can never pass for an ended lease. The share lock lasts until the write commits. Claim, cancel and every terminal transition take `FOR NO KEY UPDATE` on the task row, so they wait for an in-flight fenced write, and any write after them fails the check. `fence::lock(conn: &mut PgConnection, f: &Fence) -> Result<(), KatError>` is the same two statements with the first taking `FOR NO KEY UPDATE`, for a caller that will update the task row (`ledger::start_tool_call` for a non-Read call, `lease::complete`, `lease::abandon`), because a lock is never upgraded from `FOR SHARE`.
   - `runtime::Core { pool: PgPool, config: Arc<Config> }` and `Core::new(pool: PgPool, config: Arc<Config>) -> Core`. Task 7 adds `registry: Arc<Registry>` and Task 9 adds `events: EventHub`; both are filled inside `Core::new`, so its signature never changes.
   - `katwork_server::app::AppState { core: Arc<Core> }`
   - `katwork_server::error::ApiError(pub KatError)` with `From<KatError>` and `IntoResponse`: the body is `{"code": e.code()}` and the status comes from one `match` that each later task extends
@@ -252,7 +253,7 @@ web/
 
 ### Task 3: HTTP guards, password auth, sessions, reset, demo accounts
 
-**Status:** in review as PR #20. The interfaces below match its reviewed code; Task 3b adds operator accounts and first-run convenience on top.
+**Status:** merged in PR #20. The interfaces below match its code; Task 3b adds operator accounts and first-run convenience on top.
 
 **Files:**
 - Create: `crates/katwork/src/auth/{mod,password,session,reset,mailer}.rs`, `crates/katwork/migrations/{0002_email_unique.sql,0003_email_lowercase.sql}`, `crates/katwork-server/src/{extract.rs,guards.rs,transport.rs,peer.rs,routes/auth.rs}`, `crates/katwork-server/tests/{http_guards.rs,auth.rs,mailer.rs,security.rs,transport.rs,support/mod.rs}`
@@ -748,7 +749,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 - Modify: `Cargo.toml` (`tokio-util`)
 
 **Interfaces:**
-- Consumes: `fence::{Fence, check, lock}`, `types::Question` (Task 2); `Registry`, `Selected`, `ModelProvider`, `ChatRequest`, `ChatMsg`, `ChatChunk`, `ToolSpec`, `ModelError`, `StreamTimeouts`, `guard_stream` (Task 7); `EventSink`, `RunEnd`, `AgUiEvent`, `KatworkEvent`, `DotState`, `DeltaCoalescer` (Task 9); `Dot`, `Dot::config_hash` (Task 5); `Tenant` (Task 4); ids and `types::{SideEffect, SpacePolicy}` (Task 2).
+- Consumes: `fence::{Fence, check, lock}`, `types::Question` (Task 2); `Registry`, `Selected`, `ModelProvider`, `ChatRequest`, `ChatMsg`, `ChatChunk`, `ToolSpec`, `ModelError`, `StreamTimeouts`, `guard_stream` (Task 7); `ModelEntry.timeouts` (Task 7b); `EventSink`, `RunEnd`, `AgUiEvent`, `KatworkEvent`, `DotState`, `DeltaCoalescer` (Task 9); `Dot`, `Dot::config_hash`, `dot::get_on`, `dot::is_granted` (Task 5); `Tenant` (Task 4); ids and `types::{SideEffect, SpacePolicy}` (Task 2).
 - Produces:
   - `#[async_trait] trait Tool: Send + Sync { fn spec(&self) -> ToolSpec; fn side_effect(&self) -> SideEffect; async fn call(&self, ctx: &ToolCtx, args: serde_json::Value) -> Result<ToolOutput, ToolError>; }`
   - `ToolOutput::{Text(String), Ask(Question)}`: `Text` goes back to the model as the tool result; `Ask` ends the run with that question
@@ -772,9 +773,9 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `RunFacts::not_run(stop: StopReason) -> RunFacts`: no run id, a fresh `reply_message_id`, everything else empty; used when the harness decides without a run (Tasks 11 and 12)
   - `ToolCallRecord { id: ToolCallRecordId, step: u32, tool_call_id: String, name: String, side_effect: Option<SideEffect>, state: ToolCallState }` and `ToolCallState::{Started, Succeeded, Failed, TimedOut, OutcomeUnknown, Refused}`
   - `PendingCall { record_id: ToolCallRecordId, tool_call_id: String, name: String, args_canonical: String, args_sha256: String }`, stored as `tasks.pending_tool_call`
-  - `StopReason::{ProviderUnavailable, ProviderRateLimited, ProviderQuota, ProviderAuthFailed, ModelProtocol, StepLimit, LoopDetected, NeedsApproval, TokenBudget, OutputTruncated, TimeLimit, PolicyChanged, ResidencyDenied, QuotaExceeded, WorkspacePaused, DotPaused, NoEligibleDot, Interrupted, OutcomeUnknown, Cancelled}`
-  - `Limits { max_steps: u32, tool_timeout: Duration, result_max_chars: usize, repeat_limit: u32, repeat_window: (u32, u32), max_total_tokens: u64, run_wall_clock: Duration, task_deadline: Duration, job_deadline: Duration, model_retries: u32, stream: StreamTimeouts }`. `Limits::default()` holds the initial defaults: 24, 60 s, 8,000, 3, (5, 10), 200,000, 90 s, 5 min, 10 min, 1, and 30 s / 30 s. The run deadline is separate from the lease TTL.
-  - `guards::authorize(conn: &mut PgConnection, fence: &Fence, dot_id: DotId, space_id: SpaceId, policy_version: i64) -> Result<Option<StopReason>, KatError>`: runs `fence::check`, then reads the Dot and its workspace. A paused workspace gives `WorkspacePaused`, a paused Dot `DotPaused`, and a missing grant to `space_id` or a `policy_version` other than `input.policy_version` gives `PolicyChanged`. Status, grant and allowlist changes all increment `policy_version` (Task 5), so a change made while the task was queued is caught on the first check.
+  - `StopReason::{ProviderUnavailable, ProviderRateLimited, ProviderQuota, ProviderAuthFailed, ModelProtocol, StepLimit, LoopDetected, NeedsApproval, TokenBudget, OutputTruncated, TimeLimit, PolicyChanged, ResidencyDenied, QuotaExceeded, TooManyRequests, WorkspacePaused, DotPaused, NoEligibleDot, Interrupted, OutcomeUnknown, Cancelled}`. `TooManyRequests` is the per-sender throttle at intake (Task 12), kept apart from `QuotaExceeded`, the daily token budget.
+  - `Limits { max_steps: u32, tool_timeout: Duration, result_max_chars: usize, repeat_limit: u32, repeat_window: (u32, u32), max_total_tokens: u64, run_wall_clock: Duration, task_deadline: Duration, job_deadline: Duration, model_retries: u32 }`. `Limits::default()` holds the initial defaults: 24, 60 s, 8,000, 3, (5, 10), 200,000, 90 s, 5 min, 10 min and 1. Stream timeouts are not a run limit: each model entry carries its own (`ModelEntry.timeouts`, Task 7b). The run deadline is separate from the lease TTL.
+  - `guards::authorize(conn: &mut PgConnection, tenant: &Tenant, fence: &Fence, dot_id: DotId, space_id: SpaceId, policy_version: i64) -> Result<Option<StopReason>, KatError>`: runs `fence::check`, then reads the Dot with `dot::get_on`, its grant with `dot::is_granted`, and its workspace. A paused workspace gives `WorkspacePaused`, a paused Dot `DotPaused`, and a missing grant to `space_id` or a `policy_version` other than `input.policy_version` gives `PolicyChanged`. Allowlist, status, grant, autonomy and model-tier changes all increment `policy_version` (Task 5), so a change made while the task was queued is caught on the first check; an edit to `max_concurrency`, `daily_token_budget`, `persona`, `instructions`, `name` or `appearance` never stops a run and applies from the next one.
   - `guards::canonical_args(args: &serde_json::Value) -> String`: object keys sorted and whitespace normalized; array order and values kept
   - `guards::RepeatKey { tool_name: String, canonical_args: String, target_revision: Option<String> }`, where `target_revision` is always `None` in SP1 (SP2 fills it so a render after each edit is not a loop), and `guards::RepeatGuard::new(limit: u32, window: (u32, u32))` with `check(&mut self, key: &RepeatKey) -> bool`, false meaning stop before this call. The provider's call id is never part of the key.
   - `guards::truncate_result(text: &str, max_scalars: usize) -> String`: at most `max_scalars` Unicode scalar values, the marker `"…[truncated]"` included. A JSON result over the cap becomes a plain-string preview prefixed `"[JSON truncated] "`, never cut inside its structure.
@@ -786,13 +787,14 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - Fencing: every run-scoped write (the `runs` row, each ledger function, each event through the fenced `PgEventSink`, each tool write) runs `fence::check` in the same transaction as the write, and `lease_lost` aborts it. Before each model attempt the loop also runs `guards::authorize`, which includes `fence::check`, so a reclaimed or cancelled worker makes no further model calls. On `lease_lost` the loop stops at once, writes nothing further and returns `Err(RunAbort::LeaseLost)`.
 - Loop rules:
   - **Steps.** A step is one model attempt, retries included. An answer on attempt 24 is accepted; a tool batch that would need attempt 25 is not executed (`StepLimit`).
-  - **Model attempts.** Each attempt calls `models.for_tier(dot.model_tier, &input.space_policy)`, so a provider change re-checks residency, and wraps the stream in `guard_stream`, raced against `input.deadline` (`TimeLimit`); no attempt starts once `input.deadline` has passed. It retries only before the first chunk, at most `model_retries` times. Every attempt gets one `model_calls` row and one `katwork.usage` event. Each request uses `max_output_tokens = min(entry.max_output_tokens, the run's remaining token budget)` and `temperature = entry.temperature`; with less than 256 tokens of budget left, the run stops `TokenBudget` before the attempt.
+  - **Model attempts.** Each attempt calls `models.for_tier(dot.model_tier, &input.space_policy)`, so a provider change re-checks residency, and wraps the stream in `guard_stream` with the selected entry's `timeouts`, each capped by the run's remaining time, raced against `input.deadline` (`TimeLimit`); no attempt starts once `input.deadline` has passed.
+  - **Retries.** A model attempt may be retried only before the first content chunk (a non-empty `TextDelta`, `Progress`, `ToolCall` or `Done`), at most `model_retries` times. Once content has started, a failure ends the attempt with its mapped `StopReason` and is never retried. Record one `model_calls` row per attempt and charge each attempt once. Every attempt also gets one `katwork.usage` event. Task 7's adapters never retry, so this is the only retry. Each request uses `max_output_tokens = min(entry.max_output_tokens, the run's remaining token budget)` and `temperature = entry.temperature`; with less than 256 tokens of budget left, the run stops `TokenBudget` before the attempt.
   - **Provider errors.** Every `ModelError` has exactly one outcome. Provider text stays in private, redacted logs, never in events, messages or the job reason.
 
-    | `ModelError` | retried before the first chunk | outcome when it persists |
+    | `ModelError` | retried before the first content chunk | outcome when it persists, or at once after content started |
     |---|---|---|
     | `ProviderUnavailable`, `Other(_)`, `Timeout { phase: FirstChunk }` | yes, up to `model_retries` | stop `ProviderUnavailable`, `executor_unavailable = true` |
-    | `Timeout { phase: Idle }` | no, a chunk already arrived | stop `ProviderUnavailable`, `executor_unavailable = true` |
+    | `Timeout { phase: Idle }` | no, content already arrived | stop `ProviderUnavailable`, `executor_unavailable = true` |
     | `RateLimited { retry_after_secs }` | once, only if the wait fits in the run's remaining time | stop `ProviderRateLimited` |
     | `QuotaExceeded { .. }` | no | stop `ProviderQuota` |
     | `AuthFailed` | no | stop `ProviderAuthFailed` |
@@ -851,6 +853,9 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `tool_output_never_enters_system_role`
   - `capability_preamble_lists_effective_tools`
   - `usage_recorded_once_per_attempt`
+  - `no_retry_after_content_or_progress`: a scripted `TextDelta`, and in a second case only a `Progress`, followed by `ProviderUnavailable`; the provider receives exactly one request, the run stops `ProviderUnavailable`, and one `model_calls` row is charged once
+  - `retry_before_first_content_gets_its_own_row`: a first attempt that fails before any content is retried once; two `model_calls` rows, each charged once
+  - `attempt_uses_its_entrys_stream_timeouts`: paused tokio clock; an entry with 120 s / 60 s timeouts does not time out at 30 s, and its wait is still capped by the run's remaining time
   - `every_model_error_maps_to_a_stable_stop_reason`: table-driven over the table above; no provider text reaches an event or message
   - `max_output_tokens_capped_by_remaining_budget`
   - `missing_usage_is_charged_conservatively_and_stored_null`
@@ -870,6 +875,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 **Interfaces:**
 - Consumes: `RunFacts`, `StopReason`, `Initiator` (Task 8); `ChatMsg` (Task 7); `log::append`, `EventHub`, `AgUiEvent`, `KatworkEvent`, `DotState` (Task 9); `message::append`, `NewMessage` (Task 6); `Tenant`; `types::{ReasonCode, JobStatus}`.
 - Produces:
+  - `ReasonCode` gains `TooManyRequests` (wire `too_many_requests`), added to `ReasonCode::ALL`, for the per-sender throttle (Task 12); it is never `quota_exceeded`
   - `NextStep::{RunCheapChecks, AskUser, HandToLead, SaveDraftWithReport, Retry, RestartJob}`
   - `Thresholds { version: u32 }` and `Thresholds::SP1` (`version: 1`)
   - `Verdict { status: JobStatus, reason: Option<ReasonCode>, next: Option<NextStep> }`; `status` is never `Cancelled` or `Error`
@@ -884,6 +890,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
     |---|---|---|---|
     | `ProviderUnavailable` / `ProviderRateLimited` / `ModelProtocol` / `TimeLimit` | `stopped` | `provider_unavailable` / `provider_rate_limited` / `model_protocol_error` / `time_limit` | `Retry` |
     | `ProviderQuota` / `QuotaExceeded` / `WorkspacePaused` | `stopped` | `provider_quota` / `quota_exceeded` / `workspace_paused` | `Retry` (after the reset or unpause) |
+    | `TooManyRequests` | `stopped` | `too_many_requests` | `Retry` (after a minute) |
     | `ProviderAuthFailed` / `DotPaused` / `ResidencyDenied` / `NoEligibleDot` | `stopped` | `provider_auth_failed` / `dot_paused` / `residency_denied` / `no_eligible_dot` | `AskUser` (an admin) |
     | `StepLimit` / `TokenBudget` / `OutputTruncated` | `stopped` | `step_limit` / `token_budget` / `output_truncated` | `SaveDraftWithReport` |
     | `LoopDetected` | `stopped` | `loop_detected` | `HandToLead` |
@@ -893,7 +900,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
     | `Cancelled` | `stopped` | `cancelled` | `Retry`; never reached in practice, because cancelled jobs end through the harness |
 
   - `policy::decision_event(job_id: JobId, facts: &RunFacts, v: &Verdict, t: &Thresholds) -> KatworkEvent`: builds `katwork.decision`. `inputs` is `{"stop": the stop reason's wire name or null, "executorUnavailable", "hasFinalText", "pendingQuestion", "artifactsCreated", "toolCalls": count, "synthetic"}`; `verdict` is `{"status", "reason", "next"}` as wire strings; `thresholds` is `Thresholds` as JSON; `policyVersion` is `Thresholds.version`.
-  - `job::create(conn: &mut PgConnection, &Tenant, ThreadId, MessageId) -> Result<JobId, KatError>`: a running job (`status` NULL) with `requested_by = tenant.user_id`
+  - `job::create(conn: &mut PgConnection, &Tenant, ThreadId, MessageId) -> Result<JobId, KatError>`: a running job (`status` NULL) with `requested_by = tenant.user_id()`
   - `job::create_follow_up(conn: &mut PgConnection, &Tenant, parent: JobId, MessageId) -> Result<JobId, KatError>`: `parent` must be `needs_input` in the same thread, otherwise `job_not_awaiting_input`; sets `parent_job_id` (ADR-0002)
   - `JobSummary { id: JobId, status: Option<JobStatus> }` and `job::latest_in_thread(conn: &mut PgConnection, &Tenant, ThreadId) -> Result<Option<JobSummary>, KatError>`
   - `job::finish_by_policy(tx: &mut Transaction<'_, Postgres>, job_id: JobId, v: &Verdict, decision_seq: EventSeq) -> Result<EventSeq, KatError>`: sets `status`, `reason`, `decided_by = 'policy'` and `decision_seq`, then appends `katwork.job_status` and returns its seq. The caller has already appended `katwork.decision`.
@@ -923,24 +930,24 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 ### Task 11: Leases, worker pool and restart recovery
 
 **Files:**
-- Create: `crates/katwork/src/jobs/{lease,worker}.rs`, `crates/katwork/tests/leases.rs`
+- Create: `crates/katwork/src/jobs/{lease,worker}.rs`, `crates/katwork/migrations/0005_task_first_claim.sql` (`ALTER TABLE tasks ADD COLUMN first_claimed_at TIMESTAMPTZ NULL`), `crates/katwork/tests/leases.rs`
 
 **Interfaces:**
 - Consumes: `fence::{Fence, check, lock}` (Task 2); `TaskInput`, `job::{conclude, finish_by_harness}` (Task 10); `run::execute`, `RunAbort`, `RunEnv`, `RunInput`, `RunFacts`, `RunFacts::not_run`, `RunKind`, `Limits`, `StopReason`, `ToolRegistry::builtin` (Task 8); `PgEventSink`, `log::append` (Task 9); `dot::get` (Task 5); `thread::get` (Task 6); `space::get`, `tenancy::resolve` (Task 4); `Core`.
 - Produces:
-  - `lease::claim(core: &Core, worker_id: &str, ttl: Duration, limits: &Limits) -> Result<Option<ClaimedTask>, KatError>`. Candidates are tasks with `state = 'queued'`, or `state = 'leased'` with an expired lease, **whose job is still running** (`jobs.status IS NULL`), selected with `FOR NO KEY UPDATE OF tasks, jobs SKIP LOCKED`; every time comes from Postgres, and lease expiry is compared with `clock_timestamp()`. Each candidate is handled in its own transaction. A branch that ends without a run commits and claim moves on to the next candidate (at most 16 per call); the first candidate that gets a lease is returned. Each candidate's transaction takes all its locks before any write, in the global order: the job and task rows from the `SKIP LOCKED` select (never waiting), then the thread row (`SELECT … FROM threads WHERE id = $1 FOR NO KEY UPDATE`), then the Dot row (`SELECT … FROM dots WHERE id = $1 FOR NO KEY UPDATE`), all held until commit. Every branch below, including the ones that only emit an event (recovery closing, `dot_busy`, `workspace_paused`), runs after those locks. Then, in order:
+  - `lease::claim(core: &Core, worker_id: &str, ttl: Duration, limits: &Limits) -> Result<Option<ClaimedTask>, KatError>`. Candidates are tasks with `state = 'queued'`, or `state = 'leased'` with an expired lease, **whose job is still running** (`jobs.status IS NULL`), selected in `(tasks.created_at, tasks.id)` order, so each Dot's queue is first come, first served, with `FOR NO KEY UPDATE OF tasks, jobs SKIP LOCKED`; every time comes from Postgres, and lease expiry is compared with `clock_timestamp()`. That select joins `task_leases` without locking it, so its expiry test may be stale: a renewal committed after the select's snapshot but before it locked the task row changes no task row, so Postgres does not re-check it. Once the task row is locked, claim therefore re-reads the task and its lease in a separate statement (Global Constraints: lock first, then check) and goes on only if the task is still `queued`, or still `leased` with `expires_at <= clock_timestamp()`; otherwise it rolls that candidate back and moves to the next. Each candidate is handled in its own transaction. A branch that ends without a run commits and claim moves on to the next candidate (at most 16 per call); the first candidate that gets a lease is returned. Each candidate's transaction takes all its locks before any write, in the global order: the job and task rows from the `SKIP LOCKED` select (never waiting), then the thread row (`SELECT … FROM threads WHERE id = $1 FOR NO KEY UPDATE`), then the Dot row (`SELECT … FROM dots WHERE id = $1 FOR NO KEY UPDATE`), all held until commit. Every branch below, including the ones that only emit an event (recovery closing, `dot_busy`, `workspace_paused`), runs after those locks. Then, in order:
     - **closing an expired lease, once:** only a run of this task in state `running` is closed. For each of its open calls (started in `tool_calls` with no end) claim emits `TOOL_CALL_RESULT` and `katwork.tool_status{ok: false}` and marks the call `outcome_unknown`; it marks the run `interrupted`, emits `RUN_ERROR{code: "lease_lost"}` and `katwork.run_closed {end: interrupted}` before any later `RUN_STARTED`, and deletes the expired lease row. When no effect started (`effects_started_at IS NULL`), the task goes back to `queued` in the same transaction. A later poll then finds a queued task with no running run, so a task held by the branches below is never closed twice. A run leaves `running` only together with its terminal event, so this predicate finds exactly the runs that have none, including a run whose worker died after `execute` returned but before `lease::complete` committed.
-    - **deadline:** a task past `created_at + task_deadline`, or whose job is past `created_at + job_deadline`, becomes `failed`, its lease row is deleted, and the job ends with `job::conclude` on `RunFacts::not_run(StopReason::TimeLimit)`
+    - **deadline:** a task whose `first_claimed_at` is set and is past `first_claimed_at + task_deadline`, or whose job is past `jobs.created_at + job_deadline`, both compared with `clock_timestamp()`, becomes `failed`. Time a task waits in the queue before its first claim never counts against its task deadline, only against its job's. The task's lease row is deleted, its lease row is deleted, and the job ends with `job::conclude` on `RunFacts::not_run(StopReason::TimeLimit)`
     - **retries exhausted:** at `attempts >= max_attempts` (3), the task becomes `failed`, its lease row is deleted, and the job ends with `finish_by_harness(tx, Error { code: RetriesExhausted })`
     - **effects started:** a task whose expired lease was just closed and whose `effects_started_at` is set becomes `interrupted` and ends the job with `job::conclude` on `RunFacts::not_run(StopReason::Interrupted)`
     - skips a task of a paused workspace and sets `hold_reason = 'workspace_paused'`
     - **eligibility,** against the values stored on the task: the Dot must be `active`, still granted to the thread's Space, and at `policy_version = tasks.dot_policy_version`. A paused Dot ends the job with `job::conclude` on `RunFacts::not_run(StopReason::DotPaused)`; a revoked grant or any other policy change ends it on `RunFacts::not_run(StopReason::PolicyChanged)`. Either way the task becomes `failed` and its lease row is deleted, so queued history never reaches a model after the Dot lost its authority.
     - **concurrency:** counts the Dot's **other** tasks with a live lease (`state = 'leased'`, lease `expires_at > clock_timestamp()`, a different task id); expired leases never count. At `max_concurrency` or more it skips the candidate and sets `hold_reason = 'dot_busy'`. Because the Dot row is held, a second claimer for the same Dot waits on it and then sees the first lease.
     - emits `katwork.job_status {status: null, holdReason}` when it first sets a hold reason
-    - otherwise claims it: attempts + 1 (a `Recovery` run when `attempts > 0`, which covers a task re-queued by the closing above or by `lease::abandon`), increments `tasks.lease_epoch`, writes the lease with the same epoch, and clears `hold_reason`
+    - otherwise claims it: attempts + 1 (a `Recovery` run when `attempts > 0`, which covers a task re-queued by the closing above or by `lease::abandon`), increments `tasks.lease_epoch`, writes the lease with the same epoch, clears `hold_reason`, and sets `first_claimed_at = COALESCE(first_claimed_at, clock_timestamp())`, so the task deadline starts at the first claim and a recovery claim keeps it
 
     Because each no-run branch moves the task to a terminal state and finishes its job in the same transaction, a repeated poll never finishes the same job twice.
-  - `ClaimedTask { task_id: TaskId, job_id: JobId, dot_id: DotId, workspace_id: WorkspaceId, thread_id: ThreadId, requested_by: UserId, input: TaskInput, attempts: i32, lease_epoch: LeaseEpoch, policy_version: i64, kind: RunKind, remaining: Duration }`. `policy_version` is the task's stored `dot_policy_version`. `remaining` comes from the claim transaction's last statement, `SELECT GREATEST(0, (EXTRACT(EPOCH FROM LEAST(t.created_at + $1 * INTERVAL '1 microsecond', j.created_at + $2 * INTERVAL '1 microsecond') - clock_timestamp()) * 1000000)::bigint) AS remaining_micros`, with the task and job deadlines bound as `i64` microseconds. It is decoded as `i64` and converted with `Duration::from_micros(u64::try_from(remaining_micros).unwrap_or(0))`. Because the statement runs last, the time spent acquiring the claim is already subtracted, and the worker's wall clock is never consulted. The deadline branch above uses the same bound microsecond values.
+  - `ClaimedTask { task_id: TaskId, job_id: JobId, dot_id: DotId, workspace_id: WorkspaceId, thread_id: ThreadId, requested_by: UserId, input: TaskInput, attempts: i32, lease_epoch: LeaseEpoch, policy_version: i64, kind: RunKind, remaining: Duration }`. `policy_version` is the task's stored `dot_policy_version`. `remaining` comes from the claim transaction's last statement, `SELECT GREATEST(0, (EXTRACT(EPOCH FROM LEAST(t.first_claimed_at + $1 * INTERVAL '1 microsecond', j.created_at + $2 * INTERVAL '1 microsecond') - clock_timestamp()) * 1000000)::bigint) AS remaining_micros`, with the task and job deadlines bound as `i64` microseconds; it runs after the claim's update, so `first_claimed_at` is always set. It is decoded as `i64` and converted with `Duration::from_micros(u64::try_from(remaining_micros).unwrap_or(0))`. Because the statement runs last, the time spent acquiring the claim is already subtracted, and the worker's wall clock is never consulted. The deadline branch above uses the same bound microsecond values.
   - `HeartbeatStatus::{Continue, Stop(StopReason)}` and `lease::heartbeat(pool, task_id: TaskId, worker_id: &str, epoch: LeaseEpoch, ttl: Duration) -> Result<HeartbeatStatus, KatError>`: takes `fence::check` (the task row, shared) and then updates the lease row, in the global order; it renews `expires_at = now() + ttl` only while the check passes, so an expired lease is never revived; `Stop(WorkspacePaused)` once the workspace is paused. A task that is no longer leased under this epoch (reclaimed, cancelled or finished by the harness) is `lease_lost`.
   - `lease::complete(core: &Core, task_id: TaskId, worker_id: &str, epoch: LeaseEpoch, facts: RunFacts) -> Result<(), KatError>`: its transaction first reads the task's `job_id` and `thread_id` without locking, then takes, in the global order and before any write, the job row (`FOR NO KEY UPDATE`), the task row with `fence::lock`, and the thread row (`FOR NO KEY UPDATE`). A task that is no longer leased under this epoch is `lease_lost`, and the worker drops its facts, because whoever ended the lease (reclaim or cancel) already closed the run. Otherwise, in one transaction: `job::conclude` (with `idem_key` = the task id); the task state (`done`, or `interrupted` for `WorkspacePaused`) and `pending_tool_call`; the lease release. Then it commits and notifies the hub.
   - `worker::spawn_pool(core: Arc<Core>, n: usize, ttl: Duration) -> JoinSet<()>`. Each worker:
@@ -956,6 +963,8 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 - [ ] **Step 1: Write the failing tests** in `crates/katwork/tests/leases.rs`:
   - `two_workers_never_claim_same_task`: 50 tasks, 2 workers in parallel, each task claimed once
   - `expired_lease_is_reclaimed_once`: worker A claims and stops heartbeating; after the TTL, worker B claims it with a higher epoch; A's late `heartbeat` and `complete` are rejected with `lease_lost`
+  - `renewal_committed_between_snapshot_and_lock_is_not_reclaimed`: a lease within 50 ms of expiry is renewed by its worker's `heartbeat` while another worker's `claim` starts, both released from a `tokio::sync::Barrier`, 200 times over. Whenever the renewal commits, the task is not reclaimed: its epoch is unchanged, it has one `runs` row, and the first worker's next `heartbeat` and `lease::complete` succeed
+  - `claims_follow_queue_order`: a Dot's queued tasks are claimed in `(created_at, id)` order
   - `expired_lease_after_side_effect_is_interrupted_not_rerun`
   - `reclaim_does_not_duplicate_reply`
   - `reclaimed_run_closes_open_calls_before_new_run_started`
@@ -965,7 +974,8 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `cancelled_job_task_is_never_claimed`: a job cancelled while its task is queued is never claimed, and no model call happens
   - `deadline_branch_finishes_once_across_repeated_polls`: the task ends `failed` with no lease row, and one job status is written however often workers poll
   - `retries_exhausted_branch_finishes_once_across_repeated_polls`
-  - `one_dot_runs_one_task_at_a_time`
+  - `one_dot_runs_one_task_at_a_time`: a Dot with `max_concurrency = 1`
+  - `lead_runs_three_tasks_at_once_specialists_one`: with the default roster's values (Task 5 follow-up), three tasks for the Lead are leased together and a fourth gets `dot_busy`, while a specialist's second task gets `dot_busy`
   - `expired_claim_racing_paused_dot_claim_does_not_deadlock`: one worker claims an expired task (whose recovery closing emits events) while another claims a fresh task of the same paused Dot in the same thread. The two calls start together from a `tokio::sync::Barrier`, 50 times over; both always finish, and no error carries SQLSTATE `40P01`
   - `simultaneous_claims_for_one_dot_dispatch_once`: two workers claim two different tasks of one Dot (`max_concurrency = 1`) at the same moment behind a barrier; exactly one lease is granted and the other task gets `dot_busy`
   - `expired_lease_does_not_block_reclaim_at_max_concurrency_one`: the Dot's only task has an expired lease; it is reclaimed rather than held as `dot_busy`
@@ -980,7 +990,8 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `task_past_deadline_finishes_time_limit`
   - `run_deadline_clamps_to_the_shorter_limit`: `remaining` of 10 s with a 90 s wall clock gives `claimed_at + 10 s`; zero gives `claimed_at`
   - `remaining_micros_from_sql_for_future_and_expired_deadlines`: runs the real claim query; a deadline 10 s ahead decodes to a `remaining` between 9 and 10 s, and a passed deadline decodes to zero
-  - `deadline_comes_from_database_time`: a task whose `created_at` is 4 min 50 s in the past by Postgres time is claimed with `remaining` of about 10 s, whatever the worker's clock says
+  - `deadline_comes_from_database_time`: a recovery claim of a task whose `first_claimed_at` is 4 min 50 s in the past by Postgres time gets `remaining` of about 10 s, whatever the worker's clock says
+  - `task_deadline_starts_at_first_claim`: a task created 3 minutes ago by Postgres time and never claimed gets `remaining` between 4 min 59 s and 5 min at its first claim, which sets `first_claimed_at`; a later recovery claim keeps that value
   - `zero_remaining_makes_no_model_call`: a run started with `remaining = 0` stops `TimeLimit` and the provider receives no request
 - [ ] **Step 2: Run** `cargo test -p katwork --test leases`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
@@ -990,8 +1001,8 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 ### Task 12: Message → job pipeline (SP1 routing)
 
 **Files:**
-- Create: `crates/katwork/src/pipeline.rs`, `crates/katwork/src/jobs/quota.rs`, `crates/katwork-server/src/routes/jobs.rs`, `crates/katwork-server/tests/pipeline.rs`
-- Modify: `crates/katwork/src/jobs/job.rs` (`job::cancel`), `crates/katwork-server/src/routes/threads.rs` (`POST` messages calls `pipeline::submit` and returns its `job_id`), `crates/katwork-server/src/main.rs` (`serve` spawns the worker pool)
+- Create: `crates/katwork/src/pipeline.rs`, `crates/katwork/src/jobs/quota.rs`, `crates/katwork/migrations/0006_scheduler_indexes.sql`, `crates/katwork-server/src/routes/jobs.rs`, `crates/katwork-server/tests/pipeline.rs`
+- Modify: `crates/katwork/src/jobs/job.rs` (`job::cancel`, `job::view`), `crates/katwork/tests/schema.rs` (EXPLAIN tests), `crates/katwork-server/src/routes/threads.rs` (`POST` messages calls `pipeline::submit` and returns its `job_id`), `crates/katwork-server/src/main.rs` (`serve` spawns the worker pool)
 
 **Interfaces:**
 - Consumes: Tasks 4–11.
@@ -1004,19 +1015,19 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
     4. `task::enqueue`, or `job::conclude` for a job that ends at intake, plus the notices, each written with `job_id` set to the job
   - `pipeline::submit(core: &Core, tenant: &Tenant, thread_id: ThreadId, post: UserPost) -> Result<Submitted, KatError>`: begins a transaction, runs `intake`, commits, then notifies the hub. A crash at any point before the commit leaves no message, job or task, so the client's retry with the same `client_msg_id` starts clean; a concurrent retry waits on the thread lock, then finds the first post's message and returns its ids. The route answers 201 when `created`, otherwise 200.
   - Intake rules inside `intake`:
-    - SP1 routing (spec §6.2 Stage 0 subset; Laya arrives in SP4). The eligible set is the thread team's Dots that are `active` and granted to the thread's Space. Mentions from `mentions::parse` are matched, in text order, against the team's Dot names (case-insensitive, NFC; names are unique within a team, Task 5):
+    - SP1 routing (spec §6.2 Stage 0 subset; Laya arrives in SP4). The eligible set is `team::eligible_members(conn, tenant, thread.team_id, thread.space_id)` (Task 5): the thread team's active members whose Dot is `active` and granted to the thread's Space, lead first, then by `position`. Mentions from `mentions::parse` are matched, in text order, against the names of the team's active members, by the same `NFKC_Casefold` key as Task 5's uniqueness check (names are unique within a team):
       1. the first mention that names an eligible Dot gets the task; later mentions are ignored in SP1 (team jobs arrive in SP4)
       2. a mention of a team Dot that is not eligible posts a `System` notice, `dot_paused` or `dot_not_in_space`, and matching moves on to the next mention
       3. with no eligible mention, the Lead gets the task if it is eligible, otherwise the first eligible Dot in team order (`team_members.position`)
       4. with no eligible Dot at all, the job ends with `job::conclude` on `RunFacts::not_run(StopReason::NoEligibleDot)`
-    - quotas before enqueue: `quota::check`; when exceeded, the job ends with `job::conclude` on `RunFacts::not_run(StopReason::QuotaExceeded)`, which posts a localized notice. Nothing is dropped silently.
+    - quotas before enqueue: `quota::check`; when it returns a stop reason (`QuotaExceeded` or `TooManyRequests`), the job ends with `job::conclude` on `RunFacts::not_run(that reason)`, which posts a localized notice. Nothing is dropped silently.
     - in a paused workspace the task is still enqueued and waits (Task 11), and the pipeline posts a `System` notice `workspace_paused`
     - every `job::conclude` call here uses the job id as `idem_key`, and each notice uses the idempotency key `"notice:{job_id}:{code}"`, so a retried post never doubles them
     - builds `TaskInput` with `build_history`, and calls `task::enqueue` with the routed Dot's `policy_version`, read after `quota::check` has locked the Dot row, and key `"job:{job_id}:dot:{dot_id}"`
   - `quota::check(conn: &mut PgConnection, dot: &Dot, sender: UserId) -> Result<Option<StopReason>, KatError>`, run inside intake's transaction:
     - it first locks the Dot row (`FOR NO KEY UPDATE`): the last lock intake takes, after the thread row and before any write
-    - the daily budget is `dot.daily_token_budget` (`None` means no cap), compared with the sum of `model_calls.charged_tokens` for that Dot over the last 24 hours, so missing usage counts at its conservative charge, never as zero
-    - the rate limit is at most 6 jobs per minute per (Dot, sender), counted from tasks routed to that Dot whose job that sender requested in the last 60 s
+    - the daily budget is `dot.daily_token_budget` (`None` means no cap), compared with the sum of `model_calls.charged_tokens` for that Dot with `created_at > statement_timestamp() - interval '24 hours'`, so missing usage counts at its conservative charge, never as zero. The sum runs as its own statement after the Dot lock, so its one cutoff is computed after any lock wait and the `(dot_id, created_at)` index bounds the scan (Global Constraints). Over budget returns `QuotaExceeded`.
+    - the per-sender throttle allows at most 6 jobs per minute per (Dot, sender), counted from tasks routed to that Dot whose job that sender requested with `jobs.created_at > statement_timestamp() - interval '60 seconds'`, also after the Dot lock. Over it returns `TooManyRequests` (`too_many_requests`), never `QuotaExceeded`.
     - intake's `task::enqueue` records the routing in the same transaction, so a concurrent submission for the same Dot waits on the Dot row and then counts it
   - `History { messages: Vec<ChatMsg>, cut: u32 }` and `pipeline::build_history(messages: &[Message], dot_id: DotId, names: &HashMap<Author, String>, budget_chars: usize) -> History`:
     - the newest messages up to `budget_chars` (24,000); the latest user message is always kept whole, and the number of cut messages is recorded
@@ -1024,6 +1035,8 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
     - system notes become plain `User` notes, never the system role
   - `job::cancel(pool, hub: &EventHub, tenant: &Tenant, job_id: JobId) -> Result<(), KatError>`: another workspace's job is `NotFound`; a finished job is `job_already_finished`. In one transaction it locks the job row (`FOR NO KEY UPDATE`); if the job is already finished it returns `job_already_finished` at once, before taking any other lock. Otherwise it locks, before any write and in the global order, the job's task rows in ascending id, then the thread row, all `FOR NO KEY UPDATE`. Each queued or leased task becomes `cancelled` and its lease row is deleted. For a running run it closes the open calls (`TOOL_CALL_RESULT`, `katwork.tool_status{ok: false}`, ledger state `outcome_unknown`), marks the run `cancelled`, and emits `RUN_ERROR{code: "cancelled"}`, `katwork.run_closed {end: cancelled}` and `katwork.dot_state idle`. It then calls `finish_by_harness(tx, Cancelled)`, commits and notifies the hub. The old worker's next heartbeat or write finds the task no longer leased and gets `lease_lost`.
   - Route `POST /api/workspaces/{workspace_id}/jobs/{job_id}/cancel` returns 202, 404 across tenants, and 409 `job_already_finished`.
+  - `JobView { id: JobId, status: Option<JobStatus>, reason: Option<ReasonCode>, hold_reason: Option<HoldReason>, queue_position: Option<u32> }` and `job::view(pool, &Tenant, JobId) -> Result<JobView, KatError>`. `queue_position` is set only while the job's task is `queued`: 1 plus the number of the same Dot's `queued` tasks of running jobs with a smaller `(created_at, id)`, so 1 means next in line (claim follows that order, Task 11). It is null for a leased task or a finished job. Route `GET /api/workspaces/{workspace_id}/jobs/{job_id}` → 200 `JobView`, 404 across tenants; the chat shows the position (Task 13b).
+  - Migration `0006_scheduler_indexes.sql`: `jobs_thread_created ON jobs (thread_id, created_at DESC)` for `job::latest_in_thread`, `jobs_requester_created ON jobs (requested_by, created_at, id)` for the per-sender throttle, and `tasks_job_dot ON tasks (job_id, dot_id)` for the throttle's join, `job::cancel` and `job::view`.
   - `serve` builds `Core` and runs `worker::spawn_pool(core, 4, Duration::from_secs(60))`.
   - Event order for an answered job: `RUN_STARTED`, `katwork.run_started`, `katwork.dot_state working`, `TEXT_MESSAGE_*`, `katwork.decision`, `katwork.message_stored`, `katwork.job_status answered`, `katwork.dot_state idle`, `RUN_FINISHED`, `katwork.run_closed`. `katwork.job_status` is the only success signal; cancelled, needs-input and interrupted outcomes are explicit job statuses, never an omitted one.
 
@@ -1046,8 +1059,11 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `reply_to_needs_input_job_starts_linked_follow_up`
   - `history_budget_keeps_latest_user_message_whole`
   - `other_dots_messages_are_user_role_with_name`
-  - `seventh_message_in_a_minute_is_stopped_quota_exceeded`
-  - `two_simultaneous_submissions_with_five_recent_jobs_admit_one`: one is enqueued and the other ends `stopped/quota_exceeded`
+  - `seventh_message_in_a_minute_is_stopped_too_many_requests`: the notice code is `too_many_requests`, not `quota_exceeded`
+  - `two_simultaneous_submissions_with_five_recent_jobs_admit_one`: one is enqueued and the other ends `stopped/too_many_requests`
+  - `daily_budget_exceeded_is_stopped_quota_exceeded`
+  - `job_view_shows_queue_position_while_queued`: two jobs queued behind a busy Dot report positions 1 and 2; once the first is claimed, the second reports 1; a running or finished job reports null
+  - in `crates/katwork/tests/schema.rs`, each running `EXPLAIN` with `enable_seqscan = off` on the exact query the code runs: `latest_job_in_thread_uses_thread_index`, `sender_throttle_uses_requester_and_task_indexes`, `cancel_finds_tasks_by_job_index` and `daily_budget_index_cond_bounds_created_at`. Each asserts the index name and that the time column, where there is one, appears in the plan's `Index Cond`, not only in a `Filter`.
   - `daily_budget_counts_charged_tokens_when_usage_is_missing`
   - `first_eligible_mention_wins_among_several`
   - `paused_lead_routes_to_first_active_specialist`
@@ -1058,25 +1074,27 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `quota_reject_racing_claim_does_not_deadlock`: an intake that ends `stopped/quota_exceeded` and a claim of another task of the same Dot in the same thread start together from a `tokio::sync::Barrier`, 50 times over; both always finish, and no error carries SQLSTATE `40P01`
   - `cancel_queued_job_terminalizes_its_task`: the task becomes `cancelled` with no lease row, and no worker ever claims it
   - `cancel_other_workspace_job_is_404`
-- [ ] **Step 2: Run** `cargo test -p katwork-server --test pipeline`. Expected: FAIL.
+- [ ] **Step 2: Run** `cargo test -p katwork-server --test pipeline && cargo test -p katwork --test schema`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit** with `feat: message to job pipeline with mention routing`.
 
-### Task 13: Web app (login, reset, team, chat)
+Task 13 is split in two PRs: 13a, the web shell, starts after Task 6 against mocked APIs; 13b adds the Team, Chat and Members pages against the real routes once Tasks 12 and 3b have merged.
+
+### Task 13a: Web shell (login, reset, transcript and event folding)
 
 **Files:**
-- Create: `web/` (Vite React TS), `web/index.html` (with a pre-paint theme script), `web/scripts/check-contrast.ts`, `web/src/{main.tsx,app.tsx,api.ts,sse.ts,theme.css}`, `web/src/i18n/{index.ts,en.json,th.json}`, `web/src/pages/{Login,ResetRequest,ResetConfirm,Team,Chat}.tsx` with `*.test.tsx`, `crates/katwork-server/src/static_files.rs`, `crates/katwork-server/tests/i18n.rs`
+- Create: `web/` (Vite React TS), `web/index.html` (with a pre-paint theme script), `web/scripts/check-contrast.ts`, `web/src/{main.tsx,app.tsx,router.tsx,api.ts,sse.ts,theme.css,theme.ts}`, `web/src/i18n/{index.ts,en.json,th.json}`, `web/src/components/{Layout,Preferences,Announce,Transcript,Composer}.tsx`, `web/src/pages/{Login,ResetRequest,ResetConfirm,Home}.tsx`, each with its `*.test.ts(x)`, `crates/katwork-server/src/static_files.rs`, `crates/katwork-server/tests/{i18n.rs,static_files.rs}`
 - Modify: `crates/katwork-server/src/app.rs` (serve `web/dist` at `/`, SPA fallback), `Dockerfile` (web stage `node:22-bookworm-slim`), `.github/workflows/ci.yml` (`node-version: 22`, `npm run check:contrast`)
 
 **Interfaces:**
-- Consumes: the auth, workspaces, teams, threads, events and jobs routes; `crates/katwork-server/tests/fixtures/sse/thai_emoji.sse` (Task 9); `ReasonCode::ALL` (Task 2).
+- Consumes: the auth routes (Task 3), mocked threads, events and jobs routes; `crates/katwork-server/tests/fixtures/sse/thai_emoji.sse` (Task 9); `ReasonCode::ALL` (Task 2, with Task 10's `too_many_requests`).
 - Produces:
+  - `Transcript` and `Composer` components, which Task 13b's Chat page uses, and `Home`, the signed-in placeholder that 13b replaces with Team and Chat
   - `sse.ts`: `subscribe(url, onEvent): () => void`, using the browser `EventSource` (no Rust or SDK client) and its native `Last-Event-ID` resume. It keeps the last seq and drops duplicates after a reconnect, and folds text by `messageId` and tool arguments by `toolCallId`, never into "the last message". It follows Task 9's folding rules: `TEXT_MESSAGE_START` resets a message's provisional text, `katwork.message_stored` replaces it with the stored body, `synthetic` flag and any question with its options, and `katwork.run_closed` drops that run's unconfirmed provisional message.
   - `i18n.t(key, vars?)` with locales `en` and `th`; the locale switch persists in `localStorage`, and the locale is read with try/catch
   - `i18n.formatDate(date, { calendar: 'gregory' | 'buddhist' })`: Gregorian in the UI chrome, Buddhist Era where a template asks for it
   - every `ReasonCode` has a `reason.<code>` key in both locales
-  - a Stop button in the chat that calls the cancel route while a job runs
   - CSS tokens in `theme.css`, redefined under `[data-theme=dark]`, and a pre-paint theme script in `index.html` that sets `data-theme` before first paint
   - `npm run check:contrast`: fails when any text/surface token pair has contrast below 4.5:1
   - copy calls the coworkers "Dots" in both locales; Thai copy describes them as ผู้ช่วย AI and never says พนักงาน AI
@@ -1084,7 +1102,6 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 - [ ] **Step 1: Write the failing tests** (Vitest + Testing Library, and one Rust test):
   - `login_shows_localized_error_on_401`, in both `en` and `th`
   - `reset_request_shows_same_message_regardless_of_email`
-  - `team_page_lists_lead_first_with_thai_names`
   - `chat_streams_deltas_into_one_bubble`: a mocked EventSource with 3 deltas gives 1 bubble with the concatenated text
   - `chat_streams_thai_and_emoji_split_at_every_byte`: a mocked EventSource fed from the Task 9 fixture
   - `sse_folds_by_id_and_drops_duplicates_after_reconnect`
@@ -1095,7 +1112,6 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `new_turn_start_resets_provisional_text`
   - `ask_user_question_and_options_render_from_snapshot`
   - `synthetic_reply_shows_badge`: a message with `synthetic: true` shows a visible "Demo / ตัวอย่าง" badge; the same text with `synthetic: false` shows none
-  - `stop_button_cancels_running_job`
   - `replayed_run_error_cleared_by_later_success`
   - `interrupt_does_not_clear_run_error`
   - `composer_enter_during_ime_composition_does_not_send`
@@ -1103,10 +1119,68 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
   - `format_date_buddhist_era_in_thai`
   - `every_key_exists_in_both_locales`: `en.json` and `th.json` have identical key sets
   - Rust, in `crates/katwork-server/tests/i18n.rs`: `reason_codes_have_en_and_th_messages`
+  - Rust, in `crates/katwork-server/tests/static_files.rs`: `spa_routes_fall_back_to_index`, `api_paths_never_fall_back`, `missing_asset_is_404_not_index`, `static_responses_carry_security_headers`
 - [ ] **Step 2: Run** `cd web && npm test`. Expected: FAIL.
-- [ ] **Step 3: Implement** the pages, plain CSS with tokens, and keyboard-reachable controls. Serve `dist/` from Axum with SPA fallback; `/api/*` never falls back.
+- [ ] **Step 3: Implement** the pages and components, plain CSS with tokens, and keyboard-reachable controls. Serve `dist/` from Axum with SPA fallback; `/api/*` never falls back.
 - [ ] **Step 4: Run** `npm test && npm run check:contrast && npm run build && cargo test -p katwork-server --locked`. Expected: PASS.
-- [ ] **Step 5: Commit** with `feat: web app for login, reset, team and streaming chat`.
+- [ ] **Step 5: Commit** with `feat: web shell for login, reset and streaming transcript`.
+
+### Task 13b: Team, Chat and Members pages
+
+This task comes after Tasks 12 and 3b and builds on Task 13a. It adds no migration.
+
+**Files:**
+- Create: `web/src/pages/{Team,Chat,Members}.tsx` with their `*.test.tsx`, `crates/katwork/src/tenancy/members.rs`, `crates/katwork-server/src/routes/members.rs`, `crates/katwork-server/tests/members.rs`
+- Modify: `web/src/{router.tsx,api.ts}`, `web/src/components/Layout.tsx`, `web/src/i18n/{en,th}.json`, `crates/katwork/src/{tenancy/mod.rs,auth/mailer.rs,error.rs}`, `crates/katwork-server/src/{app.rs,error.rs}`
+
+**Interfaces:**
+- Consumes: the workspaces, dots, teams, threads, events and jobs routes (Tasks 4–12); `JobView` and `GET …/jobs/{job_id}` (Task 12); `accounts::normalize_email`, `accounts::ensure_user`, `reset::issue`, `reset::link`, `Mailer`, `MailKind` (Tasks 3 and 3b); `Tenant`, `Role`, `WorkspaceSummary.role` (Task 4); `Transcript`, `Composer`, `sse.ts`, `api.ts`, `i18n` (Task 13a).
+- Produces:
+  - `Team.tsx`: the thread's team from `GET …/teams/{team_id}`, lead first, names in the stored script (Thai names shown as stored)
+  - `Chat.tsx`: posts with a fresh `client_msg_id`, subscribes to the thread's events through `sse.ts`, and renders `Transcript` and `Composer`. While a job runs it shows a Stop button that calls the cancel route. When a job's latest `katwork.job_status` has `holdReason: "dot_busy"`, it fetches `GET …/jobs/{job_id}` and shows `chat.queue_position` (`Waiting in line: {position}` / `รอคิว ลำดับที่ {position}`), refreshing every 5 s until that job's next `katwork.job_status` or its `RUN_STARTED`.
+  - `Member { user_id: UserId, email: String, display_name: String, role: Role }` and `members::list(pool, &Tenant) -> Result<Vec<Member>, KatError>`: owner or admin only, ordered by email
+  - `InviteDelivery::{Email, Link}` (serde `email | link`), `Invite { email: String, role: Role, delivery: InviteDelivery }` and `InviteResult { user_id: UserId, created: bool, link: Option<String> }`
+  - `members::invite(pool, config: &Config, mailer: &dyn Mailer, &Tenant, Invite) -> Result<InviteResult, KatError>`, in one transaction that first locks the workspace row (`FOR NO KEY UPDATE`, the first class of the global lock order):
+    - owner or admin only; only an owner may invite with `role = Owner`, otherwise `forbidden`
+    - `delivery = Email` with SMTP unconfigured is 422 `smtp_unconfigured`, before anything is written; the demo console mailer prints only the demo account's mail, so it never counts as configured
+    - `accounts::ensure_user` on `accounts::normalize_email(&invite.email)`; an account that is already a member is 409 `member_exists`
+    - an existing account (`created = false`) gets the membership and nothing else: never a link, never a mail, so an admin can never take over an account that another workspace or the operator created (ADR-0004)
+    - a new account gets the membership and `reset::issue`. `Link` returns `reset::link(config.public_url_or_default(), &token)` in `link`. `Email` returns `link: None` and, after the commit, sends `mailer::invite_mail` without delaying the response; a failed delivery is logged with the mail kind and outcome only, and the invite stands (the person can still use password reset).
+  - `members::set_role(pool, &Tenant, UserId, Role) -> Result<(), KatError>`, in one transaction that first locks the workspace row: owner or admin only; only an owner may grant `Owner` or change an owner's role; demoting the workspace's last owner is 422 `last_owner_required`; a user who is not a member is 404 `not_found`. It applies on that user's next request, because `tenancy::resolve` reads the membership every time.
+  - `MailKind::Invite` and `mailer::invite_mail(to: String, locale: Locale, link: &str, workspace: &str) -> Mail`: bilingual in the invitee's locale order, like the reset mail. Subject `คำเชิญเข้าร่วม KatWork / You're invited to KatWork` (halves swapped for `en`). Thai: `คุณได้รับเชิญเข้าร่วม {workspace} บน KatWork ใช้ลิงก์นี้ภายใน 30 นาทีเพื่อตั้งรหัสผ่าน`. English: `You have been invited to {workspace} on KatWork. Use this link within 30 minutes to set your password.` The link stands alone on the last line.
+  - New codes: `member_exists` (409), `last_owner_required` (422) and `smtp_unconfigured` (422), each with an `error.<code>` message in both locales
+  - Routes, each calling `require_admin()` before parsing any body:
+    - `GET /api/workspaces/{workspace_id}/members` → 200 `[Member]`
+    - `POST /api/workspaces/{workspace_id}/members` with `Invite` → 201 `InviteResult`
+    - `PUT /api/workspaces/{workspace_id}/members/{user_id}/role` with `{"role": Role}` → 204
+  - `Members.tsx`, linked from `Layout` only when the signed-in user's role in the workspace (`WorkspaceSummary.role`) is owner or admin: the member list with a role select per member; an invite form with email, role, and a choice between "send by email" and "copy a link"; a returned link is shown once with a copy button and is gone once the person leaves the page; `smtp_unconfigured` shows a message that suggests the link option.
+
+- [ ] **Step 1: Write the failing Team and Chat tests** (Vitest + Testing Library, mocked `fetch` and `EventSource`):
+  - `team_page_lists_lead_first_with_thai_names`
+  - `chat_posts_with_client_msg_id_and_streams_the_reply`
+  - `stop_button_cancels_running_job`
+  - `chat_shows_queue_position_while_the_dot_is_busy`: a `katwork.job_status {holdReason: "dot_busy"}` makes the chat fetch the job and show its `queue_position` in both locales; the line goes away at the job's `RUN_STARTED`
+- [ ] **Step 2: Run** `cd web && npm test`. Expected: FAIL.
+- [ ] **Step 3: Implement** `Team.tsx` and `Chat.tsx`, replacing `Home`'s placeholders. Run again. Expected: PASS.
+- [ ] **Step 4: Members page and routes.** Write the failing tests:
+  - in `crates/katwork-server/tests/members.rs`:
+    - `member_cannot_list_invite_or_change_roles`: 403, with a valid and with an invalid body
+    - `invite_new_email_by_link_returns_a_single_use_link`: the link sets a password once; the new account then lists the workspace with the invited role
+    - `invite_by_email_sends_a_bilingual_invite_mail`: with `CapturingMailer`; the response has no link
+    - `invite_by_email_without_smtp_is_422_and_writes_nothing`
+    - `invite_of_an_existing_account_adds_membership_without_a_link`: Review Focus 4; `link` is null, no mail is sent, and the account's password and sessions are unchanged
+    - `invite_of_an_existing_member_is_409`
+    - `only_an_owner_can_invite_or_promote_an_owner`
+    - `last_owner_cannot_be_demoted`
+    - `role_change_applies_on_the_next_request`
+    - `concurrent_invites_for_one_email_create_one_account`
+    - `members_routes_hide_other_workspaces`: 404
+    - `invite_tokens_never_reach_logs`
+  - in `web/src/pages/Members.test.tsx`: `members_page_is_offered_only_to_owners_and_admins`, `members_page_invites_by_link_and_shows_it_once`, `members_page_explains_email_invites_without_smtp`, `members_page_changes_a_role`
+
+  Run `cargo test -p katwork-server --test members && (cd web && npm test)`. Expected: FAIL. Implement `tenancy/members.rs`, `routes/members.rs`, `MailKind::Invite` with `mailer::invite_mail`, the new codes and `Members.tsx`. Run again. Expected: PASS.
+- [ ] **Step 5: Run** `npm test && npm run check:contrast && npm run build && cargo test --workspace --locked`. Expected: PASS.
+- [ ] **Step 6: Commit** with `feat: team, chat and members pages`.
 
 ### Task 14: Compose smoke, backup before migrate, HTTPS profile
 
