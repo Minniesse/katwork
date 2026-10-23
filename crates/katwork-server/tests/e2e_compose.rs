@@ -638,6 +638,9 @@ async fn offline_demo_uses_synthetic_provider_with_host_keys_cleared() {
     let thread = stack.thread().await;
     let job = stack.post(&thread).await;
     stack.answered(&thread, &job).await;
+    let before = fs::read_dir(stack.dir.join("backups-demo"))
+        .unwrap()
+        .count();
     stack.run(&["down"]);
     stack.start().await;
     assert_eq!(fs::read_dir(stack.dir.join("backups")).unwrap().count(), 0);
@@ -645,14 +648,13 @@ async fn offline_demo_uses_synthetic_provider_with_host_keys_cleared() {
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .collect();
-    assert_eq!(archives.len(), 1);
-    assert!(
-        archives[0]
-            .to_str()
-            .unwrap()
-            .starts_with("katwork-katwork-")
-    );
-    assert!(archives[0].to_str().unwrap().ends_with(".dump"));
+    // Starting the publishing proxy can rerun completed backup dependencies too.
+    assert!(archives.len() > before);
+    for archive in archives {
+        let archive = archive.to_str().unwrap();
+        assert!(archive.starts_with("katwork-katwork-"));
+        assert!(archive.ends_with(".dump"));
+    }
 }
 
 #[tokio::test]
