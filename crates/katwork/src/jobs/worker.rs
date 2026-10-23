@@ -132,11 +132,19 @@ async fn work(
     limits: &Limits,
 ) {
     let cancel = CancellationToken::new();
+    let interrupted = core.shutdown.child_token();
     let stop_renewal = CancellationToken::new();
     // Even the first window starts before SQL; commit latency must not extend authority.
     let (window, watchdog) = watch::channel(claim_started + ttl);
-    let execution =
-        AssertUnwindSafe(execute(core, &c, claimed_at, limits, cancel.clone())).catch_unwind();
+    let execution = AssertUnwindSafe(execute(
+        core,
+        &c,
+        claimed_at,
+        limits,
+        cancel.clone(),
+        &interrupted,
+    ))
+    .catch_unwind();
     let renewal = renew(core, &c, worker, ttl, window, stop_renewal.clone());
     tokio::pin!(execution, renewal);
     let mut renewal_done = false;
@@ -156,6 +164,9 @@ async fn work(
         },
         ()=expired(watchdog)=>{lost=true;None},
     };
+    if lost {
+        interrupted.cancel();
+    }
     if result.is_none() {
         cancel.cancel();
     }
@@ -226,6 +237,7 @@ async fn execute(
     claimed_at: Instant,
     limits: &Limits,
     cancel: CancellationToken,
+    interrupted: &CancellationToken,
 ) -> Result<RunFacts, RunAbort> {
     let prepare = async {
         let tenant = tenancy::for_task(&core.pool, c.task_id).await?;
@@ -262,7 +274,7 @@ async fn execute(
         }),
     );
     let tools = ToolRegistry::builtin();
-    run::execute_with_shutdown(
+    run::execute_with_interruption(
         &RunEnv {
             pool: &core.pool,
             models: &core.registry,
@@ -289,7 +301,7 @@ async fn execute(
             cancel,
         },
         limits,
-        Some(&core.shutdown),
+        Some(interrupted),
     )
     .await
 }
