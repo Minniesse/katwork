@@ -52,6 +52,25 @@ pub async fn assert_backend_idle(pool: &PgPool, pid: i32) {
     .expect("backend remained active or idle in transaction");
 }
 
+pub async fn assert_backend_gone(pool: &PgPool, pid: i32) {
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1)")
+                    .bind(pid)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            if !exists {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("disconnected backend did not exit");
+}
+
 pub async fn poll_once_then_drop(future: impl Future) {
     let mut future = Box::pin(future);
     assert!(futures::poll!(future.as_mut()).is_pending());

@@ -26,12 +26,6 @@ impl GuardedConnection {
     fn connection(&mut self) -> &mut PgConnection {
         &mut self.connection
     }
-
-    async fn finish<T>(mut self, result: Result<T, KatError>) -> Result<T, KatError> {
-        recycle(&mut self.connection).await?;
-        self.complete = true;
-        result
-    }
 }
 
 /// Run database work with close-on-cancellation and rollback-on-normal-return semantics.
@@ -42,7 +36,9 @@ pub async fn guarded<T>(
 ) -> Result<T, KatError> {
     let mut connection = GuardedConnection::acquire(pool).await?;
     let result = operation(connection.connection()).await;
-    connection.finish(result).await
+    // Pool release owns cleanup; a failed cleanup must not change a committed result.
+    connection.complete = true;
+    result
 }
 
 impl Drop for GuardedConnection {
@@ -89,7 +85,7 @@ fn pool_options() -> PgPoolOptions {
     PgPoolOptions::new()
         .after_connect(|conn, _| {
             Box::pin(async move {
-                sqlx::query("SET idle_in_transaction_session_timeout = '60s'")
+                sqlx::raw_sql("SET idle_in_transaction_session_timeout = '60s'; SET client_connection_check_interval = '2s'")
                     .execute(conn)
                     .await?;
                 Ok(())
@@ -158,6 +154,77 @@ mod cancellation;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn committed_work_survives_release_failure(pool: PgPool) {
+        let single = pool_options()
+            .max_connections(1)
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE committed_probe (value integer)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let pid = cancellation::backend_pid(&single).await;
+        guarded(&single, async |conn| {
+            let mut tx = conn.begin().await?;
+            sqlx::query("INSERT INTO committed_probe VALUES (1)")
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            sqlx::query("SELECT pg_terminate_backend($1)")
+                .bind(pid)
+                .execute(&pool)
+                .await?;
+            Ok(())
+        })
+        .await
+        .expect("release failure changed a committed result");
+        assert_ne!(cancellation::backend_pid(&single).await, pid);
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM committed_probe")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        single.close().await;
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn disconnected_active_backends_exit_without_unblocking(pool: PgPool) {
+        let single = pool_options()
+            .max_connections(1)
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(48)")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        for statement in ["SELECT pg_advisory_xact_lock(48)", "SELECT pg_sleep(60)"] {
+            let pid = cancellation::backend_pid(&single).await;
+            let mut pending = Box::pin(guarded(&single, async |conn| {
+                sqlx::query(statement).execute(conn).await?;
+                Ok(())
+            }));
+            tokio::select! {
+                result = &mut pending => panic!("query escaped barrier: {result:?}"),
+                waited = tokio::time::timeout(cancellation::DEADLINE, async {
+                    loop {
+                        let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND state='active' AND wait_event IS NOT NULL AND query=$2)")
+                            .bind(pid).bind(statement).fetch_one(&pool).await.unwrap();
+                        if waiting { break; }
+                        tokio::task::yield_now().await;
+                    }
+                }) => { waited.expect("query did not reach wait state"); }
+            }
+            drop(pending);
+            cancellation::assert_backend_gone(&pool, pid).await;
+        }
+        blocker.rollback().await.unwrap();
+        single.close().await;
+    }
 
     #[sqlx::test(migrations = "./migrations")]
     async fn guarded_cancelled_begin_closes_backend(pool: PgPool) {
@@ -248,6 +315,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(idle, "1min");
+        let client_check: String = sqlx::query_scalar("SHOW client_connection_check_interval")
+            .fetch_one(&single)
+            .await
+            .unwrap();
+        assert_eq!(client_check, "2s");
         let statement: String = sqlx::query_scalar("SHOW statement_timeout")
             .fetch_one(&single)
             .await
