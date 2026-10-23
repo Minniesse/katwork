@@ -1,10 +1,15 @@
-import { useEffect, useLayoutEffect, useRef } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { StickToBottom, useStickToBottomContext } from 'use-stick-to-bottom';
 import { formatTime, hasMessage, t, tPlural, useLocale } from '../i18n';
 import type { ChatMessage } from '../sse';
 
-/** How many recent arrivals the announcer keeps; older lines can go, removals are silent. */
-const ANNOUNCED = 20;
+// The new-arrival announcer. More than BURST arrivals with no quiet gap of QUIET_MS between
+// them are summed up in one line once things are quiet; each line leaves the log CLEAR_MS after
+// it was added (removals are silent), and the log never holds more than MAX_LINES.
+const BURST = 3;
+const QUIET_MS = 1_000;
+const CLEAR_MS = 5_000;
+const MAX_LINES = 5;
 
 /** The person's own post before the server confirmed it, keyed by its `client_msg_id`. */
 export interface PendingMessage {
@@ -69,9 +74,6 @@ export function Transcript({
   const firstRender = useRef<ReadonlySet<string> | null>(null);
   firstRender.current ??= new Set(messages.map((message) => message.id));
   const known = history ?? firstRender.current;
-  const arrivals = messages
-    .filter((message) => !message.provisional && !known.has(message.id))
-    .slice(-ANNOUNCED);
   const empty = messages.length === 0 && pending.length === 0;
   const item = (message: ChatMessage) => (
     <MessageItem
@@ -105,22 +107,102 @@ export function Transcript({
             ))}
           </ol>
         )}
-        <div
-          className="sr-only"
-          role="log"
-          aria-live="polite"
-          aria-relevant="additions"
-          aria-label={t('chat.new_messages')}
-        >
-          {arrivals.map((message) => (
-            <p key={message.id}>
-              {authorName(message, me, katName)}: {messageText(message)}
-            </p>
-          ))}
-        </div>
+        <NewArrivals
+          messages={messages}
+          known={known}
+          describe={(message) => `${authorName(message, me, katName)}: ${messageText(message)}`}
+        />
       </StickToBottom.Content>
       <JumpToLatest />
     </StickToBottom>
+  );
+}
+
+type Line = { key: string; message: ChatMessage } | { key: string; count: number };
+
+/**
+ * A visually hidden log that announces each genuinely new stored message once, in the order
+ * it arrives (not its id order: a reply minted at its run's start can be stored after many
+ * newer messages). Ids from history (`known`) are marked seen and never announced, and an id
+ * is never announced twice, whatever the history set later holds. A rush of arrivals is summed
+ * up as "N new messages", and every line leaves shortly after it is added, so the log is
+ * normally empty and a browsing screen reader doesn't meet a message twice.
+ */
+function NewArrivals({
+  messages,
+  known,
+  describe,
+}: {
+  messages: ChatMessage[];
+  known: ReadonlySet<string>;
+  describe: (message: ChatMessage) => string;
+}) {
+  useLocale();
+  const [lines, setLines] = useState<Line[]>([]);
+  const seen = useRef(new Set<string>());
+  const rush = useRef({ last: -Infinity, count: 0, pending: 0 });
+  const timers = useRef(new Set<ReturnType<typeof setTimeout>>());
+  const summary = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const keys = useRef(0);
+
+  useEffect(() => {
+    const pending = timers.current;
+    return () => {
+      pending.forEach(clearTimeout);
+      pending.clear();
+      clearTimeout(summary.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    const add = (line: Line) => {
+      setLines((current) => [...current, line].slice(-MAX_LINES));
+      const timer = setTimeout(() => {
+        timers.current.delete(timer);
+        setLines((current) => current.filter((other) => other.key !== line.key));
+      }, CLEAR_MS);
+      timers.current.add(timer);
+    };
+    for (const id of known) seen.current.add(id);
+    const fresh = messages.filter(
+      (message) => !message.provisional && !seen.current.has(message.id),
+    );
+    if (fresh.length === 0) return;
+    for (const message of fresh) seen.current.add(message.id);
+    const now = Date.now();
+    const state = rush.current;
+    if (now - state.last > QUIET_MS) state.count = 0;
+    state.last = now;
+    state.count += fresh.length;
+    if (state.pending === 0 && state.count <= BURST) {
+      fresh.forEach((message) => add({ key: `m:${message.id}`, message }));
+      return;
+    }
+    state.pending += fresh.length;
+    clearTimeout(summary.current);
+    summary.current = setTimeout(() => {
+      keys.current += 1;
+      add({ key: `n:${keys.current}`, count: state.pending });
+      state.pending = 0;
+    }, QUIET_MS);
+  });
+
+  return (
+    <div
+      className="sr-only"
+      role="log"
+      aria-live="polite"
+      aria-relevant="additions"
+      aria-label={t('chat.new_messages')}
+    >
+      {lines.map((line) => (
+        <p key={line.key}>
+          {'count' in line
+            ? tPlural('chat.new_messages_count', line.count)
+            : describe(line.message)}
+        </p>
+      ))}
+    </div>
   );
 }
 

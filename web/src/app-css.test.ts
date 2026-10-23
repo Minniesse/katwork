@@ -24,3 +24,11 @@ test('phone_header_wraps_when_both_pickers_show', () => {
   // The single-picker case keeps the links on one compact row.
   expect(phoneRule('.nav-links')).toMatch(/flex-wrap:\s*nowrap/);
 });
+
+test('sr_only_hides_from_sight_but_not_from_assistive_tech', () => {
+  // The new-message announcer relies on it: display:none or visibility:hidden would silence it.
+  const rule = /(?:^|})\s*\.sr-only\s*\{([^}]*)\}/m.exec(css)?.[1] ?? '';
+  expect(rule).toMatch(/position:\s*absolute/);
+  expect(rule).toMatch(/clip-path:\s*inset\(50%\)/);
+  expect(rule).not.toMatch(/display:\s*none|visibility:\s*hidden/);
+});

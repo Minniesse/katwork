@@ -79,6 +79,8 @@
   "team.chat": "Chat with this team",
   "chat.transcript": "Conversation",
   "chat.new_messages": "New messages",
+  "chat.new_messages_count.one": "{count} new message",
+  "chat.new_messages_count.other": "{count} new messages",
   "chat.empty": "No messages yet. Say hello to your team to get started.",
   "chat.composer_label": "Message your team",
   "chat.composer_hint": "Enter sends. Shift+Enter adds a new line. Type @ to mention a Kat.",

@@ -1,5 +1,5 @@
 import { act, render, screen, within } from '@testing-library/react';
-import { afterEach, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import { setLocale } from '../i18n';
 import en from '../i18n/en.json';
 import th from '../i18n/th.json';
@@ -7,7 +7,10 @@ import { emptyTranscript, foldEvent, transcriptMessages } from '../sse';
 import { ev, numbered } from '../testing/agui';
 import { Transcript } from './Transcript';
 
-afterEach(() => act(() => setLocale('en')));
+afterEach(() => {
+  act(() => setLocale('en'));
+  vi.useRealTimers();
+});
 
 const messagesFrom = (events: Parameters<typeof numbered>[0]) =>
   transcriptMessages(numbered(events).reduce(foldEvent, emptyTranscript()));
@@ -182,4 +185,149 @@ test('question_options_are_buttons_only_for_the_active_question', () => {
       .getAllByRole('button')
       .map((button) => button.textContent),
   ).toEqual(['PDF', 'Word']);
+});
+
+describe('new-arrival announcer', () => {
+  // Ids sort in time order, as UUIDv7 ids do.
+  const id = (n: number) => `m-${String(n).padStart(4, '0')}`;
+  const range = (from: number, to: number) =>
+    Array.from({ length: to - from + 1 }, (_, i) => from + i);
+  const stored = (ns: number[], body = (n: number) => `message ${n}`) =>
+    messagesFrom(ns.map((n) => ev.stored(id(n), body(n))));
+  // By role alone: its name changes with the locale.
+  const log = () => screen.getByRole('log');
+  const lines = () => [...log().children].map((node) => node.textContent);
+
+  test('announcer_is_visually_hidden_but_exposed_to_assistive_tech', () => {
+    render(<Transcript messages={stored([1])} />);
+    expect(screen.getByRole('log', { name: en['chat.new_messages'] })).toBe(log());
+    // getByRole only finds what the accessibility tree holds; sr-only hides it from sight only.
+    expect(log()).toHaveClass('sr-only');
+    expect(log()).not.toHaveAttribute('aria-hidden');
+    expect(log().closest('[aria-hidden="true"]')).toBeNull();
+  });
+
+  test('a_late_reply_after_twenty_newer_arrivals_is_announced', () => {
+    vi.useFakeTimers();
+    const shown = range(51, 100);
+    const { rerender } = render(<Transcript messages={stored(shown)} />);
+    for (const n of range(101, 120)) {
+      shown.push(n);
+      rerender(<Transcript messages={stored(shown)} />);
+      // Each arrival comes after a quiet second, so each is its own line, and the log stays
+      // small however many arrive.
+      expect(log().children.length).toBeLessThanOrEqual(5);
+      act(() => vi.advanceTimersByTime(1_100));
+    }
+    // The reply's id was minted at its run's start, before every message above.
+    shown.push(25);
+    rerender(
+      <Transcript
+        messages={stored(
+          shown.sort((a, b) => a - b),
+          (n) => (n === 25 ? 'Late reply' : `message ${n}`),
+        )}
+      />,
+    );
+    expect(lines()).toContain('Kat: Late reply');
+  });
+
+  test('a_burst_of_arrivals_is_one_summary_line', () => {
+    vi.useFakeTimers();
+    const { rerender } = render(<Transcript messages={stored(range(1, 10))} />);
+    // A catch-up: twelve stored messages land at once.
+    rerender(<Transcript messages={stored(range(1, 22))} />);
+    expect(lines()).toEqual([]);
+    act(() => vi.advanceTimersByTime(1_000));
+    expect(lines()).toEqual(['12 new messages']);
+    act(() => setLocale('th'));
+    expect(lines()).toEqual(['ข้อความใหม่ 12 ข้อความ']);
+  });
+
+  test('arrivals_one_by_one_in_a_rush_say_three_then_sum_up_the_rest', () => {
+    vi.useFakeTimers();
+    const shown = range(1, 10);
+    const { rerender } = render(<Transcript messages={stored(shown)} />);
+    for (const n of range(11, 19)) {
+      shown.push(n);
+      rerender(<Transcript messages={stored(shown)} />);
+      act(() => vi.advanceTimersByTime(100));
+    }
+    act(() => vi.advanceTimersByTime(1_000));
+    expect(lines()).toEqual([
+      'Kat: message 11',
+      'Kat: message 12',
+      'Kat: message 13',
+      '6 new messages',
+    ]);
+  });
+
+  test('a_single_new_message_summary_is_singular', () => {
+    vi.useFakeTimers();
+    const shown = range(1, 3);
+    const { rerender } = render(<Transcript messages={stored(shown)} />);
+    for (const n of range(4, 7)) {
+      shown.push(n);
+      rerender(<Transcript messages={stored(shown)} />);
+    }
+    act(() => vi.advanceTimersByTime(1_000));
+    expect(lines().at(-1)).toBe('1 new message');
+  });
+
+  test('the_log_never_holds_more_than_five_lines', () => {
+    vi.useFakeTimers();
+    const shown = [1];
+    const { rerender } = render(<Transcript messages={stored(shown)} />);
+    // Two rushes of three, a quiet second apart: six single lines inside one clearing period.
+    for (const rushOf of [range(2, 4), range(5, 7)]) {
+      for (const n of rushOf) {
+        shown.push(n);
+        rerender(<Transcript messages={stored(shown)} />);
+      }
+      act(() => vi.advanceTimersByTime(1_100));
+    }
+    expect(lines()).toEqual([3, 4, 5, 6, 7].map((n) => `Kat: message ${n}`));
+  });
+
+  test('announcements_are_cleared_after_they_are_read', () => {
+    vi.useFakeTimers();
+    const { rerender } = render(<Transcript messages={stored([1])} />);
+    rerender(<Transcript messages={stored([1, 2])} />);
+    expect(lines()).toEqual(['Kat: message 2']);
+    act(() => vi.advanceTimersByTime(4_000));
+    expect(lines()).toEqual(['Kat: message 2']);
+    act(() => vi.advanceTimersByTime(1_000));
+    // A browsing screen reader doesn't meet the message twice.
+    expect(log()).toBeEmptyDOMElement();
+  });
+
+  test('history_and_snapshot_are_never_announced_even_after_earlier_arrivals', () => {
+    vi.useFakeTimers();
+    const snapshot = new Set(range(101, 150).map(id));
+    const shown = range(101, 150);
+    const { rerender } = render(<Transcript messages={stored(shown)} history={snapshot} />);
+    expect(log()).toBeEmptyDOMElement();
+    // Delayed replies with old ids arrive live: 1-20, then 51-70.
+    for (const batch of [range(1, 20), range(51, 70)]) {
+      shown.push(...batch);
+      rerender(
+        <Transcript messages={stored([...shown].sort((a, b) => a - b))} history={snapshot} />,
+      );
+      act(() => vi.advanceTimersByTime(10_000));
+    }
+    expect(log()).toBeEmptyDOMElement();
+
+    // An older page (51-100) overlaps the live 51-70; nothing is announced for it.
+    const added: Node[] = [];
+    const observer = new MutationObserver((records) =>
+      records.forEach((record) => added.push(...record.addedNodes)),
+    );
+    observer.observe(log(), { childList: true });
+    shown.push(...range(71, 100));
+    const history = new Set([...snapshot, ...range(51, 100).map(id)]);
+    rerender(<Transcript messages={stored([...shown].sort((a, b) => a - b))} history={history} />);
+    act(() => vi.advanceTimersByTime(10_000));
+    observer.disconnect();
+    expect(added).toHaveLength(0);
+  });
 });
