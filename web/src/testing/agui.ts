@@ -1,5 +1,5 @@
 // Builders for AG-UI and katwork.* events, shaped like Task 9's wire JSON. Test-only.
-import type { AgUiEvent, SeqEvent } from '../sse';
+import type { AgUiEvent, ApiMessage, SeqEvent } from '../sse';
 
 const custom = (name: string, value: unknown): AgUiEvent => ({ type: 'CUSTOM', name, value });
 
@@ -44,32 +44,70 @@ export const ev = {
     toolCallId,
     content,
   }),
-  kwRunStarted: (runId: string, katId: string, replyMessageId: string) =>
-    custom('katwork.run_started', { runId, katId, replyMessageId }),
-  kwRunClosed: (runId: string, end: 'finished' | 'cancelled' | 'interrupted') =>
-    custom('katwork.run_closed', { runId, end }),
+  kwRunStarted: (
+    runId: string,
+    katId: string,
+    replyMessageId: string,
+    opts: { jobId?: string; synthetic?: boolean } = {},
+  ) =>
+    custom('katwork.run_started', {
+      runId,
+      jobId: opts.jobId ?? `job-of-${runId}`,
+      katId,
+      replyMessageId,
+      synthetic: opts.synthetic ?? false,
+    }),
+  kwRunClosed: (
+    runId: string,
+    end: 'finished' | 'cancelled' | 'interrupted',
+    code: string | null = null,
+  ) => custom('katwork.run_closed', { runId, end, code }),
   stored: (
     messageId: string,
     body: string,
     opts: {
       author?: unknown;
+      authorName?: string;
       synthetic?: boolean;
+      stopped?: boolean;
       question?: { question: string; options: string[] } | null;
+      meta?: { code: string; kats: { id: string; name: string }[] } | null;
+      jobId?: string | null;
+      clientMsgId?: string | null;
     } = {},
   ) =>
     custom('katwork.message_stored', {
       messageId,
       author: opts.author ?? { kind: 'kat', id: 'kat-a' },
+      authorName: opts.authorName ?? '',
       body,
       synthetic: opts.synthetic ?? false,
+      stopped: opts.stopped ?? false,
       question: opts.question ?? null,
+      meta: opts.meta ?? null,
+      jobId: opts.jobId ?? null,
+      clientMsgId: opts.clientMsgId ?? null,
+      createdAt: '2026-10-23T05:00:00Z',
     }),
-  userStored: (messageId: string, body: string) =>
-    ev.stored(messageId, body, { author: { kind: 'user', id: 'user-1' } }),
-  notice: (messageId: string, code: string) =>
-    ev.stored(messageId, code, { author: { kind: 'system' } }),
-  jobStatus: (jobId: string, status: string | null, reason: string | null = null) =>
-    custom('katwork.job_status', { jobId, status, reason, holdReason: null }),
+  userStored: (
+    messageId: string,
+    body: string,
+    opts: { userId?: string; authorName?: string; jobId?: string; clientMsgId?: string } = {},
+  ) =>
+    ev.stored(messageId, body, {
+      author: { kind: 'user', id: opts.userId ?? 'user-1' },
+      authorName: opts.authorName ?? 'Person',
+      jobId: opts.jobId ?? null,
+      clientMsgId: opts.clientMsgId ?? null,
+    }),
+  notice: (messageId: string, code: string, kats: { id: string; name: string }[] = []) =>
+    ev.stored(messageId, code, { author: { kind: 'system' }, meta: { code, kats } }),
+  jobStatus: (
+    jobId: string,
+    status: string | null,
+    reason: string | null = null,
+    holdReason: string | null = null,
+  ) => custom('katwork.job_status', { jobId, status, reason, holdReason }),
   katState: (katId: string, state: string) => custom('katwork.kat_state', { katId, state }),
   decision: (jobId: string) =>
     custom('katwork.decision', {
@@ -86,4 +124,28 @@ export const ev = {
 /** Numbers events as the server's per-thread log would, starting at `first`. */
 export function numbered(events: AgUiEvent[], first = 1): SeqEvent[] {
   return events.map((event, i) => ({ seq: first + i, event }));
+}
+
+/** A message as the messages API returns it (Task 6's `Message`). */
+export function apiMessage(
+  id: string,
+  body: string,
+  opts: Partial<Omit<ApiMessage, 'id' | 'body'>> = {},
+): ApiMessage {
+  return {
+    id,
+    author: { kind: 'kat', id: 'kat-a' },
+    author_name: '',
+    body,
+    synthetic: false,
+    stopped: false,
+    question: null,
+    meta: null,
+    job_id: null,
+    job_status: null,
+    job_reason: null,
+    client_msg_id: null,
+    created_at: '2026-10-23T05:00:00Z',
+    ...opts,
+  };
 }

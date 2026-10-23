@@ -1,15 +1,35 @@
-import { useEffect, useState } from 'react';
-import { api, type AuthUser } from './api';
-import { AuthLayout, PageTitle } from './components/Layout';
+import { useEffect, useState, type ReactNode } from 'react';
+import { api, ApiError, errorMessage, type AuthUser } from './api';
+import { AppLayout, AuthLayout, PageTitle } from './components/Layout';
 import { t, useLocale } from './i18n';
+import { Chat } from './pages/Chat';
 import { Home } from './pages/Home';
 import { InviteAccept } from './pages/InviteAccept';
 import { Login } from './pages/Login';
+import { Members } from './pages/Members';
 import { ResetConfirm } from './pages/ResetConfirm';
 import { ResetRequest } from './pages/ResetRequest';
+import { TeamPage } from './pages/Team';
 import { Link, navigate, useLinkToken, useLocation } from './router';
+import { useWorkspace, type WorkspaceContext } from './workspace';
 
 type Session = { state: 'checking' } | { state: 'signed_out' } | { state: 'signed_in'; user: AuthUser };
+
+type Page =
+  | { page: 'home' }
+  | { page: 'chat'; threadId: string | null }
+  | { page: 'team'; teamId: string | null }
+  | { page: 'members' };
+
+// `/chat/:threadId?`, `/team/:teamId?`, `/members` and `/`.
+function route(path: string): Page | null {
+  if (path === '/') return { page: 'home' };
+  if (path === '/members') return { page: 'members' };
+  const match = /^\/(chat|team)(?:\/([^/]+))?\/?$/.exec(path);
+  if (!match) return null;
+  const id = match[2] ? decodeURIComponent(match[2]) : null;
+  return match[1] === 'chat' ? { page: 'chat', threadId: id } : { page: 'team', teamId: id };
+}
 
 export function App() {
   useLocale();
@@ -20,6 +40,10 @@ export function App() {
   const [signOutProblem, setSignOutProblem] = useState<{ error: unknown } | null>(null);
   // The token from an emailed or printed `/reset?token=…` link, held in memory only: see useLinkToken.
   const token = useLinkToken('/reset');
+  const linkPage = location.pathname === '/reset' || location.pathname === '/invite';
+  const [workspace, chooseWorkspace, chooseSpace] = useWorkspace(
+    session.state === 'signed_in' && !linkPage,
+  );
 
   useEffect(() => {
     let live = true;
@@ -85,9 +109,92 @@ export function App() {
     );
   }
   if (!signedIn) return null;
-  if (path === '/') return <Home onSignOut={signOut} signOutProblem={signOutProblem} />;
-  // TODO(13b): routes for the Team and Chat pages.
-  return <NotFound />;
+  const page = route(path);
+  if (!page) return <NotFound />;
+
+  // The server ended this session (a stream or request answered 401).
+  const sessionEnded = () => {
+    setSession({ state: 'signed_out' });
+    navigate('/login', { replace: true });
+  };
+  const nav =
+    workspace.state === 'ready'
+      ? {
+          path,
+          workspaces: workspace.workspaces,
+          workspace: workspace.workspace,
+          spaces: workspace.spaces,
+          space: workspace.space,
+          onWorkspace: chooseWorkspace,
+          onSpace: chooseSpace,
+        }
+      : null;
+  return (
+    <AppLayout onSignOut={signOut} signOutProblem={signOutProblem} nav={nav}>
+      <SignedInPage page={page} workspace={workspace} me={session.user.user_id} onSessionEnded={sessionEnded} />
+    </AppLayout>
+  );
+}
+
+function SignedInPage({
+  page,
+  workspace,
+  me,
+  onSessionEnded,
+}: {
+  page: Page;
+  workspace: WorkspaceContext;
+  me: string;
+  onSessionEnded: () => void;
+}): ReactNode {
+  useLocale();
+  const failed = workspace.state === 'failed';
+  const unauthenticated = failed && workspace.error instanceof ApiError && workspace.error.status === 401;
+  useEffect(() => {
+    if (unauthenticated) onSessionEnded();
+  }, [unauthenticated, onSessionEnded]);
+
+  switch (workspace.state) {
+    case 'loading':
+      return (
+        <p className="hint" aria-busy="true">
+          {t('workspace.loading')}
+        </p>
+      );
+    case 'failed':
+      return (
+        <div className="alert" role="alert">
+          <p>{errorMessage(workspace.error)}</p>
+        </div>
+      );
+    case 'none':
+      return <p>{t('workspace.none')}</p>;
+    case 'ready':
+      break;
+  }
+  const { workspace: current, space, teamId } = workspace;
+  if (page.page === 'members') {
+    return (
+      <Members key={current.id} workspaceId={current.id} workspaceName={current.name} me={me} myRole={current.role} />
+    );
+  }
+  if (page.page === 'team') {
+    return <TeamPage workspaceId={current.id} teamId={page.teamId ?? teamId} />;
+  }
+  if (!space) return <p>{t('workspace.no_space')}</p>;
+  if (page.page === 'chat') {
+    return (
+      <Chat
+        workspaceId={current.id}
+        spaceId={space.id}
+        teamId={teamId}
+        threadId={page.threadId}
+        me={me}
+        onSignedOut={onSessionEnded}
+      />
+    );
+  }
+  return <Home workspaceId={current.id} spaceId={space.id} teamId={teamId} />;
 }
 
 function NotFound() {

@@ -16,22 +16,25 @@ test('transcript_is_live_region', () => {
   const streaming = messagesFrom([
     ev.userStored('u1', 'Hello'),
     ev.runStarted('r1'),
-    ev.kwRunStarted('r1', 'kat-a', 'm1'),
-    ev.textStart('m1'),
-    ev.text('m1', 'Hi'),
+    ev.kwRunStarted('r1', 'kat-a', 'u2'),
+    ev.textStart('u2'),
+    ev.text('u2', 'Hi'),
   ]);
   const { rerender } = render(<Transcript messages={streaming} />);
   const log = screen.getByRole('log', { name: en['chat.transcript'] });
   expect(log).toHaveAttribute('aria-live', 'polite');
   expect(log).toHaveAttribute('aria-relevant', 'additions');
-  // While a reply streams, assistive tech waits for the finished text.
-  expect(log).toHaveAttribute('aria-busy', 'true');
-  expect(within(log).getAllByRole('listitem')).toHaveLength(2);
+  // Streaming text is hidden from assistive tech; the stored message is announced once.
+  expect(within(log).getAllByRole('listitem')).toHaveLength(1);
+  const streamingNode = within(log).getByText('Hi').closest('li')!;
+  expect(streamingNode).toHaveAttribute('aria-hidden', 'true');
 
-  const done = messagesFrom([ev.userStored('u1', 'Hello'), ev.stored('m1', 'Hi there')]);
+  const done = messagesFrom([ev.userStored('u1', 'Hello'), ev.stored('u2', 'Hi there')]);
   rerender(<Transcript messages={done} />);
-  expect(log).toHaveAttribute('aria-busy', 'false');
-  expect(within(log).getByText('Hi there')).toBeInTheDocument();
+  expect(within(log).getAllByRole('listitem')).toHaveLength(2);
+  const storedNode = within(log).getByText('Hi there').closest('li')!;
+  expect(storedNode).not.toBe(streamingNode);
+  expect(storedNode).not.toHaveAttribute('aria-hidden');
 });
 
 test('synthetic_reply_shows_badge', () => {
@@ -87,4 +90,49 @@ test('kat_messages_use_the_given_kat_name', () => {
 test('empty_transcript_invites_a_first_message', () => {
   render(<Transcript messages={[]} />);
   expect(screen.getByText(en['chat.empty'])).toBeInTheDocument();
+});
+
+test('stopped_reply_is_labelled_in_both_locales', () => {
+  const messages = messagesFrom([ev.stored('m1', 'Hello', { stopped: true })]);
+  render(<Transcript messages={messages} />);
+  const item = screen.getByText('Hello').closest('li')!;
+  expect(within(item).getByText(en['chat.stopped_label'])).toBeVisible();
+  act(() => setLocale('th'));
+  expect(within(item).getByText(th['chat.stopped_label'])).toBeVisible();
+});
+
+test('people_are_named_and_the_signed_in_person_is_you', () => {
+  const messages = messagesFrom([
+    ev.userStored('m1', 'Mine', { userId: 'user-1', authorName: 'Pat' }),
+    ev.userStored('m2', 'Theirs', { userId: 'user-2', authorName: 'สมชาย' }),
+  ]);
+  render(<Transcript messages={messages} me="user-1" />);
+  expect(within(screen.getByText('Mine').closest('li')!).getByText(en['chat.author.you'])).toBeVisible();
+  expect(within(screen.getByText('Theirs').closest('li')!).getByText('สมชาย')).toBeVisible();
+});
+
+test('notice_names_the_kats_in_its_meta', () => {
+  const messages = messagesFrom([
+    ev.notice('n1', 'kat_paused', [
+      { id: 'kat-w', name: 'นักเขียน' },
+      { id: 'kat-a', name: 'Analyst' },
+    ]),
+  ]);
+  render(<Transcript messages={messages} />);
+  expect(screen.getByText(en['reason.kat_paused'])).toBeVisible();
+  expect(screen.getByText('About: นักเขียน, Analyst')).toBeVisible();
+});
+
+test('question_options_are_buttons_only_for_the_active_question', () => {
+  const question = { question: 'Which format?', options: ['PDF', 'Word'] };
+  const messages = messagesFrom([
+    ev.stored('m1', 'Which format?', { question }),
+    ev.stored('m2', 'Which format?', { question }),
+  ]);
+  render(<Transcript messages={messages} activeQuestion="m2" onOption={() => {}} />);
+  const [first, second] = screen.getAllByText('Which format?').map((node) => node.closest('li')!);
+  expect(within(first!).queryAllByRole('button')).toHaveLength(0);
+  expect(within(first!).getByText('PDF')).toBeVisible();
+  const group = within(second!).getByRole('group', { name: en['chat.question_options'] });
+  expect(within(group).getAllByRole('button').map((button) => button.textContent)).toEqual(['PDF', 'Word']);
 });

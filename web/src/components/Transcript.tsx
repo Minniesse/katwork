@@ -1,78 +1,218 @@
-import { hasMessage, t, useLocale } from '../i18n';
+import { StickToBottom, useStickToBottomContext } from 'use-stick-to-bottom';
+import { formatTime, hasMessage, t, useLocale } from '../i18n';
 import type { ChatMessage } from '../sse';
+
+/** The person's own post before the server confirmed it, keyed by its `client_msg_id`. */
+export interface PendingMessage {
+  clientMsgId: string;
+  body: string;
+  /** Set when the post failed; the person can send it again with the same `client_msg_id`. */
+  error: string | null;
+}
 
 interface Props {
   messages: ChatMessage[];
-  /** A Kat's display name; the Team data arrives in 13b. */
+  pending?: PendingMessage[];
+  /** The signed-in user, whose messages read "You". */
+  me?: string | null;
+  /** A Kat's display name from the team, for text still streaming. */
   katName?: (katId: string) => string | undefined;
+  /** The question whose options can be clicked now; every other question is read-only. */
+  activeQuestion?: string | null;
+  optionsDisabled?: boolean;
+  onOption?: (option: string) => void;
+  onRetry?: (clientMsgId: string) => void;
 }
 
 /**
- * The conversation as a polite live region. While a reply streams, `aria-busy` holds the
- * announcement until the text settles, so a screen reader doesn't read every delta.
+ * The conversation. The `log` region holds stored messages only: text still streaming sits in
+ * the same list, in id order, but hidden from assistive tech, and the stored message replaces
+ * it as a new node, so a screen reader hears each finished message once. Scrolling follows new
+ * content until the person scrolls up.
  */
-export function Transcript({ messages, katName }: Props) {
+export function Transcript({
+  messages,
+  pending = [],
+  me = null,
+  katName,
+  activeQuestion = null,
+  optionsDisabled = false,
+  onOption,
+  onRetry,
+}: Props) {
   useLocale();
-  const streaming = messages.some((message) => message.provisional);
+  const empty = messages.length === 0 && pending.length === 0;
   return (
-    <div
-      className="transcript"
-      role="log"
-      aria-live="polite"
-      aria-relevant="additions"
-      aria-busy={streaming}
-      aria-label={t('chat.transcript')}
-    >
-      {messages.length === 0 ? (
-        <p className="transcript-empty">{t('chat.empty')}</p>
-      ) : (
-        <ol className="transcript-list">
-          {messages.map((message) => (
-            <MessageItem key={message.id} message={message} katName={katName} />
-          ))}
-        </ol>
-      )}
-    </div>
+    <StickToBottom className="transcript" initial="instant" resize="smooth">
+      <StickToBottom.Content className="transcript-content">
+        <div
+          role="log"
+          aria-live="polite"
+          aria-relevant="additions"
+          aria-label={t('chat.transcript')}
+        >
+          {empty ? (
+            <p className="transcript-empty">{t('chat.empty')}</p>
+          ) : (
+            <ol className="transcript-list">
+              {messages.map((message) => (
+                <MessageItem
+                  key={`${message.id}:${message.provisional ? 'streaming' : 'stored'}`}
+                  message={message}
+                  me={me}
+                  katName={katName}
+                  options={
+                    message.id === activeQuestion
+                      ? { disabled: optionsDisabled, onOption: onOption ?? (() => {}) }
+                      : null
+                  }
+                />
+              ))}
+              {pending.map((post) => (
+                <PendingItem key={post.clientMsgId} post={post} onRetry={onRetry} />
+              ))}
+            </ol>
+          )}
+        </div>
+      </StickToBottom.Content>
+      <JumpToLatest />
+    </StickToBottom>
   );
 }
 
-function authorName(message: ChatMessage, katName: Props['katName']): string {
+function JumpToLatest() {
+  const { isAtBottom, scrollToBottom } = useStickToBottomContext();
+  if (isAtBottom) return null;
+  return (
+    <button type="button" className="button jump-latest" onClick={() => void scrollToBottom()}>
+      {t('chat.jump_latest')}
+    </button>
+  );
+}
+
+function authorName(message: ChatMessage, me: string | null, katName: Props['katName']): string {
   switch (message.author?.kind) {
     case 'user':
-      // TODO(13b): show other members' names once the workspace member list exists.
-      return t('chat.author.you');
+      if (message.author.id === me) return t('chat.author.you');
+      return message.authorName || t('chat.author.member');
     case 'system':
       return t('chat.author.system');
     case 'kat':
-      return katName?.(message.author.id) ?? t('chat.author.kat');
+      return message.authorName || katName?.(message.author.id) || t('chat.author.kat');
     default:
       return t('chat.author.kat');
   }
 }
 
-function MessageItem({ message, katName }: { message: ChatMessage; katName: Props['katName'] }) {
+/** A notice's copy comes from its own code (Task 6's `NoticeMeta`), never from its job's reason. */
+function noticeText(message: ChatMessage): string {
+  const code = message.meta?.code ?? message.body;
+  const key = `reason.${code}`;
+  return hasMessage(key) ? t(key) : message.body;
+}
+
+function MessageItem({
+  message,
+  me,
+  katName,
+  options,
+}: {
+  message: ChatMessage;
+  me: string | null;
+  katName: Props['katName'];
+  options: { disabled: boolean; onOption: (option: string) => void } | null;
+}) {
   const kind = message.author?.kind ?? 'kat';
-  // A system notice's body is a reason code (plan Task 10).
-  const noticeKey = `reason.${message.body}`;
-  const body = kind === 'system' && hasMessage(noticeKey) ? t(noticeKey) : message.body;
+  const kats = message.meta?.kats ?? [];
   return (
-    <li className={`message message-${kind}`} data-provisional={message.provisional || undefined}>
+    <li
+      className={`message message-${kind}`}
+      data-provisional={message.provisional || undefined}
+      aria-hidden={message.provisional || undefined}
+    >
       <p className="message-meta">
-        <span className="message-author">{authorName(message, katName)}</span>
+        <span className="message-author">{authorName(message, me, katName)}</span>
         {message.synthetic && (
           <span className="badge badge-demo" title={t('chat.synthetic_hint')}>
             {t('chat.synthetic_badge')}
           </span>
         )}
+        {message.stopped && <span className="badge badge-stopped">{t('chat.stopped_label')}</span>}
         {message.provisional && <span className="message-writing">{t('chat.writing')}</span>}
+        {message.createdAt && (
+          <time className="message-time" dateTime={message.createdAt}>
+            {formatTime(message.createdAt)}
+          </time>
+        )}
       </p>
-      <p className="message-body">{body}</p>
+      <p className="message-body">{kind === 'system' ? noticeText(message) : message.body}</p>
+      {kind === 'system' && kats.length > 0 && (
+        <p className="message-about">
+          {t('chat.notice_about', { names: kats.map((kat) => kat.name).join(', ') })}
+        </p>
+      )}
       {message.question && message.question.options.length > 0 && (
-        <ul className="message-options" aria-label={t('chat.question_options')}>
-          {message.question.options.map((option) => (
-            <li key={option}>{option}</li>
-          ))}
-        </ul>
+        <Options question={message.question.options} active={options} />
+      )}
+    </li>
+  );
+}
+
+function Options({
+  question,
+  active,
+}: {
+  question: string[];
+  active: { disabled: boolean; onOption: (option: string) => void } | null;
+}) {
+  if (!active) {
+    return (
+      <ul className="message-options" aria-label={t('chat.question_options')}>
+        {question.map((option) => (
+          <li key={option}>{option}</li>
+        ))}
+      </ul>
+    );
+  }
+  return (
+    <div className="message-options" role="group" aria-label={t('chat.question_options')}>
+      {question.map((option) => (
+        <button
+          key={option}
+          type="button"
+          className="button option-button"
+          disabled={active.disabled}
+          onClick={() => active.onOption(option)}
+        >
+          {option}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function PendingItem({ post, onRetry }: { post: PendingMessage; onRetry: Props['onRetry'] }) {
+  const failed = post.error !== null;
+  return (
+    <li className="message message-user" data-pending aria-hidden={failed ? undefined : true}>
+      <p className="message-meta">
+        <span className="message-author">{t('chat.author.you')}</span>
+        {!failed && <span className="message-writing">{t('chat.sending')}</span>}
+      </p>
+      <p className="message-body">{post.body}</p>
+      {failed && (
+        <div className="message-failed" role="alert">
+          <p>
+            {t('chat.not_sent')} {post.error}
+          </p>
+          <button
+            type="button"
+            className="button button-quiet"
+            onClick={() => onRetry?.(post.clientMsgId)}
+          >
+            {t('chat.retry')}
+          </button>
+        </div>
       )}
     </li>
   );

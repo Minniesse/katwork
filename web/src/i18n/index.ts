@@ -74,6 +74,15 @@ export function formatDate(
   }).format(new Date(date));
 }
 
+/** A time of day for the UI chrome, such as when a message was sent. */
+export function formatTime(date: Date | string | number, options: { timeZone?: string } = {}): string {
+  const tag = current === 'th' ? 'th-TH' : 'en-GB';
+  return new Intl.DateTimeFormat(`${tag}-u-ca-gregory`, {
+    timeStyle: 'short',
+    timeZone: options.timeZone,
+  }).format(new Date(date));
+}
+
 function subscribe(listener: () => void): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);

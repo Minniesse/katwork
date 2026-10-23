@@ -35,8 +35,19 @@ const REASON_CODES = [
   'kat_paused_stopped',
 ];
 
-// API error codes the auth routes and guards can return (KatError::code).
+// API error codes the routes and guards can return (KatError::code) that a page shows.
 const API_CODES = [
+  'forbidden',
+  'member_exists',
+  'last_owner_required',
+  'smtp_unconfigured',
+  'message_empty',
+  'message_invalid',
+  'message_too_large',
+  'thread_title_invalid',
+  'client_msg_id_conflict',
+  'busy',
+  'too_many_streams',
   'unauthenticated',
   'reset_token_invalid',
   'invite_token_invalid',
