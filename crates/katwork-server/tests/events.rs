@@ -40,7 +40,10 @@ struct Setup {
 impl Setup {
     async fn new(pool: &PgPool) -> Self {
         let data = data::Fixture::new(pool).await;
-        let token = session::create(pool, UserId(data.user)).await.unwrap().0;
+        let token = session::create(pool, UserId(data.user), std::time::Duration::from_secs(5))
+            .await
+            .unwrap()
+            .0;
         let core = Arc::new(Core::new(pool.clone(), Arc::new(support::config(None))));
         let app = build_router(AppState { core: core.clone() });
         Self {
@@ -370,7 +373,10 @@ async fn stream_closes_after_session_revoked_or_member_removed(pool: PgPool) {
             .await
             .unwrap();
             s.data.user = viewer;
-            s.token = session::create(&pool, UserId(viewer)).await.unwrap().0;
+            s.token = session::create(&pool, UserId(viewer), std::time::Duration::from_secs(5))
+                .await
+                .unwrap()
+                .0;
         }
         let mut stream = s.stream(None).await;
         next(&mut stream).await;
@@ -429,14 +435,28 @@ async fn ninth_stream_across_user_sessions_gets_too_many_streams_frame(pool: PgP
     let mut s = Setup::new(&pool).await;
     let mut held = Vec::new();
     for _ in 0..2 {
-        s.token = session::create(&pool, UserId(s.data.user)).await.unwrap().0;
+        s.token = session::create(
+            &pool,
+            UserId(s.data.user),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap()
+        .0;
         for _ in 0..4 {
             let mut stream = s.stream(None).await;
             assert_eq!(&next(&mut stream).await[..], b"retry: 3000\n\n");
             held.push(stream);
         }
     }
-    s.token = session::create(&pool, UserId(s.data.user)).await.unwrap().0;
+    s.token = session::create(
+        &pool,
+        UserId(s.data.user),
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap()
+    .0;
     let mut overflow = s.stream(None).await;
     assert_eq!(&next(&mut overflow).await[..], b"retry: 30000\n\n");
     let bytes = next(&mut overflow).await;
@@ -447,7 +467,10 @@ async fn ninth_stream_across_user_sessions_gets_too_many_streams_frame(pool: PgP
 
     // Another account still has its own budget on this same hub.
     let other = data::Fixture::new(&pool).await;
-    let token = session::create(&pool, UserId(other.user)).await.unwrap().0;
+    let token = session::create(&pool, UserId(other.user), std::time::Duration::from_secs(5))
+        .await
+        .unwrap()
+        .0;
     let response = support::request(
         &s.app,
         "GET",
@@ -523,7 +546,14 @@ async fn open_streams_do_not_count_against_the_request_limit(pool: PgPool) {
             s.data = data::Fixture::new(&pool).await;
         }
         if i % 4 == 0 {
-            s.token = session::create(&pool, UserId(s.data.user)).await.unwrap().0;
+            s.token = session::create(
+                &pool,
+                UserId(s.data.user),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap()
+            .0;
         }
         let mut stream = s.stream(None).await;
         assert_eq!(&next(&mut stream).await[..], b"retry: 3000\n\n");

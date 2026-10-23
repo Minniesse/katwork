@@ -250,6 +250,10 @@ pub async fn conclude(
     idem_key: &str,
     facts: &RunFacts,
 ) -> Result<EventSeq, KatError> {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "A savepoint borrows the caller-owned transaction; request callers guard its connection and workers drain it"
+    )]
     let mut savepoint = tx.begin().await?;
     let tx = &mut savepoint;
     let job: JobRow = sqlx::query_as(
@@ -493,7 +497,7 @@ pub async fn cancel(
         sink::{close_locked_calls, close_locked_run},
     };
     let (thread, seq) = crate::db::guarded(pool, async |conn| {
-        let mut tx = conn.begin().await?;
+        let mut tx = sqlx::Connection::begin(conn).await?;
         crate::db::set_lock_timeout(&mut tx, lock_timeout).await?;
         let workspace = tenant.workspace_id();
         sqlx::query("SELECT id FROM jobs WHERE workspace_id=$1 AND id=$2 FOR NO KEY UPDATE")

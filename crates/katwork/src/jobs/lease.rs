@@ -469,11 +469,12 @@ pub async fn heartbeat(
     worker_id: &str,
     epoch: LeaseEpoch,
     ttl: Duration,
+    lock_timeout: Duration,
 ) -> Result<HeartbeatStatus, KatError> {
     owner(worker_id)?;
     let ttl = ttl_micros(ttl)?;
     let mut tx = pool.begin().await?;
-    db::set_configured_lock_timeout(&mut tx).await?;
+    db::set_lock_timeout(&mut tx, lock_timeout).await?;
     let fence = Fence { task_id, epoch };
     fence::check(&mut tx, &fence).await?;
     lock_lease(&mut tx, task_id).await?;

@@ -46,9 +46,15 @@ impl Fixture {
             .unwrap();
         let space = SpaceId::new();
         sqlx::query("INSERT INTO spaces (id, workspace_id, name, allow_external) VALUES ($1, $2, 'Chat', false)").bind(space).bind(workspace).execute(pool).await.unwrap();
-        let team = team::create_default(pool, &tenant, space, Locale::Th)
-            .await
-            .unwrap();
+        let team = team::create_default(
+            pool,
+            &tenant,
+            space,
+            Locale::Th,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
         // Seed the first thread directly so route tests fail at the missing route, not in setup.
         let thread = ThreadId::new();
         sqlx::query("INSERT INTO threads (id, workspace_id, space_id, team_id, title) VALUES ($1,$2,$3,$4,'')").bind(thread).bind(workspace).bind(space).bind(team).execute(pool).await.unwrap();

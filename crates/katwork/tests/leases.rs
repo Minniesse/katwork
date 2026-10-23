@@ -179,6 +179,7 @@ fn sink(core: &Core, c: &ClaimedTask, run: RunId) -> PgEventSink {
 }
 async fn tool(core: &Core, c: &ClaimedTask, run: RunId, effect: SideEffect) -> ToolCallRecordId {
     let ctx = ToolCtx {
+        lock_timeout: std::time::Duration::from_secs(5),
         tenant: tenancy::resolve(&core.pool, c.requested_by, c.workspace_id)
             .await
             .unwrap(),
@@ -310,7 +311,15 @@ async fn expired_lease_is_reclaimed_once(pool: PgPool) {
     assert!(claim(&core, "c").await.is_none());
     let before = events(&pool, a.thread_id).await;
     assert!(matches!(
-        lease::heartbeat(&pool, a.task_id, "a", a.lease_epoch, TTL).await,
+        lease::heartbeat(
+            &pool,
+            a.task_id,
+            "a",
+            a.lease_epoch,
+            TTL,
+            std::time::Duration::from_secs(5)
+        )
+        .await,
         Err(KatError::LeaseLost)
     ));
     assert!(matches!(
@@ -379,6 +388,7 @@ async fn expired_lease_after_side_effect_is_interrupted_not_rerun(pool: PgPool) 
         call,
         ToolCallState::Succeeded,
         Some("written"),
+        std::time::Duration::from_secs(5),
     )
     .await
     .unwrap();
@@ -443,9 +453,16 @@ async fn renewal_committed_between_snapshot_and_lock_is_not_reclaimed(pool: PgPo
         .unwrap();
     assert_eq!(epoch, a.lease_epoch.0);
     assert!(terminals(&pool, run).await.is_empty());
-    lease::heartbeat(&pool, a.task_id, "a", a.lease_epoch, TTL)
-        .await
-        .unwrap();
+    lease::heartbeat(
+        &pool,
+        a.task_id,
+        "a",
+        a.lease_epoch,
+        TTL,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     lease::complete(&core, a.task_id, "a", a.lease_epoch, answered(run))
         .await
         .unwrap();
@@ -692,9 +709,15 @@ async fn lead_runs_three_tasks_at_once_specialists_one(pool: PgPool) {
     let f = setup(&pool).await;
     let core = core(&pool);
     let tenant = tenant(&pool, &f).await;
-    let team_id = team::create_default(&pool, &tenant, SpaceId(f.space), Locale::En)
-        .await
-        .unwrap();
+    let team_id = team::create_default(
+        &pool,
+        &tenant,
+        SpaceId(f.space),
+        Locale::En,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     let roster = team::get(&pool, &tenant, team_id).await.unwrap();
     sqlx::query("UPDATE tasks SET state='cancelled' WHERE id=$1")
         .bind(f.task)
@@ -887,7 +910,15 @@ async fn infrastructure_abort_goes_through_reclaim(pool: PgPool) {
         .unwrap();
     assert_eq!(outcome(&pool, a.job_id).await, (None, None));
     assert!(matches!(
-        lease::heartbeat(&pool, a.task_id, "a", a.lease_epoch, TTL).await,
+        lease::heartbeat(
+            &pool,
+            a.task_id,
+            "a",
+            a.lease_epoch,
+            TTL,
+            std::time::Duration::from_secs(5)
+        )
+        .await,
         Err(KatError::LeaseLost)
     ));
     let b = claim(&core, "b").await.unwrap();

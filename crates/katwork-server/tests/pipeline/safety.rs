@@ -222,3 +222,26 @@ pub(super) async fn assert_pool_clean(pool: &PgPool) {
     .await
     .expect("worker shutdown left a busy pool or a backend inside a transaction");
 }
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn pool_clean_probe_rejects_idle_transaction(pool: PgPool) {
+    let single = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let mut conn = single.acquire().await.unwrap();
+    // Raw BEGIN intentionally bypasses sqlx's transaction-depth bookkeeping.
+    sqlx::query("BEGIN").execute(&mut *conn).await.unwrap();
+    conn.return_to_pool().await;
+    assert_eq!(single.num_idle(), 1);
+    assert!(
+        timeout(Duration::from_millis(200), assert_pool_clean(&single))
+            .await
+            .is_err(),
+        "pool inspection accepted a backend idle in transaction"
+    );
+    sqlx::query("ROLLBACK").execute(&single).await.unwrap();
+    assert_pool_clean(&single).await;
+    single.close().await;
+}

@@ -66,7 +66,9 @@ async fn person(pool: &PgPool, email: &str, locale: &str) -> Person {
         .execute(pool)
         .await
         .unwrap();
-    let token = session::create(pool, id).await.unwrap();
+    let token = session::create(pool, id, std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
     Person {
         id,
         email: email.to_owned(),
@@ -919,9 +921,15 @@ async fn removing_a_member_keeps_their_message_history(pool: PgPool) {
     .await
     .unwrap();
     let owner_tenant = tenancy::resolve(&pool, owner.id, ws).await.unwrap();
-    let team_id = team::create_default(&pool, &owner_tenant, space, Locale::En)
-        .await
-        .unwrap();
+    let team_id = team::create_default(
+        &pool,
+        &owner_tenant,
+        space,
+        Locale::En,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     let chat = thread::create(&pool, &owner_tenant, space, team_id, "Plans")
         .await
         .unwrap();

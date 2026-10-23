@@ -50,7 +50,13 @@ pub(crate) async fn create(
     body: Result<Json<NewWorkspace>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let body = payload(body)?;
-    let id = workspace::create(&state.core.pool, &body.name, user.user_id).await?;
+    let id = workspace::create(
+        &state.core.pool,
+        &body.name,
+        user.user_id,
+        state.core.config.lock_timeout,
+    )
+    .await?;
     Ok((StatusCode::CREATED, Json(json!({"id": id}))))
 }
 

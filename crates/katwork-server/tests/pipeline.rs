@@ -78,9 +78,15 @@ impl Fixture {
         .execute(pool)
         .await
         .unwrap();
-        let team = team::create_default(pool, &tenant, space, locale)
-            .await
-            .unwrap();
+        let team = team::create_default(
+            pool,
+            &tenant,
+            space,
+            locale,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
         let kats = team::get(pool, &tenant, team).await.unwrap().members;
         let thread = thread::create(pool, &tenant, space, team, "")
             .await

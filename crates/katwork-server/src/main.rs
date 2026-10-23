@@ -295,7 +295,7 @@ async fn run() -> Result<(), KatError> {
                 role,
                 space_policy,
                 locale,
-                config.public_url_or_default(),
+                &config,
             )
             .await?;
             print_link(&link)

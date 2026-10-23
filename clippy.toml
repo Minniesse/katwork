@@ -2,4 +2,9 @@ disallowed-methods = [
     { path = "sqlx::Pool::begin", reason = "Use db::guarded for cancellable database work" },
     { path = "sqlx::Pool::acquire", reason = "Use db::guarded for cancellable database work" },
     { path = "sqlx::Pool::begin_with", reason = "Use db::guarded for cancellable database work" },
+    { path = "sqlx::Pool::try_begin", reason = "Use db::guarded for cancellable database work" },
+    { path = "sqlx::Pool::try_acquire", reason = "Use db::guarded for cancellable database work" },
+    { path = "sqlx::Pool::try_begin_with", reason = "Use db::guarded for cancellable database work" },
+    { path = "sqlx::Acquire::begin", reason = "Use db::guarded for cancellable database work" },
+    { path = "sqlx::Acquire::acquire", reason = "Use db::guarded for cancellable database work" },
 ]

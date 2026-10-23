@@ -384,9 +384,10 @@ async fn colleague(f: &Fixture, role: &str) -> (Tenant, String) {
     let tenant = tenancy::resolve(&f.core.pool, user, f.tenant.workspace_id())
         .await
         .unwrap();
-    let token = katwork::auth::session::create(&f.core.pool, user)
-        .await
-        .unwrap();
+    let token =
+        katwork::auth::session::create(&f.core.pool, user, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
     (tenant, format!("kw_session={}", token.0))
 }
 

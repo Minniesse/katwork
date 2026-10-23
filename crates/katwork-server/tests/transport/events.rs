@@ -102,7 +102,10 @@ async fn open(addr: SocketAddr, path: &str, token: &str) -> TcpStream {
 #[sqlx::test(migrations = "../katwork/migrations")]
 async fn stream_ends_on_shutdown_token(pool: PgPool) {
     let f = data::Fixture::new(&pool).await;
-    let token = session::create(&pool, UserId(f.user)).await.unwrap().0;
+    let token = session::create(&pool, UserId(f.user), std::time::Duration::from_secs(5))
+        .await
+        .unwrap()
+        .0;
     let (core, addr, stop, task) = serve(&pool, false).await;
     let mut stream = open(addr, &path(&f), &token).await;
     core.shutdown.cancel();
@@ -167,7 +170,10 @@ async fn shutdown_aborts_connections_after_grace() {
 #[sqlx::test(migrations = "../katwork/migrations")]
 async fn four_streams_leave_two_connections_for_requests(pool: PgPool) {
     let f = data::Fixture::new(&pool).await;
-    let token = session::create(&pool, UserId(f.user)).await.unwrap().0;
+    let token = session::create(&pool, UserId(f.user), std::time::Duration::from_secs(5))
+        .await
+        .unwrap()
+        .0;
     let (_core, addr, stop, task) = serve(&pool, false).await;
     let mut streams = Vec::new();
     for _ in 0..4 {
@@ -225,7 +231,10 @@ async fn streams_through_trusted_proxy_peer_do_not_block_login(pool: PgPool) {
     let mut token = String::new();
     for _ in 0..10 {
         f = data::Fixture::new(&pool).await;
-        token = session::create(&pool, UserId(f.user)).await.unwrap().0;
+        token = session::create(&pool, UserId(f.user), std::time::Duration::from_secs(5))
+            .await
+            .unwrap()
+            .0;
         for _ in 0..4 {
             streams.push(open(addr, &path(&f), &token).await);
         }
@@ -262,7 +271,10 @@ async fn stalled_socket_releases_stream_after_write_deadline(pool: PgPool) {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let f = data::Fixture::new(&pool).await;
-    let token = session::create(&pool, UserId(f.user)).await.unwrap().0;
+    let token = session::create(&pool, UserId(f.user), std::time::Duration::from_secs(5))
+        .await
+        .unwrap()
+        .0;
     let mut tx = pool.begin().await.unwrap();
     for _ in 0..500 {
         log::append(

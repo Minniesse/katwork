@@ -199,9 +199,13 @@ async fn login_does_not_reuse_a_preexisting_session_cookie(pool: PgPool) {
 #[sqlx::test(migrations = "../katwork/migrations")]
 async fn me_stays_responsive_during_fifty_logins_with_two_connections(pool: PgPool) {
     let (id, _) = support::user(&pool).await;
-    let token = katwork::auth::session::create(&pool, katwork::ids::UserId(id))
-        .await
-        .unwrap();
+    let token = katwork::auth::session::create(
+        &pool,
+        katwork::ids::UserId(id),
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     let cookie = format!("kw_session={}", token.0);
     let small = PgPoolOptions::new()
         .max_connections(2)

@@ -15,12 +15,17 @@ pub struct WorkspaceSummary {
     pub paused: bool,
 }
 
-pub async fn create(pool: &PgPool, name: &str, owner: UserId) -> Result<WorkspaceId, KatError> {
+pub async fn create(
+    pool: &PgPool,
+    name: &str,
+    owner: UserId,
+    lock_timeout: std::time::Duration,
+) -> Result<WorkspaceId, KatError> {
     let name = super::validate_name(name)?;
     let id = WorkspaceId::new();
     crate::db::guarded(pool, async |conn| {
         let mut tx = conn.begin().await?;
-        crate::db::set_configured_lock_timeout(&mut tx).await?;
+        crate::db::set_lock_timeout(&mut tx, lock_timeout).await?;
         sqlx::query("INSERT INTO workspaces (id, name) VALUES ($1, $2)")
             .bind(id)
             .bind(name)

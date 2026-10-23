@@ -29,18 +29,6 @@ pub struct EnsuredUser {
     pub created: bool,
 }
 
-/// The account for `email`, created with `locale` when there is none. A new account's password
-/// is the hash of 32 random bytes nobody ever sees, so it has no usable password until its link
-/// is used.
-pub async fn ensure_user(
-    conn: &mut PgConnection,
-    email: &str,
-    locale: Locale,
-) -> Result<EnsuredUser, KatError> {
-    let hash = unusable_password_hash().await?;
-    ensure_user_with_hash(conn, email, locale, hash).await
-}
-
 /// The Argon2id hash of 32 random bytes nobody ever sees. It can wait for a hash slot, so a
 /// caller that holds row locks computes it before taking them.
 pub async fn unusable_password_hash() -> Result<String, KatError> {
@@ -48,8 +36,8 @@ pub async fn unusable_password_hash() -> Result<String, KatError> {
     password::run(move || password::hash(&unknown)).await?
 }
 
-/// `ensure_user` with the new account's password hash computed by the caller, from
-/// [`unusable_password_hash`].
+/// The account for `email`, created with `locale` when absent. Compute the unusable
+/// password hash with [`unusable_password_hash`] before opening a transaction.
 pub async fn ensure_user_with_hash(
     conn: &mut PgConnection,
     email: &str,
@@ -105,7 +93,7 @@ impl WorkspaceRef {
 
 /// Creates an account in `workspace` with `role` and `locale` and returns its invite link. An
 /// unknown workspace name is created, with a first Space `General` and its default team in
-/// `locale`, only for an owner and only with a `space_policy`. Everything happens in one
+/// `locale`, only for an owner and only with a `space_policy`. All database changes happen in one
 /// transaction, so a refusal changes nothing.
 pub async fn create_user(
     pool: &PgPool,
@@ -114,13 +102,13 @@ pub async fn create_user(
     role: Role,
     space_policy: Option<SpacePolicy>,
     locale: Locale,
-    link_base: &str,
+    config: &crate::config::Config,
 ) -> Result<String, KatError> {
     let email = normalize_email(email)?;
     let hash = unusable_password_hash().await?;
     crate::db::guarded(pool, async |conn| {
         let mut tx = conn.begin().await?;
-        crate::db::set_configured_lock_timeout(&mut tx).await?;
+        crate::db::set_lock_timeout(&mut tx, config.lock_timeout).await?;
         // An existing account is served by `reset-link`, so an operator never overwrites one here.
         let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE email = $1)")
             .bind(&email)
@@ -192,7 +180,7 @@ pub async fn create_user(
         }
         let token = invite::issue(&mut tx, user.user_id).await?;
         tx.commit().await?;
-        Ok(invite::link(link_base, &token))
+        Ok(invite::link(config.public_url_or_default(), &token))
     })
     .await
 }

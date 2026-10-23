@@ -57,11 +57,6 @@ pub async fn set_lock_timeout(conn: &mut PgConnection, timeout: Duration) -> Res
     Ok(())
 }
 
-pub(crate) async fn set_configured_lock_timeout(conn: &mut PgConnection) -> Result<(), KatError> {
-    let timeout = crate::config::lock_timeout(std::env::var("KATWORK_LOCK_TIMEOUT_MS").ok())?;
-    set_lock_timeout(conn, timeout).await
-}
-
 async fn recycle(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
     // Drain the rollback queued by Transaction::drop before checking the server state.
     conn.flush().await?;

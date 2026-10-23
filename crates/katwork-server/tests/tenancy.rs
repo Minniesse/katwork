@@ -755,9 +755,14 @@ async fn workspace_pause_locks_only_workspace_without_blocking_foreign_keys(pool
 async fn workspace_creation_rolls_back_without_valid_owner(pool: PgPool) {
     use katwork::{ids::UserId, tenancy::workspace as workspaces};
     assert!(
-        workspaces::create(&pool, "Orphan", UserId::new())
-            .await
-            .is_err()
+        workspaces::create(
+            &pool,
+            "Orphan",
+            UserId::new(),
+            std::time::Duration::from_secs(5)
+        )
+        .await
+        .is_err()
     );
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM workspaces")
         .fetch_one(&pool)

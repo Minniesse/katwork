@@ -14,10 +14,14 @@ impl fmt::Debug for SessionToken {
     }
 }
 
-pub async fn create(pool: &PgPool, user_id: UserId) -> Result<SessionToken, KatError> {
+pub async fn create(
+    pool: &PgPool,
+    user_id: UserId,
+    lock_timeout: std::time::Duration,
+) -> Result<SessionToken, KatError> {
     crate::db::guarded(pool, async |conn| {
         let mut tx = conn.begin().await?;
-        crate::db::set_configured_lock_timeout(&mut tx).await?;
+        crate::db::set_lock_timeout(&mut tx, lock_timeout).await?;
         sqlx::query("SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE")
             .bind(user_id)
             .fetch_one(&mut *tx)

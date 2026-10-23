@@ -53,7 +53,15 @@ async fn reclaimed_epoch_rejects_late_completion(pool: PgPool) {
         Err(KatError::LeaseLost)
     ));
     assert!(matches!(
-        lease::heartbeat(&pool, a.task_id, "a", a.lease_epoch, TTL).await,
+        lease::heartbeat(
+            &pool,
+            a.task_id,
+            "a",
+            a.lease_epoch,
+            TTL,
+            std::time::Duration::from_secs(5)
+        )
+        .await,
         Err(KatError::LeaseLost)
     ));
     assert_eq!(before, events(&pool, a.thread_id).await);
@@ -100,8 +108,17 @@ async fn heartbeat_rechecks_expiry_after_waiting_for_lease_row(pool: PgPool) {
     let other = pool.clone();
     let task = c.task_id;
     let epoch = c.lease_epoch;
-    let renewal =
-        tokio::spawn(async move { lease::heartbeat(&other, task, "a", epoch, TTL).await });
+    let renewal = tokio::spawn(async move {
+        lease::heartbeat(
+            &other,
+            task,
+            "a",
+            epoch,
+            TTL,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+    });
     waiting(&pool, "SELECT task_id FROM task_leases").await;
     sqlx::query(
         "UPDATE task_leases SET expires_at=clock_timestamp()-interval '1 second' WHERE task_id=$1",
@@ -171,7 +188,15 @@ async fn wrong_owner_cannot_renew_complete_or_abandon(pool: PgPool) {
     let run = start_run(&core, &c).await;
     let before = events(&pool, c.thread_id).await;
     assert!(matches!(
-        lease::heartbeat(&pool, c.task_id, "other", c.lease_epoch, TTL).await,
+        lease::heartbeat(
+            &pool,
+            c.task_id,
+            "other",
+            c.lease_epoch,
+            TTL,
+            std::time::Duration::from_secs(5)
+        )
+        .await,
         Err(KatError::LeaseLost)
     ));
     assert!(matches!(
@@ -356,8 +381,17 @@ async fn heartbeat_cannot_revive_lease_that_expires_during_policy_read(pool: PgP
     let other = pool.clone();
     let task = c.task_id;
     let epoch = c.lease_epoch;
-    let renewal =
-        tokio::spawn(async move { lease::heartbeat(&other, task, "a", epoch, TTL).await });
+    let renewal = tokio::spawn(async move {
+        lease::heartbeat(
+            &other,
+            task,
+            "a",
+            epoch,
+            TTL,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+    });
     waiting(&pool, "SELECT w.paused").await;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {

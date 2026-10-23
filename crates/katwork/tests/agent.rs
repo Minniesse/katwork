@@ -97,6 +97,7 @@ impl EventSink for Sink {
     }
 }
 struct Harness {
+    lock_timeout: Duration,
     pool: PgPool,
     f: Fixture,
     kat: Kat,
@@ -171,6 +172,7 @@ impl Harness {
         let fake = FakeProvider::scripted(script);
         let models = Registry::from_entries(vec![(entry(&fake), Arc::new(fake.clone()))]);
         Self {
+            lock_timeout: Duration::from_secs(5),
             pool,
             f,
             kat,
@@ -194,6 +196,7 @@ impl Harness {
     async fn run(&self) -> Result<RunFacts, RunAbort> {
         run::execute(
             &RunEnv {
+                lock_timeout: self.lock_timeout,
                 pool: &self.pool,
                 models: &self.models,
                 tools: &self.tools,
@@ -1729,6 +1732,7 @@ async fn old_worker_cannot_emit_text_after_reclaim(pool: PgPool) {
     };
     let result = run::execute(
         &RunEnv {
+            lock_timeout: std::time::Duration::from_secs(5),
             pool: &h.pool,
             models: &h.models,
             tools: &h.tools,

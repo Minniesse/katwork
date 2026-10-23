@@ -25,11 +25,26 @@ fn config() -> Config {
         "DATABASE_URL" => Some("postgres://localhost/katwork".into()),
         "KATWORK_SECRET" => Some(Uuid::now_v7().to_string()),
         "KATWORK_DEMO" => Some("1".into()),
-        "KATWORK_DEMO_PASSWORD" => Some("configured-password".into()),
+        "KATWORK_DEMO_PASSWORD" => Some(Uuid::now_v7().to_string()),
         "KATWORK_LOCK_TIMEOUT_MS" => Some("20000".into()),
         _ => None,
     })
     .unwrap()
+}
+
+fn fixture_hash() -> String {
+    use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
+    Argon2::new(
+        argon2::Algorithm::Argon2id,
+        argon2::Version::V0x13,
+        argon2::Params::new(1024, 1, 1, None).unwrap(),
+    )
+    .hash_password(
+        Uuid::now_v7().to_string().as_bytes(),
+        &SaltString::generate(&mut rand_core::OsRng),
+    )
+    .unwrap()
+    .to_string()
 }
 
 async fn single(pool: &PgPool) -> (PgPool, i32) {
@@ -56,7 +71,7 @@ async fn create_user(
             allow_external: false,
         }),
         Locale::En,
-        "http://localhost:3000",
+        &config(),
     )
     .await
 }
@@ -100,7 +115,7 @@ async fn create_user_waits_for_hash_capacity_without_a_transaction(pool: PgPool)
 #[sqlx::test(migrations = "../katwork/migrations")]
 async fn create_user_preserves_an_account_created_concurrently(pool: PgPool) {
     let _serial = SERIAL.lock().await;
-    let existing_hash = password::hash("existing-password").unwrap();
+    let existing_hash = fixture_hash();
     let (single, pid) = single(&pool).await;
     let mut blocker = pool.begin().await.unwrap();
     sqlx::query("SELECT pg_advisory_xact_lock(3000004)")
@@ -174,8 +189,10 @@ async fn seed_demo_rechecks_a_password_changed_after_verification(pool: PgPool) 
         .fetch_one(&pool)
         .await
         .unwrap();
-    let session = auth::session::create(&pool, user).await.unwrap();
-    let changed_hash = password::hash("changed-concurrently").unwrap();
+    let session = auth::session::create(&pool, user, std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    let changed_hash = fixture_hash();
     let (single, pid) = single(&pool).await;
     let mut blocker = pool.begin().await.unwrap();
     sqlx::query("SELECT pg_advisory_xact_lock(3000003)")

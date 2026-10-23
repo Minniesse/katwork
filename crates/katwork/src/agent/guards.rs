@@ -17,8 +17,9 @@ pub async fn authorize(
     kat_id: KatId,
     space_id: SpaceId,
     policy_version: i64,
+    lock_timeout: std::time::Duration,
 ) -> Result<Option<StopReason>, KatError> {
-    crate::db::set_configured_lock_timeout(conn).await?;
+    crate::db::set_lock_timeout(conn, lock_timeout).await?;
     scoped_task(conn, tenant, fence).await?;
     sqlx::query("SELECT id FROM workspaces WHERE id=$1 FOR SHARE")
         .bind(tenant.workspace_id())
@@ -61,6 +62,7 @@ pub async fn authorize_write(
         ctx.kat_id,
         ctx.space_id,
         ctx.policy_version,
+        ctx.lock_timeout,
     )
     .await
 }

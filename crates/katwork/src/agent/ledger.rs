@@ -19,9 +19,12 @@ pub(crate) fn clean(text: &str) -> String {
     clippy::disallowed_methods,
     reason = "Worker execution drains ledger SQL before ending or abandoning the run"
 )]
-pub(crate) async fn transaction(pool: &PgPool) -> Result<Transaction<'_, Postgres>, KatError> {
+pub(crate) async fn transaction(
+    pool: &PgPool,
+    lock_timeout: std::time::Duration,
+) -> Result<Transaction<'_, Postgres>, KatError> {
     let mut tx = pool.begin().await?;
-    db::set_configured_lock_timeout(&mut tx).await?;
+    db::set_lock_timeout(&mut tx, lock_timeout).await?;
     Ok(tx)
 }
 async fn insert(
@@ -31,7 +34,7 @@ async fn insert(
     args: &str,
     result: Option<&str>,
 ) -> Result<ToolCallRecordId, KatError> {
-    let mut tx = transaction(&ctx.pool).await?;
+    let mut tx = transaction(&ctx.pool, ctx.lock_timeout).await?;
     guards::scoped_task(&mut tx, &ctx.tenant, &ctx.fence()).await?;
     let starts_effect = result.is_none() && effect != Some(SideEffect::Read);
     if starts_effect {
@@ -88,8 +91,9 @@ pub async fn retry_read(
     pool: &PgPool,
     fence: &Fence,
     id: ToolCallRecordId,
+    lock_timeout: std::time::Duration,
 ) -> Result<(), KatError> {
-    let mut tx = transaction(pool).await?;
+    let mut tx = transaction(pool, lock_timeout).await?;
     fence::check(&mut tx, fence).await?;
     let changed=sqlx::query("UPDATE tool_calls c SET attempts=2,state='started',ended_at=NULL,result=NULL FROM runs r,tasks t
         WHERE c.id=$1 AND c.run_id=r.id AND c.workspace_id=r.workspace_id AND r.task_id=t.id AND r.workspace_id=t.workspace_id
@@ -107,11 +111,12 @@ pub async fn end_tool_call(
     id: ToolCallRecordId,
     state: ToolCallState,
     result: Option<&str>,
+    lock_timeout: std::time::Duration,
 ) -> Result<(), KatError> {
     if matches!(state, ToolCallState::Started | ToolCallState::Refused) {
         return Err(KatError::RequestInvalid);
     }
-    let mut tx = transaction(pool).await?;
+    let mut tx = transaction(pool, lock_timeout).await?;
     fence::check(&mut tx, fence).await?;
     let changed=sqlx::query("UPDATE tool_calls c SET state=$4,result=$5,ended_at=clock_timestamp() FROM runs r,tasks t
         WHERE c.id=$1 AND c.run_id=r.id AND c.workspace_id=r.workspace_id AND r.task_id=t.id AND r.workspace_id=t.workspace_id
@@ -129,8 +134,9 @@ pub(crate) async fn refuse_started(
     fence: &Fence,
     id: ToolCallRecordId,
     code: &str,
+    lock_timeout: std::time::Duration,
 ) -> Result<(), KatError> {
-    let mut tx = transaction(pool).await?;
+    let mut tx = transaction(pool, lock_timeout).await?;
     fence::lock(&mut tx, fence).await?;
     let changed = sqlx::query(
         "UPDATE tool_calls c SET state='refused',result=$4,ended_at=clock_timestamp() FROM runs r
@@ -180,8 +186,9 @@ pub async fn record_model_call(
     pool: &PgPool,
     fence: &Fence,
     row: &ModelCallRow,
+    lock_timeout: std::time::Duration,
 ) -> Result<ModelCallId, KatError> {
-    let mut tx = transaction(pool).await?;
+    let mut tx = transaction(pool, lock_timeout).await?;
     sqlx::query("SELECT id FROM tasks WHERE workspace_id=$1 AND id=$2")
         .bind(row.workspace_id)
         .bind(fence.task_id)

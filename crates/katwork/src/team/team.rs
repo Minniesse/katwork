@@ -170,10 +170,11 @@ pub async fn create_default(
     tenant: &Tenant,
     space: SpaceId,
     locale: Locale,
+    lock_timeout: std::time::Duration,
 ) -> Result<TeamId, KatError> {
     crate::db::guarded(pool, async |conn| {
         let mut tx = conn.begin().await?;
-        crate::db::set_configured_lock_timeout(&mut tx).await?;
+        crate::db::set_lock_timeout(&mut tx, lock_timeout).await?;
         let id = create_default_on(&mut tx, tenant, space, locale).await?;
         tx.commit().await?;
         Ok(id)

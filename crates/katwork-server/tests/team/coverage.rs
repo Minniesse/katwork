@@ -174,10 +174,16 @@ async fn default_roster_failure_rolls_back_all_rows(pool: PgPool) {
     sqlx::raw_sql("CREATE SEQUENCE roster_attempts; CREATE FUNCTION fail_fourth_kat() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF nextval('roster_attempts') = 4 THEN RAISE EXCEPTION 'injected roster failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_roster BEFORE INSERT ON kats FOR EACH ROW EXECUTE FUNCTION fail_fourth_kat();")
         .execute(&pool).await.unwrap();
     assert_eq!(
-        team::create_default(&pool, &tenant, SpaceId(f.space), Locale::En)
-            .await
-            .unwrap_err()
-            .code(),
+        team::create_default(
+            &pool,
+            &tenant,
+            SpaceId(f.space),
+            Locale::En,
+            std::time::Duration::from_secs(5)
+        )
+        .await
+        .unwrap_err()
+        .code(),
         "database_error"
     );
     let attempted: i64 = sqlx::query_scalar("SELECT last_value FROM roster_attempts")
@@ -198,9 +204,15 @@ async fn default_roster_failure_rolls_back_all_rows(pool: PgPool) {
         .execute(&pool)
         .await
         .unwrap();
-    let team = team::create_default(&pool, &tenant, SpaceId(f.space), Locale::En)
-        .await
-        .unwrap();
+    let team = team::create_default(
+        &pool,
+        &tenant,
+        SpaceId(f.space),
+        Locale::En,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         team::get(&pool, &tenant, team).await.unwrap().members.len(),
         6
@@ -510,9 +522,15 @@ async fn member_can_create_the_thai_default_team(pool: PgPool) {
     let member = tenancy::resolve(&pool, UserId(f.user), WorkspaceId(f.workspace))
         .await
         .unwrap();
-    let id = team::create_default(&pool, &member, SpaceId(f.space), Locale::Th)
-        .await
-        .unwrap();
+    let id = team::create_default(
+        &pool,
+        &member,
+        SpaceId(f.space),
+        Locale::Th,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     let view = team::get(&pool, &member, id).await.unwrap();
     assert_eq!(view.team.name, "ทีมเริ่มต้น");
     let names: Vec<_> = view.members.iter().map(|kat| kat.name.as_str()).collect();

@@ -166,9 +166,15 @@ async fn lead_defaults_to_three_concurrent_tasks_specialists_to_one(pool: PgPool
         .unwrap();
     for locale in [Locale::En, Locale::Th] {
         let space = space(&pool, f.workspace).await;
-        let id = team::create_default(&pool, &tenant, SpaceId(space), locale)
-            .await
-            .unwrap();
+        let id = team::create_default(
+            &pool,
+            &tenant,
+            SpaceId(space),
+            locale,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
         let view = body(f.call("GET", &format!("teams/{id}"), None).await).await;
         let limits: Vec<_> = view["members"]
             .as_array()
@@ -764,8 +770,20 @@ async fn thai_default_roster_is_atomic_and_idempotent(pool: PgPool) {
         .unwrap();
     let lock = concurrency::lock_workspace(&pool, f.workspace).await;
     let (a, b, ()) = tokio::join!(
-        team::create_default(&pool, &tenant, SpaceId(f.space), Locale::Th),
-        team::create_default(&pool, &tenant, SpaceId(f.space), Locale::Th),
+        team::create_default(
+            &pool,
+            &tenant,
+            SpaceId(f.space),
+            Locale::Th,
+            std::time::Duration::from_secs(5)
+        ),
+        team::create_default(
+            &pool,
+            &tenant,
+            SpaceId(f.space),
+            Locale::Th,
+            std::time::Duration::from_secs(5)
+        ),
         async {
             concurrency::wait_for_blocked_writers(&pool, 2).await;
             lock.rollback().await.unwrap();
