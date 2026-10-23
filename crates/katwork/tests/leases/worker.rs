@@ -771,7 +771,9 @@ async fn first_watchdog_window_includes_claim_latency(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn failed_heartbeat_abandons_without_waiting_for_ttl(pool: PgPool) {
     let f = setup(&pool).await;
-    let (core, provider) = hanging(&pool);
+    let (mut core, provider) = hanging(&pool);
+    let config = &mut Arc::get_mut(&mut core).unwrap().config;
+    Arc::get_mut(config).unwrap().lock_timeout = Duration::from_secs(30);
     let _clock = Clock::pause();
     let mut workers = worker::spawn_pool(core.clone(), 1, TTL);
     until(|| provider.started.load(Ordering::SeqCst) == 1).await;
@@ -783,7 +785,29 @@ async fn failed_heartbeat_abandons_without_waiting_for_ttl(pool: PgPool) {
         CREATE TRIGGER reject_renewal BEFORE UPDATE ON task_leases FOR EACH ROW EXECUTE FUNCTION reject_renewal()")
         .execute(&pool).await.unwrap();
     paused(&pool, &f, true).await;
+    // Let the run close before abandonment invalidates its fence.
+    let mut gate = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM tasks WHERE id=$1 FOR SHARE")
+        .bind(f.task)
+        .execute(&mut *gate)
+        .await
+        .unwrap();
     tokio::time::advance(Duration::from_millis(20_001)).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let ev = events(&pool, ThreadId(f.thread)).await;
+        if let Some(closed) = ev.iter().find(|e| e["name"] == "katwork.run_closed") {
+            assert_eq!(closed["value"]["end"], "interrupted");
+            assert_eq!(closed["value"]["code"], "lease_lost");
+            let errors: Vec<_> = ev.iter().filter(|e| e["type"] == "RUN_ERROR").collect();
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0]["code"], "lease_lost");
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "run never closed");
+        tokio::task::yield_now().await;
+    }
+    gate.rollback().await.unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let recovered: bool = sqlx::query_scalar("SELECT state='queued' AND hold_reason IS NOT DISTINCT FROM 'workspace_paused' FROM tasks WHERE id=$1")

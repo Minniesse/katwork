@@ -29,15 +29,15 @@ pub async fn execute(
     input: RunInput,
     limits: &Limits,
 ) -> Result<RunFacts, RunAbort> {
-    execute_with_shutdown(env, kat, input, limits, None).await
+    execute_with_interruption(env, kat, input, limits, None).await
 }
 
-pub(crate) async fn execute_with_shutdown(
+pub(crate) async fn execute_with_interruption(
     env: &RunEnv<'_>,
     kat: &Kat,
     input: RunInput,
     limits: &Limits,
-    shutdown: Option<&CancellationToken>,
+    interrupted: Option<&CancellationToken>,
 ) -> Result<RunFacts, RunAbort> {
     let started = Instant::now();
     let mut facts = RunFacts::not_run(StopReason::Interrupted);
@@ -59,7 +59,7 @@ pub(crate) async fn execute_with_shutdown(
     runner.insert().await?;
     runner.drive().await?;
     if runner.facts.stop == Some(StopReason::Cancelled) {
-        let (end, code) = if shutdown.is_some_and(CancellationToken::is_cancelled) {
+        let (end, code) = if interrupted.is_some_and(CancellationToken::is_cancelled) {
             (RunEnd::Interrupted, "lease_lost")
         } else {
             (RunEnd::Cancelled, "cancelled")

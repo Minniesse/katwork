@@ -112,8 +112,9 @@ mod tests {
             .connect_with((*pool.connect_options()).clone())
             .await
             .unwrap();
-        sqlx::query("SELECT 1").execute(&single).await.unwrap();
-        drop(single.acquire().await.unwrap());
+        let mut conn = single.acquire().await.unwrap();
+        sqlx::query("SELECT 1").execute(&mut *conn).await.unwrap();
+        conn.return_to_pool().await;
         single.close().await;
         let logs = logs.0.lock().unwrap();
         assert!(
@@ -130,11 +131,22 @@ mod tests {
             .await
             .unwrap();
         let mut conn = single.acquire().await.unwrap();
-        assert!(
-            sqlx::query("BEGIN; SELECT 1/0")
-                .execute(&mut *conn)
-                .await
-                .is_err()
+        sqlx::query("BEGIN").execute(&mut *conn).await.unwrap();
+        let error = sqlx::query("SELECT 1/0")
+            .execute(&mut *conn)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("22012")
+        );
+        let error = sqlx::query("SELECT 1")
+            .execute(&mut *conn)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("25P02")
         );
         drop(conn);
         assert_eq!(
