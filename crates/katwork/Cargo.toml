@@ -6,6 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+async-stream.workspace = true
+bytes.workspace = true
+futures.workspace = true
+rig-core.workspace = true
+rig-reqwest.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
 percent-encoding.workspace = true
 thiserror.workspace = true
 url.workspace = true
@@ -18,12 +26,10 @@ serde_json.workspace = true
 tokio.workspace = true
 
 argon2.workspace = true
-async-trait.workspace = true
 base64.workspace = true
 rand_core.workspace = true
 sha2.workspace = true
 lettre.workspace = true
-tracing.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "io-util"] }
