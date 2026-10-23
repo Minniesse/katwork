@@ -27,8 +27,9 @@ pub(crate) fn fold_name(name: &str) -> String {
     for marks in key.split_mut(|ch| !is_thai_mark(*ch)) {
         marks.sort_by_key(|ch| (if *ch == '\u{0e4d}' { '\u{0e47}' } else { *ch }, *ch));
     }
+    let mut key: Vec<_> = key.into_iter().nfc().collect();
     key.dedup_by(|a, b| a == b && is_thai_mark(*a));
-    key.into_iter().nfc().collect()
+    key.into_iter().collect()
 }
 
 fn is_thai_mark(ch: char) -> bool {
@@ -63,8 +64,21 @@ async fn check_space(
 }
 
 fn validate_name(name: &str) -> Result<&str, KatError> {
-    if name.contains('@') {
+    let name = crate::tenancy::validate_name(name)?;
+    if name_key(name).contains('@') {
         return Err(KatError::RequestInvalid);
     }
-    crate::tenancy::validate_name(name)
+    Ok(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fold_name;
+
+    #[test]
+    fn fold_name_is_idempotent_with_mixed_thai_marks() {
+        let name = "ß\u{0e38}\u{0308}\u{0e4e}\u{0e38}";
+        let folded = fold_name(name);
+        assert_eq!(fold_name(&folded), folded);
+    }
 }
