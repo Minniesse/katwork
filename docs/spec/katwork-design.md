@@ -13,8 +13,8 @@
 KatWork lets anyone in an organization hire a team of named AI coworkers ("Kats") that do real office work on their own isolated computers and hand back **finished files with proof**. People talk to the team from LINE, Slack, Teams, RustChat/Mattermost, Telegram, Discord, WhatsApp, the web, desktop or mobile, and they watch the work in a cute 3D office and a live graph of every agent call. Anything risky waits for a human to approve. The whole system runs **on the organization's own servers**, with the model providers you choose (qualified hosted APIs or local models), in English and Thai.
 
 **Positioning:** KatWork is *the self-hosted AI team office*, for organizations of any size. It turns folders of everyday files into finished, source-cited documents through a persistent team of named coworkers, with human approvals. It differs from:
-- hosted coworker products such as OpenAI ChatGPT Kats, which run in the vendor's cloud;
-- open-source coworker templates such as CopilotKit OpenKats, which self-host but depend on CopilotKit Intelligence (a vendor service, hosted or licensed) for conversations, approve only some actions, and keep no evidence;
+- hosted coworker products such as OpenAI ChatGPT Dots, which run in the vendor's cloud;
+- open-source coworker templates such as CopilotKit OpenDots, which self-host but depend on CopilotKit Intelligence (a vendor service, hosted or licensed) for conversations, approve only some actions, and keep no evidence;
 - general AI assistants, which help draft but don't deliver template-exact files with claim-level proof and approvals.
 
 
@@ -47,7 +47,7 @@ KatWork lets anyone in an organization hire a team of named AI coworkers ("Kats"
 | Area | Decision |
 |---|---|
 | Product shape | A general AI team for any office work. Templates showcase jobs; they do not limit them. |
-| Team model | Persistent "Kats", like OpenAI ChatGPT Kats and CopilotKit OpenKats. Each has a name, role, personality, memory, its own computer, and a tool allowlist. |
+| Team model | Persistent "Kats", like OpenAI ChatGPT Dots and CopilotKit OpenDots. Each has a name, role, personality, memory, its own computer, and a tool allowlist. |
 | Edge | A team anyone can build · finished work with proof · a safe computer per agent · English and Thai together. |
 | Beachheads | University report offices (SAR and annual reports) and listed-company One Report sustainability teams. KatWork itself stays horizontal. |
 | Core language | Rust for all KatWork code. Inside their sandbox, agents may run JavaScript, Python (Pyodide) and WASM; native tools run as KatWork Rust tools or pinned containers (§9). |
