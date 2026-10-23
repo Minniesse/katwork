@@ -21,3 +21,13 @@ Registry defaults were checked on 2026-10-23. OpenAI uses [GPT-4.1 nano](https:/
 `anthropic_spend_cap.json`, `anthropic_organization_spend_limit.json`, and `anthropic_workspace_spend_limit.json` cover the [documented spend-limit responses](https://platform.claude.com/docs/en/api/rate-limits#reaching-your-spend-cap): the nested 429 spend-cap code and both HTTP 400 `invalid_request_error` message prefixes. `anthropic_credit_balance.json` covers the [documented exhausted-credit message](https://platform.claude.com/docs/en/about-claude/api-credits-for-subscribers). These classify as `QuotaExceeded` before generic rate-limit or protocol errors; unrelated invalid requests and ordinary 429 rate limits keep their own classifications.
 
 The server blocks all Rig dependency logs because Rig can log provider messages at WARN. KatWork logs only the classified error kind, available HTTP status and request-id header, and error-body byte count. The server regression sends an actual OpenAI SSE error and an HTTP error through its tracing filter, including an explicit trace override.
+
+
+`local_ollama.sse`, `local_vllm.sse`, and `local_llamacpp.sse` are synthetic
+OpenAI-compatible server shapes. They cover inline usage, indexed tool-argument
+fragments with a usage-only tail, and absent usage respectively. The tool fixture
+also splits HTTP bytes inside the call ID. IDs and names are complete fields in
+the first SSE tool delta; later deltas carry argument fragments. These fixtures
+exercise the local Chat route without a key, with an optional key, and without
+`tool_choice`; they are not live server or model qualification tests. Existing
+malformed, truncated, duplicate-ID and size fixtures also cover local calls.

@@ -1,6 +1,6 @@
 //! Rig is confined to model I/O here. KatWork owns retries and tool execution.
 use super::*;
-use crate::config::ProviderEnv;
+use crate::config::{LocalEnv, ProviderEnv};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, stream::BoxStream};
@@ -22,6 +22,7 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 #[derive(Debug, Clone, Copy)]
 pub struct HttpLimits {
     pub connect: Duration,
+    pub first_byte: Duration,
     pub read: Duration,
     pub max_response_bytes: usize,
     pub max_error_body_bytes: usize,
@@ -31,10 +32,20 @@ impl Default for HttpLimits {
     fn default() -> Self {
         Self {
             connect: Duration::from_secs(10),
+            first_byte: Duration::from_secs(30),
             read: Duration::from_secs(30),
             max_response_bytes: 16 * 1024 * 1024,
             max_error_body_bytes: 64 * 1024,
             max_sse_frame_bytes: 1024 * 1024,
+        }
+    }
+}
+impl HttpLimits {
+    pub fn for_entry(t: &ModelTimeouts) -> Self {
+        Self {
+            first_byte: t.first_chunk,
+            read: t.first_chunk.max(t.idle),
+            ..Self::default()
         }
     }
 }
@@ -60,14 +71,21 @@ impl BoundedHttp {
     )]
     async fn open(&self, req: Request<Bytes>) -> http_client::Result<reqwest::Response> {
         let (parts, body) = req.into_parts();
-        let mut response = self
-            .client
-            .request(parts.method, parts.uri.to_string())
-            .headers(parts.headers)
-            .body(body)
-            .send()
-            .await
-            .map_err(http_client::Error::instance)?;
+        let mut response = tokio::time::timeout(
+            self.limits.first_byte,
+            self.client
+                .request(parts.method, parts.uri.to_string())
+                .headers(parts.headers)
+                .body(body)
+                .send(),
+        )
+        .await
+        .map_err(|_| {
+            http_client::Error::instance(ModelError::Timeout {
+                phase: TimeoutPhase::FirstChunk,
+            })
+        })?
+        .map_err(http_client::Error::instance)?;
         if !response.status().is_success() {
             let status = response.status();
             let headers = response.headers().clone();
@@ -235,15 +253,19 @@ enum Backend {
 }
 #[derive(Clone)]
 pub struct RigProvider {
+    id: &'static str,
+    residency: Residency,
     backend: Backend,
     model: String,
     http: BoundedHttp,
 }
-fn validate_env(env: &ProviderEnv) -> Result<(), ModelError> {
-    if env.api_key.trim().is_empty() || http_client::HeaderValue::from_str(&env.api_key).is_err() {
+fn validate_env(api_key: Option<&str>, base_url: Option<&str>) -> Result<(), ModelError> {
+    if api_key.is_some_and(|key| {
+        key.trim().is_empty() || http_client::HeaderValue::from_str(key).is_err()
+    }) {
         return Err(ModelError::AuthFailed);
     }
-    if let Some(base) = &env.base_url {
+    if let Some(base) = base_url {
         let url =
             url::Url::parse(base).map_err(|_| ModelError::Protocol("invalid_base_url".into()))?;
         if !matches!(url.scheme(), "http" | "https") || !url.has_host() {
@@ -253,28 +275,66 @@ fn validate_env(env: &ProviderEnv) -> Result<(), ModelError> {
     Ok(())
 }
 impl RigProvider {
-    pub fn openai(env: &ProviderEnv, model: &str, api: OpenAiApi) -> Result<Self, ModelError> {
-        validate_env(env)?;
+    pub fn openai(
+        env: &ProviderEnv,
+        model: &str,
+        api: OpenAiApi,
+        limits: HttpLimits,
+    ) -> Result<Self, ModelError> {
+        validate_env(Some(&env.api_key), env.base_url.as_deref())?;
         let mut config = OpenAIConfig::new(env.api_key.clone());
         if let Some(base) = &env.base_url {
             config = config.with_base_url(base);
         }
         Ok(Self {
+            id: match api {
+                OpenAiApi::Chat => "openai:chat",
+                OpenAiApi::Responses => "openai:responses",
+            },
+            residency: Residency::External,
             backend: Backend::OpenAi(Box::new(config), api),
             model: model.into(),
-            http: BoundedHttp::new(HttpLimits::default())?,
+            http: BoundedHttp::new(limits)?,
         })
     }
-    pub fn anthropic(env: &ProviderEnv, model: &str) -> Result<Self, ModelError> {
-        validate_env(env)?;
+    pub fn anthropic(
+        env: &ProviderEnv,
+        model: &str,
+        limits: HttpLimits,
+    ) -> Result<Self, ModelError> {
+        validate_env(Some(&env.api_key), env.base_url.as_deref())?;
         let mut config = AnthropicConfig::new(env.api_key.clone());
         if let Some(base) = &env.base_url {
             config = config.with_base_url(base);
         }
         Ok(Self {
+            id: "anthropic",
+            residency: Residency::External,
             backend: Backend::Anthropic(config),
             model: model.into(),
-            http: BoundedHttp::new(HttpLimits::default())?,
+            http: BoundedHttp::new(limits)?,
+        })
+    }
+    pub fn local(env: &LocalEnv, limits: HttpLimits) -> Result<Self, ModelError> {
+        validate_env(env.api_key.as_deref(), Some(&env.base_url))?;
+        let mut base_url = url::Url::parse(&env.base_url)
+            .map_err(|_| ModelError::Protocol("invalid_base_url".into()))?;
+        // Reqwest otherwise turns URL userinfo into implicit Basic authorization.
+        base_url
+            .set_username("")
+            .map_err(|_| ModelError::Protocol("invalid_base_url".into()))?;
+        base_url
+            .set_password(None)
+            .map_err(|_| ModelError::Protocol("invalid_base_url".into()))?;
+        let config = OpenAIConfig::new(env.api_key.clone().unwrap_or_default())
+            .with_auth(rig_core::providers::openai::wire::Auth::OptionalBearer)
+            .with_base_url(base_url.as_str());
+        Ok(Self {
+            id: "local",
+            residency: Residency::Local,
+            backend: Backend::OpenAi(Box::new(config), OpenAiApi::Chat),
+            model: env.model.clone(),
+            http: BoundedHttp::new(limits)?,
         })
     }
     pub fn with_http(mut self, http: BoundedHttp) -> Self {
@@ -369,16 +429,12 @@ impl RigProvider {
 #[async_trait]
 impl ModelProvider for RigProvider {
     fn id(&self) -> &str {
-        match self.backend {
-            Backend::OpenAi(_, OpenAiApi::Chat) => "openai:chat",
-            Backend::OpenAi(_, OpenAiApi::Responses) => "openai:responses",
-            Backend::Anthropic(_) => "anthropic",
-        }
+        self.id
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             tools: true,
-            residency: Residency::External,
+            residency: self.residency,
             synthetic: false,
         }
     }
@@ -409,11 +465,12 @@ fn to_rig(req: ChatRequest, provider_id: &str) -> Result<CompletionRequest, Mode
                 if tool_call_id.is_empty() {
                     return Err(ModelError::Protocol("empty_tool_call_id".into()));
                 }
-                let content = if is_error && provider_id.starts_with("openai:") {
-                    format!("Error: {content}")
-                } else {
-                    content
-                };
+                let content =
+                    if is_error && (provider_id.starts_with("openai:") || provider_id == "local") {
+                        format!("Error: {content}")
+                    } else {
+                        content
+                    };
                 Message::tool_results(vec![ToolResult {
                     call: CallId::from_wire(tool_call_id),
                     name: tool_name(&name)?,
@@ -555,7 +612,7 @@ fn accepted_turn(
 }
 fn validate_wire_ids(raw: &serde_json::Value, provider_id: &str) -> Result<(), ModelError> {
     let (calls, id_key, kind) = match provider_id {
-        "openai:chat" => (raw.pointer("/choices/0/message/tool_calls"), "id", None),
+        "openai:chat" | "local" => (raw.pointer("/choices/0/message/tool_calls"), "id", None),
         "openai:responses" => (raw.get("output"), "call_id", Some("function_call")),
         "anthropic" => (raw.get("content"), "id", Some("tool_use")),
         _ => return Ok(()),
@@ -879,6 +936,36 @@ mod tests {
         assert_socket_closed(socket).await;
     }
 
+    #[tokio::test]
+    async fn http_header_deadline_can_be_shorter_than_body_silence() {
+        let (socket, client) = connected_request(
+            HttpLimits {
+                first_byte: Duration::from_secs(5),
+                read: Duration::from_secs(60),
+                ..HttpLimits::default()
+            },
+            false,
+        )
+        .await;
+        tokio::time::pause();
+        let error = tokio::time::timeout(Duration::from_secs(6), client)
+            .await
+            .expect("header deadline must not inherit the body read limit")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            model_error(
+                ProviderError::Http(Arc::new(error)),
+                TimeoutPhase::FirstChunk
+            ),
+            ModelError::Timeout {
+                phase: TimeoutPhase::FirstChunk
+            }
+        );
+        tokio::time::resume();
+        assert_socket_closed(socket).await;
+    }
+
     #[derive(Clone)]
     struct TimedHttp {
         frames: Vec<(Duration, &'static str)>,
@@ -934,8 +1021,8 @@ mod tests {
             base_url: None,
         };
         let provider = match api {
-            Some(api) => RigProvider::openai(&env, "gpt-4.1", api),
-            None => RigProvider::anthropic(&env, "claude-sonnet-4-6"),
+            Some(api) => RigProvider::openai(&env, "gpt-4.1", api, HttpLimits::default()),
+            None => RigProvider::anthropic(&env, "claude-sonnet-4-6", HttpLimits::default()),
         }
         .unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));

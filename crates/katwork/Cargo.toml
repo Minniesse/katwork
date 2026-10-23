@@ -34,4 +34,5 @@ unicode-normalization.workspace = true
 caseless.workspace = true
 
 [dev-dependencies]
+tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util", "io-util"] }

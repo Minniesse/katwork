@@ -68,3 +68,28 @@ pub fn guard_stream(
         }
     })
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelTimeouts {
+    pub first_chunk: Duration,
+    pub idle: Duration,
+    pub run_wall_clock: Duration,
+}
+impl ModelTimeouts {
+    pub const HOSTED: Self = Self {
+        first_chunk: Duration::from_secs(30),
+        idle: Duration::from_secs(30),
+        run_wall_clock: Duration::from_secs(90),
+    };
+    pub const LOCAL: Self = Self {
+        first_chunk: Duration::from_secs(120),
+        idle: Duration::from_secs(60),
+        run_wall_clock: Duration::from_secs(300),
+    };
+    pub fn stream(&self) -> StreamTimeouts {
+        StreamTimeouts {
+            first_chunk: self.first_chunk,
+            idle: self.idle,
+        }
+    }
+}

@@ -22,6 +22,42 @@ Planned: single-host Docker Compose installation, Rust core, React/Vite workspac
 and Apache-2.0 core licensing. No verified installation command is supplied here.
 Publish exercised steps and dependency notices with the actual release.
 
+### Local model provider (development)
+
+Set `KATWORK_LOCAL_BASE_URL` to an OpenAI-compatible API root such as
+`http://local-llm:8000/v1`, and set `KATWORK_LOCAL_MODEL` to a loaded model ID.
+`KATWORK_LOCAL_API_KEY` is optional; without it KatWork sends no Authorization
+header. URL userinfo is ignored; use the API key variable for authentication.
+Startup does not discover models or call the model server. The same model
+serves all three tiers, with output caps of 2,048, 4,096 and 8,192 tokens.
+
+A local-only Space selects this provider without demo mode. A Space allowing
+external providers prefers a configured hosted entry. Configuring a local provider
+disables demo fallback. Local entries allow 120 seconds to first content, 60 seconds
+between content chunks and a 300-second run budget; hosted and demo entries use
+30, 30 and 90 seconds. Task and job deadlines still bound runs.
+
+**Residency is operator-declared.** KatWork does not verify that the URL stays
+inside your network. A remote URL configured here receives local-only prompts.
+Redirects are disabled. Responses are capped at 16 MiB, error bodies at 64 KiB,
+and SSE frames at 1 MiB, before Rig buffers or decodes them.
+
+The tools capability describes the adapter, not a guarantee about your model.
+[Ollama](https://docs.ollama.com/api/openai-compatibility) needs the selected model
+pulled; KatWork sends tools and requests streamed usage without forcing
+`tool_choice`. [vLLM](https://docs.vllm.ai/en/latest/features/tool_calling/) needs
+a compatible chat template, `--enable-auto-tool-choice` and a matching
+`--tool-call-parser`. [llama.cpp server](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
+needs `--jinja` and a compatible tool template. Model support also varies in
+[LM Studio](https://lmstudio.ai/docs/developer/openai-compat/tools).
+
+Usage-only tails are accepted; absent counters stay unknown. Complete streamed
+arguments are buffered until the turn is accepted; malformed or truncated
+arguments never become executable calls. No local model is qualified for Thai
+office work by these synthetic compatibility tests. Conservative missing-usage
+charging assumes at most one token per UTF-8 byte, which operators must verify
+for their selected model.
+
 <a id="sample"></a>
 ## Sample
 

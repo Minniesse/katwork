@@ -869,3 +869,103 @@ fn error_redaction_scrubs_all_configured_credentials() {
     }
     assert_eq!(redacted.matches("[redacted]").count(), names.len());
 }
+
+#[test]
+fn local_base_url_and_model_must_be_set_together() {
+    for (present, value, missing) in [
+        (
+            "KATWORK_LOCAL_BASE_URL",
+            "http://localhost:8000/v1",
+            "KATWORK_LOCAL_MODEL",
+        ),
+        (
+            "KATWORK_LOCAL_MODEL",
+            "local-model",
+            "KATWORK_LOCAL_BASE_URL",
+        ),
+    ] {
+        let error = Config::from_lookup(|name| {
+            if name == present {
+                Some(value.into())
+            } else {
+                lookup(name)
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), "config_invalid");
+        assert!(format!("{error:?}").contains(missing));
+        assert!(!format!("{error:?}").contains(value));
+    }
+}
+
+#[test]
+fn local_base_url_must_be_http_or_https() {
+    for bad in [
+        "garbage",
+        "file:///tmp",
+        "ftp://host",
+        "https://",
+        "mailto:user@example.test",
+    ] {
+        let error = Config::from_lookup(|name| match name {
+            "KATWORK_LOCAL_BASE_URL" => Some(bad.into()),
+            "KATWORK_LOCAL_MODEL" => Some("local-model".into()),
+            _ => lookup(name),
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), "config_invalid");
+        assert!(format!("{error:?}").contains("KATWORK_LOCAL_BASE_URL"));
+        assert!(!format!("{error:?}").contains(bad));
+    }
+}
+
+#[test]
+fn local_api_key_is_redacted_in_debug() {
+    let key = uuid::Uuid::now_v7().to_string();
+    let password = uuid::Uuid::now_v7().to_string();
+    let query = uuid::Uuid::now_v7().to_string();
+    let url = format!("https://user:{password}@local.test:8443/private?token={query}");
+    let cfg = Config::from_lookup(|name| match name {
+        "KATWORK_LOCAL_BASE_URL" => Some(url.clone()),
+        "KATWORK_LOCAL_MODEL" => Some("local-model".into()),
+        "KATWORK_LOCAL_API_KEY" => Some(key.clone()),
+        _ => lookup(name),
+    })
+    .unwrap();
+    let local = cfg.local.as_ref().unwrap();
+    assert_eq!(local.base_url, url);
+    assert_eq!(local.model, "local-model");
+    assert_eq!(local.api_key.as_ref(), Some(&key));
+    for debug in [format!("{cfg:?}"), format!("{local:?}")] {
+        assert!(debug.contains("https://local.test:8443"));
+        for secret in [&key, &password, &query, "/private", "user:"] {
+            assert!(!debug.contains(secret), "secret leaked");
+        }
+    }
+    let redacted = cfg.redact_secrets(&format!("key={key} url={url}"));
+    for secret in [&key, &password, &query] {
+        assert!(!redacted.contains(secret));
+    }
+}
+
+#[test]
+fn config_invalid_names_variable_without_value() {
+    for var in [
+        "KATWORK_SECRET",
+        "DATABASE_URL",
+        "SMTP_PORT",
+        "KATWORK_HEADER_TIMEOUT_SECONDS",
+        "KATWORK_TRUSTED_PROXIES",
+    ] {
+        let error = Config::from_lookup(|name| match name {
+            "SMTP_HOST" => Some("localhost".into()),
+            n if n == var => Some(" ".into()),
+            _ => lookup(name),
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, katwork::error::KatError::ConfigInvalid { var: actual } if actual == var)
+        );
+        assert_eq!(error.to_string(), "config_invalid");
+    }
+}
