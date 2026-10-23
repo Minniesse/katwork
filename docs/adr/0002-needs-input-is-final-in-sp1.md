@@ -5,7 +5,7 @@
 
 ## Context
 
-A Dot can stop to ask a person something (the `ask_user` tool) or because a tool needs approval. The job then ends `needs_input`. The person's answer can either resume the same job or start a new one.
+A Kat can stop to ask a person something (the `ask_user` tool) or because a tool needs approval. The job then ends `needs_input`. The person's answer can either resume the same job or start a new one.
 
 Resuming the same job needs a parked task, a rule for who may answer, and a change to the set of final statuses. Approval resume needs the same machinery, and it arrives with the approval host in sub-project 3. In sub-project 1, jobs carry no plan or evidence that a new job would lose.
 

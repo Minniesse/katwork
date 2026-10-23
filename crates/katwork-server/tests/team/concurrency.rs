@@ -32,7 +32,7 @@ async fn rename_racing_add_member_preserves_unique_names(pool: PgPool) {
     let original = f.hire("Original", json!("writer")).await;
     let outsider = f.hire("Ｗｒｉｔｅｒ", json!("writer")).await;
     let team = f.team(&lead, std::slice::from_ref(&original)).await;
-    let rename = format!("dots/{}", id(&original));
+    let rename = format!("kats/{}", id(&original));
     let add = format!("teams/{}/members/{}", id(&team["team"]), id(&outsider));
     let lock = lock_workspace(&pool, f.workspace).await;
     let (renamed, added, ()) = tokio::join!(
@@ -44,8 +44,8 @@ async fn rename_racing_add_member_preserves_unique_names(pool: PgPool) {
         }
     );
     match (renamed.status().as_u16(), added.status().as_u16()) {
-        (200, 422) => assert_code(added, 422, "dot_name_conflict").await,
-        (422, 204) => assert_code(renamed, 422, "dot_name_conflict").await,
+        (200, 422) => assert_code(added, 422, "kat_name_conflict").await,
+        (422, 204) => assert_code(renamed, 422, "kat_name_conflict").await,
         statuses => panic!("unexpected race outcomes: {statuses:?}"),
     }
     let view = body(
@@ -57,7 +57,7 @@ async fn rename_racing_add_member_preserves_unique_names(pool: PgPool) {
         .as_array()
         .unwrap()
         .iter()
-        .map(|dot| dot["name"].as_str().unwrap())
+        .map(|kat| kat["name"].as_str().unwrap())
         .collect();
     assert_eq!(
         names
@@ -90,7 +90,7 @@ async fn concurrent_second_leads_fail_with_database_backstop(pool: PgPool) {
     for response in [a, b] {
         assert_code(response, 422, "team_lead_conflict").await;
     }
-    let error = sqlx::query("UPDATE team_members SET is_lead=true WHERE team_id=$1 AND dot_id=$2")
+    let error = sqlx::query("UPDATE team_members SET is_lead=true WHERE team_id=$1 AND kat_id=$2")
         .bind(Uuid::parse_str(id(&team["team"])).unwrap())
         .bind(Uuid::parse_str(id(&first)).unwrap())
         .execute(&pool)
@@ -104,12 +104,12 @@ async fn concurrent_second_leads_fail_with_database_backstop(pool: PgPool) {
 #[sqlx::test(migrations = "../katwork/migrations")]
 async fn mixed_concurrent_writers_do_not_deadlock(pool: PgPool) {
     let f = Fixture::new(&pool).await;
-    let dot = f.hire("Writer", json!("writer")).await;
+    let kat = f.hire("Writer", json!("writer")).await;
     let second = space(&pool, f.workspace).await;
     let lead = body(
         f.call(
             "POST",
-            &format!("spaces/{second}/dots"),
+            &format!("spaces/{second}/kats"),
             Some(json!({"name":"Lead","role":"lead","persona":""})),
         )
         .await,
@@ -124,9 +124,9 @@ async fn mixed_concurrent_writers_do_not_deadlock(pool: PgPool) {
         .await,
     )
     .await;
-    let grant = format!("dots/{}/spaces/{second}", id(&dot));
-    let member = format!("teams/{}/members/{}", id(&team["team"]), id(&dot));
-    let path = format!("dots/{}", id(&dot));
+    let grant = format!("kats/{}/spaces/{second}", id(&kat));
+    let member = format!("teams/{}/members/{}", id(&team["team"]), id(&kat));
+    let path = format!("kats/{}", id(&kat));
     let lock = lock_workspace(&pool, f.workspace).await;
     tokio::time::timeout(Duration::from_secs(20), async {
         tokio::join!(
@@ -157,7 +157,7 @@ async fn mixed_concurrent_writers_do_not_deadlock(pool: PgPool) {
                 for _ in 0..5 {
                     let response = f.call("PUT", &member, Some(json!({"is_lead":false}))).await;
                     if response.status() != 204 {
-                        assert_code(response, 422, "dot_not_in_space").await;
+                        assert_code(response, 422, "kat_not_in_space").await;
                     }
                     assert_eq!(f.call("DELETE", &member, None).await.status(), 204);
                 }
@@ -170,7 +170,7 @@ async fn mixed_concurrent_writers_do_not_deadlock(pool: PgPool) {
     })
     .await
     .expect("mixed writers must complete without deadlock");
-    let invalid: i64 = sqlx::query_scalar("SELECT count(*) FROM team_members m JOIN teams t ON t.id=m.team_id WHERE m.active AND NOT EXISTS (SELECT 1 FROM dot_spaces s WHERE s.workspace_id=m.workspace_id AND s.dot_id=m.dot_id AND s.space_id=t.space_id)")
+    let invalid: i64 = sqlx::query_scalar("SELECT count(*) FROM team_members m JOIN teams t ON t.id=m.team_id WHERE m.active AND NOT EXISTS (SELECT 1 FROM kat_spaces s WHERE s.workspace_id=m.workspace_id AND s.kat_id=m.kat_id AND s.space_id=t.space_id)")
         .fetch_one(&pool).await.unwrap();
     assert_eq!(invalid, 0);
 }
@@ -204,8 +204,8 @@ async fn concurrent_seed_demo_creates_exactly_one_roster(pool: PgPool) {
         ("SELECT count(*) FROM workspaces", 1),
         ("SELECT count(*) FROM memberships", 1),
         ("SELECT count(*) FROM spaces", 1),
-        ("SELECT count(*) FROM dots", 6),
-        ("SELECT count(*) FROM dot_spaces", 6),
+        ("SELECT count(*) FROM kats", 6),
+        ("SELECT count(*) FROM kat_spaces", 6),
         ("SELECT count(*) FROM teams", 1),
         ("SELECT count(*) FROM team_members", 6),
     ] {

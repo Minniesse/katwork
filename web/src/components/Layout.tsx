@@ -4,12 +4,12 @@ import { t, useLocale } from '../i18n';
 import { navigationCount } from '../router';
 import { Preferences } from './Preferences';
 
-/** The team as six dots: the Lead in yellow and five specialists. Decorative. */
-export function DotCluster({ size = 'large' }: { size?: 'large' | 'small' }) {
+/** The team as six kats: the Lead in yellow and five specialists. Decorative. */
+export function KatCluster({ size = 'large' }: { size?: 'large' | 'small' }) {
   return (
-    <div className={`dot-cluster dot-cluster-${size}`} aria-hidden="true">
+    <div className={`kat-cluster kat-cluster-${size}`} aria-hidden="true">
       {[1, 2, 3, 4, 5, 6].map((n) => (
-        <span key={n} className={`dot dot-${n}`} />
+        <span key={n} className={`kat kat-${n}`} />
       ))}
     </div>
   );
@@ -60,10 +60,10 @@ export function AuthLayout({ children }: { children: ReactNode }) {
       <SkipLink />
       <aside className="auth-panel">
         <Brand />
-        <DotCluster />
+        <KatCluster />
         <div className="auth-panel-copy">
           <p className="auth-panel-title">{t('auth.panel.title')}</p>
-          <p>{t('auth.panel.dots')}</p>
+          <p>{t('auth.panel.kats')}</p>
           <p className="auth-panel-trust">{t('auth.panel.trust')}</p>
         </div>
       </aside>

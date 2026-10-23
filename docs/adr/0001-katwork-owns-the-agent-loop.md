@@ -5,11 +5,11 @@
 
 ## Context
 
-A Dot's agent loop alternates model calls and tool calls. Rig offers more than model clients: an agent runner, a tool server, hooks, typed-output retries and provider-hosted tools. Those parts would decide when a tool runs, how often a call is retried, what the model sees as a tool result and when a run ends.
+A Kat's agent loop alternates model calls and tool calls. Rig offers more than model clients: an agent runner, a tool server, hooks, typed-output retries and provider-hosted tools. Those parts would decide when a tool runs, how often a call is retried, what the model sees as a tool result and when a run ends.
 
 KatWork's trust rules sit exactly there:
 
-- a tool is allowed only if it is in the Dot's allowlist *and* the registry, checked at call time;
+- a tool is allowed only if it is in the Kat's allowlist *and* the registry, checked at call time;
 - destructive and outward tools stop before dispatch and become a Proposal;
 - every tool call is recorded in a ledger before it runs, and a mutating call is never repeated after a crash;
 - calls race a per-call timeout, the run's remaining time and a cancellation token;

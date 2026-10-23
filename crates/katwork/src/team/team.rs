@@ -3,10 +3,10 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use sqlx::{Executor, PgConnection, PgPool, Postgres};
 
-use super::{Dot, dot};
+use super::{Kat, kat};
 use crate::{
     error::KatError,
-    ids::{DotId, SpaceId, TeamId},
+    ids::{KatId, SpaceId, TeamId},
     tenancy::{self, Tenant},
     types::Locale,
 };
@@ -21,15 +21,15 @@ pub struct Team {
 #[derive(Debug, Serialize)]
 pub struct TeamView {
     pub team: Team,
-    pub members: Vec<Dot>,
+    pub members: Vec<Kat>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewTeam {
     pub name: String,
-    pub lead: DotId,
-    pub members: Vec<DotId>,
+    pub lead: KatId,
+    pub members: Vec<KatId>,
 }
 
 async fn get_team<'e, E: Executor<'e, Database = Postgres>>(
@@ -47,7 +47,7 @@ async fn get_team<'e, E: Executor<'e, Database = Postgres>>(
 
 pub async fn get(pool: &PgPool, tenant: &Tenant, id: TeamId) -> Result<TeamView, KatError> {
     let team = get_team(pool, tenant, id).await?;
-    let members = sqlx::query_as("SELECT d.*, ARRAY(SELECT s.space_id FROM dot_spaces s WHERE s.dot_id = d.id AND s.workspace_id = d.workspace_id ORDER BY s.space_id) AS spaces FROM dots d JOIN team_members m ON m.dot_id=d.id AND m.workspace_id=d.workspace_id WHERE m.workspace_id=$1 AND m.team_id=$2 AND m.active ORDER BY m.is_lead DESC, m.position, d.id")
+    let members = sqlx::query_as("SELECT d.*, ARRAY(SELECT s.space_id FROM kat_spaces s WHERE s.kat_id = d.id AND s.workspace_id = d.workspace_id ORDER BY s.space_id) AS spaces FROM kats d JOIN team_members m ON m.kat_id=d.id AND m.workspace_id=d.workspace_id WHERE m.workspace_id=$1 AND m.team_id=$2 AND m.active ORDER BY m.is_lead DESC, m.position, d.id")
         .bind(tenant.workspace_id()).bind(id).fetch_all(pool).await?;
     Ok(TeamView { team, members })
 }
@@ -57,9 +57,9 @@ pub async fn eligible_members(
     conn: &mut PgConnection,
     tenant: &Tenant,
     id: TeamId,
-) -> Result<Vec<Dot>, KatError> {
+) -> Result<Vec<Kat>, KatError> {
     let team = get_team(&mut *conn, tenant, id).await?;
-    Ok(sqlx::query_as("SELECT d.*, ARRAY(SELECT s.space_id FROM dot_spaces s WHERE s.dot_id=d.id AND s.workspace_id=d.workspace_id ORDER BY s.space_id) AS spaces FROM dots d JOIN team_members m ON m.dot_id=d.id AND m.workspace_id=d.workspace_id WHERE m.workspace_id=$1 AND m.team_id=$2 AND m.active AND d.status='active' AND EXISTS (SELECT 1 FROM dot_spaces s WHERE s.workspace_id=d.workspace_id AND s.dot_id=d.id AND s.space_id=$3) ORDER BY m.is_lead DESC, m.position, d.id")
+    Ok(sqlx::query_as("SELECT d.*, ARRAY(SELECT s.space_id FROM kat_spaces s WHERE s.kat_id=d.id AND s.workspace_id=d.workspace_id ORDER BY s.space_id) AS spaces FROM kats d JOIN team_members m ON m.kat_id=d.id AND m.workspace_id=d.workspace_id WHERE m.workspace_id=$1 AND m.team_id=$2 AND m.active AND d.status='active' AND EXISTS (SELECT 1 FROM kat_spaces s WHERE s.workspace_id=d.workspace_id AND s.kat_id=d.id AND s.space_id=$3) ORDER BY m.is_lead DESC, m.position, d.id")
         .bind(tenant.workspace_id()).bind(id).bind(team.space_id).fetch_all(conn).await?)
 }
 
@@ -97,25 +97,25 @@ async fn create_on(
     super::check_space(conn, tenant, space).await?;
     let name = tenancy::validate_name(&new.name)?;
     let mut seen = HashSet::new();
-    let members: Vec<DotId> = std::iter::once(new.lead)
+    let members: Vec<KatId> = std::iter::once(new.lead)
         .chain(new.members)
         .filter(|id| seen.insert(*id))
         .collect();
     let ids: Vec<_> = members.iter().map(|id| id.0).collect();
-    sqlx::query("SELECT id FROM dots WHERE workspace_id=$1 AND id=ANY($2) ORDER BY id FOR SHARE")
+    sqlx::query("SELECT id FROM kats WHERE workspace_id=$1 AND id=ANY($2) ORDER BY id FOR SHARE")
         .bind(tenant.workspace_id())
         .bind(&ids)
         .fetch_all(&mut *conn)
         .await?;
     let mut names = HashSet::new();
     for member in &members {
-        let dot = dot::get_on(&mut *conn, tenant, *member).await?;
-        if !dot.spaces.contains(&space) {
-            return Err(KatError::DotNotInSpace);
+        let kat = kat::get_on(&mut *conn, tenant, *member).await?;
+        if !kat.spaces.contains(&space) {
+            return Err(KatError::KatNotInSpace);
         }
-        tenancy::validate_name(&dot.name)?;
-        if !names.insert(super::name_key(&dot.name)) {
-            return Err(KatError::DotNameConflict);
+        tenancy::validate_name(&kat.name)?;
+        if !names.insert(super::name_key(&kat.name)) {
+            return Err(KatError::KatNameConflict);
         }
     }
     let id = TeamId::new();
@@ -130,7 +130,7 @@ async fn create_on(
     .execute(&mut *conn)
     .await?;
     for (position, member) in members.into_iter().enumerate() {
-        sqlx::query("INSERT INTO team_members (workspace_id, team_id, dot_id, is_lead, position) VALUES ($1,$2,$3,$4,$5)")
+        sqlx::query("INSERT INTO team_members (workspace_id, team_id, kat_id, is_lead, position) VALUES ($1,$2,$3,$4,$5)")
             .bind(tenant.workspace_id()).bind(id).bind(member).bind(member == new.lead)
             .bind(i32::try_from(position).map_err(|_| KatError::RequestInvalid)?).execute(&mut *conn).await?;
     }
@@ -169,7 +169,7 @@ pub(crate) async fn create_default_on(
     }
     let mut members = Vec::new();
     for new in super::roles::default_roster(locale) {
-        members.push(dot::hire_on(conn, tenant, space, new).await?);
+        members.push(kat::hire_on(conn, tenant, space, new).await?);
     }
     let lead = members.remove(0);
     create_on(
@@ -194,24 +194,24 @@ pub async fn add_member(
     pool: &PgPool,
     tenant: &Tenant,
     id: TeamId,
-    member: DotId,
+    member: KatId,
     is_lead: bool,
 ) -> Result<(), KatError> {
     let mut tx = pool.begin().await?;
     super::lock_workspace(&mut tx, tenant).await?;
     let team = get_team(&mut *tx, tenant, id).await?;
-    sqlx::query("SELECT id FROM dots WHERE workspace_id=$1 AND id=$2 FOR SHARE")
+    sqlx::query("SELECT id FROM kats WHERE workspace_id=$1 AND id=$2 FOR SHARE")
         .bind(tenant.workspace_id())
         .bind(member)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(KatError::NotFound)?;
-    let dot = dot::get_on(&mut *tx, tenant, member).await?;
-    if !dot.spaces.contains(&team.space_id) {
-        return Err(KatError::DotNotInSpace);
+    let kat = kat::get_on(&mut *tx, tenant, member).await?;
+    if !kat.spaces.contains(&team.space_id) {
+        return Err(KatError::KatNotInSpace);
     }
-    tenancy::validate_name(&dot.name)?;
-    let current: Vec<(DotId, String, bool)> = sqlx::query_as("SELECT d.id, d.name, m.is_lead FROM team_members m JOIN dots d ON d.id=m.dot_id AND d.workspace_id=m.workspace_id WHERE m.workspace_id=$1 AND m.team_id=$2 AND m.active")
+    tenancy::validate_name(&kat.name)?;
+    let current: Vec<(KatId, String, bool)> = sqlx::query_as("SELECT d.id, d.name, m.is_lead FROM team_members m JOIN kats d ON d.id=m.kat_id AND d.workspace_id=m.workspace_id WHERE m.workspace_id=$1 AND m.team_id=$2 AND m.active")
         .bind(tenant.workspace_id()).bind(id).fetch_all(&mut *tx).await?;
     if is_lead
         && current
@@ -228,11 +228,11 @@ pub async fn add_member(
         return Err(KatError::TeamLeadRequired);
     }
     if current.iter().any(|(other, name, _)| {
-        *other != member && super::name_key(name) == super::name_key(&dot.name)
+        *other != member && super::name_key(name) == super::name_key(&kat.name)
     }) {
-        return Err(KatError::DotNameConflict);
+        return Err(KatError::KatNameConflict);
     }
-    sqlx::query("INSERT INTO team_members (workspace_id, team_id, dot_id, is_lead, position) SELECT $1,$2,$3,$4,COALESCE(MAX(position),-1)+1 FROM team_members WHERE workspace_id=$1 AND team_id=$2 ON CONFLICT (team_id,dot_id) DO UPDATE SET active=true, is_lead=EXCLUDED.is_lead")
+    sqlx::query("INSERT INTO team_members (workspace_id, team_id, kat_id, is_lead, position) SELECT $1,$2,$3,$4,COALESCE(MAX(position),-1)+1 FROM team_members WHERE workspace_id=$1 AND team_id=$2 ON CONFLICT (team_id,kat_id) DO UPDATE SET active=true, is_lead=EXCLUDED.is_lead")
         .bind(tenant.workspace_id()).bind(id).bind(member).bind(is_lead).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
@@ -242,18 +242,18 @@ pub async fn remove_member(
     pool: &PgPool,
     tenant: &Tenant,
     id: TeamId,
-    member: DotId,
+    member: KatId,
 ) -> Result<(), KatError> {
     let mut tx = pool.begin().await?;
     super::lock_workspace(&mut tx, tenant).await?;
     get_team(&mut *tx, tenant, id).await?;
-    dot::get_on(&mut *tx, tenant, member).await?;
-    let is_lead: Option<bool> = sqlx::query_scalar("SELECT is_lead FROM team_members WHERE workspace_id=$1 AND team_id=$2 AND dot_id=$3 AND active")
+    kat::get_on(&mut *tx, tenant, member).await?;
+    let is_lead: Option<bool> = sqlx::query_scalar("SELECT is_lead FROM team_members WHERE workspace_id=$1 AND team_id=$2 AND kat_id=$3 AND active")
         .bind(tenant.workspace_id()).bind(id).bind(member).fetch_optional(&mut *tx).await?;
     if is_lead == Some(true) {
         return Err(KatError::TeamLeadRequired);
     }
-    sqlx::query("UPDATE team_members SET active=false WHERE workspace_id=$1 AND team_id=$2 AND dot_id=$3 AND active")
+    sqlx::query("UPDATE team_members SET active=false WHERE workspace_id=$1 AND team_id=$2 AND kat_id=$3 AND active")
         .bind(tenant.workspace_id()).bind(id).bind(member).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())

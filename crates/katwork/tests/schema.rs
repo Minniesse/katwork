@@ -1,3 +1,5 @@
+#[path = "schema/legacy.rs"]
+mod legacy;
 mod support;
 
 use katwork::{
@@ -18,10 +20,10 @@ async fn migrations_apply_cleanly(pool: PgPool) {
     assert_eq!(
         tables,
         [
-            "dot_spaces",
-            "dots",
             "events",
             "jobs",
+            "kat_spaces",
+            "kats",
             "memberships",
             "messages",
             "model_calls",
@@ -39,94 +41,27 @@ async fn migrations_apply_cleanly(pool: PgPool) {
             "workspaces"
         ]
     );
-    Fixture::new(&pool).await;
-}
-
-#[sqlx::test(migrations = false)]
-async fn team_membership_migration_preserves_existing_rows_and_constraints(pool: PgPool) {
-    for migration in [
-        include_str!("../migrations/0001_init.sql"),
-        include_str!("../migrations/0002_email_unique.sql"),
-        include_str!("../migrations/0003_email_lowercase.sql"),
+    let old_names: Vec<String> = sqlx::query_scalar(
+        "SELECT relname::text FROM pg_class WHERE relnamespace='public'::regnamespace AND relname LIKE '%dot%'
+         UNION ALL SELECT conname::text FROM pg_constraint WHERE connamespace='public'::regnamespace AND (conname LIKE '%dot%' OR pg_get_constraintdef(oid) LIKE '%dot%')
+         UNION ALL SELECT column_name::text FROM information_schema.columns WHERE table_schema='public' AND column_name LIKE '%dot%'",
+    ).fetch_all(&pool).await.unwrap();
+    assert!(old_names.is_empty(), "legacy schema names: {old_names:?}");
+    for name in [
+        "kats_pkey",
+        "kats_id_workspace_id_key",
+        "kat_spaces_pkey",
+        "tasks_live_leases_by_kat",
+        "model_calls_kat_daily_tokens",
     ] {
-        sqlx::raw_sql(migration).execute(&pool).await.unwrap();
-    }
-    let f = Fixture::new(&pool).await;
-    sqlx::query("INSERT INTO team_members (workspace_id,team_id,dot_id,is_lead,position) VALUES ($1,$2,$3,true,7)")
-        .bind(f.workspace).bind(f.team).bind(f.dot).execute(&pool).await.unwrap();
-    let mut member: serde_json::Value =
-        sqlx::query_scalar("SELECT to_jsonb(m) FROM team_members m")
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(name)
             .fetch_one(&pool)
             .await
             .unwrap();
-    let mut team: serde_json::Value = sqlx::query_scalar("SELECT to_jsonb(t) FROM teams t")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    sqlx::raw_sql(include_str!("../migrations/0004_team_membership.sql"))
-        .execute(&pool)
-        .await
-        .unwrap();
-    member["active"] = serde_json::json!(true);
-    team["is_default"] = serde_json::json!(false);
-    assert_eq!(
-        sqlx::query_scalar::<_, serde_json::Value>("SELECT to_jsonb(m) FROM team_members m")
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-        member
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, serde_json::Value>("SELECT to_jsonb(t) FROM teams t")
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-        team
-    );
-    for query in [
-        "UPDATE dots SET daily_token_budget=-1 WHERE id=$1",
-        "UPDATE dots SET max_concurrency=65536 WHERE id=$1",
-    ] {
-        sqlstate(
-            sqlx::query(query)
-                .bind(f.dot)
-                .execute(&pool)
-                .await
-                .unwrap_err(),
-            "23514",
-        );
+        assert!(exists, "missing index: {name}");
     }
-    let other_dot = Uuid::now_v7();
-    let mut tx = pool.begin().await.unwrap();
-    sqlx::query("INSERT INTO dots (id,workspace_id,default_space_id,name,role,persona,instructions,tool_allowlist,model_tier,autonomy) SELECT $1,workspace_id,default_space_id,'Other',role,persona,instructions,tool_allowlist,model_tier,autonomy FROM dots WHERE id=$2")
-        .bind(other_dot).bind(f.dot).execute(&mut *tx).await.unwrap();
-    sqlx::query("INSERT INTO dot_spaces (workspace_id,dot_id,space_id) VALUES ($1,$2,$3)")
-        .bind(f.workspace)
-        .bind(other_dot)
-        .bind(f.space)
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    sqlstate(sqlx::query("INSERT INTO team_members (workspace_id,team_id,dot_id,is_lead,position) VALUES ($1,$2,$3,true,8)")
-        .bind(f.workspace).bind(f.team).bind(other_dot).execute(&pool).await.unwrap_err(), "23505");
-    sqlx::query("INSERT INTO team_members (workspace_id,team_id,dot_id,is_lead,position,active) VALUES ($1,$2,$3,true,8,false)")
-        .bind(f.workspace).bind(f.team).bind(other_dot).execute(&pool).await.unwrap();
-    sqlstate(
-        sqlx::query("UPDATE team_members SET active=true WHERE dot_id=$1")
-            .bind(other_dot)
-            .execute(&pool)
-            .await
-            .unwrap_err(),
-        "23505",
-    );
-    sqlx::query("UPDATE teams SET is_default=true WHERE id=$1")
-        .bind(f.team)
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlstate(sqlx::query("INSERT INTO teams (id,workspace_id,space_id,name,is_default) VALUES ($1,$2,$3,'Second default',true)")
-        .bind(Uuid::now_v7()).bind(f.workspace).bind(f.space).execute(&pool).await.unwrap_err(), "23505");
+    Fixture::new(&pool).await;
 }
 
 #[sqlx::test]
@@ -168,7 +103,7 @@ async fn job_status_wire_values_pass_the_schema_check(pool: PgPool) {
 async fn hold_reason_wire_values_pass_the_schema_check(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     for reason in [
-        HoldReason::DotBusy,
+        HoldReason::KatBusy,
         HoldReason::ProviderQuota,
         HoldReason::WorkspacePaused,
     ] {
@@ -184,12 +119,12 @@ async fn hold_reason_wire_values_pass_the_schema_check(pool: PgPool) {
 #[sqlx::test]
 async fn message_author_columns_match_kind(pool: PgPool) {
     let f = Fixture::new(&pool).await;
-    for kind in ["user", "dot", "system"] {
+    for kind in ["user", "kat", "system"] {
         for user in [None, Some(f.user)] {
-            for dot in [None, Some(f.dot)] {
-                let result = sqlx::query("INSERT INTO messages (id, workspace_id, thread_id, author_kind, author_user_id, author_dot_id, body) VALUES ($1, $2, $3, $4, $5, $6, '')")
-                    .bind(Uuid::now_v7()).bind(f.workspace).bind(f.thread).bind(kind).bind(user).bind(dot).execute(&pool).await;
-                if (kind == "user") == user.is_some() && (kind == "dot") == dot.is_some() {
+            for kat in [None, Some(f.kat)] {
+                let result = sqlx::query("INSERT INTO messages (id, workspace_id, thread_id, author_kind, author_user_id, author_kat_id, body) VALUES ($1, $2, $3, $4, $5, $6, '')")
+                    .bind(Uuid::now_v7()).bind(f.workspace).bind(f.thread).bind(kind).bind(user).bind(kat).execute(&pool).await;
+                if (kind == "user") == user.is_some() && (kind == "kat") == kat.is_some() {
                     result.unwrap();
                 } else {
                     sqlstate(result.unwrap_err(), "23514");
@@ -202,9 +137,9 @@ async fn message_author_columns_match_kind(pool: PgPool) {
 #[sqlx::test]
 async fn client_msg_id_requires_user_author(pool: PgPool) {
     let f = Fixture::new(&pool).await;
-    for (kind, dot) in [("system", None), ("dot", Some(f.dot))] {
-        sqlstate(sqlx::query("INSERT INTO messages (id, workspace_id, thread_id, author_kind, author_dot_id, body, client_msg_id) VALUES ($1, $2, $3, $4, $5, '', 'retry')")
-            .bind(Uuid::now_v7()).bind(f.workspace).bind(f.thread).bind(kind).bind(dot).execute(&pool).await.unwrap_err(), "23514");
+    for (kind, kat) in [("system", None), ("kat", Some(f.kat))] {
+        sqlstate(sqlx::query("INSERT INTO messages (id, workspace_id, thread_id, author_kind, author_kat_id, body, client_msg_id) VALUES ($1, $2, $3, $4, $5, '', 'retry')")
+            .bind(Uuid::now_v7()).bind(f.workspace).bind(f.thread).bind(kind).bind(kat).execute(&pool).await.unwrap_err(), "23514");
     }
 }
 
@@ -395,21 +330,21 @@ async fn claim_live_lease_and_quota_queries_have_indexes(pool: PgPool) {
             "tasks_claim_state_created_at",
         ),
         (
-            "EXPLAIN SELECT count(*) FROM tasks JOIN task_leases ON task_leases.task_id = tasks.id WHERE tasks.dot_id = $1 AND tasks.state = 'leased' AND task_leases.expires_at > clock_timestamp()",
-            "tasks_live_leases_by_dot",
+            "EXPLAIN SELECT count(*) FROM tasks JOIN task_leases ON task_leases.task_id = tasks.id WHERE tasks.kat_id = $1 AND tasks.state = 'leased' AND task_leases.expires_at > clock_timestamp()",
+            "tasks_live_leases_by_kat",
         ),
         (
-            // Task 12: run this quota query after locking the Dot, with one fresh cutoff.
-            "EXPLAIN SELECT sum(charged_tokens) FROM model_calls WHERE dot_id = $1 AND created_at > statement_timestamp() - interval '24 hours'",
-            "model_calls_dot_daily_tokens",
+            // Task 12: run this quota query after locking the Kat, with one fresh cutoff.
+            "EXPLAIN SELECT sum(charged_tokens) FROM model_calls WHERE kat_id = $1 AND created_at > statement_timestamp() - interval '24 hours'",
+            "model_calls_kat_daily_tokens",
         ),
     ] {
-        let has_dot = query.contains("$1");
+        let has_kat = query.contains("$1");
         let query = sqlx::query_scalar::<_, String>(query);
-        let query = if has_dot { query.bind(f.dot) } else { query };
+        let query = if has_kat { query.bind(f.kat) } else { query };
         let plan = query.fetch_all(&mut *tx).await.unwrap().join("\n");
         assert!(plan.contains(index), "{index}: {plan}");
-        if index == "model_calls_dot_daily_tokens" {
+        if index == "model_calls_kat_daily_tokens" {
             assert!(
                 plan.lines()
                     .any(|line| line.contains("Index Cond:") && line.contains("created_at")),
@@ -422,8 +357,8 @@ async fn claim_live_lease_and_quota_queries_have_indexes(pool: PgPool) {
 #[sqlx::test]
 async fn thai_text_round_trips(pool: PgPool) {
     let f = Fixture::new(&pool).await;
-    let name: String = sqlx::query_scalar("SELECT name FROM dots WHERE id = $1")
-        .bind(f.dot)
+    let name: String = sqlx::query_scalar("SELECT name FROM kats WHERE id = $1")
+        .bind(f.kat)
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -460,10 +395,10 @@ async fn event_seq_is_per_thread_and_unique(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn dot_default_space_must_be_granted(pool: PgPool) {
+async fn kat_default_space_must_be_granted(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let mut tx = pool.begin().await.unwrap();
-    sqlx::query("INSERT INTO dots (id, workspace_id, default_space_id, name, role, persona, instructions, tool_allowlist, model_tier, autonomy) SELECT $1, workspace_id, default_space_id, name, role, persona, instructions, tool_allowlist, model_tier, autonomy FROM dots WHERE id = $2").bind(Uuid::now_v7()).bind(f.dot).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO kats (id, workspace_id, default_space_id, name, role, persona, instructions, tool_allowlist, model_tier, autonomy) SELECT $1, workspace_id, default_space_id, name, role, persona, instructions, tool_allowlist, model_tier, autonomy FROM kats WHERE id = $2").bind(Uuid::now_v7()).bind(f.kat).execute(&mut *tx).await.unwrap();
     sqlstate(tx.commit().await.unwrap_err(), "23503");
 }
 
@@ -553,7 +488,7 @@ async fn fence_check_fails_after_epoch_or_state_change(pool: PgPool) {
 #[sqlx::test]
 async fn missing_usage_is_stored_as_null(pool: PgPool) {
     let f = Fixture::new(&pool).await;
-    let usage = sqlx::query("INSERT INTO model_calls (id, workspace_id, space_id, job_id, task_id, run_id, dot_id, provider_id, model, residency, attempt, usage_complete, charged_tokens, latency_ms, outcome) VALUES ($1, $2, $3, $4, $5, $6, $7, 'fake', 'test', 'local', 1, false, 200, 1, 'error') RETURNING input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, cost_micros, charged_tokens, usage_complete").bind(Uuid::now_v7()).bind(f.workspace).bind(f.space).bind(f.job).bind(f.task).bind(f.run).bind(f.dot).fetch_one(&pool).await.unwrap();
+    let usage = sqlx::query("INSERT INTO model_calls (id, workspace_id, space_id, job_id, task_id, run_id, kat_id, provider_id, model, residency, attempt, usage_complete, charged_tokens, latency_ms, outcome) VALUES ($1, $2, $3, $4, $5, $6, $7, 'fake', 'test', 'local', 1, false, 200, 1, 'error') RETURNING input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, cost_micros, charged_tokens, usage_complete").bind(Uuid::now_v7()).bind(f.workspace).bind(f.space).bind(f.job).bind(f.task).bind(f.run).bind(f.kat).fetch_one(&pool).await.unwrap();
     for column in [
         "input_tokens",
         "cache_read_tokens",
@@ -648,7 +583,7 @@ async fn fence_locks_last_until_commit_and_allow_foreign_keys(pool: PgPool) {
         .await
         .unwrap();
     fence::check(&mut other, &fence).await.unwrap();
-    sqlx::query("INSERT INTO runs (id, workspace_id, job_id, task_id, dot_id, kind, lease_epoch, dot_config_hash, state) VALUES ($1, $2, $3, $4, $5, 'recovery', 1, 'hash', 'running')").bind(Uuid::now_v7()).bind(f.workspace).bind(f.job).bind(f.task).bind(f.dot).execute(&mut *other).await.unwrap();
+    sqlx::query("INSERT INTO runs (id, workspace_id, job_id, task_id, kat_id, kind, lease_epoch, kat_config_hash, state) VALUES ($1, $2, $3, $4, $5, 'recovery', 1, 'hash', 'running')").bind(Uuid::now_v7()).bind(f.workspace).bind(f.job).bind(f.task).bind(f.kat).execute(&mut *other).await.unwrap();
     other.commit().await.unwrap();
     let mut updater = pool.begin().await.unwrap();
     sqlx::query("SET LOCAL lock_timeout = '100ms'")
@@ -673,7 +608,7 @@ async fn fence_locks_last_until_commit_and_allow_foreign_keys(pool: PgPool) {
         .execute(&mut *blocked)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO runs (id, workspace_id, job_id, task_id, dot_id, kind, lease_epoch, dot_config_hash, state) VALUES ($1, $2, $3, $4, $5, 'recovery', 1, 'hash', 'running')").bind(Uuid::now_v7()).bind(f.workspace).bind(f.job).bind(f.task).bind(f.dot).execute(&mut *blocked).await.unwrap();
+    sqlx::query("INSERT INTO runs (id, workspace_id, job_id, task_id, kat_id, kind, lease_epoch, kat_config_hash, state) VALUES ($1, $2, $3, $4, $5, 'recovery', 1, 'hash', 'running')").bind(Uuid::now_v7()).bind(f.workspace).bind(f.job).bind(f.task).bind(f.kat).execute(&mut *blocked).await.unwrap();
     let error = fence::check(&mut blocked, &fence).await.unwrap_err();
     let katwork::error::KatError::Database(error) = error else {
         panic!("expected database lock timeout")
@@ -698,10 +633,10 @@ async fn schema_checks_reject_invalid_domain_values(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     for query in [
         "UPDATE users SET locale = 'unknown'",
-        "UPDATE dots SET status = 'unknown'",
-        "UPDATE dots SET model_tier = 'unknown'",
-        "UPDATE dots SET autonomy = 'unknown'",
-        "UPDATE dots SET max_concurrency = 0",
+        "UPDATE kats SET status = 'unknown'",
+        "UPDATE kats SET model_tier = 'unknown'",
+        "UPDATE kats SET autonomy = 'unknown'",
+        "UPDATE kats SET max_concurrency = 0",
         "UPDATE messages SET author_kind = 'unknown'",
         "UPDATE jobs SET decided_by = 'unknown'",
         "UPDATE tasks SET hold_reason = 'unknown'",
@@ -746,18 +681,18 @@ async fn schema_checks_reject_invalid_domain_values(pool: PgPool) {
 #[sqlx::test]
 async fn team_allows_only_one_lead(pool: PgPool) {
     let f = Fixture::new(&pool).await;
-    sqlx::query("INSERT INTO team_members (workspace_id, team_id, dot_id, is_lead, position) VALUES ($1, $2, $3, true, 0)").bind(f.workspace).bind(f.team).bind(f.dot).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO team_members (workspace_id, team_id, kat_id, is_lead, position) VALUES ($1, $2, $3, true, 0)").bind(f.workspace).bind(f.team).bind(f.kat).execute(&pool).await.unwrap();
     let mut tx = pool.begin().await.unwrap();
-    let dot = Uuid::now_v7();
-    sqlx::query("INSERT INTO dots (id, workspace_id, default_space_id, name, role, persona, instructions, tool_allowlist, model_tier, autonomy) SELECT $1, workspace_id, default_space_id, name, role, persona, instructions, tool_allowlist, model_tier, autonomy FROM dots WHERE id = $2").bind(dot).bind(f.dot).execute(&mut *tx).await.unwrap();
-    sqlx::query("INSERT INTO dot_spaces (workspace_id, dot_id, space_id) VALUES ($1, $2, $3)")
+    let kat = Uuid::now_v7();
+    sqlx::query("INSERT INTO kats (id, workspace_id, default_space_id, name, role, persona, instructions, tool_allowlist, model_tier, autonomy) SELECT $1, workspace_id, default_space_id, name, role, persona, instructions, tool_allowlist, model_tier, autonomy FROM kats WHERE id = $2").bind(kat).bind(f.kat).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO kat_spaces (workspace_id, kat_id, space_id) VALUES ($1, $2, $3)")
         .bind(f.workspace)
-        .bind(dot)
+        .bind(kat)
         .bind(f.space)
         .execute(&mut *tx)
         .await
         .unwrap();
-    sqlstate(sqlx::query("INSERT INTO team_members (workspace_id, team_id, dot_id, is_lead, position) VALUES ($1, $2, $3, true, 1)").bind(f.workspace).bind(f.team).bind(dot).execute(&mut *tx).await.unwrap_err(), "23505");
+    sqlstate(sqlx::query("INSERT INTO team_members (workspace_id, team_id, kat_id, is_lead, position) VALUES ($1, $2, $3, true, 1)").bind(f.workspace).bind(f.team).bind(kat).execute(&mut *tx).await.unwrap_err(), "23505");
 }
 
 #[sqlx::test]
@@ -786,28 +721,28 @@ fn workspace_fk(error: sqlx::Error, constraint: &str) {
 }
 
 #[sqlx::test]
-async fn dot_default_space_rejects_another_workspace(pool: PgPool) {
+async fn kat_default_space_rejects_another_workspace(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let other = Fixture::new(&pool).await;
     let mut tx = pool.begin().await.unwrap();
-    workspace_fk(sqlx::query("INSERT INTO dots (id, workspace_id, default_space_id, name, role, persona, instructions, tool_allowlist, model_tier, autonomy) SELECT $1, workspace_id, $2, name, role, persona, instructions, tool_allowlist, model_tier, autonomy FROM dots WHERE id = $3")
-        .bind(Uuid::now_v7()).bind(other.space).bind(f.dot).execute(&mut *tx).await.unwrap_err(), "dots_default_space_id_workspace_id_fkey");
+    workspace_fk(sqlx::query("INSERT INTO kats (id, workspace_id, default_space_id, name, role, persona, instructions, tool_allowlist, model_tier, autonomy) SELECT $1, workspace_id, $2, name, role, persona, instructions, tool_allowlist, model_tier, autonomy FROM kats WHERE id = $3")
+        .bind(Uuid::now_v7()).bind(other.space).bind(f.kat).execute(&mut *tx).await.unwrap_err(), "kats_default_space_id_workspace_id_fkey");
 }
 
 #[sqlx::test]
-async fn dot_space_grants_reject_cross_workspace_parents(pool: PgPool) {
+async fn kat_space_grants_reject_cross_workspace_parents(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let other = Fixture::new(&pool).await;
-    for (dot, space, constraint) in [
-        (other.dot, f.space, "dot_spaces_dot_id_workspace_id_fkey"),
-        (f.dot, other.space, "dot_spaces_space_id_workspace_id_fkey"),
+    for (kat, space, constraint) in [
+        (other.kat, f.space, "kat_spaces_kat_id_workspace_id_fkey"),
+        (f.kat, other.space, "kat_spaces_space_id_workspace_id_fkey"),
     ] {
         workspace_fk(
             sqlx::query(
-                "INSERT INTO dot_spaces (workspace_id, dot_id, space_id) VALUES ($1, $2, $3)",
+                "INSERT INTO kat_spaces (workspace_id, kat_id, space_id) VALUES ($1, $2, $3)",
             )
             .bind(f.workspace)
-            .bind(dot)
+            .bind(kat)
             .bind(space)
             .execute(&pool)
             .await
@@ -839,12 +774,12 @@ async fn team_rejects_space_in_another_workspace(pool: PgPool) {
 async fn team_members_reject_cross_workspace_parents(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let other = Fixture::new(&pool).await;
-    for (team, dot, constraint) in [
-        (other.team, f.dot, "team_members_team_id_workspace_id_fkey"),
-        (f.team, other.dot, "team_members_dot_id_workspace_id_fkey"),
+    for (team, kat, constraint) in [
+        (other.team, f.kat, "team_members_team_id_workspace_id_fkey"),
+        (f.team, other.kat, "team_members_kat_id_workspace_id_fkey"),
     ] {
-        workspace_fk(sqlx::query("INSERT INTO team_members (workspace_id, team_id, dot_id, is_lead, position) VALUES ($1, $2, $3, false, 0)")
-            .bind(f.workspace).bind(team).bind(dot).execute(&pool).await.unwrap_err(), constraint);
+        workspace_fk(sqlx::query("INSERT INTO team_members (workspace_id, team_id, kat_id, is_lead, position) VALUES ($1, $2, $3, false, 0)")
+            .bind(f.workspace).bind(team).bind(kat).execute(&pool).await.unwrap_err(), constraint);
     }
 }
 
@@ -865,28 +800,28 @@ async fn threads_reject_cross_workspace_parents(pool: PgPool) {
 async fn messages_reject_cross_workspace_parents(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let other = Fixture::new(&pool).await;
-    for (thread, dot, job, constraint) in [
+    for (thread, kat, job, constraint) in [
         (
             other.thread,
-            f.dot,
+            f.kat,
             f.job,
             "messages_thread_id_workspace_id_fkey",
         ),
         (
             f.thread,
-            other.dot,
+            other.kat,
             f.job,
-            "messages_author_dot_id_workspace_id_fkey",
+            "messages_author_kat_id_workspace_id_fkey",
         ),
         (
             f.thread,
-            f.dot,
+            f.kat,
             other.job,
             "messages_job_id_workspace_id_fkey",
         ),
     ] {
-        workspace_fk(sqlx::query("INSERT INTO messages (id, workspace_id, thread_id, author_kind, author_dot_id, job_id, body) VALUES ($1, $2, $3, 'dot', $4, $5, '')")
-            .bind(Uuid::now_v7()).bind(f.workspace).bind(thread).bind(dot).bind(job).execute(&pool).await.unwrap_err(), constraint);
+        workspace_fk(sqlx::query("INSERT INTO messages (id, workspace_id, thread_id, author_kind, author_kat_id, job_id, body) VALUES ($1, $2, $3, 'kat', $4, $5, '')")
+            .bind(Uuid::now_v7()).bind(f.workspace).bind(thread).bind(kat).bind(job).execute(&pool).await.unwrap_err(), constraint);
     }
 }
 
@@ -929,12 +864,12 @@ async fn jobs_reject_cross_workspace_parents(pool: PgPool) {
 async fn tasks_reject_cross_workspace_parents(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let other = Fixture::new(&pool).await;
-    for (job, dot, constraint) in [
-        (other.job, f.dot, "tasks_job_id_workspace_id_fkey"),
-        (f.job, other.dot, "tasks_dot_id_workspace_id_fkey"),
+    for (job, kat, constraint) in [
+        (other.job, f.kat, "tasks_job_id_workspace_id_fkey"),
+        (f.job, other.kat, "tasks_kat_id_workspace_id_fkey"),
     ] {
-        workspace_fk(sqlx::query("INSERT INTO tasks (id, workspace_id, job_id, dot_id, dot_policy_version, input, state) VALUES ($1, $2, $3, $4, 1, '{}', 'queued')")
-            .bind(Uuid::now_v7()).bind(f.workspace).bind(job).bind(dot).execute(&pool).await.unwrap_err(), constraint);
+        workspace_fk(sqlx::query("INSERT INTO tasks (id, workspace_id, job_id, kat_id, kat_policy_version, input, state) VALUES ($1, $2, $3, $4, 1, '{}', 'queued')")
+            .bind(Uuid::now_v7()).bind(f.workspace).bind(job).bind(kat).execute(&pool).await.unwrap_err(), constraint);
     }
 }
 
@@ -942,13 +877,13 @@ async fn tasks_reject_cross_workspace_parents(pool: PgPool) {
 async fn runs_reject_cross_workspace_parents(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let other = Fixture::new(&pool).await;
-    for (job, task, dot, constraint) in [
-        (other.job, f.task, f.dot, "runs_job_id_workspace_id_fkey"),
-        (f.job, other.task, f.dot, "runs_task_id_workspace_id_fkey"),
-        (f.job, f.task, other.dot, "runs_dot_id_workspace_id_fkey"),
+    for (job, task, kat, constraint) in [
+        (other.job, f.task, f.kat, "runs_job_id_workspace_id_fkey"),
+        (f.job, other.task, f.kat, "runs_task_id_workspace_id_fkey"),
+        (f.job, f.task, other.kat, "runs_kat_id_workspace_id_fkey"),
     ] {
-        workspace_fk(sqlx::query("INSERT INTO runs (id, workspace_id, job_id, task_id, dot_id, kind, lease_epoch, dot_config_hash, state) VALUES ($1, $2, $3, $4, $5, 'initial', 1, 'hash', 'running')")
-            .bind(Uuid::now_v7()).bind(f.workspace).bind(job).bind(task).bind(dot).execute(&pool).await.unwrap_err(), constraint);
+        workspace_fk(sqlx::query("INSERT INTO runs (id, workspace_id, job_id, task_id, kat_id, kind, lease_epoch, kat_config_hash, state) VALUES ($1, $2, $3, $4, $5, 'initial', 1, 'hash', 'running')")
+            .bind(Uuid::now_v7()).bind(f.workspace).bind(job).bind(task).bind(kat).execute(&pool).await.unwrap_err(), constraint);
     }
 }
 
@@ -969,13 +904,13 @@ async fn tool_calls_reject_run_in_another_workspace(pool: PgPool) {
 async fn model_calls_reject_cross_workspace_parents(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let other = Fixture::new(&pool).await;
-    for (space, job, task, run, dot, constraint) in [
+    for (space, job, task, run, kat, constraint) in [
         (
             other.space,
             f.job,
             f.task,
             f.run,
-            f.dot,
+            f.kat,
             "model_calls_space_id_workspace_id_fkey",
         ),
         (
@@ -983,7 +918,7 @@ async fn model_calls_reject_cross_workspace_parents(pool: PgPool) {
             other.job,
             f.task,
             f.run,
-            f.dot,
+            f.kat,
             "model_calls_job_id_workspace_id_fkey",
         ),
         (
@@ -991,7 +926,7 @@ async fn model_calls_reject_cross_workspace_parents(pool: PgPool) {
             f.job,
             other.task,
             f.run,
-            f.dot,
+            f.kat,
             "model_calls_task_id_workspace_id_fkey",
         ),
         (
@@ -999,7 +934,7 @@ async fn model_calls_reject_cross_workspace_parents(pool: PgPool) {
             f.job,
             f.task,
             other.run,
-            f.dot,
+            f.kat,
             "model_calls_run_id_workspace_id_fkey",
         ),
         (
@@ -1007,12 +942,12 @@ async fn model_calls_reject_cross_workspace_parents(pool: PgPool) {
             f.job,
             f.task,
             f.run,
-            other.dot,
-            "model_calls_dot_id_workspace_id_fkey",
+            other.kat,
+            "model_calls_kat_id_workspace_id_fkey",
         ),
     ] {
-        workspace_fk(sqlx::query("INSERT INTO model_calls (id, workspace_id, space_id, job_id, task_id, run_id, dot_id, provider_id, model, residency, attempt, usage_complete, charged_tokens, latency_ms, outcome) VALUES ($1, $2, $3, $4, $5, $6, $7, 'fake', 'test', 'local', 1, false, 200, 1, 'error')")
-            .bind(Uuid::now_v7()).bind(f.workspace).bind(space).bind(job).bind(task).bind(run).bind(dot).execute(&pool).await.unwrap_err(), constraint);
+        workspace_fk(sqlx::query("INSERT INTO model_calls (id, workspace_id, space_id, job_id, task_id, run_id, kat_id, provider_id, model, residency, attempt, usage_complete, charged_tokens, latency_ms, outcome) VALUES ($1, $2, $3, $4, $5, $6, $7, 'fake', 'test', 'local', 1, false, 200, 1, 'error')")
+            .bind(Uuid::now_v7()).bind(f.workspace).bind(space).bind(job).bind(task).bind(run).bind(kat).execute(&pool).await.unwrap_err(), constraint);
     }
 }
 

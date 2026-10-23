@@ -642,7 +642,7 @@ async fn tenant_extractor_reads_workspace_id_by_name(pool: PgPool) {
     let cookie = cookie(&login(&app(&pool, None), &password).await);
     let router = Router::new()
         .route(
-            "/probe/{space_id}/{workspace_id}/{dot_id}",
+            "/probe/{space_id}/{workspace_id}/{kat_id}",
             get(|tenant: Tenant| async move {
                 Json(json!({"workspace_id": tenant.workspace_id(), "user_id": tenant.user_id()}))
             }),
@@ -716,7 +716,7 @@ async fn workspace_pause_locks_only_workspace_without_blocking_foreign_keys(pool
         .execute(&mut *locks)
         .await
         .unwrap();
-    sqlx::query("LOCK TABLE spaces, dots, jobs, tasks, task_leases, threads IN SHARE MODE")
+    sqlx::query("LOCK TABLE spaces, kats, jobs, tasks, task_leases, threads IN SHARE MODE")
         .execute(&mut *locks)
         .await
         .unwrap();
