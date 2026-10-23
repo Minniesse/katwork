@@ -391,7 +391,8 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let expected = b"GET /healthz HTTP/1.1\r\n";
+                let expected =
+                    b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
                 let mut request = vec![0; expected.len()];
                 socket.read_exact(&mut request).await.unwrap();
                 assert_eq!(request, expected);
@@ -402,7 +403,7 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn healthcheck_times_out_when_the_server_stalls() {
         use tokio::io::AsyncReadExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -411,6 +412,8 @@ mod tests {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut request = [0; 1];
         socket.read_exact(&mut request).await.unwrap();
+        // Establish real I/O before virtual time can advance past the connection attempt.
+        tokio::time::pause();
         tokio::time::advance(std::time::Duration::from_secs(2)).await;
         assert_eq!(
             check.await.unwrap().unwrap_err().kind(),
