@@ -1,0 +1,14 @@
+{
+	servers {
+		timeouts {
+			read_header 10s
+			idle 60s
+		}
+		keepalive_interval 30s
+	}
+}
+
+{$KATWORK_HTTPS_HOST} {
+	# SSE stays uncompressed; Caddy flushes text/event-stream immediately.
+	reverse_proxy katwork:3000
+}

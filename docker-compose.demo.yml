@@ -1,0 +1,18 @@
+services:
+  katwork:
+    networks: !override
+      backend:
+    ports: !override ["127.0.0.1:3000:3000"]
+    environment:
+      KATWORK_DEMO: "1"
+      KATWORK_PUBLIC_URL: http://localhost:3000
+      KATWORK_BIND: 127.0.0.1
+      KATWORK_TRUSTED_PROXIES: ""
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+      KATWORK_LOCAL_BASE_URL: ""
+      KATWORK_LOCAL_MODEL: ""
+      KATWORK_LOCAL_API_KEY: ""
+      SMTP_HOST: ""
+      SMTP_USERNAME: ""
+      SMTP_PASSWORD: ""

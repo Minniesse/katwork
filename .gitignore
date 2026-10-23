@@ -26,3 +26,7 @@ CLAUDE.local.md
 .DS_Store
 .idea/
 .vscode/
+
+# Private operator data
+/backups/
+/.demo-credentials

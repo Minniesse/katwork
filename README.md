@@ -8,7 +8,7 @@ The AI coworkers are called **Kats** in English and Thai. See [ADR-0006](docs/ad
 Pre-alpha planning status. Public-alpha target: week of 2027-01-25.
 No capability is verified “in alpha” in this README.
 
-[Status](#status) · [Setup](#setup) · [Sample](#sample) · [Scope](#scope) · [Data path](#data-path) · [ภาษาไทย](#thai) · [Evaluation](#evaluation)
+[Status](#status) · [Try it](#try-it) · [Setup](#setup) · [Sample](#sample) · [Scope](#scope) · [Data path](#data-path) · [ภาษาไทย](#thai) · [Evaluation](#evaluation)
 
 <a id="status"></a>
 ## Status
@@ -20,76 +20,154 @@ working automation. Unbuilt UI must say “concept mockup — planned.”
 <a id="setup"></a>
 ## Setup
 
-Planned: single-host Docker Compose installation, Rust core, React/Vite workspace
-and Apache-2.0 core licensing. No verified installation command is supplied here.
-Publish exercised steps and dependency notices with the actual release.
+KatWork runs on one Linux host with Docker Engine and Docker Compose **2.24.4 or
+newer**. The core is Rust, the web app is React/Vite, and the core licence is
+Apache-2.0. This is development software, not a public-alpha release. The Compose
+smoke checks run in CI; they do not establish production readiness.
 
-### First account (development)
+<a id="try-it"></a>
+### Try it: offline demo
 
-These steps match the current code; they are not yet a verified installation.
-Run them on the Docker host, from a fresh checkout of this repository:
+From this checkout, run:
 
-1. Create your settings file from the template:
+```sh
+scripts/demo.sh
+```
+
+The first run builds or downloads the images, so it needs internet access.
+Once those images are available, the demo works without internet access. Open
+**http://localhost:3000** and sign in as **demo@katwork.local**. Open the private
+`.demo-credentials` file on the host to read the initial password. If you set
+`KATWORK_DEMO_PASSWORD` in `.env`, use that instead. Scripts never print passwords.
+Rerunning the script preserves an existing account's password.
+
+The demo includes English `Demo` and Thai `เดโม` workspaces, each with a team of
+six Kats. Replies are synthetic and marked as such; no model or mail service is
+called. The demo override clears provider and mail settings and gives the app
+only the internal network. It is available only from this host. It exercises the
+API and streaming pipeline; available web pages depend on your checkout.
+
+### First account
+
+Run these commands on the Docker host, from this checkout:
+
+1. Create a private settings file with random secrets:
 
    ```sh
-   cp .env.example .env
+   scripts/init-env.sh
    ```
 
-   Open `.env` in a text editor and fill in the three required values:
-
-   - `POSTGRES_PASSWORD`: a new random password, for example the output of
-     `openssl rand -hex 16`.
-   - `DATABASE_URL`: `postgres://katwork:<that password>@postgres:5432/katwork`,
-     with the same password. `postgres` is the database's name inside Compose.
-   - `KATWORK_SECRET`: at least 32 random characters, for example the output of
-     `openssl rand -hex 32`.
-
-   Leave the other values empty for now; `.env.example` explains each one.
+   This writes `.env` with permissions `600`. Keep it private and back it up
+   securely. A second run refuses to replace it. `--force` deliberately replaces
+   it, including the database password; do not use that on an existing install.
+   Open `.env` in a text editor for optional model or mail settings.
 
 2. Start KatWork:
 
    ```sh
-   docker compose up -d
+   docker compose up -d --build
    ```
 
-   `docker compose ps` should list `katwork` as running. If it stopped,
-   `docker compose logs katwork` names the setting to fix, as
+   Compose waits for PostgreSQL, backs up an existing database, applies
+   migrations, then starts KatWork. A fresh database needs no backup. Visit
+   **http://localhost:3000**. If it does not start, run `docker compose ps -a` and
+   `docker compose logs backup migrate katwork`. A bad setting is reported as
    `config_invalid (NAME)`.
 
-3. Set up the database, once per install and after each upgrade:
-
-   ```sh
-   docker compose exec katwork /app/katwork-server migrate
-   ```
-
-4. Create the first owner and their workspace. `--space-policy local` keeps the
-   first Space's data on this server; `hosted` lets it use hosted AI providers.
+3. Create the first owner and their workspace:
 
    ```sh
    docker compose exec katwork /app/katwork-server create-user \
-     --email you@example.com --workspace "My team" --role owner --space-policy local
+     --email you@example.com --workspace "My team" --role owner \
+     --space-policy local --locale en
    ```
 
-   The workspace's first Space, `General`, comes with a default team of six
-   Kats, a Lead and five specialists, so it has a team to chat with from the
-   start. Add `--locale th` to make Thai the account's language and give the
-   Kats Thai names; the default is `--locale en`.
+   Choose `--locale en` or `--locale th`. Thai creates Thai Kat names. The first
+   Space, `General`, has six Kats: a Lead and five specialists. `local` keeps
+   model calls on your declared local provider; choose `hosted` to allow hosted
+   providers. Configure a model before expecting real replies.
 
-5. The command prints one link. Open it in a browser within 72 hours, choose a
-   password, then sign in with your email and that password. The link works once.
+4. Open the printed link within 72 hours, choose a password, then sign in.
+   The link works once.
 
-Use `docker compose exec`, never `docker compose run`: `run` starts a new
-container whose output Docker's logging driver keeps, and may ship off the host,
-so the link would end up in a log.
+Use `docker compose exec`, never `docker compose run`, for account commands:
+`run` starts a container whose output Docker's logging driver keeps, so the link
+would enter a log. Operator commands intentionally print links to your terminal;
+the convenience scripts do not print credentials.
 
-The link starts with `KATWORK_PUBLIC_URL` (default `http://localhost:3000`). If
-people open KatWork from other machines, set it to the address they use first.
+The link uses `KATWORK_PUBLIC_URL` (default `http://localhost:3000`). For people
+on other machines, use HTTPS below. Without mail, recover a forgotten password
+with `docker compose exec katwork /app/katwork-server reset-link --email you@example.com`.
+The link works once within 30 minutes. **Anyone who can run commands on this host
+can take over any account with `reset-link`. Give host access only to operators.**
 
-Without mail set up, a forgotten password is recovered on the host:
-`docker compose exec katwork /app/katwork-server reset-link --email you@example.com`
-prints a reset link that works once within 30 minutes. Anyone who can run
-commands on this host can do this for any account (ADR-0004), so give that
-access only to the people who operate KatWork.
+### HTTPS
+
+Point your domain's DNS at this host and allow incoming ports 80 and 443. On a
+fresh install, replace `work.example.com` with that domain:
+
+```sh
+scripts/init-env.sh --https work.example.com
+docker compose up -d --build
+```
+
+On an existing install, keep your secrets. Add `KATWORK_HTTPS_HOST=work.example.com`
+and `COMPOSE_FILE=docker-compose.yml:docker-compose.https.yml` to `.env`, stop the
+old stack with `docker compose down`, then start it again. Open your HTTPS address.
+Caddy obtains the certificate and is the only public entry point. KatWork has no
+published port in this configuration. Caddy's certificate state lives in the
+`caddy_data` and `caddy_config` volumes; keep both across upgrades.
+
+The override trusts only Caddy at `172.31.250.2`, on subnet `172.31.250.0/29`.
+That subnet must be free on your host. Keep `KATWORK_TRUSTED_PROXIES` limited to
+proxies you operate. Caddy keeps event streams uncompressed and flushes them
+immediately. It bounds header and idle waits and enables TCP keepalive on the
+browser connection. The app still limits total connections and authenticated
+streams; stock Caddy does not provide a per-client connection quota. Add edge
+rate limits before exposing a large public installation.
+
+Demo mode is refused on HTTPS unless `KATWORK_ALLOW_DEMO_ON_HTTPS=1` is explicitly
+set. Keep demo mode off for normal installations. `localhost` uses Caddy's local
+certificate authority, suitable for testing; a browser must trust that authority.
+
+### Backups and upgrades
+
+Before an upgrade, stop the running app, keep its volumes, build the new version,
+then start it:
+
+```sh
+docker compose down
+git pull --ff-only
+docker compose build katwork
+docker compose up -d
+```
+
+Do not add `-v` to `down`: that deletes the database and certificate volumes.
+Stopping first matters: a failed backup cannot stop an app that was already
+running. Every startup waits for the backup to succeed before it runs migrations
+or starts the app. Do not run migrations by hand around that gate.
+
+Existing databases are saved under `backups/katwork-<UTC timestamp>-<suffix>.dump`.
+The script writes a private `.partial` file and renames it only after `pg_dump`
+succeeds. A failed backup stops startup. Check free disk space and file permissions,
+fix the cause, then start again. No retention policy deletes old backups; copy them
+to secure storage and remove old files yourself after checking a restore.
+
+A dump contains **one database**, including users and migration history. It does
+not contain PostgreSQL roles or tablespaces, `.env`, or Caddy's certificates.
+Keep those separately. To restore into a fresh PostgreSQL 17 server, first create
+the role and empty database, using that server's operator connection settings:
+
+```sh
+createuser --login --pwprompt katwork
+createdb --owner=katwork katwork
+pg_restore --exit-on-error --no-owner --username=katwork --dbname=katwork /path/to/backup.dump
+```
+
+Set the restored role's password to match your private settings. Stop KatWork
+while restoring, and point its `DATABASE_URL` at the restored database before
+starting it. The restore smoke check verifies the demo user and all migration
+versions in a separate PostgreSQL 17 container.
 
 ### Local model provider (development)
 

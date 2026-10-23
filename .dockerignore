@@ -11,3 +11,6 @@ data
 .agents
 .claude
 .codex
+
+backups
+.demo-credentials*

@@ -8,7 +8,8 @@ RUN npm run build
 FROM rust:bookworm AS build
 WORKDIR /build
 COPY . .
-RUN cargo build --locked --release -p katwork-server
+ARG CARGO_FEATURES=""
+RUN cargo build --locked --release -p katwork-server --features "$CARGO_FEATURES"
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 WORKDIR /app
