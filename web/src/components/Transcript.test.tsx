@@ -374,7 +374,7 @@ describe('new-arrival announcer', () => {
   });
 });
 
-test('missing_mention_space_names_the_kat_in_both_locales', () => {
+test('missing_mention_space_names_the_kat_once_in_both_locales', () => {
   const messages = messagesFrom([
     {
       type: 'CUSTOM',
@@ -388,7 +388,12 @@ test('missing_mention_space_names_the_kat_in_both_locales', () => {
     },
   ]);
   render(<Transcript messages={messages} />);
-  expect(screen.getByText('Add a space after @เลขา to mention this Kat.')).toBeVisible();
+  const notice = screen.getByText('Add a space after @เลขา to mention this Kat.');
+  expect(notice).toBeVisible();
+  // The sentence names the Kat, so no "About:" line repeats it.
+  const item = notice.closest('li')!;
+  expect(within(item).getAllByText(/เลขา/)).toHaveLength(1);
   act(() => setLocale('th'));
-  expect(screen.getByText('เว้นวรรคหลัง @เลขา เพื่อเรียก Kat คนนี้')).toBeVisible();
+  expect(screen.getByText('โปรดเว้นวรรคหลัง @เลขา เพื่อเรียก Kat คนนี้')).toBeVisible();
+  expect(within(item).getAllByText(/เลขา/)).toHaveLength(1);
 });

@@ -290,13 +290,22 @@ function authorName(message: ChatMessage, me: string | null, katName: Props['kat
   }
 }
 
+function noticeKey(message: ChatMessage): string {
+  return `reason.${message.meta?.code ?? message.body}`;
+}
+
 /** A notice's copy comes from its own code (Task 6's `NoticeMeta`), never from its job's reason. */
 function noticeText(message: ChatMessage): string {
-  const code = message.meta?.code ?? message.body;
-  const key = `reason.${code}`;
+  const key = noticeKey(message);
   // Some notices name their Kats in the sentence (Task 12's `mention_needs_space`).
   const name = message.meta?.kats.map((kat) => kat.name).join(', ') ?? '';
   return hasMessage(key) ? t(key, { name }) : message.body;
+}
+
+/** A notice whose sentence fills `{name}` already names its Kats; an "About:" line would repeat them. */
+function noticeNamesKats(message: ChatMessage): boolean {
+  const key = noticeKey(message);
+  return hasMessage(key) && t(key).includes('{name}');
 }
 
 function messageText(message: ChatMessage): string {
@@ -338,7 +347,7 @@ function MessageItem({
         )}
       </p>
       <p className="message-body">{messageText(message)}</p>
-      {kind === 'system' && kats.length > 0 && (
+      {kind === 'system' && kats.length > 0 && !noticeNamesKats(message) && (
         <p className="message-about">
           {t('chat.notice_about', { names: kats.map((kat) => kat.name).join(', ') })}
         </p>
