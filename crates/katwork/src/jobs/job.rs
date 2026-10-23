@@ -1,4 +1,4 @@
-use sqlx::{PgConnection, Postgres, Transaction, types::Json};
+use sqlx::{Acquire, PgConnection, Postgres, Transaction, types::Json};
 
 pub use super::{HarnessEnd, JobSummary};
 use crate::{
@@ -245,7 +245,7 @@ async fn finish(
 }
 
 /// Caller locks job, tasks (and the run being closed), then thread, before any write.
-/// Roll back on error; commit and notify the hub only after all caller-owned writes succeed.
+/// Errors roll back this conclusion; commit and notify only after all caller-owned writes succeed.
 pub async fn conclude(
     tx: &mut Transaction<'_, Postgres>,
     tenant: &Tenant,
@@ -255,6 +255,8 @@ pub async fn conclude(
     idem_key: &str,
     facts: &RunFacts,
 ) -> Result<EventSeq, KatError> {
+    let mut savepoint = tx.begin().await?;
+    let tx = &mut savepoint;
     let job: JobRow = sqlx::query_as(
         "SELECT id,workspace_id,thread_id,status FROM jobs
         WHERE workspace_id=$1 AND id=$2 AND thread_id=$3",
@@ -293,8 +295,30 @@ pub async fn conclude(
         if !valid {
             return Err(KatError::RequestInvalid);
         }
-    } else if facts.run_closed {
-        return Err(KatError::RequestInvalid);
+        // The loop must close its ledger calls before handing facts to conclusion.
+        let open_calls: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM tool_calls
+            WHERE workspace_id=$1 AND run_id=$2 AND ended_at IS NULL)",
+        )
+        .bind(job.workspace_id)
+        .bind(run)
+        .fetch_one(&mut **tx)
+        .await?;
+        if open_calls {
+            return Err(KatError::RequestInvalid);
+        }
+    } else {
+        let running: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM runs
+            WHERE workspace_id=$1 AND job_id=$2 AND state='running')",
+        )
+        .bind(job.workspace_id)
+        .bind(job_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if facts.run_closed || running {
+            return Err(KatError::RequestInvalid);
+        }
     }
     let v = policy::decide_job(facts, &Thresholds::SP1);
     // Job events remain thread-scoped, including when the loop already closed its run.
@@ -346,7 +370,11 @@ pub async fn conclude(
         }
     }
     if v.status == PolicyStatus::Stopped {
-        let code = v.reason.ok_or(KatError::RequestInvalid)?;
+        let code = match v.reason.ok_or(KatError::RequestInvalid)? {
+            ReasonCode::WorkspacePaused => ReasonCode::WorkspacePausedStopped,
+            ReasonCode::KatPaused => ReasonCode::KatPausedStopped,
+            code => code,
+        };
         let kats = kat
             .as_ref()
             .map(|k| NoticeKat {
@@ -432,6 +460,7 @@ pub async fn conclude(
             .await?;
         }
     }
+    savepoint.commit().await?;
     Ok(seq)
 }
 

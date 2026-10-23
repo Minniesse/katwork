@@ -31,6 +31,8 @@ const REASON_CODES = [
   'kat_not_in_space',
   'lease_lost',
   'too_many_requests',
+  'workspace_paused_stopped',
+  'kat_paused_stopped',
 ];
 
 // API error codes the auth routes and guards can return (KatError::code).

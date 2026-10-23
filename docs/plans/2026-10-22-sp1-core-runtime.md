@@ -1069,6 +1069,8 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
 
     Then, whatever rule matched: when `next` is `Retry` and `effects_dispatched` is true, `next` becomes `ReviewBeforeRetry`. A provider can fail after a non-Read call succeeded, and a blind retry would repeat that call's effect.
 
+    - [ ] **SP2 prerequisite before adding non-Read tools:** extend review-before-retry to every path that can repeat work after a dispatched effect, including `RestartJob`, `HandToLead`, and `needs_input` follow-ups through `AskUser`. Surface the required review in the user-facing notice, rather than showing the reason's ordinary retry copy. Add tests for each path and its notice; SP1 keeps its current behavior because all builtin tools are `Read`.
+
     | `StopReason` | status | reason | next step |
     |---|---|---|---|
     | `ProviderUnavailable` / `ProviderRateLimited` / `ModelProtocol` / `TimeLimit` | `stopped` | `provider_unavailable` / `provider_rate_limited` / `model_protocol_error` / `time_limit` | `Retry` |
@@ -1099,7 +1101,9 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
     6. calls `job::finish_by_policy`, which stores `JobStatus::from(v.status)`
     7. when `facts.run_id` is set, appends `katwork.kat_state` (`needs_approval` for an approval stop, `waiting` for a question, `paused` for a workspace pause, `idle` otherwise), then, unless `facts.run_closed` (the loop already ended that run with `RUN_ERROR`), `katwork.run_closed {end: finished, code}` immediately followed by `RUN_FINISHED`, where `code` is `None` when the verdict's status is `Answered` or `Ready` and the verdict's reason (its wire value) otherwise, and with them it sets the run's `state = 'finished'`, `stop_reason` and `ended_at`, in the same transaction.
 
-    It returns the last seq; the caller commits and notifies the hub.
+    `conclude` uses a savepoint: any error rolls back its own writes even if the caller commits other work. Before writing, it refuses a referenced run with any open ledger call, or facts without a run id while the job still has a `running` run. The caller's existing task lock prevents concurrent ledger inserts while these guards run. It returns the last seq; the caller commits and notifies the hub.
+
+    **Pause-notice ruling:** terminal conclusions use the distinct notice codes `workspace_paused_stopped` and `kat_paused_stopped`; the stored policy reason and run stop reason remain `workspace_paused` / `kat_paused`. Both locales tell the person to send the request again after resuming. Queued notices keep their existing codes and waiting copy. `approval_pending` copy says that approval is unavailable and the request has ended, without promising a resume.
   - `RouteRule::{Mention, FollowUp, Lead, FirstEligible}` (`Serialize`, `Deserialize`, snake_case) and `Routing { rule: RouteRule, ignored: Vec<KatId> }`: how intake chose the task's Kat, and which eligible Kats the post also mentioned and SP1 skipped (Task 12). Recorded on every task, so routing is testable by assertion and SP4's routing receipts can extend it.
   - `TaskInput { thread_id: ThreadId, request_message_id: MessageId, routing: Routing, actor: UserId, initiator: Initiator }` (`Serialize`, `Deserialize`; stored in `tasks.input`). It holds no history: the worker loads it when the run starts (Task 12's `pipeline::load_history`), so a queued job sees replies that landed while it waited, and a task never stores up to 24,000 characters of copied text.
   - `task::enqueue(conn: &mut PgConnection, job_id: JobId, kat_id: KatId, kat_policy_version: i64, input: &TaskInput, idempotency_key: &str) -> Result<TaskId, KatError>`: idempotent on the key; stores the version the routing decision saw
@@ -1112,7 +1116,7 @@ This task comes before Task 8, because the agent loop emits through `EventSink`.
     - `decision_event_replays_same_verdict`: for one facts value per table row, `decide` on the `PolicyInputs` read back from the `katwork.decision` event's `inputs` equals the event's `verdict`
   - in `crates/katwork/tests/jobs.rs`: `finish_by_policy_records_reason_and_decided_by`, `finish_by_harness_sets_cancelled_and_error`, `cannot_finish_twice`, `decision_event_precedes_job_status`, `conclusion_messages_link_to_their_job`, `follow_up_job_links_parent_needs_input_job`, `enqueue_is_idempotent_on_key`, and:
     - `conclude_retry_returns_one_reply_and_one_status`: a second `conclude` with the same `idem_key` returns `job_already_finished` before writing; the job has one Kat reply, one `katwork.decision` and one `katwork.job_status`
-    - `stopped_notice_names_the_kat_in_meta`: a `KatPaused` conclusion with `kat_id` set stores a notice whose body is `kat_paused` and whose `meta.kats` holds that Kat's id and name
+    - `stopped_notice_names_the_kat_in_meta`: a `KatPaused` conclusion with `kat_id` set stores a notice whose body is `kat_paused_stopped` and whose `meta.kats` holds that Kat's id and name
     - `reply_with_nul_is_stored_with_replacement_character`: a `final_text` holding U+0000 is stored, and announced, with U+FFFD
     - `run_closed_precedes_run_finished`: an answered run's log ends with `katwork.run_closed {end: finished, code: null}` at seq n and `RUN_FINISHED` at n + 1
     - `run_closed_carries_the_reason_of_a_run_that_did_not_answer`: runs concluded on `ProviderUnavailable`, `TimeLimit` and a pending question close with `code` `provider_unavailable`, `time_limit` and `question_pending`

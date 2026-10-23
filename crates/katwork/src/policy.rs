@@ -145,6 +145,7 @@ pub fn decide(inputs: &PolicyInputs, _t: &Thresholds) -> Verdict {
             PolicyStatus::Stopped
         },
         reason: Some(reason),
+        // SP2: guard RestartJob, HandToLead and needs_input follow-ups after writes, and show review-first notices.
         next: Some(if next == Retry && inputs.effects_dispatched {
             ReviewBeforeRetry
         } else {

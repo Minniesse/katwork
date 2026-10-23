@@ -64,6 +64,11 @@ fn answered(f: &Fixture) -> RunFacts {
     facts.synthetic = true;
     facts
 }
+fn stopped(f: &Fixture, stop: StopReason) -> RunFacts {
+    let mut facts = RunFacts::not_run(stop);
+    facts.run_id = Some(RunId(f.run));
+    facts
+}
 async fn conclude(pool: &PgPool, f: &Fixture, facts: &RunFacts) -> Result<EventSeq, KatError> {
     let t = tenant(pool, f).await;
     let mut tx = locked(pool, f).await;
@@ -241,6 +246,164 @@ async fn decision_event_precedes_job_status(pool: PgPool) {
     assert_eq!(ev[4]["value"]["state"], "idle");
 }
 #[sqlx::test(migrations = "./migrations")]
+async fn paused_conclusion_uses_stopped_notice_without_changing_job_reason(pool: PgPool) {
+    for (stop, reason, notice) in [
+        (
+            StopReason::WorkspacePaused,
+            "workspace_paused",
+            "workspace_paused_stopped",
+        ),
+        (StopReason::KatPaused, "kat_paused", "kat_paused_stopped"),
+    ] {
+        let f = Fixture::new(&pool).await;
+        let mut facts = answered(&f);
+        facts.stop = Some(stop);
+        conclude(&pool, &f, &facts).await.unwrap();
+        assert_eq!(outcome(&pool, &f).await.1.as_deref(), Some(reason));
+        let (body, meta): (String, Value) = sqlx::query_as(
+            "SELECT body,meta FROM messages WHERE workspace_id=$1 AND job_id=$2 AND author_kind='system'",
+        )
+        .bind(f.workspace).bind(f.job).fetch_one(&pool).await.unwrap();
+        assert_eq!(body, notice);
+        assert_eq!(meta["code"], notice);
+    }
+}
+#[sqlx::test(migrations = "./migrations")]
+async fn conclude_rejects_open_tool_calls_even_when_facts_omit_them(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    f.tool_call(&pool, 1, Some("read"), "started")
+        .await
+        .unwrap();
+    let mut facts = answered(&f);
+    facts.stop = Some(StopReason::TimeLimit);
+    let mut tx = locked(&pool, &f).await;
+    let result = job::conclude(
+        &mut tx,
+        &tenant(&pool, &f).await,
+        JobId(f.job),
+        ThreadId(f.thread),
+        Some(KatId(f.kat)),
+        "open-call",
+        &facts,
+    )
+    .await;
+    assert_eq!(result.unwrap_err().code(), "request_invalid");
+    tx.commit().await.unwrap();
+    assert_eq!(outcome(&pool, &f).await.0, None);
+    assert!(events(&pool, &f).await.is_empty());
+    let state: (String, bool) =
+        sqlx::query_as("SELECT state,ended_at IS NULL FROM runs WHERE id=$1")
+            .bind(f.run)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, ("running".into(), true));
+}
+#[sqlx::test(migrations = "./migrations")]
+async fn conclude_without_run_id_rejects_a_running_run(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let mut tx = locked(&pool, &f).await;
+    let result = job::conclude(
+        &mut tx,
+        &tenant(&pool, &f).await,
+        JobId(f.job),
+        ThreadId(f.thread),
+        Some(KatId(f.kat)),
+        "missing-run",
+        &RunFacts::not_run(StopReason::TimeLimit),
+    )
+    .await;
+    assert_eq!(result.unwrap_err().code(), "request_invalid");
+    tx.commit().await.unwrap();
+    assert_eq!(outcome(&pool, &f).await.0, None);
+    assert!(events(&pool, &f).await.is_empty());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn conclude_without_run_id_accepts_a_job_with_no_run(pool: PgPool) {
+    let mut f = Fixture::new(&pool).await;
+    let request = new_request(&pool, &f, ThreadId(f.thread)).await;
+    f.job = job::create(
+        &mut pool.acquire().await.unwrap(),
+        &tenant(&pool, &f).await,
+        ThreadId(f.thread),
+        request,
+    )
+    .await
+    .unwrap()
+    .0;
+    conclude(&pool, &f, &RunFacts::not_run(StopReason::TimeLimit))
+        .await
+        .unwrap();
+    assert_eq!(outcome(&pool, &f).await.0.as_deref(), Some("stopped"));
+    assert!(
+        events(&pool, &f)
+            .await
+            .iter()
+            .all(|e| e["type"] != "RUN_FINISHED")
+    );
+}
+#[sqlx::test(migrations = "./migrations")]
+async fn conclude_notice_collision_rolls_back_even_if_caller_commits(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let mut facts = answered(&f);
+    facts.stop = Some(StopReason::TimeLimit);
+    let mut tx = locked(&pool, &f).await;
+    // Keep a caller-owned write outside the conclusion's savepoint.
+    sqlx::query("UPDATE messages SET idempotency_key='notice:collision' WHERE id=$1")
+        .bind(f.message)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let err = job::conclude(
+        &mut tx,
+        &tenant(&pool, &f).await,
+        JobId(f.job),
+        ThreadId(f.thread),
+        Some(KatId(f.kat)),
+        "collision",
+        &facts,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), "request_invalid");
+    tx.commit().await.unwrap();
+    assert!(events(&pool, &f).await.is_empty());
+    assert_eq!(outcome(&pool, &f).await, (None, None, None, None));
+    let messages: Vec<(MessageId, Option<String>)> =
+        sqlx::query_as("SELECT id,idempotency_key FROM messages WHERE workspace_id=$1")
+            .bind(f.workspace)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        messages,
+        [(MessageId(f.message), Some("notice:collision".into()))]
+    );
+    let state: (String, bool) =
+        sqlx::query_as("SELECT state,ended_at IS NULL FROM runs WHERE id=$1")
+            .bind(f.run)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, ("running".into(), true));
+    let seq: i64 = sqlx::query_scalar("SELECT last_event_seq FROM threads WHERE id=$1")
+        .bind(f.thread)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(seq, 0);
+    conclude(&pool, &f, &facts).await.unwrap();
+    assert_eq!(
+        events(&pool, &f)
+            .await
+            .iter()
+            .filter(|e| e["name"] == "katwork.decision")
+            .count(),
+        1
+    );
+}
+#[sqlx::test(migrations = "./migrations")]
 async fn conclusion_messages_link_to_their_job(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let mut facts = answered(&f);
@@ -278,7 +441,7 @@ async fn follow_up_job_links_parent_needs_input_job(pool: PgPool) {
             .code(),
         "job_not_awaiting_input"
     );
-    conclude(&pool, &f, &RunFacts::not_run(StopReason::NeedsApproval))
+    conclude(&pool, &f, &stopped(&f, StopReason::NeedsApproval))
         .await
         .unwrap();
     let child = job::create_follow_up(&mut conn, &t, JobId(f.job), request)
@@ -352,16 +515,16 @@ async fn conclude_retry_returns_one_reply_and_one_status(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn stopped_notice_names_the_kat_in_meta(pool: PgPool) {
     let f = Fixture::new(&pool).await;
-    conclude(&pool, &f, &RunFacts::not_run(StopReason::KatPaused))
+    conclude(&pool, &f, &stopped(&f, StopReason::KatPaused))
         .await
         .unwrap();
     let ev = events(&pool, &f).await;
-    assert_eq!(ev[1]["value"]["body"], "kat_paused");
+    assert_eq!(ev[1]["value"]["body"], "kat_paused_stopped");
     assert_eq!(
         ev[1]["value"]["meta"],
-        json!({"code":"kat_paused","kats":[{"id":f.kat,"name":"นักวิจัย"}]})
+        json!({"code":"kat_paused_stopped","kats":[{"id":f.kat,"name":"นักวิจัย"}]})
     );
-    assert_eq!(ev.len(), 3);
+    assert_eq!(ev.len(), 6);
 }
 #[sqlx::test(migrations = "./migrations")]
 async fn reply_with_nul_is_stored_with_replacement_character(pool: PgPool) {
@@ -690,24 +853,78 @@ async fn already_closed_run_gets_no_second_terminal_or_later_run_event(pool: PgP
     assert_eq!(kinds, ["katwork.run_closed", "RUN_ERROR"]);
 }
 #[sqlx::test(migrations = "./migrations")]
-async fn approval_pending_is_non_executable_in_sp1(pool: PgPool) {
+async fn approval_follow_up_gets_a_fresh_task_without_the_pending_call(pool: PgPool) {
     let f = Fixture::new(&pool).await;
-    let mut facts = RunFacts::not_run(StopReason::NeedsApproval);
-    facts.pending_tool_call = Some(PendingCall {
-        record_id: ToolCallRecordId::new(),
-        tool_call_id: "pending".into(),
-        name: "write".into(),
-        args_canonical: "{}".into(),
-        args_sha256: "digest".into(),
-    });
-    conclude(&pool, &f, &facts).await.unwrap();
-    assert_eq!(outcome(&pool, &f).await.0.as_deref(), Some("needs_input"));
-    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM tool_calls WHERE workspace_id=$1")
-        .bind(f.workspace)
-        .fetch_one(&pool)
+    f.tool_call(&pool, 1, Some("destructive"), "refused")
         .await
         .unwrap();
-    assert_eq!(n, 0);
+    let record: ToolCallRecordId = sqlx::query_scalar(
+        "UPDATE tool_calls SET ended_at=clock_timestamp(),result='needs_approval'
+        WHERE workspace_id=$1 AND run_id=$2 RETURNING id",
+    )
+    .bind(f.workspace)
+    .bind(f.run)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let mut facts = stopped(&f, StopReason::NeedsApproval);
+    facts.pending_tool_call = Some(PendingCall {
+        record_id: record,
+        tool_call_id: "call".into(),
+        name: "tool".into(),
+        args_canonical: "{}".into(),
+        args_sha256: "hash".into(),
+    });
+    let pending = serde_json::to_value(&facts.pending_tool_call).unwrap();
+    sqlx::query("UPDATE tasks SET pending_tool_call=$2 WHERE id=$1")
+        .bind(f.task)
+        .bind(&pending)
+        .execute(&pool)
+        .await
+        .unwrap();
+    conclude(&pool, &f, &facts).await.unwrap();
+    assert_eq!(
+        outcome(&pool, &f).await.1.as_deref(),
+        Some("approval_pending")
+    );
+
+    let request = new_request(&pool, &f, ThreadId(f.thread)).await;
+    let mut conn = pool.acquire().await.unwrap();
+    let child = job::create_follow_up(&mut conn, &tenant(&pool, &f).await, JobId(f.job), request)
+        .await
+        .unwrap();
+    let mut inp = input(&f);
+    inp.request_message_id = request;
+    inp.routing.rule = RouteRule::FollowUp;
+    let child_task = task::enqueue(&mut conn, child, KatId(f.kat), 1, &inp, "follow-up")
+        .await
+        .unwrap();
+    assert_ne!(child_task, TaskId(f.task));
+    let saved: (String, Value, Option<Value>) =
+        sqlx::query_as("SELECT state,input,pending_tool_call FROM tasks WHERE id=$1")
+            .bind(child_task)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+    assert_eq!(
+        saved,
+        ("queued".into(), serde_json::to_value(inp).unwrap(), None)
+    );
+    let parent_pending: Value =
+        sqlx::query_scalar("SELECT pending_tool_call FROM tasks WHERE id=$1")
+            .bind(f.task)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+    assert_eq!(parent_pending, pending);
+    let calls: Vec<(ToolCallRecordId, String, bool)> = sqlx::query_as(
+        "SELECT id,state,ended_at IS NOT NULL FROM tool_calls WHERE workspace_id=$1",
+    )
+    .bind(f.workspace)
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(calls, [(record, "refused".into(), true)]);
 }
 
 async fn race(pool: &PgPool, f: &Fixture, cancel: bool) {
@@ -818,7 +1035,7 @@ async fn double_conclude_has_one_reply_decision_and_status(pool: PgPool) {
 async fn follow_up_rejects_a_request_from_another_thread(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let t = tenant(&pool, &f).await;
-    conclude(&pool, &f, &RunFacts::not_run(StopReason::NeedsApproval))
+    conclude(&pool, &f, &stopped(&f, StopReason::NeedsApproval))
         .await
         .unwrap();
     let thread = ThreadId::new();

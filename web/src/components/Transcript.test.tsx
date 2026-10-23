@@ -58,6 +58,26 @@ test('system_notice_shows_localized_reason', () => {
   expect(screen.queryByText('provider_unavailable')).toBeNull();
 });
 
+test('pause_notices_distinguish_stopped_work_from_queued_work_in_both_locales', () => {
+  const messages = messagesFrom([
+    ev.notice('queued', 'workspace_paused'),
+    ev.notice('workspace-stopped', 'workspace_paused_stopped'),
+    ev.notice('kat-stopped', 'kat_paused_stopped'),
+    ev.notice('approval', 'approval_pending'),
+  ]);
+  render(<Transcript messages={messages} />);
+  expect(screen.getByText("Your admin has paused the Kats in this workspace. The work waits until they're resumed.")).toBeVisible();
+  expect(screen.getByText('Stopped because the Kats in this workspace were paused. Send the request again after they resume.')).toBeVisible();
+  expect(screen.getByText('Stopped because this Kat was paused. Send the request again after it resumes.')).toBeVisible();
+  expect(screen.getByText('This action needs approval. Approving actions is not available yet, so this request has ended.')).toBeVisible();
+
+  act(() => setLocale('th'));
+  expect(screen.getByText('ผู้ดูแลระบบหยุด Kats ในเวิร์กสเปซนี้ไว้ชั่วคราว งานจะรอจนกว่าจะเปิดใช้อีกครั้ง')).toBeVisible();
+  expect(screen.getByText('งานหยุดแล้ว เพราะ Kats ในเวิร์กสเปซนี้ถูกพักไว้ ส่งคำขออีกครั้งหลังจากเปิดใช้งานแล้ว')).toBeVisible();
+  expect(screen.getByText('งานหยุดแล้ว เพราะ Kats ที่รับงานนี้ถูกพักไว้ ส่งคำขออีกครั้งหลังจากเปิดใช้งานแล้ว')).toBeVisible();
+  expect(screen.getByText('ขั้นตอนนี้ต้องได้รับอนุมัติ แต่ยังไม่มีระบบอนุมัติ คำขอนี้จึงจบแล้ว')).toBeVisible();
+});
+
 test('kat_messages_use_the_given_kat_name', () => {
   const messages = messagesFrom([ev.stored('m1', 'Done.', { author: { kind: 'kat', id: 'kat-a' } })]);
   render(<Transcript messages={messages} katName={(id) => (id === 'kat-a' ? 'Mali' : undefined)} />);
