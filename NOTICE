@@ -7,3 +7,11 @@ Third-party notices for bundled dependencies, fonts and assets will be listed he
 AG-UI Protocol 1.0 JSON Schema and valid event fixtures (test data only)
 https://github.com/ag-ui-protocol/ag-ui, commit 8aa86867fb2918001dca1c64db3976cd37f50703
 MIT License; copyright and full licence text: crates/katwork/tests/fixtures/agui/LICENSE.
+
+PyThaiNLP 5.4.0: the Thai mark-reordering rules and the number-word grammar, ported to Rust
+https://github.com/PyThaiNLP/pythainlp
+Copyright 2016-2026 PyThaiNLP Project. Apache License, Version 2.0.
+crates/katwork-thai/src/normalize.rs ports the reordering rules of pythainlp/util/normalize.py,
+and crates/katwork-thai/src/numbers.rs the grammar of pythainlp/util/wordtonum.py, whose first
+version was adapted from a notebook by Korakot Chaovavanich. PyThaiNLP itself runs only in
+scripts/fixtures/pythainlp_oracle.py, an offline fixture generator for developers and CI.
