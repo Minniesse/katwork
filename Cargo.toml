@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/katwork", "crates/katwork-server"]
+members = ["crates/katwork", "crates/katwork-server", "crates/katwork-thai"]
 resolver = "3"
 
 [workspace.package]
@@ -43,6 +43,7 @@ sha2 = "0.10"
 socket2 = { version = "0.6", features = ["all"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls", "aws-lc-rs", "webpki-roots"] }
 unicode-normalization = "0.1"
+rust_decimal = "1"
 caseless = "0.2.2"
 unicode-segmentation = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
