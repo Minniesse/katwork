@@ -26,7 +26,7 @@ The model that didn't write a PR reviews it. A Codex-written PR gets two reviews
    cd <scratch-dir> && scripts/test-db.sh start
    ```
 
-3. **Read the spec.** The issue the PR closes, its task in `docs/plans/2026-10-22-sp1-core-runtime.md`, the Global Constraints, and the Review Focus items the task names. Done when you can list what the task promises: files, interfaces, tests and failure modes.
+3. **Read the spec.** The issue the PR closes, its task in its plan (`docs/plans/2026-10-22-sp1-core-runtime.md` for SP1, `docs/plans/2026-10-24-sp2a-documents-evidence.md` for SP2a), the Global Constraints, and the Review Focus items the task names. Done when you can list what the task promises: files, interfaces, tests and failure modes.
 
 4. **Read every changed file** (`gh pr diff <n>`), and apply every rule in `CODING_STANDARDS.md` to the diff. Done when each rule is either satisfied or a finding.
 

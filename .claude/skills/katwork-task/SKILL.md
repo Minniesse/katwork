@@ -9,7 +9,7 @@ One task, one branch, one PR, stacked on the task it depends on. The review come
 
 ## Steps
 
-1. **Read the task.** Open `docs/plans/2026-10-22-sp1-core-runtime.md` and read the task, the Global Constraints, the Review Focus items the task names, and the **Dependency order** section. Then read `CODING_STANDARDS.md`: the review enforces every rule in it. Done when you can list the task's Files, Interfaces and Tests, and the issue it closes.
+1. **Read the task.** Open the task's plan (`docs/plans/2026-10-22-sp1-core-runtime.md` for SP1, `docs/plans/2026-10-24-sp2a-documents-evidence.md` for SP2a) and read the task, the Global Constraints, the Review Focus items the task names, and the **Dependency order** section. Then read `CODING_STANDARDS.md`: the review enforces every rule in it. Done when you can list the task's Files, Interfaces and Tests, and the issue it closes.
 
 2. **Branch, in a worktree of your own.** Another session switching branches in a shared checkout moves your commits onto its branch. Find the base: the branch of the task this one depends on, or `main` once that task's PR has merged (`gh pr list --state all --json number,headRefName,baseRefName,state`). Then:
 

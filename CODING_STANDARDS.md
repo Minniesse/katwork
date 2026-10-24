@@ -2,7 +2,7 @@
 
 The reviewer applies every rule here to every PR (see the `katwork-review` skill). **Mechanical** rules have a command or a guard that decides them; run it rather than eyeballing. **Judgement** rules need a reading of the diff. A broken rule is a finding, with its severity.
 
-The plan's **Global Constraints** (`docs/plans/2026-10-22-sp1-core-runtime.md`) are part of these standards. Where a rule below names one, the plan's text is authoritative.
+The plans' **Global Constraints** (`docs/plans/2026-10-22-sp1-core-runtime.md`, and `docs/plans/2026-10-24-sp2a-documents-evidence.md` for SP2a work) are part of these standards. Where a rule below names one, the plan's text is authoritative.
 
 ## Mechanical
 
