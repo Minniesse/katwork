@@ -80,9 +80,11 @@ Every narrowed ref also carries a `TextQuoteSelector` (`exact`, plus up to 32 co
 
 ### Judge
 
-- `ClaimJudge` is a trait. Sub-project 2a ships one implementation: a frontier-model judge called through KatWork's model gateway, using only providers the Space allows, with a model and provider other than the one that wrote the artifact. When no such model is configured, the claim stays unverified with `judge_unavailable`.
+- `ClaimJudge` is a trait. Sub-project 2a ships one implementation: a frontier-model judge called through KatWork's model gateway, using only providers the Space allows, and always from **another provider** than the one that wrote the artifact, because models favour their own output ([arXiv 2404.13076](https://arxiv.org/abs/2404.13076)). When no such provider is configured, the claim stays unverified with `judge_unavailable`.
 - The judge sees only the claim and its cited span texts, as data, and answers from a closed set. Span text is untrusted; because the judge can only lower a claim, text that tries to talk the judge into `supported` changes nothing.
-- No local NLI model in sub-project 2a. A local judge is another `ClaimJudge` implementation, added only after it passes the Thai claim gold set.
+- **For Thai claims the judge is advisory**: its verdict is stored and shown, and never changes the status. LLM judges agree poorly across languages (average Fleiss κ about 0.3 over 25 languages, [arXiv 2505.12201](https://arxiv.org/abs/2505.12201)), and no human-labelled Thai set exists yet. Lifting this needs a passing run of the preregistered calibration protocol on human-labelled Thai claims, and a founder decision.
+- **Calibration is preregistered.** A protocol file fixes the judge, its prompt hash, the votes, the label set (`supported`, `contradicted`, `unverifiable`), the metrics and the pass thresholds before any judge number is recorded; in that calibration a parse failure counts as a wrong answer and stays in the denominator. In the product, a parse failure leaves the claim unchanged.
+- No local NLI model in sub-project 2a. A local judge is another `ClaimJudge` implementation, added only after it passes the same protocol.
 
 ## Consequences
 
