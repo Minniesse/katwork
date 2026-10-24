@@ -736,8 +736,11 @@ impl<'a> Scanner<'a> {
         }
         let (bare_start, bare_end) = (start, end);
         // Accounting parentheses, unless the figure is a list marker such as (1).
-        let list_marker =
-            !minus && frac.is_empty() && int.len() <= 2 && token.end - token.start == int.len();
+        let list_marker = !minus
+            && frac.is_empty()
+            && int.len() <= 2
+            && token.end - token.start == int.len()
+            && (start, end) == (token.start, token.end);
         let parens = !minus && self.free_before(start) == Some('(') && self.get(end) == Some(')');
         let negative = minus || (parens && !list_marker);
         if parens && !list_marker {
@@ -801,7 +804,9 @@ impl<'a> Scanner<'a> {
         }
         let range = start..end;
         let number = match mixed_total {
-            Some(total) => mixed(total, exponent, frac.len()).map(|number| (number, Form::Mixed)),
+            Some(total) => {
+                mixed(total, negative, exponent, frac.len()).map(|number| (number, Form::Mixed))
+            }
             None => digits(&int, &frac, negative, exponent).map(|number| (number, Form::Digits)),
         };
         let Some(((value, scale, decimals), form)) = number else {
@@ -852,9 +857,20 @@ impl<'a> Scanner<'a> {
         if self.taken[at] {
             return None;
         }
-        self.get(at)
-            .and_then(symbol_unit)
-            .filter(|unit| *unit != Unit::Percent)
+        self.symbol_before_figure(at)
+    }
+
+    /// The unit of a symbol at `at` written before a figure: ฿, or $ unless letters name
+    /// another dollar (S$, HK$; US$ is USD).
+    fn symbol_before_figure(&self, at: usize) -> Option<Unit> {
+        let unit = self.get(at).and_then(symbol_unit)?;
+        if unit == Unit::Percent {
+            return None;
+        }
+        let other_dollar = self.get(at) == Some('$')
+            && self.before(at).is_some_and(is_latin_letter)
+            && !has_before(self.t, at, "us");
+        (!other_dollar).then_some(unit)
     }
 
     /// A character right before `start` that no earlier figure took.
@@ -1036,8 +1052,7 @@ impl<'a> Scanner<'a> {
                 if end == start {
                     return None;
                 }
-                let symbol =
-                    symbol_unit(self.before(end)?).filter(|unit| *unit != Unit::Percent)?;
+                let symbol = self.symbol_before_figure(end.checked_sub(1)?)?;
                 Some((symbol, end - 1))
             })
     }
@@ -1102,7 +1117,7 @@ impl<'a> Scanner<'a> {
         if self.get(close) != Some(')') {
             return;
         }
-        self.push_words(start..end, &words, unit, Flags::AMOUNT_IN_WORDS);
+        self.push_words(start..end, &words, false, unit, Flags::AMOUNT_IN_WORDS);
     }
 
     /// The longest run of number words from `at` that no figure, date or percent word took.
@@ -1127,6 +1142,7 @@ impl<'a> Scanner<'a> {
         &mut self,
         range: Range<usize>,
         words: &[Word],
+        negative: bool,
         unit: Option<Unit>,
         flags: Flags,
     ) {
@@ -1141,7 +1157,10 @@ impl<'a> Scanner<'a> {
             .position(|word| *word == Word::Chut)
             .map_or(0, |point| words.len() - point - 1);
         match words_value(words) {
-            Ok(value) if decimals <= 27 => {
+            Ok(mut value) if decimals <= 27 => {
+                if negative && !value.is_zero() {
+                    value.set_sign_negative(!value.is_sign_negative());
+                }
                 let decimals = u32::try_from(decimals).unwrap_or(0);
                 let number = Number {
                     value,
@@ -1187,8 +1206,11 @@ impl<'a> Scanner<'a> {
             } else {
                 unit
             };
+            // A minus right before the words, as before a figure: a dash after a figure is a range.
+            let minus = self.free_before(at) == Some('-') && !self.figure_before(at - 1);
+            let start = if minus { at - 1 } else { at };
             if unit.is_some() {
-                self.push_words(at..end, &words, unit, Flags::default());
+                self.push_words(start..end, &words, minus, unit, Flags::default());
             }
             at = end;
         }
@@ -1228,15 +1250,22 @@ fn digits(int: &[u8], frac: &[u8], negative: bool, exponent: u32) -> Option<(Dec
 
 /// A Mixed number as the figure times its leading scale words plus the rest: `3 ล้านห้าแสน` is
 /// 3.5 with scale 6, so its last written place, แสน, sets the precision.
-fn mixed(total: Decimal, exponent: u32, figure_decimals: usize) -> Option<(Decimal, u8, u32)> {
+fn mixed(
+    total: Decimal,
+    negative: bool,
+    exponent: u32,
+    figure_decimals: usize,
+) -> Option<(Decimal, u8, u32)> {
     let unit = power_of_ten(exponent)?;
-    let value = total.checked_div(unit)?.normalize();
+    let mut value = total.checked_div(unit)?.normalize();
     let decimals = value.scale().max(u32::try_from(figure_decimals).ok()?);
     if decimals > 27 {
         return None;
     }
-    let mut value = value;
     value.rescale(decimals);
+    if negative && !value.is_zero() {
+        value.set_sign_negative(true);
+    }
     Some((value, u8::try_from(exponent).ok()?, decimals))
 }
 

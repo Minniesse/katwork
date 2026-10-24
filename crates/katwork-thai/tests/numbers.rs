@@ -342,6 +342,10 @@ fn number_words_inside_ordinary_words_are_not_numbers() {
     assert!(found[1].flags.contains(Flags::AMOUNT_IN_WORDS));
     assert!(found[1].flags.contains(Flags::WORDS));
     assert_eq!(span(&text, &found[1]), format!("{NUENG}{PHAN}{SONG}{ROI}"));
+    // A minus before number words counts as before a figure.
+    let minus = format!("-{NUENG}{ROI}{BAHT}");
+    assert_eq!(only(&minus).value.value, dec("-100"));
+    assert_eq!(span(&minus, &only(&minus)), format!("-{NUENG}{ROI}"));
     // Number words followed by a unit are read; without one they are not.
     assert_eq!(only(&format!("{SAM}{ROI}{BAHT}")).value.value, dec("300"));
     assert!(numbers(&format!("{SAM}{ROI}{KHON}")).is_empty());
@@ -390,6 +394,10 @@ fn ranges_lists_and_codes_are_not_negatives_or_thousands() {
     assert_eq!(only("(12)").value.value, dec("12"));
     assert_eq!(only("(123)").value.value, dec("-123"));
     assert_eq!(only("(1.5)").value.value, dec("-1.5"));
+    // Only bare digits make a list marker; a symbol inside the parentheses makes a negative.
+    assert_eq!(only("(5%)").value.value, dec("-5"));
+    assert!(only("(5%)").flags.contains(Flags::PAREN_NEGATIVE));
+    assert_eq!(only("($12)").value.value, dec("-12"));
     assert_eq!(only("(1,250)").value.value, dec("-1250"));
     for text in ["1.2.3", "192.168.0.1"] {
         let code = only(text);
@@ -420,6 +428,10 @@ fn english_scale_and_unit_in_either_order() {
         assert_eq!(found.value.unit, unit, "{text:?}");
         assert_eq!(found.value.role, NumberRole::Quantity, "{text:?}");
     }
+    // Another dollar is no USD; US$ is.
+    assert_eq!(only("S$100").value.unit, None);
+    assert_eq!(only("HK$ 100").value.unit, None);
+    assert_eq!(only("US$100").value.unit, Some(Unit::Currency("USD")));
     assert_eq!(only("12 bahts").value.unit, None);
     assert_eq!(only("12 Bahtnet").value.unit, None);
     assert_eq!(
@@ -460,6 +472,10 @@ fn mixed_number_is_read_whatever_follows() {
     let thousands = only(&format!("5 {PHAN}{HA}{ROI}{KHON}"));
     assert_eq!(thousands.value.effective(), dec("5500"));
     assert_eq!(thousands.value.scale, Scale(3));
+    // A sign stays with the whole Mixed number.
+    let negative = only(&format!("-3 {LAN}{HA}{SAEN} {BAHT}"));
+    assert_eq!(negative.value.effective(), dec("-3500000"));
+    assert_eq!(negative.value.form, Form::Mixed);
     let plain = only(&format!("3 {LAN} {KHON}"));
     assert_eq!(plain.value.form, Form::Digits);
     assert_eq!(plain.value.scale, Scale(6));
