@@ -1,6 +1,6 @@
 # 0008. Thai OCR behind an `OcrEngine` trait, with line boxes for citations
 
-- Status: Proposed (2026-10-24), with the sub-project 2a plan; it becomes Accepted when the founder approves that plan, and the 100-page Thai bake-off in it confirms or overturns the engine choice
+- Status: Accepted (2026-10-24), with the sub-project 2a plan, which the founder approved that day; the 100-page Thai bake-off in it confirms or overturns the engine choice
 - Decision owner: Founder
 - Spec: §5.2 (documents and inference picks), §9 (document tools), §9.1 (the PdfCraft row), §11 (model gateway), §13 (isolation), §15 (document fidelity gates), §19 item 2
 

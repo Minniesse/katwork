@@ -1,6 +1,6 @@
 # 0010. Untrusted content posture: the verifier and the approval gate are the controls
 
-- Status: Proposed (2026-10-24), with the sub-project 2a plan (founder-approved routing U1–U6); it becomes Accepted when the founder approves that plan
+- Status: Accepted (2026-10-24), with the sub-project 2a plan (founder-approved routing U1–U6), which the founder approved that day
 - Decision owner: Founder
 - Spec: §5.1 (tool registry), §6.5 (approvals and the evidence verifier), §7 (proof), §13 (security), §15 (judges), §19 items 2 and 3
 

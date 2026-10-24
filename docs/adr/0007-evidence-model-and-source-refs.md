@@ -1,6 +1,6 @@
 # 0007. Evidence model: claims, source refs and a verification ladder that only moves down
 
-- Status: Proposed (2026-10-24), with the sub-project 2a plan; it becomes Accepted when the founder approves that plan. Revised the same day after three review rounds (generated sources, subject words, judge providers, deletion; the full roll-up, R18's judge rule, instruction-like and low-contrast sources, qualifiers and periods, refinement alternatives, the deletion protocol; quotes that cut a figure, per-character hidden text, formula-only cache distrust)
+- Status: Accepted (2026-10-24), with the sub-project 2a plan, which the founder approved that day. Revised the same day after three review rounds (generated sources, subject words, judge providers, deletion; the full roll-up, R18's judge rule, instruction-like and low-contrast sources, qualifiers and periods, refinement alternatives, the deletion protocol; quotes that cut a figure, per-character hidden text, formula-only cache distrust)
 - Decision owner: Founder
 - Spec: §4 (Evidence, Claim), §6.5 (evidence verifier), §7.1 (evidence model), §13 (deletion), §15 (judges), §19 items 2 and 3
 
