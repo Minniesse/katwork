@@ -647,7 +647,7 @@ docs/adr/0010-untrusted-content-posture.md                                      
     - its optional-content group is off by default (`OptionalContentOff`);
     - its box lies outside the page's CropBox (`OutsideCropBox`);
     - its box's centre lies outside the bounding box of the clipping path in force (`Clipped`; the bounding box is a conservative stand-in for the path, so it can miss text, never hide visible text);
-    - its painting alpha is below `min_text_alpha`: `ca` for render modes 0 and 4, `CA` for modes 1 and 5, both for modes 2 and 6 (`Transparent`; a soft mask on text counts as unknown, not hidden);
+    - its painting alpha is below `min_text_alpha`: `ca` for render modes 0 and 4, `CA` for modes 1 and 5, and for modes 2 and 6 only when both are below it (`Transparent`; a soft mask on text counts as unknown, not hidden);
     - its effective size is below `min_visible_pt` (`Tiny`): the effective height is font size × the text matrix's and CTM's vertical scale, the effective width scale is font size × `Tz` / 100 × their horizontal scale, and either one below the limit counts;
     - its painting colour's `contrast_ratio` against its background is below `min_contrast` (`LowContrast`). The painting colour is the fill colour for modes 0 and 4 and the stroke colour for modes 1 and 5; for modes 2 and 6 the character is low-contrast only when both are. The background is the colour of the last opaque filled path drawn **before** it whose box contains the character's box centre, else white; an image beneath gives an unknown background, and a character on an unknown background or with an unknown colour is not hidden for colour;
     - an opaque filled path or an image drawn **after** it covers its whole box (`Covered`).
@@ -1465,7 +1465,7 @@ docs/adr/0010-untrusted-content-posture.md                                      
        - rows of jobs still unfinished at this point are not touched (the lock-order exception covers finished jobs only); their ids go to `pending_jobs`, and `finish` sweeps them the same way once each has finished;
        - `source_spans` of the artifact's versions: `text = ''`, `match_key = ''`, `redact_ref(source_ref)`;
        - `citations` of those spans: `exact = ''`, `display = ''`, `redact_ref(source_ref)`;
-       - `claims` citing those citations: `text = '[deleted]'`;
+       - `claims` citing those citations, and, for a Kat output, every claim on its own versions: `text = '[deleted]'` (their `claim_checks` and `evidence_reports` are redacted by the next two items, which cover these claims too);
        - `claim_refs` of those citations: `redact_ref(source_ref)`;
        - `claim_checks` of those claims: `detail = '{"redacted": true}'`;
        - `evidence_reports` holding any of those claims or refs: in `report`, each such claim's `text` set to `[deleted]`, each ref to the file's `exact` and `display` blanked, then `redact_json_strings` over the rest;
