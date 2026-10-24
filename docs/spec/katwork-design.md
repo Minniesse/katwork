@@ -349,7 +349,7 @@ The alpha computer for each Kat has these parts:
 | Deferred | Other nine apps | DeckCraft for PPTX (Phase 2), the creative apps (Phase 4), and the rest. |
 
 **How Kats drive them:**
-- **In sub-project 2a, the `katwork-craft` sidecar** is the first such sidecar: a pinned container on an internal network with no egress, its Craft CLIs built from pinned commits with recorded SHA-256s, exposing only WordCraft's labelled preview render of DOCX outputs, GridCraft's check of every XLSX output before it is saved, and PdfCraft's text extraction if it wins its reader challenge.
+- **In sub-project 2a, the `katwork-craft` sidecar** is the first such sidecar and part of the default product stack: a pinned container on an internal network with no egress, its Craft CLIs built from pinned commits with recorded SHA-256s, exposing only WordCraft's labelled preview render of DOCX outputs, GridCraft's check of every XLSX output before it is saved (failing closed when the sidecar is down), and PdfCraft's text extraction if it wins its reader challenge. An operator turns it off only with `KATWORK_CRAFT=off`, which logs a warning and marks XLSX outputs as unchecked.
 - **Sidecar CLI or MCP first** for bounded automation. These tools run as pinned images, isolated per tenant, exposed as a small allowlist of operations (inspect, render page, propose image edit, save draft).
 - **The browser build** when a person needs to see or edit the current revision. It runs from a separate origin per Kat or session, with a minimal host page that receives only a scoped artifact capability.
 - **One active editor at a time.** A control lease belongs to either the Kat or the person. Takeover pauses automation, a save creates a new revision, and stale writes are rejected.
