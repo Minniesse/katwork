@@ -1,6 +1,6 @@
 # 0009. Kat computers: agentOS for light code until KatsAgentOS, a container runtime ladder for Chromium, one egress gateway
 
-- Status: Accepted (2026-10-24), amended the same day after plan review; built in sub-project 2b, recorded now
+- Status: Accepted (2026-10-24), amended the same day after plan review and after the final reviews (the code tier's switch target is gVisor only); built in sub-project 2b, recorded now
 - Decision owner: Founder
 - Spec: §1.2 (non-goals), §4 (Task), §9, §13 (isolation), §14, §19 item 2; amends §1.2, §4 and §14 item 3
 
@@ -29,15 +29,15 @@ Spec §9 gives each Kat an agentOS workspace and a separate Chromium container. 
   - **Disk checkpoints are required**: encrypted, with a manifest of per-file hashes authenticated by a key derived from `KATWORK_SECRET`, restored only into a quarantined computer and never over live state, and never leaving the install.
   - **Memory snapshot and fork are optional and later**, on the microVM tier only. A memory snapshot is never restored into a session that holds credentials, and is refused on a different hardware or software configuration.
   - A Kat **"tries two approaches" by restarting from a disk checkpoint**, not by forking memory.
-- **Kill criteria for switching the code tier** from agentOS to a microVM (where `/dev/kvm` exists) or gVisor, checked in week 4 of sub-project 2b and after each agentOS minor release. Any one switches the `Computer` adapter, not its contract. The thresholds are frozen before the first soak test; a change is a new, preregistered version and a founder decision, never an adjustment after seeing a result.
+- **Kill criteria for switching the code tier** from agentOS to **gVisor** (`runsc`), checked in week 4 of sub-project 2b and after each agentOS minor release. Any one switches the `Computer` adapter, not its contract. In the alpha the switch target is gVisor only, so spec §1.2's "no VM per Kat for code" holds whichever criterion fires; on a host without gVisor, Kat code execution is turned off until it is installed. A per-Kat microVM for code is reserved for KatsAgentOS after the alpha. The thresholds are frozen before the first soak test; a change is a new, preregistered version and a founder decision, never an adjustment after seeing a result.
   - **K1.** A public escape or cross-VM leak in V8, WASM or the sidecar boundary that stays unfixed for 14 days, or a failure of KatWork's own conformance test.
   - **K2.** The command inventory shows that the meeting-minutes, SAR or One Report template, or any three of the six alpha templates (spec §8), need native binaries or syscalls that KatWork Rust tools and pinned containers cannot cover.
   - **K3.** More than one sidecar crash or wedge per 1,000 VM-hours over a soak of at least 2,000 VM-hours spread over at least 7 days, running the command inventory's workload with one pool per workspace. A **wedge** is a sidecar child that answers no health request for 30 s, or a VM whose exec has no completion 60 s after its deadline.
   - **K4.** Three consecutive agentOS minor releases each need adapter changes beyond `Cargo.toml` and `Cargo.lock` of more than 200 changed lines.
-  - **K5.** A design partner's security review rejects non-hardware isolation for untrusted code, or the founder makes memory snapshot and fork an alpha requirement.
+  - **K5.** A design partner's security review rejects non-hardware isolation for untrusted code, or the founder makes memory snapshot and fork an alpha requirement. gVisor answers K5 only if that partner accepts it; otherwise a microVM for code in the alpha is a founder decision that amends spec §1.2 again, never a silent switch.
   - **K6.** Idle memory above 150 MiB per Kat on the target 8 GiB host with 10 Kats. **Idle** means no exec for 10 minutes. Memory is the proportional set size (PSS) of the sidecar process tree plus each VM's own accounting, sampled every 60 s for one hour; a shared sidecar's PSS is divided equally among the Kats on it.
 
-  A `Computer` conformance suite runs against agentOS and one other backend, so that a switch is configuration.
+  A `Computer` conformance suite runs against agentOS and gVisor, so that a switch is configuration.
 
 ## Alternatives considered
 

@@ -5,25 +5,25 @@ description: Implement one task of a KatWork plan as a stacked PR. Use when aske
 
 # Implement a plan task
 
-One task, one branch, one PR, stacked on the task it depends on. The review comes from the other model; the maintainer merges.
+One task, one branch, one PR, stacked on the task it depends on. Build it with the model the task's **Builder** line names. Two fresh reviewers who did not write it review it (a fresh Opus session, and a Sonnet session with the checklist in `CODING_STANDARDS.md`); the maintainer merges.
 
 ## Steps
 
-1. **Read the task.** Open the task's plan (`docs/plans/2026-10-22-sp1-core-runtime.md` for SP1, `docs/plans/2026-10-24-sp2a-documents-evidence.md` for SP2a) and read the task, the Global Constraints, the Review Focus items the task names, and the **Dependency order** section. Then read `CODING_STANDARDS.md`: the review enforces every rule in it. Done when you can list the task's Files, Interfaces and Tests, and the issue it closes.
+1. **Read the task.** Open the task's plan (`docs/plans/2026-10-22-sp1-core-runtime.md` for SP1, `docs/plans/2026-10-24-sp2a-documents-evidence.md` for SP2a) and read the task, the Global Constraints, the Review Focus items the task names, and the **Dependency order** section. Check the task's **Builder** line: an SP2a task names `Opus` or `Sonnet`; if it is not the model you are running on, stop and say so. Then read `CODING_STANDARDS.md`: the review enforces every rule in it, and the Sonnet reviewer works through its checklist item by item. Done when you can list the task's Files, Interfaces and Tests, and the issue it closes.
 
 2. **Branch, in a worktree of your own.** Another session switching branches in a shared checkout moves your commits onto its branch. Find the base: the branch of the task this one depends on, or `main` once that task's PR has merged (`gh pr list --state all --json number,headRefName,baseRefName,state`). Then:
 
    ```sh
    git fetch origin
-   git worktree add -b sp1/task-<N>-<slug> <dir> origin/<base>   # or git switch -c in a worktree that's already yours
+   git worktree add -b <plan>/task-<N>-<slug> <dir> origin/<base>   # or git switch -c in a worktree that's already yours
    git config user.email   # must end in @users.noreply.github.com
    ```
 
-   `<slug>` is one or two words from the task title, as in `sp1/task-4-tenancy`.
+   `<plan>` is `sp1` or `sp2a`; `<slug>` is one or two words from the task title, as in `sp1/task-4-tenancy` or `sp2a/task-4-xlsx`.
 
-3. **Start this worktree's database.** `scripts/test-db.sh start` prints a `DATABASE_URL` for a private cluster. Claude Code sessions export it into later commands automatically; in Codex, prefix test commands with `DATABASE_URL=<that url>`. Run tests only against this cluster: on a shared server, parallel workers' `#[sqlx::test]` databases collide.
+3. **Start this worktree's database.** `scripts/test-db.sh start` prints a `DATABASE_URL` for a private cluster. Claude Code sessions export it into later commands automatically; elsewhere, prefix test commands with `DATABASE_URL=<that url>`. Run tests only against this cluster: on a shared server, parallel workers' `#[sqlx::test]` databases collide.
 
-4. **Red, then green, one step at a time.** For each plan step, write the failing test, run it and watch it fail for the reason you expect, then write the code that makes it pass. Every failure mode the task or its Review Focus items name gets its own test. Done when every test the task lists exists and passes.
+4. **Red, then green, one step at a time.** For each plan step, write the failing test, run it and watch it fail for the reason you expect, then write the code that makes it pass. Every failure mode the task or its Review Focus items name gets its own test. A Sonnet-built task leaves no choice open: when you meet a case the task does not decide, stop and ask in the PR (or through your coordinator) instead of choosing. Done when every test the task lists exists and passes.
 
 5. **Run every check** and fix until all pass:
 
@@ -38,13 +38,13 @@ One task, one branch, one PR, stacked on the task it depends on. The review come
 
    If a check can't run on this machine (no Docker, say), name it in the PR body; CI runs it.
 
-6. **Commit.** End every message with a `Co-Authored-By:` trailer for the model writing it: `Claude <model> <noreply@anthropic.com>` or `<model> (Codex) <noreply@openai.com>`.
+6. **Commit.** End every message with a `Co-Authored-By:` trailer for the model writing it: `Claude <model> <noreply@anthropic.com>`.
 
 7. **Push and open the PR** against the base from step 2:
 
    ```sh
    git push -u origin HEAD
-   gh pr create --base <base> --title "SP1 Task <N>: <task title>" --body-file <file>
+   gh pr create --base <base> --title "<SP1|SP2a> Task <N>: <task title>" --body-file <file>
    ```
 
    The body, in this order:
@@ -54,9 +54,9 @@ One task, one branch, one PR, stacked on the task it depends on. The review come
    - **Tests**: each new test file and what its tests prove, then each check from step 5 with its result
    - **Ambiguity rulings**: every place the plan was unclear and what you chose
    - **Out of scope**: what the task leaves for later tasks
-   - **Written by**: your model, so the other model reviews it; trust-core changes (approval, policy, evidence, sandbox) also flag that they need a security review
+   - **Written by**: your model and the task's Builder line; trust-core changes (approval, policy, evidence, sandbox) also flag that they need a security review, which the Opus reviewer gives
 
-   Done when the PR is open against the right base, CI is green on its head (`gh pr checks <n>`), and the body has every item. Then hand off: the reviewer and the maintainer take it from here.
+   Done when the PR is open against the right base, CI is green on its head (`gh pr checks <n>`), and the body has every item. Then hand off: the two reviewers and the maintainer take it from here.
 
 8. **Clean up** when you leave the worktree: `scripts/test-db.sh stop`.
 

@@ -1,11 +1,11 @@
 ---
 name: katwork-review
-description: Cross-review a KatWork pull request and post the review. Use when asked to review a PR or re-review its fixes.
+description: Review a KatWork pull request, as its fresh Opus reviewer or its Sonnet checklist reviewer, and post the review. Use when asked to review a PR or re-review its fixes.
 ---
 
-# Cross-review a PR
+# Review a PR
 
-The model that didn't write a PR reviews it. A Codex-written PR gets two reviews: one from Claude and a separate one from a fresh Codex session. The maintainer merges once a review says it's ready. `gh pr merge` refuses unless a review covers the head: one posted on it, or on an earlier commit followed only by clean merges of the base branch.
+Every PR gets two independent reviews from sessions that did not write it (spec §19.1): a **fresh Opus reviewer**, who reviews the whole change and probes every security claim, and a **Sonnet reviewer**, who works through the **Sonnet review checklist** in `CODING_STANDARDS.md` item by item. Each posts its own review. The maintainer merges once both say it's ready. `gh pr merge` refuses unless a review covers the head: one posted on it, or on an earlier commit followed only by clean merges of the base branch.
 
 ## Steps
 
@@ -16,7 +16,7 @@ The model that didn't write a PR reviews it. A Codex-written PR gets two reviews
    git log --format='%h %ae %(trailers:key=Co-Authored-By,valueonly)' origin/<base>..<head>
    ```
 
-   The trailers name the model that wrote each commit. Review only a PR you didn't write. On a re-review, the scope is the delta from the head your last review names (`git diff <reviewed-sha>..<head>`) plus each earlier finding.
+   The trailers name the model that wrote each commit. Review only a PR you didn't write, in a fresh session that took no part in writing it. On a re-review, the scope is the delta from the head your last review names (`git diff <reviewed-sha>..<head>`) plus each earlier finding.
 
 2. **Check out the head in a scratch worktree** and start its database:
 
@@ -28,9 +28,9 @@ The model that didn't write a PR reviews it. A Codex-written PR gets two reviews
 
 3. **Read the spec.** The issue the PR closes, its task in its plan (`docs/plans/2026-10-22-sp1-core-runtime.md` for SP1, `docs/plans/2026-10-24-sp2a-documents-evidence.md` for SP2a), the Global Constraints, and the Review Focus items the task names. Done when you can list what the task promises: files, interfaces, tests and failure modes.
 
-4. **Read every changed file** (`gh pr diff <n>`), and apply every rule in `CODING_STANDARDS.md` to the diff. Done when each rule is either satisfied or a finding.
+4. **Read every changed file** (`gh pr diff <n>`), and apply every rule in `CODING_STANDARDS.md` to the diff. The Sonnet reviewer answers each item of the Sonnet review checklist as pass or a finding. Done when each rule is either satisfied or a finding.
 
-5. **Probe every security claim.** A claim is any sentence in the PR body, a comment or a test name that says something can't happen: a cross-tenant request gets 404, a token works once, a secret never prints, locks follow the global order, a tool outside the allowlist never runs. For each one:
+5. **Probe every security claim** (the Opus reviewer always; the Sonnet reviewer for the claims its checklist names). A claim is any sentence in the PR body, a comment or a test name that says something can't happen: a cross-tenant request gets 404, a token works once, a secret never prints, locks follow the global order, a tool outside the allowlist never runs. For each one:
    - find the test that proves it and read its assertions: does it fail if the claim is false?
    - if none does, write a throwaway probe in the scratch worktree (a test, a `curl` against the running server, or a query against the test database) and run it
    - record the outcome as **verified** (and how) or **refuted** (a finding)
@@ -44,10 +44,12 @@ The model that didn't write a PR reviews it. A Codex-written PR gets two reviews
    ```markdown
    **Verdict: Ready for maintainer.**   (or: **Verdict: Changes needed.**)
 
-   Reviewed head `<sha>` against `<base>` as <your model>, scope: <full diff | delta <old>..<new>>.
+   Reviewed head `<sha>` against `<base>` as <your model>, <Opus full review | Sonnet checklist review>, scope: <full diff | delta <old>..<new>>.
 
    ### Findings
    1. **<Blocker|High|Medium|Low>: <title>.** `<file>:<line>`. What is wrong, why it matters, the fix, and how you know.
+
+   ### Checklist   (Sonnet review: one line per item, pass or finding k)
 
    ### Claims probed
    - <claim>: verified by <test or probe> | refuted, see finding <k>
