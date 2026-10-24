@@ -15,6 +15,7 @@ import {
   type AgUiEvent,
   type ApiMessage,
   type SeqEvent,
+  type Transcript,
 } from '../sse';
 import { apiMessage, ev } from '../testing/agui';
 import { deferred, mockApi, type Reply } from '../testing/api-mock';
@@ -1026,6 +1027,190 @@ describe('Kat status', () => {
     ).toBeVisible();
   });
 
+  // After a write a retry would repeat it, so the status line shows the job's review notice in
+  // place of any close code that ends the job's work.
+  const RERUN_STOPS = [
+    'provider_unavailable',
+    'policy_changed',
+    'loop_detected',
+    'time_limit',
+    'quota_exceeded',
+    'workspace_paused',
+  ];
+  const LEAD_NAMED = [{ id: LEAD, name: 'หัวหน้าทีม' }];
+  const reasonCopy = (code: string) => (en as Record<string, string>)[`reason.${code}`]!;
+  const leadLine = (code: string) =>
+    en['chat.kat_error'].replace('{kat}', 'หัวหน้าทีม').replace('{message}', reasonCopy(code));
+
+  test.each(RERUN_STOPS)(
+    'status_line_after_a_write_asks_for_review_not_retry (%s)',
+    async (code) => {
+      api();
+      const { source } = await openThread();
+      stream(source, 1, [
+        ev.kwRunStarted('run-1', LEAD, REPLY, { jobId: 'job-1' }),
+        ev.notice(NOTICE, 'review_before_rerun', LEAD_NAMED, 'job-1'),
+        ev.jobStatus('job-1', 'stopped', code),
+        ev.kwRunClosed('run-1', 'finished', code),
+      ]);
+      expect(katStatus()).toHaveTextContent(en['reason.review_before_rerun']);
+      expect(katStatus()).not.toHaveTextContent(reasonCopy(code));
+      expect(katStatus()).not.toHaveTextContent(en['reason.workspace_paused_stopped']);
+      expect(katStatus().textContent).toBe(leadLine('review_before_rerun'));
+    },
+  );
+
+  test('status_line_takes_a_review_notice_that_arrives_after_the_close', async () => {
+    api();
+    const { source } = await openThread();
+    let seq = 1;
+    for (const [i, code] of RERUN_STOPS.entries()) {
+      // Each stop is its own job: the review of an earlier job never touches a later error.
+      const job = `job-${i}`;
+      seq = stream(source, seq, [
+        ev.kwRunStarted(`run-${i}`, LEAD, `1${i}-reply`, { jobId: job }),
+        ev.jobStatus(job, 'stopped', code),
+        ev.kwRunClosed(`run-${i}`, 'finished', code),
+      ]);
+      const closeCopy = code === 'workspace_paused' ? 'workspace_paused_stopped' : code;
+      expect(katStatus().textContent).toBe(leadLine(closeCopy));
+      const notice = ev.notice(`1${i}-notice`, 'review_before_rerun', LEAD_NAMED, job);
+      seq = stream(source, seq, [notice]);
+      expect(katStatus().textContent).toBe(leadLine('review_before_rerun'));
+      expect(katStatus()).not.toHaveTextContent(reasonCopy(code));
+    }
+  });
+
+  test.each([
+    ['the_notice_first', true],
+    ['the_close_first', false],
+  ] as const)(
+    'interrupted_run_status_line_matches_its_review_notice (%s)',
+    async (_, noticeFirst) => {
+      api();
+      const { source } = await openThread();
+      const notice = ev.notice(NOTICE, 'interrupted_review_required', LEAD_NAMED, 'job-1');
+      // A worker that fails after a write closes its run with internal_error, then stops the job.
+      const close = ev.kwRunClosed('run-1', 'interrupted', 'internal_error');
+      stream(source, 1, [
+        ev.kwRunStarted('run-1', LEAD, REPLY, { jobId: 'job-1' }),
+        ...(noticeFirst ? [notice, close] : [close, notice]),
+        ev.jobStatus('job-1', 'stopped', 'interrupted_review_required'),
+      ]);
+      expect(katStatus()).toHaveTextContent(en['reason.interrupted_review_required']);
+      expect(katStatus()).not.toHaveTextContent(en['reason.internal_error']);
+    },
+  );
+
+  test('review_notice_of_another_job_leaves_the_status_line_alone', async () => {
+    api();
+    const { source } = await openThread();
+    const seq = stream(source, 1, [
+      ev.kwRunStarted('run-1', LEAD, REPLY, { jobId: 'job-1' }),
+      ev.notice(NOTICE, 'review_before_rerun', LEAD_NAMED, 'job-2'),
+      ev.jobStatus('job-1', 'stopped', 'provider_unavailable'),
+      ev.kwRunClosed('run-1', 'finished', 'provider_unavailable'),
+    ]);
+    expect(katStatus()).toHaveTextContent(en['reason.provider_unavailable']);
+    // Nor does one that arrives after the close.
+    stream(source, seq, [ev.notice('05-notice', 'outcome_unknown', LEAD_NAMED, 'job-2')]);
+    expect(katStatus().textContent).toBe(leadLine('provider_unavailable'));
+  });
+
+  test('lease_lost_close_keeps_its_own_line_after_an_intake_review_notice', async () => {
+    api();
+    const { source } = await openThread();
+    // A follow-up of a job that wrote gets its review notice at intake, before any run.
+    stream(source, 1, [
+      ev.userStored(ASK, 'Yes, go ahead', { userId: ME, jobId: 'job-1' }),
+      ev.notice(NOTICE, 'review_before_rerun', [], 'job-1'),
+      ev.jobStatus('job-1', null),
+      ev.kwRunStarted('run-1', LEAD, REPLY, { jobId: 'job-1' }),
+      // The lease is lost: KatWork requeues the task and runs the job again.
+      ev.kwRunClosed('run-1', 'interrupted', 'lease_lost'),
+      ev.runError('lease_lost'),
+      ev.kwRunStarted('run-2', LEAD, REPLY, { jobId: 'job-1' }),
+    ]);
+    const replying = en['chat.replying'].replace('{kat}', 'หัวหน้าทีม');
+    expect(katStatus().textContent).toBe(replying + leadLine('lease_lost'));
+  });
+
+  test('a_review_notice_after_a_lost_lease_replaces_the_line', async () => {
+    api();
+    const { source } = await openThread();
+    // The task had started a write, so the reclaim stops the job instead of running it again.
+    stream(source, 1, [
+      ev.kwRunStarted('run-1', LEAD, REPLY, { jobId: 'job-1' }),
+      ev.kwRunClosed('run-1', 'interrupted', 'lease_lost'),
+      ev.runError('lease_lost'),
+      ev.notice(NOTICE, 'interrupted_review_required', LEAD_NAMED, 'job-1'),
+      ev.jobStatus('job-1', 'stopped', 'interrupted_review_required'),
+    ]);
+    expect(katStatus().textContent).toBe(leadLine('interrupted_review_required'));
+  });
+
+  test('review_notice_before_the_job_is_known_still_counts', async () => {
+    api();
+    const { source } = await openThread();
+    // A follow-up's intake order: the person's message, the notice, then the job's status.
+    stream(source, 1, [
+      ev.userStored(ASK, 'Yes, go ahead', { userId: ME, jobId: 'job-1' }),
+      ev.notice(NOTICE, 'review_before_rerun', [], 'job-1'),
+      ev.jobStatus('job-1', null),
+      ev.kwRunStarted('run-1', LEAD, REPLY, { jobId: 'job-1' }),
+      ev.jobStatus('job-1', 'stopped', 'provider_unavailable'),
+      ev.kwRunClosed('run-1', 'finished', 'provider_unavailable'),
+    ]);
+    expect(katStatus().textContent).toBe(leadLine('review_before_rerun'));
+  });
+
+  test('the_latest_review_notice_of_a_job_wins', async () => {
+    api();
+    const { source } = await openThread();
+    const events = [
+      ev.notice(NOTICE, 'review_before_rerun', [], 'job-1'),
+      ev.kwRunStarted('run-1', LEAD, REPLY, { jobId: 'job-1' }),
+      ev.notice('05-notice', 'outcome_unknown', LEAD_NAMED, 'job-1'),
+      ev.kwRunClosed('run-1', 'finished', 'outcome_unknown'),
+    ];
+    stream(source, 1, events);
+    expect(katStatus().textContent).toBe(leadLine('outcome_unknown'));
+    expect(foldChat(emptyTranscript(), events, 1).jobs['job-1']?.review).toBe('outcome_unknown');
+  });
+
+  test('only_the_three_review_codes_count', async () => {
+    api();
+    const { source } = await openThread();
+    const events = [
+      ev.kwRunStarted('run-1', LEAD, REPLY, { jobId: 'job-1' }),
+      ev.notice(NOTICE, 'workspace_paused', [], 'job-1'),
+      ev.jobStatus('job-1', 'stopped', 'provider_unavailable'),
+      ev.kwRunClosed('run-1', 'finished', 'provider_unavailable'),
+      ev.notice('05-notice', 'extra_mention_ignored', LEAD_NAMED, 'job-1'),
+    ];
+    stream(source, 1, events);
+    expect(katStatus().textContent).toBe(leadLine('provider_unavailable'));
+    expect(foldChat(emptyTranscript(), events, 1).jobs['job-1']?.review).toBeNull();
+  });
+
+  test('only_system_notices_count', async () => {
+    api();
+    const { source } = await openThread();
+    const events = [
+      ev.kwRunStarted('run-1', LEAD, REPLY, { jobId: 'job-1' }),
+      ev.stored(REPLY, 'review_before_rerun', {
+        author: { kind: 'kat', id: LEAD },
+        meta: { code: 'review_before_rerun', kats: [] },
+        jobId: 'job-1',
+      }),
+      ev.jobStatus('job-1', 'stopped', 'provider_unavailable'),
+      ev.kwRunClosed('run-1', 'finished', 'provider_unavailable'),
+    ];
+    stream(source, 1, events);
+    expect(katStatus().textContent).toBe(leadLine('provider_unavailable'));
+    expect(foldChat(emptyTranscript(), events, 1).jobs['job-1']?.review).toBeNull();
+  });
+
   test('chat_shows_queue_position_while_the_kat_is_busy', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const calls = api({
@@ -1388,4 +1573,140 @@ test('a_poll_page_read_before_a_folded_event_is_dropped', () => {
     issuedAt: 3,
   });
   expect(fresh.messages[REPLY]?.body).toBe('Done');
+});
+
+/** The page's reducer, fed events numbered from `first` as the server's log numbers them. */
+function foldChat(state: Transcript, events: AgUiEvent[], first: number): Transcript {
+  return events.reduce(
+    (next, event, i) => reduceChat(next, { type: 'event', event: { seq: first + i, event } }),
+    state,
+  );
+}
+
+const reviewNotice = (id: string, code: string, jobId: string): ApiMessage =>
+  apiMessage(id, code, {
+    author: { kind: 'system' },
+    meta: { code, kats: [] },
+    job_id: jobId,
+    job_status: 'stopped',
+    job_reason: 'provider_unavailable',
+  });
+
+test('a_snapshot_and_its_replay_give_the_status_line_the_live_review', () => {
+  for (const noticeFirst of [true, false]) {
+    const notice = ev.notice(NOTICE, 'review_before_rerun', [], 'job-1');
+    const close = ev.kwRunClosed('run-1', 'finished', 'provider_unavailable');
+    const events = [
+      ev.kwRunStarted('run-1', LEAD, REPLY, { jobId: 'job-1' }),
+      ...(noticeFirst ? [notice, close] : [close, notice]),
+      ev.jobStatus('job-1', 'stopped', 'provider_unavailable'),
+    ];
+    const live = foldChat(emptyTranscript(), events, 1);
+    const snapshot = reduceChat(emptyTranscript(), {
+      type: 'snapshot',
+      page: {
+        messages: [reviewNotice(NOTICE, 'review_before_rerun', 'job-1')],
+        event_seq: events.length,
+      },
+    });
+    // The replay of what the snapshot covers only records run starts and closes.
+    const replayed = foldChat(snapshot, events, 1);
+    expect(live.errors).toEqual({ [LEAD]: 'review_before_rerun' });
+    expect(replayed.errors).toEqual(live.errors);
+  }
+});
+
+test('an_older_review_notice_reaches_the_status_line_but_never_replaces_a_newer_one', () => {
+  // The Lead's run of job-1 stopped before any review notice was seen; the Writer's run of
+  // job-2 stopped after its own outcome_unknown notice.
+  const live = foldChat(
+    emptyTranscript(),
+    [
+      ev.kwRunStarted('run-1', LEAD, REPLY, { jobId: 'job-1' }),
+      ev.kwRunClosed('run-1', 'finished', 'provider_unavailable'),
+      ev.kwRunStarted('run-2', WRITER, SECOND, { jobId: 'job-2' }),
+      ev.notice(NOTICE, 'outcome_unknown', [], 'job-2'),
+      ev.kwRunClosed('run-2', 'finished', 'outcome_unknown'),
+    ],
+    1,
+  );
+  expect(live.errors).toEqual({ [LEAD]: 'provider_unavailable', [WRITER]: 'outcome_unknown' });
+  // "Show earlier messages" brings each follow-up's older notice from intake.
+  const earlier = reduceChat(live, {
+    type: 'earlier',
+    messages: [
+      reviewNotice('00-intake-1', 'review_before_rerun', 'job-1'),
+      reviewNotice('00-intake-2', 'review_before_rerun', 'job-2'),
+    ],
+  });
+  expect(earlier.errors).toEqual({ [LEAD]: 'review_before_rerun', [WRITER]: 'outcome_unknown' });
+  expect(earlier.jobs['job-1']?.review).toBe('review_before_rerun');
+  expect(earlier.jobs['job-2']?.review).toBe('outcome_unknown');
+});
+
+test('a_late_review_notice_never_brings_back_an_error_a_later_answer_cleared', () => {
+  const state = foldChat(
+    emptyTranscript(),
+    [
+      ev.kwRunStarted('run-1', LEAD, REPLY, { jobId: 'job-1' }),
+      ev.kwRunClosed('run-1', 'interrupted', 'lease_lost'),
+      ev.kwRunStarted('run-2', LEAD, SECOND, { jobId: 'job-2' }),
+      ev.stored(SECOND, 'Done', { author: { kind: 'kat', id: LEAD }, jobId: 'job-2' }),
+      ev.jobStatus('job-2', 'answered'),
+      ev.kwRunClosed('run-2', 'finished'),
+      // The first job's task is reclaimed after the answer and stops for a review.
+      ev.notice(NOTICE, 'interrupted_review_required', [], 'job-1'),
+    ],
+    1,
+  );
+  expect(state.errors).toEqual({});
+  expect(state.jobs['job-1']?.review).toBe('interrupted_review_required');
+});
+
+test('an_outcome_close_leaves_the_error_and_its_job_link_alone', () => {
+  const failed = foldChat(
+    emptyTranscript(),
+    [
+      ev.kwRunStarted('run-1', LEAD, REPLY, { jobId: 'job-1' }),
+      ev.kwRunClosed('run-1', 'finished', 'provider_unavailable'),
+    ],
+    1,
+  );
+  // A close with no code, and each outcome that is no error.
+  const closed = foldChat(
+    failed,
+    [
+      ev.kwRunStarted('run-2', LEAD, '10-reply', { jobId: 'job-2' }),
+      ev.kwRunClosed('run-2', 'finished'),
+      ev.kwRunStarted('run-3', LEAD, '11-reply', { jobId: 'job-3' }),
+      ev.kwRunClosed('run-3', 'cancelled', 'cancelled'),
+      ev.kwRunStarted('run-4', LEAD, '12-reply', { jobId: 'job-4' }),
+      ev.kwRunClosed('run-4', 'finished', 'question_pending'),
+      ev.kwRunStarted('run-5', LEAD, '13-reply', { jobId: 'job-5' }),
+      ev.kwRunClosed('run-5', 'finished', 'approval_pending'),
+    ],
+    3,
+  );
+  expect(closed.errors).toEqual({ [LEAD]: 'provider_unavailable' });
+  expect(closed.errorJobs).toEqual({ [LEAD]: 'job-1' });
+  // So the first job's review notice still reaches the line.
+  const reviewed = foldChat(closed, [ev.notice(NOTICE, 'review_before_rerun', [], 'job-1')], 11);
+  expect(reviewed.errors).toEqual({ [LEAD]: 'review_before_rerun' });
+});
+
+test('an_error_close_without_a_job_drops_the_stale_job_link', () => {
+  const state = foldChat(
+    emptyTranscript(),
+    [
+      ev.kwRunStarted('run-1', LEAD, REPLY, { jobId: 'job-1' }),
+      ev.kwRunClosed('run-1', 'finished', 'provider_unavailable'),
+      ev.kwRunStarted('run-2', LEAD, SECOND, { jobId: null }),
+      ev.kwRunClosed('run-2', 'finished', 'time_limit'),
+      // The first job's review notice must not rewrite the newer error.
+      ev.notice(NOTICE, 'review_before_rerun', [], 'job-1'),
+    ],
+    1,
+  );
+  expect(state.errors).toEqual({ [LEAD]: 'time_limit' });
+  expect(state.errorJobs).toEqual({});
 });
