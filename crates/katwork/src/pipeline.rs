@@ -175,6 +175,15 @@ pub async fn intake(
     if paused && stop.is_none() {
         notices.push((ReasonCode::WorkspacePaused, vec![], None));
     }
+    // A follow-up reruns a request whose job may already have changed something. That job has
+    // finished, so its tasks need no lock (and task rows would lock before the thread row).
+    if let Some(parent) = &parent {
+        let wrote: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM tasks WHERE workspace_id=$1 AND job_id=$2 AND effects_started_at IS NOT NULL)")
+            .bind(tenant.workspace_id()).bind(parent.id).fetch_one(&mut **tx).await?;
+        if wrote {
+            notices.push((ReasonCode::ReviewBeforeRerun, vec![], None));
+        }
+    }
     // All required existing-row locks precede the first write. New rows cannot be observed before commit.
     let mut request = message::append(
         tx,

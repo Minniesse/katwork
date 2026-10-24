@@ -200,6 +200,71 @@ fn provider_failure_after_write_requires_review() {
     }
 }
 #[test]
+fn restart_after_write_becomes_review_before_retry() {
+    let mut f = RunFacts::not_run(StopReason::PolicyChanged);
+    f.tool_calls = vec![call(
+        Some(SideEffect::WorkspaceWrite),
+        ToolCallState::Succeeded,
+    )];
+    assert_eq!(
+        policy::decide_job(&f, &Thresholds::SP1),
+        verdict(
+            PolicyStatus::Stopped,
+            ReasonCode::PolicyChanged,
+            NextStep::ReviewBeforeRetry
+        )
+    );
+}
+#[test]
+fn hand_to_lead_after_write_becomes_review_before_retry() {
+    let mut f = RunFacts::not_run(StopReason::LoopDetected);
+    f.tool_calls = vec![call(
+        Some(SideEffect::WorkspaceWrite),
+        ToolCallState::Succeeded,
+    )];
+    assert_eq!(
+        policy::decide_job(&f, &Thresholds::SP1),
+        verdict(
+            PolicyStatus::Stopped,
+            ReasonCode::LoopDetected,
+            NextStep::ReviewBeforeRetry
+        )
+    );
+}
+#[test]
+fn no_review_first_without_state_changing_effects() {
+    for (stop, reason, next) in [
+        (
+            StopReason::PolicyChanged,
+            ReasonCode::PolicyChanged,
+            NextStep::RestartJob,
+        ),
+        (
+            StopReason::LoopDetected,
+            ReasonCode::LoopDetected,
+            NextStep::HandToLead,
+        ),
+    ] {
+        let mut f = RunFacts::not_run(stop);
+        for calls in [
+            vec![],
+            vec![call(Some(SideEffect::Read), ToolCallState::Succeeded)],
+            vec![call(
+                Some(SideEffect::WorkspaceWrite),
+                ToolCallState::Refused,
+            )],
+        ] {
+            f.tool_calls = calls;
+            assert_eq!(
+                policy::decide_job(&f, &Thresholds::SP1),
+                verdict(PolicyStatus::Stopped, reason, next),
+                "{stop:?} {:?}",
+                f.tool_calls
+            );
+        }
+    }
+}
+#[test]
 fn decision_event_replays_same_verdict() {
     for (stop, _, _, _) in cases() {
         let f = RunFacts::not_run(stop);
@@ -306,7 +371,12 @@ fn policy_table_covers_fact_combinations_and_every_call_state_and_effect() {
                     assert_eq!(inputs.effects_dispatched, review);
                     assert_eq!(inputs.tool_calls, 1);
                     let mut wanted = expected.clone();
-                    if review && wanted.next == Some(NextStep::Retry) {
+                    if review
+                        && matches!(
+                            wanted.next,
+                            Some(NextStep::Retry | NextStep::RestartJob | NextStep::HandToLead)
+                        )
+                    {
                         wanted.next = Some(NextStep::ReviewBeforeRetry);
                     }
                     assert_eq!(

@@ -5,20 +5,32 @@
 #[allow(dead_code)]
 mod support;
 
+use async_trait::async_trait;
 use katwork::{
-    agent::{Initiator, PendingCall, RunFacts, StopReason},
+    agent::{
+        Initiator, Limits, PendingCall, RunEnv, RunFacts, RunInput, RunKind, StopReason, Tool,
+        ToolCtx, ToolError, ToolOutput, ToolRegistry, run,
+    },
     chat::{self, Author, NewMessage},
     error::KatError,
-    events::{AgUiEvent, KatworkEvent, RunClosedEvent, RunEnd, log},
+    events::{AgUiEvent, EventHub, KatworkEvent, PgEventSink, RunClosedEvent, RunEnd, log},
+    fence::Fence,
     ids::*,
     jobs::{HarnessEnd, RouteRule, Routing, TaskInput, job, task},
+    models::{
+        AssistantTurn, ChatChunk, ChatMsg, FakeProvider, FakeTurn, ModelEntry, ModelProvider,
+        ModelTimeouts, Registry, StopKind, ToolCall, ToolSpec, Usage,
+    },
     policy::{self, Thresholds},
+    team::kat,
     tenancy::{self, Tenant},
-    types::Question,
+    types::{ModelTier, Question, SideEffect, SpacePolicy},
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Transaction};
+use std::{sync::Arc, time::Duration};
 use support::Fixture;
+use tokio_util::sync::CancellationToken;
 
 async fn tenant(pool: &PgPool, f: &Fixture) -> Tenant {
     tenancy::resolve(pool, UserId(f.user), WorkspaceId(f.workspace))
@@ -1283,4 +1295,276 @@ async fn heartbeat_stop_can_override_a_closed_run_reason(pool: PgPool) {
         1
     );
     assert_eq!(ev.last().unwrap()["value"]["state"], "paused");
+}
+
+/// A tool whose call leads the run to `stop`.
+struct Probe {
+    effect: SideEffect,
+    stop: StopReason,
+}
+#[async_trait]
+impl Tool for Probe {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "probe".into(),
+            description: "Test tool".into(),
+            parameters: json!({"type":"object"}),
+        }
+    }
+    fn side_effect(&self) -> SideEffect {
+        self.effect
+    }
+    async fn call(&self, ctx: &ToolCtx, _: Value) -> Result<ToolOutput, ToolError> {
+        match self.stop {
+            StopReason::Interrupted => return Err(ToolError::Halted(StopReason::Interrupted)),
+            StopReason::OutcomeUnknown => return Err(ToolError::OutcomeUnknown),
+            StopReason::PolicyChanged => {
+                sqlx::query("UPDATE kats SET policy_version=policy_version+1 WHERE id=$1")
+                    .bind(ctx.kat_id)
+                    .execute(&ctx.pool)
+                    .await
+                    .unwrap();
+            }
+            StopReason::WorkspacePaused => {
+                sqlx::query("UPDATE workspaces SET paused=true WHERE id=$1")
+                    .bind(ctx.tenant.workspace_id())
+                    .execute(&ctx.pool)
+                    .await
+                    .unwrap();
+            }
+            // A provider failure comes from the script running out, a loop from its repeats.
+            _ => {}
+        }
+        Ok(ToolOutput::Text("done".into()))
+    }
+}
+/// A scripted Kat calls `probe` until its run stops for `stop`; the job concludes on that run's facts.
+async fn probe_run(pool: &PgPool, effect: SideEffect, stop: StopReason) -> (Fixture, RunId) {
+    let f = Fixture::new(pool).await;
+    f.live_lease(pool).await;
+    sqlx::query("UPDATE kats SET tool_allowlist=$2, appearance='{\"avatar\":\"kat\",\"accent\":\"blue\"}' WHERE id=$1")
+        .bind(f.kat)
+        .bind(vec!["probe"])
+        .execute(pool)
+        .await
+        .unwrap();
+    let t = tenant(pool, &f).await;
+    let kat = kat::get(pool, &t, KatId(f.kat)).await.unwrap();
+    // The loop guard refuses the third identical call.
+    let calls = if stop == StopReason::LoopDetected {
+        3
+    } else {
+        1
+    };
+    let fake = FakeProvider::scripted(
+        (0..calls)
+            .map(|i| {
+                FakeTurn::Chunks(vec![
+                    ChatChunk::Usage(Usage {
+                        input: Some(10),
+                        output: Some(10),
+                        complete: true,
+                        ..Usage::default()
+                    }),
+                    ChatChunk::Done {
+                        stop: StopKind::ToolUse,
+                        turn: AssistantTurn {
+                            content: String::new(),
+                            tool_calls: vec![ToolCall {
+                                id: format!("call{i}"),
+                                name: "probe".into(),
+                                args_json: "{}".into(),
+                            }],
+                            replay: None,
+                        },
+                    },
+                ])
+            })
+            .collect(),
+    );
+    let entry = ModelEntry {
+        provider_id: fake.id().into(),
+        model: "script".into(),
+        tier: ModelTier::Standard,
+        capabilities: fake.capabilities(),
+        max_output_tokens: 4096,
+        temperature: None,
+        price: None,
+        timeouts: ModelTimeouts::HOSTED,
+    };
+    let models = Registry::from_entries(vec![(entry, Arc::new(fake) as Arc<dyn ModelProvider>)]);
+    let mut tools = ToolRegistry::builtin();
+    tools.register(Arc::new(Probe { effect, stop })).unwrap();
+    let run_id = RunId::new();
+    let sink = PgEventSink::new(
+        pool.clone(),
+        EventHub::default(),
+        Duration::from_secs(5),
+        WorkspaceId(f.workspace),
+        ThreadId(f.thread),
+        Some(run_id),
+        Some(Fence {
+            task_id: TaskId(f.task),
+            epoch: LeaseEpoch(1),
+        }),
+    );
+    let input = RunInput {
+        tenant: t,
+        run_id,
+        thread_id: ThreadId(f.thread),
+        space_id: SpaceId(f.space),
+        job_id: JobId(f.job),
+        task_id: TaskId(f.task),
+        lease_epoch: LeaseEpoch(1),
+        kind: RunKind::Initial,
+        space_policy: SpacePolicy {
+            allow_external: false,
+        },
+        history: vec![ChatMsg::User {
+            content: "Hello".into(),
+            name: None,
+        }],
+        reply_message_id: MessageId::new(),
+        policy_version: kat.policy_version,
+        actor: UserId(f.user),
+        initiator: Initiator::Person,
+        deadline: tokio::time::Instant::now() + Duration::from_secs(600),
+        cancel: CancellationToken::new(),
+    };
+    let env = RunEnv {
+        lock_timeout: Duration::from_secs(5),
+        pool,
+        models: &models,
+        tools: &tools,
+        sink: &sink,
+    };
+    let facts = run::execute(&env, &kat, input, &Limits::default())
+        .await
+        .unwrap();
+    assert_eq!(facts.stop, Some(stop));
+    conclude(pool, &f, &facts).await.unwrap();
+    (f, run_id)
+}
+async fn system_notices(pool: &PgPool, f: &Fixture) -> Vec<(String, Value)> {
+    sqlx::query_as(
+        "SELECT body,meta FROM messages WHERE workspace_id=$1 AND job_id=$2 AND author_kind='system' ORDER BY id",
+    )
+    .bind(f.workspace)
+    .bind(f.job)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+fn notice(f: &Fixture, code: &str) -> (String, Value) {
+    (
+        code.into(),
+        json!({"code":code,"kats":[{"id":f.kat,"name":"นักวิจัย"}]}),
+    )
+}
+/// The recorded decision's next step, the run's stop reason and close code, and the Kat's last state.
+async fn stop_record(
+    pool: &PgPool,
+    f: &Fixture,
+    run: RunId,
+) -> (Value, Option<String>, Value, Value) {
+    let stop_reason =
+        sqlx::query_scalar("SELECT stop_reason FROM runs WHERE workspace_id=$1 AND id=$2")
+            .bind(f.workspace)
+            .bind(run)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let ev = events(pool, f).await;
+    let named = |name: &str| ev.iter().rev().find(|e| e["name"] == name).unwrap().clone();
+    (
+        named("katwork.decision")["value"]["verdict"]["next"].clone(),
+        stop_reason,
+        named("katwork.run_closed")["value"]["code"].clone(),
+        named("katwork.kat_state")["value"]["state"].clone(),
+    )
+}
+async fn write_then_stop(pool: &PgPool, stop: StopReason, reason: &str, kat_state: &str) {
+    let (f, run) = probe_run(pool, SideEffect::WorkspaceWrite, stop).await;
+    assert_eq!(
+        system_notices(pool, &f).await,
+        [notice(&f, "review_before_rerun")]
+    );
+    assert_eq!(outcome(pool, &f).await.1.as_deref(), Some(reason));
+    assert_eq!(
+        stop_record(pool, &f, run).await,
+        (
+            json!("review_before_retry"),
+            Some(reason.into()),
+            json!(reason),
+            json!(kat_state)
+        )
+    );
+}
+#[sqlx::test(migrations = "./migrations")]
+async fn provider_failure_after_write_posts_the_review_notice(pool: PgPool) {
+    write_then_stop(
+        &pool,
+        StopReason::ProviderUnavailable,
+        "provider_unavailable",
+        "idle",
+    )
+    .await;
+}
+#[sqlx::test(migrations = "./migrations")]
+async fn policy_change_after_write_posts_the_review_notice(pool: PgPool) {
+    write_then_stop(&pool, StopReason::PolicyChanged, "policy_changed", "idle").await;
+}
+#[sqlx::test(migrations = "./migrations")]
+async fn loop_after_write_posts_the_review_notice(pool: PgPool) {
+    write_then_stop(&pool, StopReason::LoopDetected, "loop_detected", "idle").await;
+}
+#[sqlx::test(migrations = "./migrations")]
+async fn paused_stop_after_write_posts_the_review_notice(pool: PgPool) {
+    // The review notice replaces the pause notice too; the Kat still shows as paused.
+    write_then_stop(
+        &pool,
+        StopReason::WorkspacePaused,
+        "workspace_paused",
+        "paused",
+    )
+    .await;
+}
+#[sqlx::test(migrations = "./migrations")]
+async fn stops_without_a_write_keep_their_own_notice(pool: PgPool) {
+    for (stop, code, next) in [
+        (
+            StopReason::ProviderUnavailable,
+            "provider_unavailable",
+            "retry",
+        ),
+        (StopReason::PolicyChanged, "policy_changed", "restart_job"),
+        (StopReason::LoopDetected, "loop_detected", "hand_to_lead"),
+    ] {
+        let (f, run) = probe_run(&pool, SideEffect::Read, stop).await;
+        assert_eq!(
+            system_notices(&pool, &f).await,
+            [notice(&f, code)],
+            "{stop:?}"
+        );
+        assert_eq!(stop_record(&pool, &f, run).await.0, json!(next), "{stop:?}");
+    }
+}
+#[sqlx::test(migrations = "./migrations")]
+async fn review_reasons_keep_their_own_notice(pool: PgPool) {
+    for (stop, code) in [
+        (StopReason::Interrupted, "interrupted_review_required"),
+        (StopReason::OutcomeUnknown, "outcome_unknown"),
+    ] {
+        let (f, run) = probe_run(&pool, SideEffect::WorkspaceWrite, stop).await;
+        assert_eq!(
+            system_notices(&pool, &f).await,
+            [notice(&f, code)],
+            "{stop:?}"
+        );
+        assert_eq!(
+            stop_record(&pool, &f, run).await.0,
+            json!("review_before_retry"),
+            "{stop:?}"
+        );
+    }
 }

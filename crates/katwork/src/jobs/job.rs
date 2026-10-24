@@ -10,7 +10,7 @@ use crate::{
         MessageStoredEvent, RunClosedEvent, RunEnd, log,
     },
     ids::*,
-    policy::{self, PolicyInputs, PolicyStatus, Thresholds, Verdict},
+    policy::{self, NextStep, PolicyInputs, PolicyStatus, Thresholds, Verdict},
     team::kat,
     tenancy::Tenant,
     types::{JobStatus, ReasonCode},
@@ -370,6 +370,10 @@ pub async fn conclude(
     }
     if v.status == PolicyStatus::Stopped {
         let code = match v.reason.ok_or(KatError::RequestInvalid)? {
+            // A stop that needs a review asks for it instead of showing its usual retry copy;
+            // the two review reasons already ask.
+            code @ (ReasonCode::InterruptedReviewRequired | ReasonCode::OutcomeUnknown) => code,
+            _ if v.next == Some(NextStep::ReviewBeforeRetry) => ReasonCode::ReviewBeforeRerun,
             ReasonCode::WorkspacePaused => ReasonCode::WorkspacePausedStopped,
             ReasonCode::KatPaused => ReasonCode::KatPausedStopped,
             code => code,
