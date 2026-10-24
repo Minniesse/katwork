@@ -3,6 +3,7 @@ pub mod auth;
 pub mod chat;
 pub mod config;
 pub mod db;
+pub mod docs;
 pub mod error;
 pub mod events;
 pub mod fence;

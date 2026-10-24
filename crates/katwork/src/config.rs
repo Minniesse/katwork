@@ -7,6 +7,8 @@ use crate::error::KatError;
 
 pub struct Config {
     pub lock_timeout: Duration,
+    /// `KATWORK_DOC_WORKERS`: the document pool's threads, 1 to 16.
+    pub doc_workers: usize,
     pub database_url: String,
     pub secret: String,
     pub demo: bool,
@@ -405,6 +407,16 @@ impl Config {
             trusted_proxies,
         };
         let lock_timeout = lock_timeout(optional("KATWORK_LOCK_TIMEOUT_MS"))?;
+        let doc_workers = match optional("KATWORK_DOC_WORKERS") {
+            None => 2,
+            Some(value) => value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+                .then(|| value.parse::<usize>().ok())
+                .flatten()
+                .filter(|workers| (1..=16).contains(workers))
+                .ok_or(invalid("KATWORK_DOC_WORKERS"))?,
+        };
         let smtp = if let Some(host) = optional("SMTP_HOST") {
             if host.contains('@') {
                 return Err(invalid("SMTP_HOST"));
@@ -444,6 +456,7 @@ impl Config {
         };
         Ok(Self {
             lock_timeout,
+            doc_workers,
             local,
             database_url,
             secret,

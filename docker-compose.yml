@@ -15,6 +15,7 @@ x-katwork-environment: &katwork-environment
   KATWORK_TRUSTED_PROXIES: ${KATWORK_TRUSTED_PROXIES:-}
   KATWORK_HEADER_TIMEOUT_SECONDS: ${KATWORK_HEADER_TIMEOUT_SECONDS:-}
   KATWORK_LOCK_TIMEOUT_MS: ${KATWORK_LOCK_TIMEOUT_MS:-}
+  KATWORK_DOC_WORKERS: ${KATWORK_DOC_WORKERS:-}
   KATWORK_IDLE_TIMEOUT_SECONDS: ${KATWORK_IDLE_TIMEOUT_SECONDS:-}
   KATWORK_MAX_CONNECTIONS: ${KATWORK_MAX_CONNECTIONS:-}
   KATWORK_MAX_CONNECTIONS_PER_IP: ${KATWORK_MAX_CONNECTIONS_PER_IP:-}
@@ -86,7 +87,9 @@ services:
 
   katwork:
     <<: *katwork-image
+    # Also restarts the server the document pool watchdog exits (code 70) when the pool wedges.
     restart: unless-stopped
+    mem_limit: ${KATWORK_MEMORY_LIMIT:-4g}
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     init: true

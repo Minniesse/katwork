@@ -98,3 +98,82 @@ async fn registry_probe() {
         assert!(stream.next().now_or_never().is_some());
     }
 }
+
+#[cfg(feature = "smoke-fixtures")]
+#[tokio::test]
+async fn smoke_wedge_once_blocks_every_thread_only_without_its_marker() {
+    use katwork::docs::{DocLimits, DocPool, pool::smoke::wedge_once};
+    use std::{path::Path, sync::Arc};
+
+    let pool = Arc::new(
+        DocPool::new(
+            2,
+            DocLimits {
+                call_timeout: Duration::from_millis(10),
+                ..DocLimits::default()
+            },
+        )
+        .unwrap(),
+    );
+    // Compose passes the switch as `${VAR:-}`: empty means off.
+    assert!(!wedge_once(&pool, Path::new("")).unwrap());
+    let dir = std::env::temp_dir().join(format!("katwork-wedge-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir(&dir).unwrap();
+    let marker = dir.join("wedged");
+    std::fs::write(&marker, b"").unwrap();
+    // A restarted server finds its marker and leaves the pool alone.
+    assert!(!wedge_once(&pool, &marker).unwrap());
+    std::fs::remove_file(&marker).unwrap();
+    assert!(wedge_once(&pool, &marker).unwrap());
+    assert!(marker.exists());
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !pool.wedged() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("every thread blocked");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn smoke_call_timeout_only_affects_feature_builds() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "doc_limits_probe"])
+        .env("KATWORK_SMOKE_TEST", "1")
+        .env("KATWORK_SMOKE_DOC_CALL_TIMEOUT_MS", "200")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[tokio::test]
+async fn doc_limits_probe() {
+    if std::env::var("KATWORK_SMOKE_TEST").is_err() {
+        return;
+    }
+    let config = katwork::config::Config::from_lookup(|key| match key {
+        "DATABASE_URL" => Some("postgres://localhost/fixture".into()),
+        "KATWORK_SECRET" => Some(uuid::Uuid::now_v7().to_string()),
+        _ => None,
+    })
+    .unwrap();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy(&config.database_url)
+        .unwrap();
+    let core = katwork::runtime::Core::new(pool, std::sync::Arc::new(config));
+    let limits = core.docs.limits();
+    let expected = if cfg!(feature = "smoke-fixtures") {
+        Duration::from_millis(200)
+    } else {
+        Duration::from_secs(30)
+    };
+    assert_eq!(
+        (limits.call_timeout, limits.wedge_exit_after),
+        (expected, expected)
+    );
+}

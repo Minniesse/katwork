@@ -1219,3 +1219,23 @@ fn empty_lock_timeout_uses_default() {
     .unwrap();
     assert_eq!(config.lock_timeout, std::time::Duration::from_millis(5000));
 }
+
+#[test]
+fn doc_workers_is_one_to_sixteen() {
+    let workers = |value: Option<&str>| {
+        Config::from_lookup(|name| {
+            if name == "KATWORK_DOC_WORKERS" {
+                value.map(str::to_owned)
+            } else {
+                lookup(name)
+            }
+        })
+    };
+    for (value, expected) in [(None, 2), (Some(""), 2), (Some("1"), 1), (Some("16"), 16)] {
+        assert_eq!(workers(value).unwrap().doc_workers, expected);
+    }
+    for value in ["0", "17", "-1", "+2", "two", "2.0"] {
+        let error = workers(Some(value)).unwrap_err();
+        assert_eq!(error.to_string(), "config_invalid (KATWORK_DOC_WORKERS)");
+    }
+}
