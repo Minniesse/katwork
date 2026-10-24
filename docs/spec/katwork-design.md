@@ -37,7 +37,7 @@ KatWork lets anyone in an organization hire a team of named AI coworkers ("Kats"
 - Voice and video calls.
 - Federation between installs. It moves to the first post-alpha release (§12).
 - Native Linux binaries inside a Kat's computer. Native tools run as KatWork Rust tools or pinned containers; native Linux comes with the in-house agentOS (§9).
-- Live Kat control of Craft apps. The alpha shows revision previews; live control waits for a bridge in the Craft web builds (§9.1).
+- A streamed desktop for the Craft apps. Kats drive the apps' MCP servers and people open their web builds (§9.1); an app running windowed on a virtual display waits for sub-project 7.
 - High availability or multi-host scheduling.
 - A hosted cloud offering. The paid cloud comes after the alpha (§16).
 - Unofficial WhatsApp Web, and any GPL or AGPL code in the core.
@@ -59,7 +59,7 @@ KatWork lets anyone in an organization hire a team of named AI coworkers ("Kats"
 | Decision layer | Laya, multilingual checkpoint only, running inside Rust (ONNX via `ort`, or `laya-rust`), with separate calibration per language. Used for intake routing only, in shadow mode until it passes the 50-case calibration gate; the lead Kat routes until then (§6.3). |
 | Routing | A 4-stage routing design (§6) combined with the four JEVIS layers (§5). |
 | Sandbox | rivet agentOS now, plus one Chromium container per Kat, driven by the Rust browser supervisor. Later, an in-house agentOS replaces the existing one; candidates are under evaluation (§14). |
-| Office apps | The storytold Craft apps where they pass our gates (§9). docx-rs, umya-spreadsheet, pdf-extract, lopdf, Typst and OAR-OCR are the dependable base. |
+| Office apps | All 13 storytold Craft apps, forked, from sub-project 2a: Kats drive them behind a policy proxy, and people watch and take over in the office (§9.1; founder decisions, 2026-10-24). docx-rs, umya-spreadsheet, pdf-extract, lopdf, Typst and OAR-OCR are the dependable base, and KatWork's own readers check every file an app saves. |
 | Memory | Built in: Postgres, Qdrant and Tantivy with nlpO3, per Kat and per team. Plus a RustShare connector. |
 | Views | 3D office (react-three-fiber with Kenney and Quaternius CC0 assets), live agent graph, chat, tasks-and-files board. |
 | Federation | After the alpha (founder decision, 2026-10-22): a selective fork of reason-network with our own identity and relay (§12). |
@@ -135,10 +135,10 @@ KatWork follows the JEVIS layering: **the decision model advises, the harness ex
 │   channel adapters (LINE, Slack, Teams, RustChat/Mattermost, Telegram, Discord, WhatsApp)   │
 │   federation bridge, after the alpha (reason-network fork, OIDC identity, own relay)        │
 │ kat-workers (Rust) ── agentOS sidecars (one workspace per Kat); document tools in-process   │
-│ katwork-craft (Craft CLIs, one throwaway user per call; default stack, §9.1)                │
+│ katwork-craft (13 Craft apps behind a policy proxy, a throwaway user each; §9.1)            │
 │ katwork-ocr (OAR-OCR, Tesseract, hayro; optional profile, docs/adr/0008)                    │
 │ browser-supervisor (Rust, chromiumoxide) ── chromium per Kat (a profile per person)         │
-│ craft-apps (web builds / MCP servers that pass the gates, §9)                               │
+│ katwork-craft-web (the apps' web builds on their own origin, via a host page)               │
 │ postgres (jobs, tasks, proposals, events, memory metadata) · qdrant (vectors)               │
 │ artifact volume (local or S3-compatible) · optional: mistral.rs local LLM                   │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -148,6 +148,7 @@ Vendor picks (one primary pick per role):
 - **Core:** Rig (model provider clients only) · Tokio · Axum · SQLx on PostgreSQL · rmcp (MCP) · a2a-rs (external peers only) · openidconnect (federation identity in sub-project 8, after the alpha; SSO is Enterprise, §16).
 - **Sandbox and browser:** rivet agentOS Rust client and sidecar · chromiumoxide.
 - **Documents:** docx-rs · umya-spreadsheet · rust_xlsxwriter · pdf-extract · lopdf · Typst · OAR-OCR (PP-OCRv5 Thai, the default OCR engine) · hayro (PDF rasterizing for OCR, in the OCR container) · Craft CLIs in the `katwork-craft` sidecar (§9.1).
+- **Craft apps:** the 13 forks (`Minniesse/<app>`) and their MCP servers, in the `katwork-craft` sidecar · seccompiler (its seccomp filter) · sigstore (the image's signed hash list, verified offline) · `katwork-bridge` (the bridge protocol in every web build) · ICU4X's line segmenter (Thai line breaking in the forks).
 - **Search and Thai text:** Tantivy with nlpO3 · Qdrant · ICU4X.
 - **Inference:** ort (Laya) · mistral.rs (optional local LLM, and the opt-in Typhoon OCR model, `docs/adr/0008-thai-ocr-engines.md`).
 - **Front end:** AG-UI protocol 1.0 events as KatWork serde types, each validated against the protocol's JSON Schema; the community Rust crates are not used. A thread's stream carries overlapping runs and KatWork events, so it is KatWork's own stream built from AG-UI shapes, read by KatWork's web client, not by stock AG-UI clients (`docs/adr/0003-own-ag-ui-event-types.md`). Our own React UI, not CopilotKit Intelligence.
@@ -328,51 +329,69 @@ The alpha computer for each Kat has these parts:
   - Typst produces new cited PDF reports.
   - Filling a customer's template, editing an existing workbook, and lopdf's constrained PDF edits move to sub-project 3, with the template work.
   - The render check moves to sub-project 3 and is advisory until it passes: patched WordCraft output is compared with real-Word PDFs on a Thai and English corpus, and until it passes the §9.1 gate its render is a preview labelled "approximate" and acceptance uses read-back.
+- **Craft apps** in the `katwork-craft` sidecar, outside agentOS: a Kat opens a file in one of the 13 apps through KatWork's Craft tools, and people watch and take over (§9.1).
 - **Network rules.** Egress is limited per Kat. Secrets stay outside the sandbox, and no control-plane files or provider keys are mounted.
 
 ### 9.1 Craft apps as visible office apps
 
-**Policy.** A small, qualified set of Craft apps gives Kats visible office tools. **KatWork's document pipeline stays authoritative**: the Rust libraries above produce every deliverable. The root code of all 13 Craft repos is dual MIT OR Apache-2.0, and KatWork uses the Apache-2.0 branch; dependency exceptions are listed per app. All have browser builds, FilmCraft included. They are only 13–22 days old, though, so every operation is gated.
+**Policy.** All 13 storytold Craft apps are office apps from sub-project 2a (founder decisions, 2026-10-24; `docs/adr/0011-craft-apps-in-katwork.md`): WordCraft, GridCraft, PdfCraft, DeckCraft, DesignCraft, VectorCraft, FigCraft, PhotoCraft, LightCraft, CADCraft, FilmCraft, EffectCraft and SoundCraft. Kats drive them, and people watch the work live in the office and can take over. **KatWork's evidence pipeline stays authoritative**: the Rust libraries above produce every file KatWork writes itself, and a file a Craft app saves is read back with KatWork's own readers and checked by KatWork's verifier like any other output; nothing an app reports about a file is evidence. The root code of all 13 Craft repos is dual MIT OR Apache-2.0, and KatWork uses the Apache-2.0 branch; dependency exceptions are listed per app in ADR-0011. All have browser builds. They are young, agent-built code with hundreds of open issues, and their parity numbers are not evidence, so every tool and command a Kat can reach is allowed one by one.
 
-**The apps are displayed inside KatWork (founder decision).** Craft apps run as **web builds** inside KatWork. Live Kat control needs a `postMessage` bridge that the Craft web builds lack, so the alpha ships revision preview and person editing; KatWork proposes the bridge upstream in parallel, and WordCraft and PhotoCraft are viewers until it lands (founder decision, 2026-10-22):
-- In the 3D office, each Kat's monitor shows a labelled preview of its current revision (PdfCraft, WordCraft, PhotoCraft…), and the live app once the bridge lands.
-- Clicking the Kat opens a full-size **Computer panel** with the same web app on that revision. Where editing is enabled, a person edits through the control lease.
+**Forks and the image** (founder decisions, 2026-10-24):
+- Every app is forked under the founder's GitHub account (`Minniesse/<app>`), and each change is also opened as an upstream PR. The forks remove the ArtCraft marks; compile plug-in hosts, script engines, network clients, model downloads, collaboration clients and patent-pool codecs out of KatWork's builds; give each web build the KatWork bridge; and wrap Thai between words in every app that lacks it.
+- KatWork's CI builds the `katwork-craft` image from the pinned fork commits and publishes it under the founder's GitHub container registry; Compose pulls it by digest. The build's per-file SHA-256 list is signed (Sigstore keyless, in GitHub Actions), and the sidecar checks it at startup. An operator can still build the image locally, unsigned, by opting in.
+
+**The apps are displayed inside KatWork (founder decision).** Craft apps run as **web builds** inside KatWork, all speaking one bridge protocol: the nine apps without a host bridge get it in their forks, and the four with one (GridCraft, PdfCraft, CADCraft, VectorCraft) an adapter (founder decision, 2026-10-24).
+- In a thread, a Kat's Craft session shows each step and a labelled preview of the current revision as it happens. In the 3D office, each Kat's monitor shows the same previews.
+- Clicking the session opens a full-size **Computer panel** with the app's web build on the latest saved version, read-only; the step feed and its previews show the revision the Kat is working on. A person who takes over edits through the control lease.
 - On mobile, the panel opens full-screen, read-only by default.
-- Each embedded app is served from its own sandboxed origin per Kat session (below), so it can't reach KatWork's authenticated origin.
+- The web builds are served from their own origin, on a different host from KatWork's, through a small host page that relays the bridge protocol with origin, source and token checks, so an app can't reach KatWork's authenticated origin. Sub-project 2a serves every app from one such origin; an origin per Kat session arrives with sub-project 7.
 
-**Alpha set, in qualification order:**
+**What Kats use them for in sub-project 2a:**
 
-| Order | App | Role in the alpha |
+| App | Files | Role |
 |---|---|---|
-| 1 | **PdfCraft** | Opens source PDFs and generated report PDFs in the office, so people can see a Kat reading and checking citations. It has explicit Thai shaping. Its OCR cannot read Thai, so Thai scans go through KatWork's `OcrEngine` (`docs/adr/0008-thai-ocr-engines.md`). |
-| 2 | **PhotoCraft** | Narrow image operations through its sidecar: crop, resize, composite and format conversion, for report figures and cover images. Starts with PNG and JPEG. The web build is a viewer until the bridge lands; then it becomes a workbench where a person can continue the work. |
-| 3 | **WordCraft** | A viewer in the alpha: inspects drafts and previews the meeting-minutes template. Once the bridge lands, editing is enabled only for templates that pass independent DOCX round-trip tests. |
-| 2a, check only | **GridCraft** | In the `katwork-craft` sidecar: `gridcraft-cli check` on every XLSX output before it is saved, and a reader challenger behind KatWork's package guard. umya-spreadsheet stays the reader until GridCraft wins its challenge, and GridCraft never edits a saved file in the product: loading a file recalculates formulas, which must never replace the saved source values. |
-| Deferred | Other nine apps | DeckCraft for PPTX (Phase 2), the creative apps (Phase 4), and the rest. |
+| **WordCraft** | DOCX; saves DOCX and PDF | Drafting and editing documents. A Kat's edits to an existing document are tracked changes under its AI author name. It renders the labelled preview of each DOCX output. |
+| **GridCraft** | XLSX and CSV | Editing workbooks. Its check runs on every XLSX output before it is saved (below), and it is a reader challenger behind KatWork's package guard; umya-spreadsheet stays the reader until GridCraft wins its challenge. |
+| **PdfCraft** | PDF | Reading, annotating, combining, filling and redacting PDFs; its text extraction is a reader challenger. Its OCR cannot read Thai, so Thai scans go through KatWork's `OcrEngine` (`docs/adr/0008-thai-ocr-engines.md`). |
+| **DeckCraft** | PPTX; saves PPTX and PDF | Slides. KatWork reads PPTX for evidence. |
+| **DesignCraft** | its own format; saves PDF | Page layout. |
+| **VectorCraft** | its own format; saves SVG, PDF and PNG | Vector art, diagrams and charts. |
+| **FigCraft** | its own format; saves PDF, PNG and SVG | Interface design. |
+| **PhotoCraft** | its own format; saves PNG and JPEG | Layered images: crop, resize, composite and text, for report figures and cover images. |
+| **LightCraft** | a photo with its develop settings; saves JPEG and PNG | Photo development. |
+| **CADCraft** | DXF; saves DXF, PDF, SVG and PNG | 2D drawings. DWG waits for sub-project 7. |
+| **FilmCraft** | a project with its media; exports audio, frames and captions | Video editing. |
+| **EffectCraft** | a project with its footage; renders PNG, WebM, GIF and Lottie | Motion graphics. |
+| **SoundCraft** | its own session format; bounces WAV and FLAC | Audio editing. |
+
+Outputs KatWork cannot read (images, vector art, drawings, video, audio and the apps' own formats) are labelled "not checked against sources"; citing their content waits for sub-project 7.
 
 **How Kats drive them:**
-- **In sub-project 2a, the `katwork-craft` sidecar** is the first such sidecar and part of the default product stack: a pinned container on an internal network with no egress, its Craft CLIs built from source at pinned commits by the image itself, with each build's SHA-256s recorded, exposing only WordCraft's labelled preview render of DOCX outputs, GridCraft's check of every XLSX output before it is saved, and PdfCraft's text extraction if it wins its reader challenge. A file GridCraft reports Excel would repair is refused. **When the sidecar is unavailable, saves continue** (founder decision, 2026-10-24): the XLSX version is marked "not checked by GridCraft" on the Files page and in its evidence report, the person sees a notice, `/healthz` reports the sidecar as unavailable, and previews show a label instead of an image. An operator turns it off only with `KATWORK_CRAFT=off`, which logs a warning and marks versions the same way.
-- **Sidecar CLI or MCP first** for bounded automation. These tools run as pinned images, isolated per call in sub-project 2a (one shared `katwork-craft` container in which every CLI call runs as its own throwaway user, with a fresh uid, its own mode-0700 directory and no other writable path, and nothing kept afterwards; founder decision, 2026-10-24) and per workspace from sub-project 7, when one container per workspace arrives, exposed as a small allowlist of operations (inspect, render page, propose image edit, save draft).
-- **The browser build** when a person needs to see or edit the current revision. It runs from a separate origin per Kat or session, with a minimal host page that receives only a scoped artifact capability.
-- **One active editor at a time.** A control lease belongs to either the Kat or the person. Takeover pauses automation, a save creates a new revision, and stale writes are rejected.
-- **The office monitor shows labelled previews** of the current revision in the alpha. It streams the Kat's actual session once the bridge lands.
+- **The `katwork-craft` sidecar** runs every app and is part of the default product stack: a pinned container on an internal network with no egress, not a child process of the server. It also runs the one-shot checks: WordCraft's labelled preview render of DOCX outputs, GridCraft's check of every XLSX output before it is saved, and PdfCraft's text extraction if it wins its reader challenge. A file GridCraft reports Excel would repair is refused. **When the sidecar is unavailable, saves continue** (founder decision, 2026-10-24): the XLSX version is marked "not checked by GridCraft" on the Files page and in its evidence report, the person sees a notice, `/healthz` reports the sidecar as unavailable, and previews show a label instead of an image. An operator turns it off only with `KATWORK_CRAFT=off`, which logs a warning and marks versions the same way.
+- **Sessions through each app's MCP server.** A Kat opens a file in an app with KatWork's Craft tools. The sidecar starts that app's MCP server for the session as its own throwaway user (a fresh uid, its inputs readable and not writable (LightCraft's opened photo sits in its output folder, beside the XMP sidecar the app writes, and a save that changed the photo is refused), writing only its own output, home and temporary folders under a disk cap, no network and no socket of any kind, nothing of another session's open to it, nothing of the Kat's on its command line, and nothing kept afterwards), in one shared container in sub-project 2a and in one container per workspace from sub-project 7 (founder decision, 2026-10-24). No desktop app, control port or attach mode exists in the image.
+- **A policy proxy decides every call**, not the app. Each app has a policy: every tool, every command of its command and batch tools, and every argument constraint is allowed or forbidden, with examples it checks at startup. Unknown tools and commands are forbidden, paths stay inside the session's input and output folders, and an app's request to run a model is refused. MCP annotations decide nothing.
+- **Hidden text never reaches the model through an app** (founder decision, 2026-10-24). When the file a Kat opens, or one of its inputs, holds hidden text, as KatWork's own readers detect it (§13, `docs/adr/0010-untrusted-content-posture.md`), cannot be read by them among the formats they read, holds parts they skip with a warning (embedded objects, macros, a PDF's scripts; founder decision, 2026-10-25), or was saved by such a session, every tool and command whose reply can carry document text is refused for that session, the apps' error messages are withheld, and the Kat reads the file with `read_file`, which leaves hidden text out. Editing, saving and previews still work, but for a few editing tools whose replies echo document text; because the Kat's own edits can turn hidden text visible, the session's other results carry no document text either, it cannot save its file as CSV, text or Markdown, and the files it saves keep the rule for later sessions, and `read_file` refuses them, naming the file each was made from (a coordinator decision under founder rule D-22, 2026-10-25). In other sessions, GridCraft's grid preview lists only the cells KatWork's reader finds visible.
+- **One action log.** Every step, a Kat's or a person's, is an append-only, hash-chained entry with the revision before and after and a preview. There is no unlogged mode.
+- **One active editor at a time.** Each file has a control lease, held by nobody, a Kat's session or a person. Taking over freezes the Kat's session, saves its unsaved work as a version and pauses the Kat's run at its next tool boundary; the person's save creates a new revision, and stale writes are rejected. Handing back continues the Kat's work with a hand-off note.
+- **Every save is a new version.** A Craft save goes through KatWork's commit path: it is read back, checked by GridCraft when it is a workbook, and each of its claims is found again in the new version or marked lost. A save never changes an earlier version, so a workbook GridCraft recalculates on load never replaces the saved source values.
 
 **Rules:**
 - A Craft "Save" means *draft saved*. Approval belongs to KatWork and binds the hashes of the report, preview, template, font bundle and evidence ledger. Any later edit invalidates it.
-- Never install `craft-launcher` in sandboxes, or let it auto-update.
+- Never install `craft-launcher` or any updater, or let anything auto-update.
 - `craft-ai-integrations` is not the Kat runtime. Providers go through KatWork's model gateway.
 - `artcraft-services` stays excluded.
 
 **Thai text:**
-- Ship pinned Thai font files with their hashes and licences to both the workers and the browser builds. If a template requires TH Sarabun PSK, verify the rights to the supplied files and check which font file the template actually ships.
+- Ship pinned Thai font files with their hashes and licences to both the workers and the browser builds; the forks embed them as their first Thai fallback. If a template requires TH Sarabun PSK, verify the rights to the supplied files and check which font file the template actually ships.
 - Show any font substitution explicitly.
-- Line breaking needs ICU4X segmentation fed into the layout path. Adding the dependency alone does not change how text wraps.
+- Line breaking needs ICU4X segmentation fed into the layout path; adding the dependency alone does not change how text wraps. Every app that lacked it breaks Thai between words from sub-project 2a (founder decision, 2026-10-24), with a Thai test that fails without a Thai font.
 
 **Branding and licences:**
-- Use the Apache-2.0 branch for each app, and record per app any dependency under another licence.
+- Use the Apache-2.0 branch for each app, and record per app any dependency under another licence (ADR-0011).
 - Keep the NOTICE files.
 - **Remove ArtCraft marks from any modified build** we publish, and use KatWork names and icons instead.
-- Review the MPL-2.0 dependencies (CADCraft, DeckCraft, FilmCraft, EffectCraft, SoundCraft, and the other audio and media apps) before adopting them.
+- The MPL-2.0 dependencies (CADCraft's DWG crate, and symphonia in DeckCraft, FilmCraft, EffectCraft and SoundCraft) are used unmodified, and join the licence review.
+- Build no codec the app repositories implement without a patent or royalty statement: no H.264, HEVC or HEIC, AAC, AC-3 or E-AC-3, ProRes, DNxHD or DNxHR, APV or MPEG-2 video. The codecs kept (VP8, VP9, AV1, Motion JPEG, Opus, Vorbis, FLAC, ALAC, MP3, PCM) join the licence review.
 - Ship no restricted model weights: no SAM or RawNIND, and no PdfCraft OCR weights by default.
 
 **Gates per operation** (from early evaluation):
@@ -383,7 +402,7 @@ The alpha computer for each Kat has these parts:
 - Browser handover and persistence.
 - Licence and deployment.
 
-An optional app or operation that fails its gate is left out of the alpha. **It never blocks a template**, because the Rust library path still produces the output, unless the Rust baseline itself fails that template's Thai gate; then the template is blocked. GridCraft's check of XLSX outputs is not optional in this sense: it runs on every XLSX save. Its outage never blocks a save either (the version is marked "not checked by GridCraft"), but a file it reports Excel would repair is refused.
+An optional app or operation that fails its gate is left out of the alpha, by forbidding it in that app's policy. **It never blocks a template**, because the Rust library path still produces the output, unless the Rust baseline itself fails that template's Thai gate; then the template is blocked. GridCraft's check of XLSX outputs is not optional in this sense: it runs on every XLSX save. Its outage never blocks a save either (the version is marked "not checked by GridCraft"), but a file it reports Excel would repair is refused.
 
 ## 10. Office views
 
@@ -391,7 +410,7 @@ An optional app or operation that fails its gate is left out of the alpha. **It 
 |---|---|---|
 | 3D office | An isometric room with each Kat as an avatar at a desk. State drives the animation: idle, working, researching, waiting, needs approval, error, paused. **Each desk monitor shows the Kat's browser, or a labelled preview of its current Craft revision.** Clicking an avatar opens the Kat's profile, its current task and its **Computer panel**, the full-size app or browser with take-over | React 19, react-three-fiber 9, drei, an orthographic camera. Kenney furniture and Quaternius bases restyled to KatWork's palette (Nakama-style warmth, blue and yellow). The pixel ratio is capped and rendering pauses when idle. |
 | Live agent graph | Every Kat, tool and call animating in real time: who called whom, what is running, where it is blocked | Driven by the same event stream. Inspired by the Flo agent-graph post. |
-| Chat | Talk to one Kat or the whole team; approval and plan cards inline | Also the mobile default. |
+| Chat | Talk to one Kat or the whole team; approval, plan and Craft session cards inline | Also the mobile default. |
 | Tasks and files board | Jobs by status, tasks, outputs, evidence reports, the approval queue | The accessible fallback: everything in the office view is also here. Keyboard paths, screen-reader labels, reduced motion. |
 
 All four views read **one event model** from the core over AG-UI SSE: job and task lifecycle, tool calls, approvals, claims and Kat states. Animations never invent state.
@@ -444,10 +463,10 @@ All four views read **one event model** from the core over AG-UI SSE: job and ta
 
 ## 13. Security and privacy
 
-- **Isolation.** Each Kat has its own sandbox and browser profiles. Untrusted code never sees the control plane, and tool credentials are scoped per Kat. In the alpha, agentOS runs a Kat's JavaScript, Python (Pyodide) and WASM inside a sidecar process, not a hardware VM; the sidecar runs unprivileged in its own container. Per-Kat microVMs for code come with KatsAgentOS after the alpha (§1.2); in the alpha, a fired kill criterion moves the code tier to gVisor, and a host without gVisor keeps agentOS, with a visible warning to the operator at startup and to people in every Space whose Kats run code, until gVisor is installed (founder decision, 2026-10-24). No Kat runs code in agentOS until a CI test proves, for every enabled runtime (JavaScript, Pyodide, WASM), that guest code cannot reach host files, processes, the network or another Kat; each Kat's Chromium runs on a container runtime ladder, and egress leaves only through KatWork's egress gateway (`docs/adr/0009-kat-computer-isolation-tiers.md`).
-- **Treating inputs as untrusted.** The harness never runs model output through a shell, in the core or in checks; checks run as argv arrays. Tool ids are matched against a registry. Commands inside a Kat's sandbox run only through the agentOS exec API, as a per-Kat capability that is off by default, bounded, gated like any tool call, and recorded. Content from web pages, files and peers is treated as untrusted (prompt injection), and the harness assumes the model can be hijacked by it: the controls are the evidence verifier and the approval gate, never a prompt. Hidden text, as the document readers detect it, never reaches the model (the ADR names what they cannot see), text that reads like an instruction to an AI cannot support a claim, and every tool call records whether its output was trusted, the seam for taint-aware approvals in sub-project 3 (`docs/adr/0010-untrusted-content-posture.md`).
+- **Isolation.** Each Kat has its own sandbox and browser profiles. Untrusted code never sees the control plane, and tool credentials are scoped per Kat. In the alpha, agentOS runs a Kat's JavaScript, Python (Pyodide) and WASM inside a sidecar process, not a hardware VM; the sidecar runs unprivileged in its own container. Per-Kat microVMs for code come with KatsAgentOS after the alpha (§1.2); in the alpha, a fired kill criterion moves the code tier to gVisor, and a host without gVisor keeps agentOS, with a visible warning to the operator at startup and to people in every Space whose Kats run code, until gVisor is installed (founder decision, 2026-10-24). No Kat runs code in agentOS until a CI test proves, for every enabled runtime (JavaScript, Pyodide, WASM), that guest code cannot reach host files, processes, the network or another Kat; each Kat's Chromium runs on a container runtime ladder, and egress leaves only through KatWork's egress gateway (`docs/adr/0009-kat-computer-isolation-tiers.md`). The Craft apps run in the `katwork-craft` sidecar, each session as its own throwaway user with no network or socket, behind a policy proxy that forbids every tool and command it does not list (§9.1, `docs/adr/0011-craft-apps-in-katwork.md`).
+- **Treating inputs as untrusted.** The harness never runs model output through a shell, in the core or in checks; checks run as argv arrays. Tool ids are matched against a registry. Commands inside a Kat's sandbox run only through the agentOS exec API, as a per-Kat capability that is off by default, bounded, gated like any tool call, and recorded. Content from web pages, files and peers is treated as untrusted (prompt injection), and the harness assumes the model can be hijacked by it: the controls are the evidence verifier and the approval gate, never a prompt. Hidden text, as the document readers detect it, never reaches the model (the ADR names what they cannot see), and Craft sessions follow that rule for every format KatWork reads (§9.1; founder decision, 2026-10-24), text that reads like an instruction to an AI cannot support a claim, and every tool call records whether its output was trusted, the seam for taint-aware approvals in sub-project 3 (`docs/adr/0010-untrusted-content-posture.md`).
 - **Data residency.** Each Space declares which providers may see its data. Documents and evidence stay on the install.
-- **Deletion.** An admin can delete a file. Its bytes and every stored copy of text derived from it are purged: extracted and quoted text, the cell facts and context inside source references, the text of claims that cite it, tool-call arguments and results, and Kat messages that quote it, and its name. Evidence keeps only ids and hashes, and claims that cited it become *unverified*. Kat outputs that quote it are separate artifacts: their quoted claim text is redacted in reports, and the admin is shown the list to review or delete. Deletion is serialized with every read, citation and write of the file, and the work it leaves (blob removal, re-verification) is recorded in the same transaction, so a crash cannot lose it. Copies outside KatWork, old database row versions until they are reclaimed, and backups until they rotate are outside its reach, and the delete dialog says so; it also says that while a job in the file's Space is still running, the deletion record keeps the removed text it must still sweep from that job (`docs/adr/0007-evidence-model-and-source-refs.md`).
+- **Deletion.** An admin can delete a file. Its bytes and every stored copy of text derived from it are purged: extracted and quoted text, the cell facts and context inside source references, the text of claims that cite it, tool-call arguments and results (every result of a Craft session that opened it, took it as an input or saved it), Kat messages that quote it, the previews of those Craft sessions, and its name. Evidence keeps only ids and hashes, and claims that cited it become *unverified*. Kat outputs that quote it are separate artifacts: their quoted claim text is redacted in reports, and the admin is shown the list to review or delete. Deletion is serialized with every read, citation and write of the file, and the work it leaves (blob removal, re-verification) is recorded in the same transaction, so a crash cannot lose it. Copies outside KatWork, old database row versions until they are reclaimed, and backups until they rotate are outside its reach, and the delete dialog says so; it also says that while a job in the file's Space is still running, the deletion record keeps the removed text it must still sweep from that job (`docs/adr/0007-evidence-model-and-source-refs.md`).
 - **Accounts.** People get accounts with or without email (SMTP). The operator runs `create-user` or `reset-link` on the server, or a workspace admin invites from the Members page, by email or with a link to copy. Each gives a single-use set-password link. `create-user` and admin invites give an invite link, valid 72 hours, because the person often opens it much later; `reset-link` and the reset mail give a reset link, valid 30 minutes. The two are separate token kinds, so neither works in place of the other. A workspace that `create-user` creates gets a first Space, `General`, whose policy the operator picks with `--space-policy local|hosted`, and the default team, so it can chat at once. The web never issues a link for an account that already exists, so an admin of one workspace cannot take over an account from another. Admins also change members' roles there (`docs/adr/0004-operator-accounts-without-smtp.md`).
 - **Audit.** Logs record every proposal, approval, tool call and verdict. Enterprise adds export and retention policies.
 - **Telemetry.** No product telemetry leaves the install unless an admin turns it on; opt-in telemetry uses a closed event schema with no content, ids or keys.
@@ -500,14 +519,14 @@ The alpha uses rivet agentOS behind a stable `Computer` contract. agentOS is tem
 | Week of | Milestone |
 |---|---|
 | 2026-10-26 | Spec approved. `Minniesse/katwork` created. Skills setup switched to GitHub. Issue breakdown. Compose skeleton (core, Postgres, Qdrant). Auth with password reset. |
-| 2026-11-02 | Kat model, team builder, scheduler with leases, agent loop over a Rig provider. Web chat. AG-UI events. |
-| 2026-11-09 | agentOS computers and the browser supervisor (sub-project 2b, planned separately). Document tools (docx, xlsx, pdf). Evidence model. OCR moves to the end of sub-project 2a, in December (founder decision, 2026-10-24). |
-| 2026-11-16 | Approval host. Evidence verifier. Policy function and statuses. Meeting-minutes template end to end. |
-| 2026-11-23 | Laya in Rust, in shadow mode (the lead Kat routes). Stage 0 routing. LINE and Slack adapters. Tasks-and-files board. |
-| 2026-11-30 | Lead-Kat planning and delegation. Research-brief template. Live agent graph. |
+| 2026-11-02 | Kat model, team builder, scheduler with leases, agent loop over a Rig provider. Web chat. AG-UI events. The 13 Craft forks and the `katwork-craft` image, built and signed by CI (sub-project 2a; founder decisions, 2026-10-24). |
+| 2026-11-09 | agentOS computers and the browser supervisor (sub-project 2b, planned separately). Document tools (docx, xlsx, pdf). Evidence model. OCR moves to the end of sub-project 2a, in December (founder decision, 2026-10-24). Kats' Craft sessions behind the policy proxy. |
+| 2026-11-16 | Approval host. Evidence verifier. Policy function and statuses. Kats drive WordCraft, GridCraft and DeckCraft from a thread. The meeting-minutes template moves to 2026-11-30 (founder decision, 2026-10-24). |
+| 2026-11-23 | Laya in Rust, in shadow mode (the lead Kat routes). Stage 0 routing. LINE and Slack adapters. Tasks-and-files board. Watching a Kat in a Craft app, and taking over. |
+| 2026-11-30 | **Meeting-minutes template end to end**, laid out in WordCraft, GridCraft and DeckCraft while a person watches and takes over once. Lead-Kat planning and delegation. Research-brief template. Live agent graph. |
 | 2026-12-07 | 3D office v1. SAR template with published SARs. Calibration set collected. |
 | 2026-12-14 | Teams, Telegram, Discord and RustChat adapters. One Report template. Monthly board commentary pack. |
-| 2026-12-21 | WhatsApp Cloud adapter. Tauri and Capacitor shells. Craft-app integrations that passed the gates. |
+| 2026-12-21 | WhatsApp Cloud adapter. Tauri and Capacitor shells. |
 | 2026-12-28 | Memory stores and the RustShare connector (sub-project 2), in the week freed by moving federation after the alpha. |
 | 2027-01-04 | Hardening: kill-switch, replay and fidelity gates. Demo mode. Docs. HA SAR rubric pack with the redaction check. |
 | 2027-01-11 | Design-partner dry runs. |
@@ -522,7 +541,7 @@ The alpha uses rivet agentOS behind a stable `Computer` contract. agentOS is tem
 | Scope for a solo builder: general team, 7 channels, 3 shells, 3D | Strict weekly demos. Federation has already moved after the alpha (founder decision, 2026-10-22). If a week slips twice, cut in this order: WhatsApp and Teams → Capacitor → 3D (the board stays). |
 | Thai document fidelity (templates, OCR, numbers) | The fidelity gates in §15 run in weeks 3–4 with published and synthetic samples. Fall back to a narrower supported-feature list. |
 | Laya calibration fails in English or Thai | Laya starts in shadow mode and the lead Kat routes (higher LLM cost); a language that fails the gate stays in shadow mode. |
-| Craft apps immature | They are gated (§9); the docx-rs, umya and Typst base keeps working. |
+| Craft apps immature, and 13 forks to keep | Each session runs as its own throwaway user behind a policy proxy that allows only listed operations, and KatWork's readers and verifier check every save (§9.1); the docx-rs, umya and Typst base keeps working. Every fork change is also an upstream PR, and a fork moves back to its upstream once its changes land. If the Craft track slips, the forks the demo does not use merge after it, and their apps stay watchable through previews. |
 | Free bundled AI at universities, and OpenAI Kats | Lead with finished, cited documents, approvals and self-hosting. Measure the rewrite rate with design partners. |
 | Demo reliability: a live demo must never depend on an external login | Password reset and demo accounts in week 1; demo mode needs no keys. |
 
@@ -537,10 +556,11 @@ This spec covers the whole alpha. Implementation planning splits it into sub-pro
    - A local OpenAI-compatible model provider (§11).
    - The scheduler with leases, the agent loop over a Rig provider, and the model gateway.
    - The AG-UI event stream and web chat.
-2. **Computers, documents and memory.** Planned in three parts, each with its own plan (founder decision, 2026-10-24): **2a** the document tools, the artifact store, the evidence model, citations, the deterministic evidence verifier and the claim judge (moved forward from sub-project 3), the `katwork-craft` sidecar, file deletion and Thai OCR (`docs/plans/2026-10-24-sp2a-documents-evidence.md`); **2b** Kat computers; **2c** memory.
+2. **Computers, documents and memory.** Planned in three parts, each with its own plan (founder decision, 2026-10-24): **2a** the document tools, the artifact store, the evidence model, citations, the deterministic evidence verifier and the claim judge (moved forward from sub-project 3), the `katwork-craft` sidecar with all 13 Craft apps, which Kats drive and people watch and take over (moved forward from sub-project 7, founder decisions, 2026-10-24), file deletion and Thai OCR (`docs/plans/2026-10-24-sp2a-documents-evidence.md`); **2b** Kat computers; **2c** memory.
    - agentOS workspaces and the browser supervisor.
    - The document tools (docx, xlsx, pdf, OCR, Typst).
    - The evidence model and the artifact store.
+   - The Craft apps: the forks, the signed image, sessions behind the policy proxy, the bridge and its web origin, the Kat Craft tools, evidence for Craft saves, and watching and taking over (§9.1).
    - Memory: per-Kat and per-team stores (Postgres, Qdrant, Tantivy with nlpO3) and the RustShare connector (§11).
    - Before it starts: an inventory of the commands the alpha templates need inside agentOS (§9).
    - Carried requirements:
@@ -570,6 +590,19 @@ This spec covers the whole alpha. Implementation planning splits it into sub-pro
      - A `remember` tool proposes memory entries with provenance; they become active only when a person accepts them or a Space policy auto-accepts; entries are listed, deletable, deduplicated and expiring (§11).
      - Memory ACLs are evaluated at query time against the thread's Space and the requesting person; an assignment alone never grants access (§11).
      - A byte cap on always-in-prompt memory; the rest is retrieved by search under ACL (§11).
+     - The Craft requirements, moved from item 7 with the apps (all §9.1):
+       - Two-frame hosting: a host page frames the app on the Craft web origin; the `kw:*` protocol is checked by origin, source and a per-opening token; saves carry `If-Match` and the lease fence.
+       - Every app speaks the bridge protocol: the nine without a host bridge get it in their forks, and GridCraft, PdfCraft, CADCraft and VectorCraft an adapter, all behind the same host page.
+       - CSP `script-src 'self' 'wasm-unsafe-eval'`; builds pinned by commit, with a signed SHA-256 list; printing goes through KatWork's Files page, not the app.
+       - An allowlist keyed by tool, inner command and path arguments, with unknown ones forbidden; `control_call`, the UI tools and network tools are never exposed, and generic command tools such as `execute` and `run_command` reach only allowed commands; PdfCraft JavaScript is compiled out.
+       - Every save goes to an explicit path in the session's output folder and becomes a new version; a save without a path is refused; GridCraft previews are the cells KatWork's own reader finds visible in the session's workbook, drawn by KatWork.
+       - Read and write roots are passed wherever an app has them, and the "files confined" line, naming the session's own folders, is required wherever the app prints one (seven of the nine apps with roots; PhotoCraft and EffectCraft print none); the apps without roots are confined by the proxy and the sandbox.
+       - No desktop app and no `--connect`, `--bridge` or `--attach` mode; VectorCraft always runs `--headless`.
+       - "Never auto-update": no updater, `craft-launcher`, AppImage, Flatpak or update check is in the image, and the sidecar has no egress.
+       - The licence review adds the patent-pool codecs (compiled out), PhotoCraft's CC BY 3.0 icon, the UFL egui fonts and BSD-3 hyphenation; the forks remove the ArtCraft marks.
+       - A Thai gate per app; a Craft preview is not layout evidence.
+       - WordCraft's author is "<Kat> (AI)", given over its MCP pipe rather than as `--author` on a command line other sessions can read, and tracked changes are on.
+       - Craft tool timeouts sit above the sidecar's own: a call's sidecar deadline ends before the tool's, and a timeout ends the session, which the Kat reopens; the `katwork.craft_session` and `katwork.craft_step` events carry each session's state and steps.
 3. **Gates and policy.**
    - The approval host, and acceptance on top of sub-project 2a's evidence verifier.
    - The policy function and job statuses.
@@ -616,22 +649,15 @@ This spec covers the whole alpha. Implementation planning splits it into sub-pro
    - Carried requirements:
      - One screencast per Kat, fanned out read-only, with input only from the lease holder; desk monitors show server-side preview images labelled "preview" (§9.1).
      - AG-UI client input: only allowlisted frontend tools with server-side definitions; client `system` and `developer` roles and `forwardedProps` are dropped (§10).
-7. **Craft integration.** PdfCraft, PhotoCraft and WordCraft behind their gates. The alpha ships revision preview and person editing; live Kat control comes once the upstream bridge lands (§9.1).
+7. **Craft integration.** Sub-project 2a brings in all 13 apps: Kats drive them through a policy proxy, and people watch, open and take over through one bridge (founder decisions, 2026-10-24; item 2). This sub-project keeps what 2a defers:
+   - One `katwork-craft` container per workspace, replacing 2a's shared container with a throwaway user per session; a Craft web origin per session, with no reuse, instead of 2a's one.
+   - The UI plane: an app running windowed on a virtual display, with its screencast and an agent cursor, for what the MCP servers cannot do.
+   - Citing what KatWork cannot read yet: CAD drawings, audio, video and image content beyond OCR's text; DWG open and save.
+   - Long renders and exports as background jobs; per-role tiers of the app policies (read, write and outward) and approvals for outward Craft actions.
+   - Following the forks' upstream PRs, and moving each fork back to its upstream once its changes land.
    - Carried requirements (all §9.1):
-     - Two-frame hosting: a shim on a per-session origin, the `kw:*` protocol checked by origin, source and nonce, and saves with `If-Match` and the lease epoch.
-     - Only PdfCraft and GridCraft have a host bridge; GridCraft is used only behind the shim.
-     - Per-session origins with no reuse; CSP `script-src 'self' 'wasm-unsafe-eval'`; builds pinned by tag and `SHA256SUMS.txt`; a decision on whether printing is allowed or goes through KatWork's PDF.
-     - An allowlist keyed by tool, inner command or method, and path arguments; `control_call`, `execute`, `run_command`, `screenshot{path}` and network tools are never exposed; PdfCraft JavaScript is off.
-     - Every save goes to an explicit new path in a per-revision drafts folder; a save without a path is refused; GridCraft previews come from KatWork's renderer.
-     - Read and write roots are always passed, the "files confined" line is required, and PhotoCraft launches with roots and `--control-token-file`.
-     - GridCraft is only a calculation oracle, through a bounded `check` run in a child process.
-     - No `--connect` desktop bridges in the alpha.
-     - "Never auto-update" also covers AppImage zsync, Flatpak, the PdfCraft update check and PhotoCraft desktop integration; egress to sidecars is denied.
-     - The licence review adds patent-pool codecs (DeckCraft, PhotoCraft HEIC), the CC BY 3.0 icon, the UFL egui fonts and BSD-3 hyphenation; patched builds strip ArtCraft screens.
-     - A Thai row per app; KatWork detects font substitution itself; a Craft preview is not layout evidence.
-     - WordCraft runs with `--author "<Kat> (AI)"` and tracked changes on.
-     - §9.1 states what "13–22 days old" hides: agent-built code, hundreds of open issues, and vendor parity numbers that are not evidence.
-     - Craft tool timeouts sit above the sidecar's own, with a respawn after a timeout; the `katwork.craft_session` event is reserved; the Craft and annotation tests.
+     - KatWork detects font substitution itself, rather than taking an app's report.
+     - The Craft and annotation tests.
 8. **Federation (after the alpha).**
    - Carried requirements (all §12):
      - Budget a versioned library extraction; reason-network 0.12.6 ships as a binary.
