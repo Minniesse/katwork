@@ -643,6 +643,8 @@ This spec covers the whole alpha. Implementation planning splits it into sub-pro
 
 Two independent reviewers who did not write the PR review it; at least one is a different model or a fresh instance of the strongest model, and the maintainer approves.
 
+In practice (founder decision, 2026-10-24): Opus builds trust-core tasks and Sonnet the rest. The reviewers are a deep reviewer (the strongest model: correctness, security, concurrency, tenant isolation, prompt injection, backed by probes and mutations) and a checklist reviewer (a fixed list: spec conformance and spec deviations, tests that fail without their fix, the coding standards, English and Thai copy, public-repo hygiene). A verifier tries to refute each P0 and P1 finding before it goes back to the builder. A PR gets at most three fix rounds; after the second, P3 findings become follow-up issues, while P0, P1 and security findings always block. A PR merges only when all three have run on its exact head, nothing blocking is open and CI is green; the maintainer also reads the full diff of a trust-core PR.
+
 ## 20. References
 
 Internal research notes (market research, vendor evaluations, spikes) are kept outside this repository.

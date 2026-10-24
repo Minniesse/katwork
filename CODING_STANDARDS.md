@@ -11,21 +11,21 @@ The plans' **Global Constraints** (`docs/plans/2026-10-22-sp1-core-runtime.md`, 
 - **Commits carry the right identity.** Author email is a GitHub noreply address, and every commit has a `Co-Authored-By:` trailer naming the model that wrote it: `git log --format='%ae %(trailers:key=Co-Authored-By,valueonly)' origin/<base>..<head>`.
 - **Migrations are append-only.** A migration file that has reached `main` is released: it is never edited, renamed or deleted, and a schema change is a new numbered file in `crates/katwork/migrations/`. `git diff --name-status origin/main...<head> -- crates/katwork/migrations` lists only `A` lines.
 - **No secret-shaped literals.** No API key, token, password or private key appears as a literal anywhere in the diff, tests and docs included. GitGuardian scans every PR, and a test value that looks real fails it just like a real one. Tests build synthetic secrets at runtime, for example from `Uuid::now_v7()` or by joining pieces that match no detector, as `crates/katwork/tests/support/mod.rs` does for password hashes.
-- **Two independent reviews cover the head** (spec §19.1). Neither reviewer wrote the PR: one is a fresh Opus session doing a full review, the other a Sonnet session working through the **Sonnet review checklist** below; the maintainer approves. The commit trailers name the author model, which for a plan task is the model its **Builder** line names.
+- **Two independent reviews and a verification cover the exact head** (spec §19.1). Neither reviewer wrote the PR: the deep reviewer is a fresh Opus session, the checklist reviewer a fresh Sonnet session working through the **checklist** below, and the verifier tries to refute each P0 and P1 finding. At most three fix rounds; after the second, P3 findings become follow-up issues, while P0, P1 and security findings always block. The maintainer merges only when all three ran on the head SHA, nothing blocking is open and CI is green, and reads the full diff of a trust-core PR. The commit trailers name the author model, which for a plan task is the model its **Builder** line names.
 
 ### Guard scope
 
 `guard.py` stops agents' accidents, not deliberate evasion; the server-side ruleset on `main` (PR required, no force-push or deletion, merge commits only, admins included) is the boundary. Evasion classes the guard accepts are listed in `docs/agents/environment.md` under **Guard scope**. Review a change to the guard for accidents an agent could plausibly make; a new deliberate-evasion trick isn't a finding.
 
-## Sonnet review checklist
+## Checklist
 
-The Sonnet reviewer answers every item, in this order, as **pass** or a finding with its file and line. An item that does not apply is marked so, with the reason.
+The checklist reviewer (Sonnet) answers every item, in this order, as **pass** or a finding with its file and line. An item that does not apply is marked so, with the reason.
 
 1. CI is green on the reviewed head (`gh pr checks <n>`).
 2. The base, the commit identity and the trailers pass the Mechanical rules above; the author model matches the task's Builder line.
 3. Every file the task's **Files** list names is created or modified, and the diff touches no file outside that list without a line in the PR body saying why.
 4. Every name, signature and type in the task's **Interfaces** block exists in the diff exactly as written, and every value the task pins (limits, codes, copy, defaults) is the one the plan gives.
-5. Every test the task names exists under that name, and its assertions are the ones the plan states; each was seen failing before the code (the PR body says how).
+5. Every test the task names exists under that name and asserts what the plan states; every test asserts something and fails without its fix (the PR body says how each was seen failing).
 6. Each command in the task's steps was run, and its result in the PR body matches the step's expected output.
 7. Every request-path transaction goes through `db::guarded`, and every new SQL entry path has its named cancellation test.
 8. Every new tenant-owned table has `UNIQUE (id, workspace_id)` and composite foreign keys, and a cross-workspace request has a test that gets `404`.
@@ -33,7 +33,9 @@ The Sonnet reviewer answers every item, in this order, as **pass** or a finding 
 10. Every new user-facing string has en and th copy, and every new error code is in the plan's list.
 11. No secret-shaped literal, real customer data, third-party source tree, personal name, private path or internal id is in the diff.
 12. The PR body lists every **Ambiguity ruling**. A Sonnet-built task that met a case its task does not decide stopped and asked instead of choosing; a choice made silently is a finding.
-13. A trust-core change says so, and the Opus review covers its security claims.
+13. A trust-core change says so, and the deep review covers its security claims.
+14. **Spec conformance**, and the review's "Spec deviations" section (the `katwork-review` skill) for a plan, an ADR or a spec-touching PR.
+15. **For a plan:** a Sonnet builder could follow each non-trust-core task with no guesses (exact files, signatures, tests with assertions, commands with expected output, no open choices).
 
 ## Judgement
 

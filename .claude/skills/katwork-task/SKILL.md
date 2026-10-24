@@ -5,11 +5,11 @@ description: Implement one task of a KatWork plan as a stacked PR. Use when aske
 
 # Implement a plan task
 
-One task, one branch, one PR, stacked on the task it depends on. Build it with the model the task's **Builder** line names. Two fresh reviewers who did not write it review it (a fresh Opus session, and a Sonnet session with the checklist in `CODING_STANDARDS.md`); the maintainer merges.
+One plan task per branch, one PR, stacked on the task it depends on. Opus builds trust-core tasks and Sonnet builds the rest, as the task's **Builder** line says. A Sonnet builder follows the task's steps exactly and stops to ask rather than choosing. Two fresh reviewers who did not write it (a deep reviewer and a checklist reviewer) and a verifier take it from there, as the `katwork-review` skill describes; the maintainer merges.
 
 ## Steps
 
-1. **Read the task.** Open the task's plan (`docs/plans/2026-10-22-sp1-core-runtime.md` for SP1, `docs/plans/2026-10-24-sp2a-documents-evidence.md` for SP2a) and read the task, the Global Constraints, the Review Focus items the task names, and the **Dependency order** section. Check the task's **Builder** line: an SP2a task names `Opus` or `Sonnet`; if it is not the model you are running on, stop and say so. Then read `CODING_STANDARDS.md`: the review enforces every rule in it, and the Sonnet reviewer works through its checklist item by item. Done when you can list the task's Files, Interfaces and Tests, and the issue it closes.
+1. **Read the task.** If a research brief for the task was supplied, read it first. Then open the task's plan (`docs/plans/2026-10-22-sp1-core-runtime.md` for SP1, `docs/plans/2026-10-24-sp2a-documents-evidence.md` for SP2a) and read the task, the Global Constraints, the Review Focus items the task names, and the **Dependency order** section. Check the task's **Builder** line: an SP2a task names `Opus` or `Sonnet`; if it is not the model you are running on, stop and say so. Then read `CODING_STANDARDS.md`: the review enforces every rule in it, and the Sonnet reviewer works through its checklist item by item. Done when you can list the task's Files, Interfaces and Tests, and the issue it closes.
 
 2. **Branch, in a worktree of your own.** Another session switching branches in a shared checkout moves your commits onto its branch. Find the base: the branch of the task this one depends on, or `main` once that task's PR has merged (`gh pr list --state all --json number,headRefName,baseRefName,state`). Then:
 
@@ -56,7 +56,7 @@ One task, one branch, one PR, stacked on the task it depends on. Build it with t
    - **Out of scope**: what the task leaves for later tasks
    - **Written by**: your model and the task's Builder line; trust-core changes (approval, policy, evidence, sandbox) also flag that they need a security review, which the Opus reviewer gives
 
-   Done when the PR is open against the right base, CI is green on its head (`gh pr checks <n>`), and the body has every item. Then hand off: the two reviewers and the maintainer take it from here.
+   Done when the PR is open against the right base, CI is green on its head (`gh pr checks <n>`), and the body has every item. Then hand off: the two reviewers, the verifier and the maintainer take it from here.
 
 8. **Clean up** when you leave the worktree: `scripts/test-db.sh stop`.
 
