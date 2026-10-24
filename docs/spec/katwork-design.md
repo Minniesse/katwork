@@ -33,7 +33,7 @@ KatWork lets anyone in an organization hire a team of named AI coworkers ("Kats"
 ### 1.2 Non-goals for the alpha
 
 - KatWork's own agentOS; the alpha uses rivet agentOS (§14 lists what the in-house agentOS must provide).
-- A VM per Kat. Per-Kat microVMs come with the in-house agentOS.
+- A VM per Kat for code. Per-Kat microVMs for code come with the in-house agentOS, KatsAgentOS. Each Kat's Chromium may run in a microVM when the host has KVM (the runtime ladder in `docs/adr/0009-kat-computer-isolation-tiers.md`).
 - Voice and video calls.
 - Federation between installs. It moves to the first post-alpha release (§12).
 - Native Linux binaries inside a Kat's computer. Native tools run as KatWork Rust tools or pinned containers; native Linux comes with the in-house agentOS (§9).
@@ -88,7 +88,7 @@ KatWork lets anyone in an organization hire a team of named AI coworkers ("Kats"
 | **Team** | A lead Kat plus specialists. The team saved on the server **decides who does the work**; it is not decoration. |
 | **Thread** | A conversation between people and Kats in any channel. Each thread is mapped to one KatWork thread id. |
 | **Job** | One request, from intake to final status. It owns the plan, the runs, the evidence and the verdict. |
-| **Task** | A bounded piece of a job assigned to one Kat: inputs, acceptance conditions, a lease and retry limits. A job's tasks form a DAG of at most 5 tasks and 3 levels. By default the lead Kat runs up to 3 tasks at once and each specialist 1 (initial defaults; admin-set `max_concurrency`). Queued tasks wait their turn per Kat, oldest first (best effort), and a queued job shows its estimated place in line. A task's deadline starts when it is first picked up, not while it waits. Parallel work inside one Kat's Computer waits for Computer fork (§14 #3). |
+| **Task** | A bounded piece of a job assigned to one Kat: inputs, acceptance conditions, a lease and retry limits. A job's tasks form a DAG of at most 5 tasks and 3 levels. By default the lead Kat runs up to 3 tasks at once and each specialist 1 (initial defaults; admin-set `max_concurrency`). Queued tasks wait their turn per Kat, oldest first (best effort), and a queued job shows its estimated place in line. A task's deadline starts when it is first picked up, not while it waits. Parallel work inside one Kat's Computer waits for the optional memory fork of the microVM tier (§14 #3); until then a Kat tries a second approach by restarting from a disk checkpoint. |
 | **Run** | One Kat executing one task: steps, tool calls, tokens, cost and an event stream. |
 | **Computer** | A Kat's sandbox: an agentOS workspace, an optional browser profile, and app access (§9). |
 | **Artifact** | A versioned output file or page. Originals are immutable and every new version is written atomically. |
@@ -145,9 +145,9 @@ KatWork follows the JEVIS layering: **the decision model advises, the harness ex
 Vendor picks (one primary pick per role):
 - **Core:** Rig (model provider clients only) · Tokio · Axum · SQLx on PostgreSQL · rmcp (MCP) · a2a-rs (external peers only) · openidconnect (federation identity in sub-project 8, after the alpha; SSO is Enterprise, §16).
 - **Sandbox and browser:** rivet agentOS Rust client and sidecar · chromiumoxide.
-- **Documents:** docx-rs · umya-spreadsheet · pdf-extract · lopdf · Typst · OAR-OCR.
+- **Documents:** docx-rs · umya-spreadsheet · rust_xlsxwriter · pdf-extract · lopdf · Typst · OAR-OCR (PP-OCRv5 Thai, the default OCR engine) · hayro (PDF rasterizing for OCR, in the OCR container) · Craft CLIs in the `katwork-craft` sidecar (§9.1).
 - **Search and Thai text:** Tantivy with nlpO3 · Qdrant · ICU4X.
-- **Inference:** ort (Laya) · mistral.rs (optional local LLM).
+- **Inference:** ort (Laya) · mistral.rs (optional local LLM, and the opt-in Typhoon OCR model, `docs/adr/0008-thai-ocr-engines.md`).
 - **Front end:** AG-UI protocol 1.0 events as KatWork serde types, each validated against the protocol's JSON Schema; the community Rust crates are not used. A thread's stream carries overlapping runs and KatWork events, so it is KatWork's own stream built from AG-UI shapes, read by KatWork's web client, not by stock AG-UI clients (`docs/adr/0003-own-ag-ui-event-types.md`). Our own React UI, not CopilotKit Intelligence.
 - **Shells and art:** Tauri · Capacitor · react-three-fiber with drei · Kenney Furniture Kit · Quaternius Universal Base Characters.
 
@@ -318,13 +318,14 @@ The alpha computer for each Kat has these parts:
   - Python through Pyodide, for light data work.
   - JavaScript, Python (Pyodide) and WASM only; native binaries are rejected. Native work (OCR, Typst, Chromium, Craft sidecars) runs as KatWork Rust tools or pinned containers outside agentOS. Native Linux tools come with the in-house agentOS (founder decision, 2026-10-22).
 - **Browser profile.** A separate Chromium container per Kat, driven over CDP by the Rust browser supervisor. Each Kat keeps one profile per person by default; an admin can mark shared team logins that anyone with access to the Space may use. Profiles and downloads persist, and **a person can take over** from the office view. Signing in during take-over is allowed and audited.
-- **Document tools as Rust MCP tools.**
-  - docx-rs fills templates and makes structured edits.
-  - umya-spreadsheet edits existing workbooks without silently recalculating them.
-  - pdf-extract extracts digital PDFs, keeping page and span provenance.
-  - Scanned Thai documents go through an `OcrEngine`, out of process: Typhoon OCR 1.5 behind a local server where a GPU exists, with a line-box detector and aligner; PP-OCRv5 Thai through OAR-OCR on CPU; Tesseract `tha` as the last resort (`docs/adr/0008-thai-ocr-engines.md`).
+- **Document tools as in-process KatWork tools**, on bounded workers in the server (sub-project 2a plan).
+  - docx-rs creates new DOCX files; KatWork reads DOCX with its own reader on zip and quick-xml, so hidden and tracked content are handled explicitly.
+  - umya-spreadsheet reads workbooks, behind KatWork's package guard; rust_xlsxwriter writes new workbooks, values only.
+  - pdf-extract extracts digital PDFs on a single lopdf parser, keeping page and span provenance.
+  - Scanned Thai documents go through an `OcrEngine`, out of process: PP-OCRv5 Thai through OAR-OCR is the default; Tesseract `tha` is the last resort; Typhoon OCR 1.5, served by mistral.rs through the model gateway with a line-box detector and aligner, is opt-in (`docs/adr/0008-thai-ocr-engines.md`).
   - Typst produces new cited PDF reports.
-  - lopdf handles constrained PDF edits.
+  - Filling a customer's template, editing an existing workbook, and lopdf's constrained PDF edits move to sub-project 3, with the template work.
+  - The render check moves to sub-project 3 and is advisory until it passes: patched WordCraft output is compared with real-Word PDFs on a Thai and English corpus, and until it passes the §9.1 gate its render is a preview labelled "approximate" and acceptance uses read-back.
 - **Network rules.** Egress is limited per Kat. Secrets stay outside the sandbox, and no control-plane files or provider keys are mounted.
 
 ### 9.1 Craft apps as visible office apps
@@ -341,13 +342,14 @@ The alpha computer for each Kat has these parts:
 
 | Order | App | Role in the alpha |
 |---|---|---|
-| 1 | **PdfCraft** | Opens source PDFs and generated report PDFs in the office, so people can see a Kat reading and checking citations. It has explicit Thai shaping. Its OCR cannot read Thai, so Thai scans use OAR-OCR. |
+| 1 | **PdfCraft** | Opens source PDFs and generated report PDFs in the office, so people can see a Kat reading and checking citations. It has explicit Thai shaping. Its OCR cannot read Thai, so Thai scans go through KatWork's `OcrEngine` (`docs/adr/0008-thai-ocr-engines.md`). |
 | 2 | **PhotoCraft** | Narrow image operations through its sidecar: crop, resize, composite and format conversion, for report figures and cover images. Starts with PNG and JPEG. The web build is a viewer until the bridge lands; then it becomes a workbench where a person can continue the work. |
 | 3 | **WordCraft** | A viewer in the alpha: inspects drafts and previews the meeting-minutes template. Once the bridge lands, editing is enabled only for templates that pass independent DOCX round-trip tests. |
 | Later | **GridCraft** | Stays behind umya-spreadsheet. Loading a file recalculates formulas, which must never replace the saved source values. |
 | Deferred | Other nine apps | DeckCraft for PPTX (Phase 2), the creative apps (Phase 4), and the rest. |
 
 **How Kats drive them:**
+- **In sub-project 2a, the `katwork-craft` sidecar** is the first such sidecar: a pinned container on an internal network with no egress, its Craft CLIs built from pinned commits with recorded SHA-256s, exposing only WordCraft's labelled preview render of DOCX outputs, GridCraft's check of every XLSX output before it is saved, and PdfCraft's text extraction if it wins its reader challenge.
 - **Sidecar CLI or MCP first** for bounded automation. These tools run as pinned images, isolated per tenant, exposed as a small allowlist of operations (inspect, render page, propose image edit, save draft).
 - **The browser build** when a person needs to see or edit the current revision. It runs from a separate origin per Kat or session, with a minimal host page that receives only a scoped artifact capability.
 - **One active editor at a time.** A control lease belongs to either the Kat or the person. Takeover pauses automation, a save creates a new revision, and stale writes are rejected.
@@ -443,6 +445,7 @@ All four views read **one event model** from the core over AG-UI SSE: job and ta
 - **Isolation.** Each Kat has its own sandbox and browser profiles. Untrusted code never sees the control plane, and tool credentials are scoped per Kat. In the alpha, agentOS runs a Kat's JavaScript, Python (Pyodide) and WASM inside a sidecar process, not a hardware VM; the sidecar runs unprivileged in its own container. Per-Kat microVMs come with the in-house agentOS (§1.2). No Kat runs code in agentOS until a CI test proves guest code cannot reach host files, processes or the network; each Kat's Chromium runs on a container runtime ladder, and egress leaves only through KatWork's egress gateway (`docs/adr/0009-kat-computer-isolation-tiers.md`).
 - **Treating inputs as untrusted.** The harness never runs model output through a shell, in the core or in checks; checks run as argv arrays. Tool ids are matched against a registry. Commands inside a Kat's sandbox run only through the agentOS exec API, as a per-Kat capability that is off by default, bounded, gated like any tool call, and recorded. Content from web pages, files and peers is treated as untrusted (prompt injection).
 - **Data residency.** Each Space declares which providers may see its data. Documents and evidence stay on the install.
+- **Deletion.** An admin can delete a file. Its bytes and every text extracted or quoted from it are purged; evidence keeps only ids and hashes, and claims that cited it become *unverified* (`docs/adr/0007-evidence-model-and-source-refs.md`).
 - **Accounts.** People get accounts with or without email (SMTP). The operator runs `create-user` or `reset-link` on the server, or a workspace admin invites from the Members page, by email or with a link to copy. Each gives a single-use set-password link. `create-user` and admin invites give an invite link, valid 72 hours, because the person often opens it much later; `reset-link` and the reset mail give a reset link, valid 30 minutes. The two are separate token kinds, so neither works in place of the other. A workspace that `create-user` creates gets a first Space, `General`, whose policy the operator picks with `--space-policy local|hosted`, and the default team, so it can chat at once. The web never issues a link for an account that already exists, so an admin of one workspace cannot take over an account from another. Admins also change members' roles there (`docs/adr/0004-operator-accounts-without-smtp.md`).
 - **Audit.** Logs record every proposal, approval, tool call and verdict. Enterprise adds export and retention policies.
 - **Telemetry.** No product telemetry leaves the install unless an admin turns it on; opt-in telemetry uses a closed event schema with no content, ids or keys.
@@ -450,11 +453,11 @@ All four views read **one event model** from the core over AG-UI SSE: job and ta
 
 ## 14. agentOS requirements (for the in-house sandbox)
 
-The alpha uses rivet agentOS behind a stable `Computer` contract. The in-house agentOS is planned as a VM-based sandbox; candidates are under evaluation. Whichever is chosen must provide the following so KatWork can switch to it without product changes:
+The alpha uses rivet agentOS behind a stable `Computer` contract. agentOS is temporary: the in-house agentOS, **KatsAgentOS**, is built by the lab after the alpha as a VM-based sandbox from these requirements; candidates are under evaluation. Whichever is chosen must provide the following so KatWork can switch to it without product changes:
 
 1. **Exec and stream.** Run a command in a Kat's computer and stream stdout and stderr with exit codes.
 2. **Files.** Put and get files and list directories, with content hashes.
-3. **Snapshot and restore** a Kat's computer. A **disk checkpoint** is required: it supports rollback after a bad edit. A **memory snapshot and fork** are optional: they support "try two approaches" and fast resume. **Snapshot files are secrets**: they can hold every credential in the computer, so they are encrypted, integrity-checked by KatWork, restored only into a quarantined computer, and never leave the install (`docs/adr/0009-kat-computer-isolation-tiers.md`).
+3. **Snapshot and restore** a Kat's computer. A **disk checkpoint** is required: encrypted, validated against a KatWork-authenticated manifest, restored only into a quarantined computer, and never leaving the install; it supports rollback after a bad edit, and a Kat "tries two approaches" by restarting from one. A **memory snapshot and fork** are optional and later, on the microVM tier only, and are never restored into a session that holds credentials. **Snapshot files are secrets**: they can hold every credential in the computer (`docs/adr/0009-kat-computer-isolation-tiers.md`).
 4. **Warm pool and fast start.** A ready computer in under 1 s.
 5. **Per-Kat identity and delegated authority.** An agent acts for a person, recording both identities.
 6. **Egress policy** per computer (allowlists).
@@ -472,6 +475,7 @@ The alpha uses rivet agentOS behind a stable `Computer` contract. The in-house a
   - Per-language temperature and abstention fitting.
   - 10× resampling.
   - A 50-case routing and delegation benchmark as the release gate, and as the gate that promotes Laya from shadow mode, per language.
+- **Judges, in evaluation and in the product.** A judge never shares the writer's exact model, prefers another provider, and runs only on providers an admin marked as judges for the Space; Thai claims are not sent to a judge; a judge can lower a claim but never lift it; calibration is preregistered and measures the configuration the product runs (`docs/adr/0007-evidence-model-and-source-refs.md`).
 - **Document fidelity gates.** Published and synthetic Thai and English DOCX and XLSX samples (partner samples only after a signed data annex): read, change and save, then compare text, values, formulas, structure and the rendered output. A scanned Thai PDF goes through OCR, checking names and numbers. Templates are filled with every placeholder and section checked.
 - **Approval gate tests.**
   - Approve one action and reject another.
@@ -531,7 +535,7 @@ This spec covers the whole alpha. Implementation planning splits it into sub-pro
    - A local OpenAI-compatible model provider (§11).
    - The scheduler with leases, the agent loop over a Rig provider, and the model gateway.
    - The AG-UI event stream and web chat.
-2. **Computers, documents and memory.** Planned in three parts, each with its own plan (founder decision, 2026-10-24): **2a** the document tools, the artifact store, the evidence model, citations, the deterministic verifier core and Thai OCR (`docs/plans/2026-10-24-sp2a-documents-evidence.md`); **2b** Kat computers; **2c** memory.
+2. **Computers, documents and memory.** Planned in three parts, each with its own plan (founder decision, 2026-10-24): **2a** the document tools, the artifact store, the evidence model, citations, the deterministic evidence verifier and the claim judge (moved forward from sub-project 3), the `katwork-craft` sidecar, file deletion and Thai OCR (`docs/plans/2026-10-24-sp2a-documents-evidence.md`); **2b** Kat computers; **2c** memory.
    - agentOS workspaces and the browser supervisor.
    - The document tools (docx, xlsx, pdf, OCR, Typst).
    - The evidence model and the artifact store.
@@ -565,7 +569,7 @@ This spec covers the whole alpha. Implementation planning splits it into sub-pro
      - Memory ACLs are evaluated at query time against the thread's Space and the requesting person; an assignment alone never grants access (§11).
      - A byte cap on always-in-prompt memory; the rest is retrieved by search under ACL (§11).
 3. **Gates and policy.**
-   - The approval host and the evidence verifier.
+   - The approval host, and acceptance on top of sub-project 2a's evidence verifier.
    - The policy function and job statuses.
    - Resume for `needs_input` jobs and for approvals (`docs/adr/0002-needs-input-is-final-in-sp1.md`).
    - Replay and kill-switch tests.
