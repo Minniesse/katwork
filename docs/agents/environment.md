@@ -52,7 +52,7 @@ In Claude Code, every command run inside a worktree of this repo gets that workt
 - commits and merges whose author or committer email isn't a GitHub noreply address
 - `gh pr merge` with `--admin`, `--auto`, `--squash` or `--rebase`, or when no review covers the code being merged, and `gh api` or `curl` writes that merge PRs or move refs
 
-A review covers the head when it was posted on the head commit, or on an earlier commit followed only by merges of the base branch, each byte-identical to git's own clean merge of its two parents (`git merge-tree --write-tree`). Merging `main` into a reviewed PR keeps the review valid; resolving a conflict, changing code in the merge or adding a commit needs a new review. The guard doesn't read what a review says; the maintainer weighs that.
+A review covers the head when it was posted on the head commit, or on an earlier commit followed only by merges of the base branch, each byte-identical to git's own clean merge of its two parents (`git merge-tree --write-tree`). Merging `main` into a reviewed PR keeps the review valid; resolving a conflict, changing code in the merge or adding a commit needs a new review. The guard doesn't read what a review says; the coordinator weighs that at the merge gate.
 
 The blocking message says what to do instead. Run `.claude/hooks/guard.py --self-test` after changing it.
 
