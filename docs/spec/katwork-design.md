@@ -66,7 +66,7 @@ KatWork lets anyone in an organization hire a team of named AI coworkers ("Kats"
 | Revenue | Free core, paid Enterprise edition, and later a paid hosted cloud. |
 | Name | KatWork, "the self-hosted AI team office". Repo `Minniesse/katwork`. |
 | Team | A solo maintainer builds the app with AI coding agents orchestrated by Orca. |
-| Development loop | Approved spec, then small GitHub Issues labelled `ready-for-agent`, then Orca workers in worktrees with TDD. Two independent reviewers who did not write a PR review it (§19.1), the founder approves every PR, CI must be green, and there is a weekly demo. |
+| Development loop | Approved spec, then small GitHub Issues labelled `ready-for-agent`, then Orca workers in worktrees with TDD. Two independent reviewers who did not write a PR review it, and the coordinator (the agent that dispatches the workers) merges code PRs on the merge gate (§19.1); the founder approves each plan and answers every decision it raises; CI must be green, and there is a weekly demo. |
 | Tracking | GitHub Issues for engineering; the Notion KatWork board for phases. |
 
 ## 3. Users and their jobs
@@ -134,7 +134,9 @@ KatWork follows the JEVIS layering: **the decision model advises, the harness ex
 │   model gateway (Rig providers; capability + data-residency rules; quotas)                  │
 │   channel adapters (LINE, Slack, Teams, RustChat/Mattermost, Telegram, Discord, WhatsApp)   │
 │   federation bridge, after the alpha (reason-network fork, OIDC identity, own relay)        │
-│ kat-workers (Rust) ── agentOS sidecars (one workspace per Kat) ── document tools            │
+│ kat-workers (Rust) ── agentOS sidecars (one workspace per Kat); document tools in-process   │
+│ katwork-craft (Craft CLIs, one throwaway user per call; default stack, §9.1)                │
+│ katwork-ocr (OAR-OCR, Tesseract, hayro; optional profile, docs/adr/0008)                    │
 │ browser-supervisor (Rust, chromiumoxide) ── chromium per Kat (a profile per person)         │
 │ craft-apps (web builds / MCP servers that pass the gates, §9)                               │
 │ postgres (jobs, tasks, proposals, events, memory metadata) · qdrant (vectors)               │
@@ -350,7 +352,7 @@ The alpha computer for each Kat has these parts:
 
 **How Kats drive them:**
 - **In sub-project 2a, the `katwork-craft` sidecar** is the first such sidecar and part of the default product stack: a pinned container on an internal network with no egress, its Craft CLIs built from source at pinned commits by the image itself, with each build's SHA-256s recorded, exposing only WordCraft's labelled preview render of DOCX outputs, GridCraft's check of every XLSX output before it is saved, and PdfCraft's text extraction if it wins its reader challenge. A file GridCraft reports Excel would repair is refused. **When the sidecar is unavailable, saves continue** (founder decision, 2026-10-24): the XLSX version is marked "not checked by GridCraft" on the Files page and in its evidence report, the person sees a notice, `/healthz` reports the sidecar as unavailable, and previews show a label instead of an image. An operator turns it off only with `KATWORK_CRAFT=off`, which logs a warning and marks versions the same way.
-- **Sidecar CLI or MCP first** for bounded automation. These tools run as pinned images, isolated per tenant, exposed as a small allowlist of operations (inspect, render page, propose image edit, save draft).
+- **Sidecar CLI or MCP first** for bounded automation. These tools run as pinned images, isolated per call in sub-project 2a (one shared `katwork-craft` container in which every CLI call runs as its own throwaway user, with a fresh uid, its own mode-0700 directory and no other writable path, and nothing kept afterwards; founder decision, 2026-10-24) and per workspace from sub-project 7, when one container per workspace arrives, exposed as a small allowlist of operations (inspect, render page, propose image edit, save draft).
 - **The browser build** when a person needs to see or edit the current revision. It runs from a separate origin per Kat or session, with a minimal host page that receives only a scoped artifact capability.
 - **One active editor at a time.** A control lease belongs to either the Kat or the person. Takeover pauses automation, a save creates a new revision, and stale writes are rejected.
 - **The office monitor shows labelled previews** of the current revision in the alpha. It streams the Kat's actual session once the bridge lands.
@@ -442,7 +444,7 @@ All four views read **one event model** from the core over AG-UI SSE: job and ta
 
 ## 13. Security and privacy
 
-- **Isolation.** Each Kat has its own sandbox and browser profiles. Untrusted code never sees the control plane, and tool credentials are scoped per Kat. In the alpha, agentOS runs a Kat's JavaScript, Python (Pyodide) and WASM inside a sidecar process, not a hardware VM; the sidecar runs unprivileged in its own container. Per-Kat microVMs for code come with KatsAgentOS after the alpha (§1.2); in the alpha, a fired kill criterion moves the code tier to gVisor. No Kat runs code in agentOS until a CI test proves, for every enabled runtime (JavaScript, Pyodide, WASM), that guest code cannot reach host files, processes, the network or another Kat; each Kat's Chromium runs on a container runtime ladder, and egress leaves only through KatWork's egress gateway (`docs/adr/0009-kat-computer-isolation-tiers.md`).
+- **Isolation.** Each Kat has its own sandbox and browser profiles. Untrusted code never sees the control plane, and tool credentials are scoped per Kat. In the alpha, agentOS runs a Kat's JavaScript, Python (Pyodide) and WASM inside a sidecar process, not a hardware VM; the sidecar runs unprivileged in its own container. Per-Kat microVMs for code come with KatsAgentOS after the alpha (§1.2); in the alpha, a fired kill criterion moves the code tier to gVisor, and a host without gVisor keeps agentOS, with a visible warning to the operator at startup and to people in the Space, until gVisor is installed (founder decision, 2026-10-24). No Kat runs code in agentOS until a CI test proves, for every enabled runtime (JavaScript, Pyodide, WASM), that guest code cannot reach host files, processes, the network or another Kat; each Kat's Chromium runs on a container runtime ladder, and egress leaves only through KatWork's egress gateway (`docs/adr/0009-kat-computer-isolation-tiers.md`).
 - **Treating inputs as untrusted.** The harness never runs model output through a shell, in the core or in checks; checks run as argv arrays. Tool ids are matched against a registry. Commands inside a Kat's sandbox run only through the agentOS exec API, as a per-Kat capability that is off by default, bounded, gated like any tool call, and recorded. Content from web pages, files and peers is treated as untrusted (prompt injection), and the harness assumes the model can be hijacked by it: the controls are the evidence verifier and the approval gate, never a prompt. Hidden text never reaches the model, text that reads like an instruction to an AI cannot support a claim, and every tool call records whether its output was trusted, the seam for taint-aware approvals in sub-project 3 (`docs/adr/0010-untrusted-content-posture.md`).
 - **Data residency.** Each Space declares which providers may see its data. Documents and evidence stay on the install.
 - **Deletion.** An admin can delete a file. Its bytes and every stored copy of text derived from it are purged: extracted and quoted text, the cell facts and context inside source references, the text of claims that cite it, tool-call arguments and results, and Kat messages that quote it, and its name. Evidence keeps only ids and hashes, and claims that cited it become *unverified*. Kat outputs that quote it are separate artifacts: their quoted claim text is redacted in reports, and the admin is shown the list to review or delete. Deletion is serialized with every read, citation and write of the file, and the work it leaves (blob removal, re-verification) is recorded in the same transaction, so a crash cannot lose it. Copies outside KatWork, old database row versions until they are reclaimed, and backups until they rotate are outside its reach, and the delete dialog says so (`docs/adr/0007-evidence-model-and-source-refs.md`).
@@ -499,7 +501,7 @@ The alpha uses rivet agentOS behind a stable `Computer` contract. agentOS is tem
 |---|---|
 | 2026-10-26 | Spec approved. `Minniesse/katwork` created. Skills setup switched to GitHub. Issue breakdown. Compose skeleton (core, Postgres, Qdrant). Auth with password reset. |
 | 2026-11-02 | Kat model, team builder, scheduler with leases, agent loop over a Rig provider. Web chat. AG-UI events. |
-| 2026-11-09 | agentOS computers and the browser supervisor. Document tools (docx, xlsx, pdf, OCR). Evidence model. |
+| 2026-11-09 | agentOS computers and the browser supervisor (sub-project 2b, planned separately). Document tools (docx, xlsx, pdf). Evidence model. OCR moves to the end of sub-project 2a, in December (founder decision, 2026-10-24). |
 | 2026-11-16 | Approval host. Evidence verifier. Policy function and statuses. Meeting-minutes template end to end. |
 | 2026-11-23 | Laya in Rust, in shadow mode (the lead Kat routes). Stage 0 routing. LINE and Slack adapters. Tasks-and-files board. |
 | 2026-11-30 | Lead-Kat planning and delegation. Research-brief template. Live agent graph. |
@@ -580,7 +582,7 @@ This spec covers the whole alpha. Implementation planning splits it into sub-pro
      - The action type comes from KatWork's registry; MCP annotations are advisory; an unconfirmed tool counts as an external API call until an admin confirms it against its schema digest (§6.5).
      - The contract hash covers the template, the check ids and versions, the customer template file and the verifier build; a mismatch stops the job (`contract_changed`) with "restart the job" as the next step (§6.5).
      - Each check records its origin (template, person or Kat) and when it was registered, which implements the same-Kat rule (§6.5).
-     - Non-numeric factual claims get an advisory support check that can only lower a claim's status (§6.5).
+     - Non-numeric factual claims get an advisory support check that can only lower a claim's status (§6.5). This moved to sub-project 2a: the claim judge, which can only lower a claim and whose *contradicted* alone only flags it (item 2, §15).
      - Checks pass only on a harness-owned completion record, never import from the artifact workspace, and before/after drift makes a claim unverified and stale (§5.1).
      - The acceptance contract needs zero failed claims, and every claim in the template's required-evidence scope passed (§7.3).
      - Code renders approval cards from the Proposal; Edit creates a new person-authored Proposal; a pending Proposal is visible in the queue without opening its thread (§7.2).
@@ -641,9 +643,9 @@ This spec covers the whole alpha. Implementation planning splits it into sub-pro
 
 ### 19.1 Review rule
 
-Two independent reviewers who did not write the PR review it; at least one is a different model or a fresh instance of the strongest model, and the maintainer approves.
+Two independent reviewers who did not write the PR review it; at least one is a different model or a fresh instance of the strongest model. **The founder approves each plan and answers every "NEEDS FOUNDER DECISION" item. Code PRs merge on the merge gate**: the coordinator merges a code PR only when its reviews and verification have run on its exact head, nothing blocking is open and CI is green (founder decision, 2026-10-24).
 
-In practice (founder decision, 2026-10-24): Opus builds trust-core tasks and Sonnet the rest. The reviewers are a deep reviewer (the strongest model: correctness, security, concurrency, tenant isolation, prompt injection, backed by probes and mutations) and a checklist reviewer (a fixed list: spec conformance and spec deviations, tests that fail without their fix, the coding standards, English and Thai copy, public-repo hygiene). A verifier tries to refute each P0 and P1 finding before it goes back to the builder. A PR gets at most three fix rounds; after the second, P3 findings become follow-up issues, while P0, P1 and security findings always block. A PR merges only when all three have run on its exact head, nothing blocking is open and CI is green; the maintainer also reads the full diff of a trust-core PR.
+In practice (founder decisions, 2026-10-24): Opus builds trust-core tasks and Sonnet the rest. The reviewers are a deep reviewer (the strongest model: correctness, security, concurrency, tenant isolation, prompt injection, backed by probes and mutations) and a checklist reviewer (a fixed list: spec conformance and spec deviations, tests that fail without their fix, the coding standards, English and Thai copy, public-repo hygiene). A verifier tries to refute each P0 and P1 finding before it goes back to the builder. A PR gets at most three fix rounds; after the second, P3 findings become follow-up issues, while P0, P1 and security findings always block. The coordinator reads the full diff of a trust-core PR before it merges it.
 
 ## 20. References
 

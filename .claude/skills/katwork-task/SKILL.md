@@ -5,7 +5,7 @@ description: Implement one task of a KatWork plan as a stacked PR. Use when aske
 
 # Implement a plan task
 
-One plan task per branch, one PR, stacked on the task it depends on. Opus builds trust-core tasks and Sonnet builds the rest, as the task's **Builder** line says. A Sonnet builder follows the task's steps exactly and stops to ask rather than choosing. Two fresh reviewers who did not write it (a deep reviewer and a checklist reviewer) and a verifier take it from there, as the `katwork-review` skill describes; the maintainer merges.
+One plan task per branch, one PR, stacked on the task it depends on. Opus builds trust-core tasks and Sonnet builds the rest, as the task's **Builder** line says. A Sonnet builder follows the task's steps exactly and stops to ask rather than choosing. Two fresh reviewers who did not write it (a deep reviewer and a checklist reviewer) and a verifier take it from there, as the `katwork-review` skill describes; the coordinator merges it on the merge gate.
 
 ## Steps
 
@@ -56,7 +56,7 @@ One plan task per branch, one PR, stacked on the task it depends on. Opus builds
    - **Out of scope**: what the task leaves for later tasks
    - **Written by**: your model and the task's Builder line; trust-core changes (approval, policy, evidence, sandbox) also flag that they need a security review, which the Opus reviewer gives
 
-   Done when the PR is open against the right base, CI is green on its head (`gh pr checks <n>`), and the body has every item. Then hand off: the two reviewers, the verifier and the maintainer take it from here.
+   Done when the PR is open against the right base, CI is green on its head (`gh pr checks <n>`), and the body has every item. Then hand off: the two reviewers, the verifier and the coordinator's merge gate take it from here.
 
 8. **Clean up** when you leave the worktree: `scripts/test-db.sh stop`.
 

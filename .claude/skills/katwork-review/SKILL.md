@@ -10,7 +10,7 @@ Every PR gets two independent reviews from fresh sessions that did not write it 
 - the **checklist reviewer** (Sonnet): the **checklist** in `CODING_STANDARDS.md`, item by item;
 - the **verifier**: tries to refute each P0 and P1 finding before it goes back to the builder, and records each as confirmed or refuted.
 
-A PR gets at most three fix rounds; after the second, P3 findings become follow-up issues, while P0, P1 and security findings always block. The maintainer merges only when all three have run on the exact head SHA, nothing blocking is open and CI is green, and reads the full diff of a trust-core PR. `gh pr merge` refuses unless a review covers the head: one posted on it, or on an earlier commit followed only by clean merges of the base branch.
+A PR gets at most three fix rounds; after the second, P3 findings become follow-up issues, while P0, P1 and security findings always block. Code PRs merge on the merge gate: the coordinator merges only when all three have run on the exact head SHA, nothing blocking is open and CI is green, and reads the full diff of a trust-core PR first. The founder approves plans and answers "NEEDS FOUNDER DECISION" items. `gh pr merge` refuses unless a review covers the head: one posted on it, or on an earlier commit followed only by clean merges of the base branch.
 
 ## Steps
 
@@ -35,7 +35,7 @@ A PR gets at most three fix rounds; after the second, P3 findings become follow-
 
 4. **Read every changed file** (`gh pr diff <n>`), and apply every rule in `CODING_STANDARDS.md` to the diff. The checklist reviewer answers each checklist item as pass or a finding. Done when each rule is either satisfied or a finding.
 
-   **Spec deviations.** A review of a plan, an ADR or any PR that touches the spec has a "Spec deviations" section: every tool, service, dependency, product rule or decision in the change that the approved spec on `main` does not name or that contradicts it, with `file:line`, each marked "founder-decided (<label or date>)" or "NEEDS FOUNDER DECISION". A plan review is not Ready while a "NEEDS FOUNDER DECISION" entry is unanswered.
+   **Spec deviations.** A review of a plan, an ADR or any PR that touches the spec has a "Spec deviations" section: every tool, service, dependency, product rule or decision in the change that the approved spec on `main` does not name or that contradicts it, with `file:line`, each marked "founder-decided (<label or date>)" or "NEEDS FOUNDER DECISION". "NEEDS FOUNDER DECISION" is only for a product, scope or process choice that the spec and the founder decisions do not settle; a defect that breaks a spec rule (a tenant leak, a lock-order break, a wrong limit) is a finding with a severity, never a founder question. A plan review is not Ready while a "NEEDS FOUNDER DECISION" entry is unanswered.
 
 5. **Probe every security claim** (the deep reviewer always, with a mutation where a test should catch the claim failing; the checklist reviewer for the claims its checklist names). A claim is any sentence in the PR body, a comment or a test name that says something can't happen: a cross-tenant request gets 404, a token works once, a secret never prints, locks follow the global order, a tool outside the allowlist never runs. For each one:
    - find the test that proves it and read its assertions: does it fail if the claim is false?
@@ -49,7 +49,7 @@ A PR gets at most three fix rounds; after the second, P3 findings become follow-
 7. **Write the review** in one file:
 
    ```markdown
-   **Verdict: Ready for maintainer.**   (or: **Verdict: Changes needed.**)
+   **Verdict: Ready to merge.**   (or: **Verdict: Changes needed.**)
 
    Reviewed head `<sha>` against `<base>` as <your model>, <deep review | checklist review | verification>, scope: <full diff | delta <old>..<new>>, fix round <1|2|3>.
 
@@ -68,7 +68,7 @@ A PR gets at most three fix rounds; after the second, P3 findings become follow-
    - <command>: <result>
    ```
 
-   "Ready for maintainer" means no P0 or P1 finding and no security finding is open and, for a plan, no "NEEDS FOUNDER DECISION" entry is unanswered.
+   "Ready to merge" means no P0 or P1 finding and no security finding is open and, for a plan, no "NEEDS FOUNDER DECISION" entry is unanswered (a plan then goes to the founder for approval; a code PR to the coordinator's merge gate).
 
    **As the verifier**, write one line per P0 and P1 finding of the two reviews: the finding, what you ran to refute it, and **confirmed** or **refuted**. Only confirmed findings go back to the builder.
 
