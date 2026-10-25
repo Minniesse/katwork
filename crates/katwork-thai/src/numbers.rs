@@ -5,8 +5,10 @@ use std::ops::Range;
 use rust_decimal::Decimal;
 
 use crate::dates::{self, Scan};
+use crate::digits::{Script, script};
 use crate::found::{
-    View, char_len, check_len, digits_end, has_at, has_before, is_digit, is_latin_letter, is_thai,
+    View, char_len, check_len, digits_end, foreign_separator, has_at, has_before, is_digit,
+    is_latin_letter, is_numeral, is_thai, numerals_end,
 };
 use crate::{Ctx, Flags, Found, TooLong};
 
@@ -151,12 +153,30 @@ const WORDS: [(&str, Word); 20] = [
     ("\u{0E28}\u{0E39}\u{0E19}\u{0E22}\u{0E4C}", Word::Sun),      // ศูนย์
 ];
 
-/// Words that begin with a scale word but are not one: `3 พันธุ์` is three varieties.
-const NOT_SCALES: [&str; 6] = [
-    "\u{0E1E}\u{0E31}\u{0E19}\u{0E18}", // พันธ (พันธุ์, พันธ์, พันธะ, พันธมิตร)
+/// Ordinary words that hold a power word or ล้าน: no number word inside one starts a number,
+/// and after a figure none is a scale (`3 พันธุ์` is three varieties, `5 สิบเอก` five sergeants).
+const ORDINARY_WORDS: [&str; 23] = [
+    "\u{0E1E}\u{0E31}\u{0E19}\u{0E18}", // พันธ (พันธุ์, พันธ์, พันธะ, พันธมิตร, กุมภาพันธ์)
     "\u{0E1E}\u{0E31}\u{0E19}\u{0E15}\u{0E23}\u{0E35}", // พันตรี
     "\u{0E1E}\u{0E31}\u{0E19}\u{0E42}\u{0E17}", // พันโท
     "\u{0E1E}\u{0E31}\u{0E19}\u{0E40}\u{0E2D}\u{0E01}", // พันเอก
+    "\u{0E1E}\u{0E31}\u{0E19}\u{0E15}\u{0E33}\u{0E23}\u{0E27}\u{0E08}", // พันตำรวจ
+    "\u{0E1E}\u{0E31}\u{0E19}\u{0E08}\u{0E48}\u{0E32}", // พันจ่า
+    "\u{0E23}\u{0E49}\u{0E2D}\u{0E22}\u{0E15}\u{0E23}\u{0E35}", // ร้อยตรี
+    "\u{0E23}\u{0E49}\u{0E2D}\u{0E22}\u{0E42}\u{0E17}", // ร้อยโท
+    "\u{0E23}\u{0E49}\u{0E2D}\u{0E22}\u{0E40}\u{0E2D}\u{0E01}", // ร้อยเอก
+    "\u{0E23}\u{0E49}\u{0E2D}\u{0E22}\u{0E15}\u{0E33}\u{0E23}\u{0E27}\u{0E08}", // ร้อยตำรวจ
+    "\u{0E23}\u{0E49}\u{0E2D}\u{0E22}\u{0E40}\u{0E2D}\u{0E47}\u{0E14}", // ร้อยเอ็ด
+    "\u{0E23}\u{0E49}\u{0E2D}\u{0E22}\u{0E01}\u{0E23}\u{0E2D}\u{0E07}", // ร้อยกรอง
+    "\u{0E23}\u{0E49}\u{0E2D}\u{0E22}\u{0E40}\u{0E23}\u{0E35}\u{0E22}\u{0E07}", // ร้อยเรียง
+    "\u{0E23}\u{0E49}\u{0E2D}\u{0E22}\u{0E41}\u{0E01}\u{0E49}\u{0E27}", // ร้อยแก้ว
+    "\u{0E40}\u{0E23}\u{0E35}\u{0E22}\u{0E1A}\u{0E23}\u{0E49}\u{0E2D}\u{0E22}", // เรียบร้อย
+    "\u{0E2A}\u{0E23}\u{0E49}\u{0E2D}\u{0E22}", // สร้อย
+    "\u{0E2A}\u{0E34}\u{0E1A}\u{0E15}\u{0E23}\u{0E35}", // สิบตรี
+    "\u{0E2A}\u{0E34}\u{0E1A}\u{0E42}\u{0E17}", // สิบโท
+    "\u{0E2A}\u{0E34}\u{0E1A}\u{0E40}\u{0E2D}\u{0E01}", // สิบเอก
+    "\u{0E2A}\u{0E34}\u{0E1A}\u{0E15}\u{0E33}\u{0E23}\u{0E27}\u{0E08}", // สิบตำรวจ
+    "\u{0E41}\u{0E2A}\u{0E19}\u{0E2A}\u{0E38}\u{0E02}", // แสนสุข
     "\u{0E25}\u{0E49}\u{0E32}\u{0E19}\u{0E19}\u{0E32}", // ล้านนา
     "\u{0E25}\u{0E49}\u{0E32}\u{0E19}\u{0E0A}\u{0E49}\u{0E32}\u{0E07}", // ล้านช้าง
 ];
@@ -164,6 +184,11 @@ const NOT_SCALES: [&str; 6] = [
 const ROI_LA: &str = "\u{0E23}\u{0E49}\u{0E2D}\u{0E22}\u{0E25}\u{0E30}"; // ร้อยละ
 const BAHT_THUAN: &str = "\u{0E1A}\u{0E32}\u{0E17}\u{0E16}\u{0E49}\u{0E27}\u{0E19}"; // บาทถ้วน
 const NA_DOT: &str = "\u{0E19}."; // น. (the hour)
+const KHRUENG: &str = "\u{0E04}\u{0E23}\u{0E36}\u{0E48}\u{0E07}"; // ครึ่ง (half)
+const TID: &str = "\u{0E15}\u{0E34}\u{0E14}"; // ติด, as in ติดลบ
+const TID_LOP: &str = "\u{0E15}\u{0E34}\u{0E14}\u{0E25}\u{0E1A}"; // ติดลบ (negative)
+const LOP: &str = "\u{0E25}\u{0E1A}"; // ลบ (minus, or "delete")
+const THUENG: &str = "\u{0E16}\u{0E36}\u{0E07}"; // ถึง (to)
 
 /// Unit words after a figure, longest first; Latin ones count only as whole words.
 const UNITS_AFTER: [(&str, Unit); 10] = [
@@ -244,46 +269,63 @@ enum WordsError {
     Overflow,
 }
 
-/// `thaiword_to_num`: `(ลบ)?(G ล้าน)*G` with `G = (D แสน)?(D หมื่น)?(D พัน)?(D ร้อย)?(D สิบ)?D?`,
-/// or `ศูนย์` alone. The pending digit starts at 1, so a bare power word or ล้าน means one of
-/// it; a power word takes `max(pending, 1)` and leaves 0 pending; ล้าน multiplies everything so
-/// far. `lead` is a figure written before the words (a `Mixed` number): it is the first pending
-/// digit, used as it is.
-fn integer(words: &[Word], lead: Option<Decimal>) -> Result<Decimal, WordsError> {
-    if words.is_empty() && lead.is_none() {
-        return Err(WordsError::Invalid);
-    }
-    if lead.is_none() && words == [Word::Sun] {
-        return Ok(Decimal::ZERO);
-    }
-    let (negative, words) = match words.split_first() {
-        Some((Word::Lop, rest)) if lead.is_none() => (true, rest),
-        _ => (false, words),
-    };
+/// A number word, or a figure standing where a digit word would: the figure of a Mixed number or
+/// of a compound amount.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Term {
+    Word(Word),
+    /// A figure and its decimal places, used as written: never raised to one.
+    Figure(Decimal, i64),
+}
+
+fn terms(words: &[Word]) -> Vec<Term> {
+    words.iter().map(|word| Term::Word(*word)).collect()
+}
+
+/// `thaiword_to_num`'s grammar over `terms`: `(G ล้าน)*G` with
+/// `G = (D แสน)?(D หมื่น)?(D พัน)?(D ร้อย)?(D สิบ)?D?`, where a figure may stand for a `D`. The
+/// pending digit starts at 1, so a bare power word or ล้าน means one of it; a power word takes
+/// `max(pending, 1)` (a figure as written) and leaves 0 pending; ล้าน multiplies everything so
+/// far. Also returns the lowest place the terms write: 5 for `3 ล้านห้าแสน`, -1 for `3.5`.
+fn numeral(terms: &[Term]) -> Result<(Decimal, i64), WordsError> {
     let million = Decimal::from(1_000_000);
     // None once the total no longer fits; the grammar is still checked to the end.
     let mut total = Some(Decimal::ZERO);
-    let mut pending = lead.unwrap_or(Decimal::ONE);
-    let mut pending_is_lead = lead.is_some();
+    let mut pending = Decimal::ONE;
+    let mut exact = false;
+    let mut pending_place = 0;
+    let mut place = 0;
     let mut last_power: Option<u8> = None;
-    let mut after_digit = lead.is_some();
-    for word in words {
-        match *word {
-            Word::Digit(digit) => {
+    let mut after_digit = false;
+    for term in terms {
+        match *term {
+            Term::Figure(value, decimals) => {
+                if after_digit {
+                    return Err(WordsError::Invalid);
+                }
+                after_digit = true;
+                pending = value;
+                exact = true;
+                pending_place = -decimals;
+                place = pending_place;
+            }
+            Term::Word(Word::Digit(digit)) => {
                 if after_digit {
                     return Err(WordsError::Invalid);
                 }
                 after_digit = true;
                 pending = Decimal::from(digit);
-                pending_is_lead = false;
+                exact = false;
+                pending_place = 0;
+                place = 0;
             }
-            Word::Power(power) => {
+            Term::Word(Word::Power(power)) => {
                 if last_power.is_some_and(|last| power >= last) {
                     return Err(WordsError::Invalid);
                 }
                 last_power = Some(power);
                 after_digit = false;
-                let times = if pending_is_lead {
+                let times = if exact {
                     pending
                 } else {
                     pending.max(Decimal::ONE)
@@ -292,28 +334,85 @@ fn integer(words: &[Word], lead: Option<Decimal>) -> Result<Decimal, WordsError>
                 total = total
                     .zip(add)
                     .and_then(|(total, add)| total.checked_add(add));
+                place = i64::from(power) + pending_place;
                 pending = Decimal::ZERO;
-                pending_is_lead = false;
+                exact = false;
+                pending_place = 0;
             }
-            Word::Lan => {
+            Term::Word(Word::Lan) => {
                 last_power = None;
                 after_digit = false;
                 total = total
                     .and_then(|total| total.checked_add(pending))
                     .and_then(|sum| sum.checked_mul(million));
+                place += 6;
                 pending = Decimal::ZERO;
-                pending_is_lead = false;
+                exact = false;
+                pending_place = 0;
             }
-            Word::Lop | Word::Chut | Word::Sun => return Err(WordsError::Invalid),
+            Term::Word(Word::Lop | Word::Chut | Word::Sun) => return Err(WordsError::Invalid),
         }
     }
-    let mut total = total
+    let total = total
         .and_then(|total| total.checked_add(pending))
         .ok_or(WordsError::Overflow)?;
+    Ok((total, place))
+}
+
+/// `thaiword_to_num`: `(ลบ)?` and [`numeral`]'s grammar, or `ศูนย์` alone. A leading ลบ
+/// negates, and ลบ alone is −1, as in the oracle.
+fn integer(words: &[Word]) -> Result<Decimal, WordsError> {
+    if words.is_empty() {
+        return Err(WordsError::Invalid);
+    }
+    if words == [Word::Sun] {
+        return Ok(Decimal::ZERO);
+    }
+    let (negative, words) = match words.split_first() {
+        Some((Word::Lop, rest)) => (true, rest),
+        _ => (false, words),
+    };
+    let (mut total, _) = numeral(&terms(words))?;
     if negative && !total.is_zero() {
         total.set_sign_negative(true);
     }
     Ok(total)
+}
+
+/// Terms the grammar and a reader may read differently: a part that ends in ล้าน, then a later
+/// part with its own ล้าน that fits below it. The grammar multiplies the earlier part again
+/// (สามพันล้านห้าร้อยล้าน is 3 × 10¹⁵ + 5 × 10⁸), where a reader may mean their sum (3.5 × 10⁹).
+fn regrouped(terms: &[Term]) -> bool {
+    let lan = Term::Word(Word::Lan);
+    let mut parts = Vec::new();
+    let mut start = 0;
+    for (index, pair) in terms.windows(2).enumerate() {
+        if pair[0] == lan && pair[1] != lan {
+            parts.push(&terms[start..=index]);
+            start = index + 1;
+        }
+    }
+    parts.push(&terms[start..]);
+    if !parts.iter().skip(1).any(|part| part.contains(&lan)) {
+        return false;
+    }
+    let Some(read) = parts
+        .iter()
+        .map(|part| numeral(part).ok())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let fits = read.windows(2).all(|pair| {
+        u32::try_from(pair[0].1)
+            .ok()
+            .and_then(power_of_ten)
+            .is_some_and(|limit| pair[1].0 < limit)
+    });
+    let sum = read
+        .iter()
+        .try_fold(Decimal::ZERO, |sum, (value, _)| sum.checked_add(*value));
+    fits && !matches!((numeral(terms), sum), (Ok((whole, _)), Some(sum)) if whole == sum)
 }
 
 /// `words_to_num`: without จุด the words are one numeral; with it, the words before the first
@@ -321,13 +420,13 @@ fn integer(words: &[Word], lead: Option<Decimal>) -> Result<Decimal, WordsError>
 /// (subtracted when the integer is −1 or less). Exact, where PyThaiNLP adds floats.
 fn words_value(words: &[Word]) -> Result<Decimal, WordsError> {
     let Some(point) = words.iter().position(|word| *word == Word::Chut) else {
-        return integer(words, None);
+        return integer(words);
     };
-    let whole = integer(&words[..point], None)?;
+    let whole = integer(&words[..point])?;
     let mut fraction = Decimal::ZERO;
     let mut places = 0;
     for word in &words[point + 1..] {
-        let digit = integer(std::slice::from_ref(word), None)?;
+        let digit = integer(std::slice::from_ref(word))?;
         places += 1;
         let part = Decimal::try_from_i128_with_scale(digit.mantissa(), digit.scale() + places)
             .map_err(|_| WordsError::Overflow)?;
@@ -368,33 +467,52 @@ pub fn parse_number_words(text: &str) -> Option<Decimal> {
 /// Finds the numbers in `text`, whatever their role, in order.
 ///
 /// A figure is digits with `,` thousands (a first group of 1–3 digits, later groups of exactly
-/// 3) and `.` decimals, in any of the digit scripts `normalize_th` folds. A `-`, U+2212, U+2012
-/// or U+2013 is a minus only when no figure stands right before it; `(1,250)` is an accounting
-/// negative, while one or two digits in parentheses, as `(1)`, are a list marker. Scale words
-/// after a figure add their powers of ten (พันล้าน is 9); a unit may stand before or after.
-/// A figure followed by number words that start with a power word or ล้าน is one `Mixed`
-/// number, whatever follows it. Number words alone are read only when they form a complete
-/// numeral with a power word or ล้าน, stand right before a unit or percent word or right after
-/// ร้อยละ, or restate the figure before them in parentheses (`AMOUNT_IN_WORDS`), and touch no
-/// date or month name. A figure no `Decimal` can hold is reported as a `Code` of value 0 over
-/// its whole span, never dropped.
+/// 3) and `.` decimals, in any of the digit scripts `normalize_th` folds. A `-` (and each dash
+/// `normalize_th` folds to it) touching the figure is a minus, unless a figure stands right
+/// before the dash: `10-15` is a range, and so is `10 - 15`, but `10 -15` holds −15. ติดลบ or
+/// `minus` before a figure makes it negative; a bare ลบ, which also means "delete", leaves it
+/// positive at confidence 0.5 with the negative reading in `alts`. `(1,250)` is an accounting
+/// negative, and so are one or two digits in parentheses before a scale word or a unit, as
+/// `(5) ล้านบาท`; otherwise `(1)` is a list marker. Scale words after a figure add their powers
+/// of ten (พันล้าน is 9); a unit may stand before or after it, and one before wins. A figure
+/// followed by number words that start with a power word or ล้าน is one `Mixed` number, whatever
+/// follows it, and so is a figure with its scale followed by a figure or digit-led number words
+/// with a smaller scale of their own (`3 ล้าน 9 แสน`); a figure with no scale word of its own
+/// never joins.
 ///
-/// The span covers the sign, accounting parentheses, the figure, its scale words and a symbol
-/// unit written with no space, never a unit word (except one standing between a figure and its
-/// scale words, as in `1 THB million`). Spans are code points of `text`; a text longer than
-/// [`crate::MAX_SCAN_CODE_POINTS`] is refused whole.
+/// What the reader cannot read with confidence is one `Code` of value 0 over the whole run,
+/// never a reading of part of it: a figure no `Decimal` holds; a figure holding a separator the
+/// grammar does not read (an apostrophe, a middle dot, U+066B, U+066C, U+201A, U+FE50, a thin or
+/// figure space), a digit `normalize_th` does not fold, or Arabic-Indic digits beside another
+/// script; a decimal part followed by a comma group (`1.234,5`); a Mixed or compound number that
+/// does not fit the grammar; ครึ่ง (half) beside a scale word; number words ending in a digit word
+/// that a Thai letter continues (`5 พันเก้าอี้`); and number words with a power word or ล้าน that
+/// do not form an amount. Number words are a `Quantity` only when they start with a digit word,
+/// form a complete numeral with a power word or ล้าน, stand right before a unit or percent word
+/// (one space allowed) or right after ร้อยละ, or restate the figure before them in parentheses
+/// (`AMOUNT_IN_WORDS`), and touch no date or month name; right after ร้อยละ a numeral with no
+/// power word is a percent too (ร้อยละห้า). Number words inside an ordinary word (สามารถ,
+/// เรียบร้อย, พันตรี) are no number.
+///
+/// The span covers the sign (a sign word too), accounting parentheses, the figure, its scale
+/// words, a symbol unit written with no space and the letters glued to a code, never a unit word
+/// except one between parts of the number (`1 THB million`, `ติดลบร้อยละ 6.1`). Spans are code
+/// points of `text`; a text longer than [`crate::MAX_SCAN_CODE_POINTS`] is refused whole.
 ///
 /// The role is the first that applies: `DatePart` for the digits of a date [`crate::find_dates`]
 /// returns and for a day written before a month name with no year; `Code` for a figure right
-/// after a stray dot (`.5`); `Quantity` when a scale word or a unit goes with the figure,
-/// whatever precedes it; `Ordinal` after วาระที่, ข้อ, ครั้งที่, ลำดับที่, ที่, หน้า, `No.`, `#`,
-/// `item`, `agenda`, `section` or `page`, with at most one space between; `Time` for `HH:MM`,
-/// or `HH.MM` before `น.`; `Code` when a Latin (or other non-Thai) letter or a slash touches it,
-/// it holds two dots, or it is one of three or more digit groups joined by `-`; otherwise
-/// `Quantity`. Every number has confidence 1.0 and no alternatives.
+/// after a stray dot or comma (`.5`, `x,250`), and for one with Latin (or other non-Thai) letters
+/// glued to it (`$5M`, `COVID19`) unless an English scale word is glued on (`1.25bn`) or the
+/// letters follow a symbol unit (`12.5%YoY`); `Quantity` when a scale word or a unit goes with the
+/// figure, whatever precedes it; `Ordinal` after วาระที่, ข้อ, ครั้งที่, ลำดับที่, ที่, หน้า, `No.`,
+/// `#`, `item`, `agenda`, `section` or `page`, with at most one space between; `Time` for `HH:MM`
+/// and `HH:MM:SS`, or `HH.MM` before `น.` or before a range whose end has it; `Code` when a slash
+/// touches it, it holds two dots, or it is one of three or more digit groups joined by `-`;
+/// otherwise `Quantity`. Every number has confidence 1.0 and no alternatives, except after a bare
+/// ลบ.
 ///
 /// The text is read through [`crate::normalize_th`], so mark order, Thai and full-width digits,
-/// zero-width characters and dash variants do not change what is found. Latin era markers are
+/// invisible characters and dash variants do not change what is found. Latin era markers are
 /// matched in the original capitals, so pass the original text, not a normalized one, when it
 /// may hold them.
 pub fn find_numbers(text: &str, ctx: &Ctx) -> Result<Vec<Found<Number>>, TooLong> {
@@ -408,7 +526,7 @@ pub fn find_numbers(text: &str, ctx: &Ctx) -> Result<Vec<Found<Number>>, TooLong
     items.sort_by_key(|item| item.range.start);
     Ok(items
         .into_iter()
-        .map(|item| view.found(&item.range, item.number, Vec::new(), 1.0, item.flags))
+        .map(|item| view.found(&item.range, item.number, item.alts, item.conf, item.flags))
         .collect())
 }
 
@@ -416,6 +534,8 @@ struct Item {
     range: Range<usize>,
     number: Number,
     flags: Flags,
+    conf: f32,
+    alts: Vec<(Number, f32)>,
 }
 
 /// A figure as lexed, in normalized code points.
@@ -434,32 +554,61 @@ enum TokenKind {
         frac: Vec<u8>,
         grouped: bool,
     },
-    /// Digit groups joined by more than one `.`, or three or more joined by `-`.
+    /// Digit groups joined by more than one `.`, by a decimal part and a comma group, or by a
+    /// separator the grammar does not read; three or more joined by `-`; digits `normalize_th`
+    /// does not fold; or Arabic-Indic digits beside another script.
     Code,
-    /// `HH:MM`.
-    Clock { hours: u32, minutes: u32 },
+    /// `HH:MM`, or `HH:MM:SS` with an optional fraction of a second.
+    Clock {
+        hours: u32,
+        minutes: u32,
+        seconds: Option<u32>,
+    },
 }
 
-/// What follows a figure in Thai words.
-enum ScaleRead {
-    /// Scale words only: `ล้าน`, `พันล้าน`.
-    Scale { end: usize, exponent: u32 },
-    /// Scale or power words with more number words after them: `3 ล้านห้าแสน`.
-    Mixed {
-        end: usize,
-        exponent: u32,
-        total: Decimal,
-    },
-    /// A Mixed number too large for a `Decimal`.
-    Unholdable { end: usize },
+/// The scale part of a figure, or a later part of a compound amount.
+struct Group {
+    end: usize,
+    /// The part's whole value: the figure times its scale, plus the number words after it.
+    value: Decimal,
+    /// The lowest place the part writes: 6 for `3 ล้าน`, 5 for `3.5 ล้าน` and `3 ล้านห้าแสน`.
+    place: i64,
+    /// The sum of its scale words: พัน, หมื่น, แสน, ล้าน and the English ones.
+    scale: u32,
+    /// It holds number words beyond its scale words, so it makes a Mixed number.
+    words: bool,
+    /// Its terms for the grammar; empty for an English scale.
+    terms: Vec<Term>,
+    /// It ends with a digit word.
+    digit_last: bool,
+}
+
+enum GroupRead {
+    /// No scale or power word.
+    None,
+    Read(Group),
+    /// Words the reader cannot place: one code up to here.
+    Unreadable(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sign {
+    Negative,
+    /// ลบ alone: a minus, or the verb "delete".
+    Ambiguous,
 }
 
 struct Scanner<'a> {
+    view: &'a View,
     t: &'a [char],
     dates: &'a Scan,
     /// Code points no number word may come from: percent words, dates, month names and
     /// what figures already took.
     taken: Vec<bool>,
+    /// Code points inside an ordinary word that holds a power word or ล้าน (เรียบร้อย, พันตรี).
+    ordinary: Vec<bool>,
+    /// Where a number read so far ends.
+    ends: Vec<bool>,
     items: Vec<Item>,
 }
 
@@ -472,20 +621,29 @@ impl<'a> Scanner<'a> {
                 .iter_mut()
                 .for_each(|slot| *slot = true);
         }
+        let mut ordinary = vec![false; t.len()];
         let mut at = 0;
         while at < t.len() {
             if has_at(t, at, ROI_LA) {
                 let end = at + char_len(ROI_LA);
                 taken[at..end].iter_mut().for_each(|slot| *slot = true);
                 at = end;
-            } else {
-                at += 1;
+                continue;
             }
+            if let Some(word) = ORDINARY_WORDS.iter().find(|word| has_at(t, at, word)) {
+                ordinary[at..at + char_len(word)]
+                    .iter_mut()
+                    .for_each(|slot| *slot = true);
+            }
+            at += 1;
         }
         Scanner {
+            view,
             t,
             dates,
             taken,
+            ordinary,
+            ends: vec![false; t.len() + 1],
             items: Vec::new(),
         }
     }
@@ -509,8 +667,9 @@ impl<'a> Scanner<'a> {
     /// Lexes every figure, then reads each with its sign, units and scale.
     fn figures(&mut self) {
         let tokens = self.tokens();
-        for token in &tokens {
-            self.figure(token);
+        let mut i = 0;
+        while i < tokens.len() {
+            i += self.figure(&tokens, i);
         }
     }
 
@@ -518,22 +677,91 @@ impl<'a> Scanner<'a> {
         let mut tokens = Vec::new();
         let mut at = 0;
         while at < self.t.len() {
-            if !self.get(at).is_some_and(is_digit) {
+            if !self.get(at).is_some_and(is_numeral) {
                 at += 1;
                 continue;
             }
-            let token = self.lex(at);
-            at = token.end;
-            tokens.push(token);
+            let chain = self.chain_end(at);
+            if self.foreign(at, chain) {
+                tokens.push(Token {
+                    start: at,
+                    end: chain,
+                    kind: TokenKind::Code,
+                });
+                at = chain;
+                continue;
+            }
+            // A chain of ASCII digit groups joined by `,` and `.` holds one figure or more.
+            let mut next = at;
+            while next < chain {
+                if !self.get(next).is_some_and(is_digit) {
+                    next += 1;
+                    continue;
+                }
+                let token = self.lex(next, chain);
+                next = token.end;
+                let mixed = matches!(token.kind, TokenKind::Figure { .. })
+                    && self.mixed_scripts(&(token.start..token.end));
+                tokens.push(if mixed {
+                    Token {
+                        kind: TokenKind::Code,
+                        ..token
+                    }
+                } else {
+                    token
+                });
+            }
+            at = chain;
         }
         self.join_runs(tokens)
     }
 
-    /// One figure from `at`: digit groups joined by `,` thousands (a first group of 1–3 digits,
-    /// later groups of exactly 3) and one `.` decimal part. A second `.` makes the whole chain
-    /// of groups one code (`1.2.3`, `192.168.0.1`). Each group is read once, so a run such as
-    /// `1,2,3,…` costs no more than its length.
-    fn lex(&self, at: usize) -> Token {
+    /// Where the run of numerals from `at` ends, over single separators a numeral follows: `,`,
+    /// `.`, the separators the grammar does not read, and thin or figure spaces.
+    fn chain_end(&self, at: usize) -> usize {
+        let mut end = numerals_end(self.t, at);
+        while self.get(end).is_some_and(|c| {
+            c == ',' || c == '.' || foreign_separator(c) || self.view.group_space(end)
+        }) && self.get(end + 1).is_some_and(is_numeral)
+        {
+            end = numerals_end(self.t, end + 1);
+        }
+        end
+    }
+
+    /// The chain holds a numeral `normalize_th` does not fold or a separator the grammar does not
+    /// read.
+    fn foreign(&self, start: usize, end: usize) -> bool {
+        (start..end).any(|at| {
+            self.get(at)
+                .is_some_and(|c| (is_numeral(c) && !is_digit(c)) || foreign_separator(c))
+                || self.view.group_space(at)
+        })
+    }
+
+    /// The figure mixes digit scripts other than Thai with ASCII, as `1٠250` (an Arabic-Indic
+    /// zero that looks like a dot).
+    fn mixed_scripts(&self, range: &Range<usize>) -> bool {
+        let written = self.view.written(range);
+        let mut scripts = written.chars().filter_map(script);
+        let Some(first) = scripts.next() else {
+            return false;
+        };
+        scripts.any(|other| {
+            other != first
+                && !matches!(
+                    (first, other),
+                    (Script::Ascii, Script::Thai) | (Script::Thai, Script::Ascii)
+                )
+        })
+    }
+
+    /// One figure from `at`, inside the chain of digit groups that ends at `chain`: groups joined
+    /// by `,` thousands (a first group of 1–3 digits, later groups of exactly 3) and one `.`
+    /// decimal part. A second `.`, or a comma group after the decimal part (`1.234,5`), makes the
+    /// whole chain one code. Each group is read once, so a run such as `1,2,3,…` costs no more
+    /// than its length.
+    fn lex(&self, at: usize, chain: usize) -> Token {
         let first = digits_end(self.t, at);
         let mut int_end = first;
         // The group after a separator at `sep`, when one follows it.
@@ -570,17 +798,12 @@ impl<'a> Scanner<'a> {
                 },
             };
         };
-        if self.get(frac_group.end) == Some('.') && group_after(frac_group.end).is_some() {
-            let mut end = frac_group.end;
-            while matches!(self.get(end), Some('.' | ',')) {
-                match group_after(end) {
-                    Some(group) => end = group.end,
-                    None => break,
-                }
-            }
+        if matches!(self.get(frac_group.end), Some('.' | ','))
+            && group_after(frac_group.end).is_some()
+        {
             return Token {
                 start: at,
-                end,
+                end: chain,
                 kind: TokenKind::Code,
             };
         }
@@ -600,7 +823,8 @@ impl<'a> Scanner<'a> {
             .collect()
     }
 
-    /// Three or more figures joined by `-` are one code (`000-000-0000`); `HH:MM` is a time.
+    /// Three or more figures joined by `-` are one code (`000-000-0000`); `HH:MM` and
+    /// `HH:MM:SS` are a time.
     fn join_runs(&self, tokens: Vec<Token>) -> Vec<Token> {
         let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
         let mut i = 0;
@@ -620,15 +844,13 @@ impl<'a> Scanner<'a> {
                 i = last + 1;
                 continue;
             }
-            if let (Some(clock), Some(next)) =
-                (self.clock(&tokens[i], tokens.get(i + 1)), tokens.get(i + 1))
-            {
+            if let Some((clock, used)) = self.clock(&tokens[i..]) {
                 out.push(Token {
                     start: tokens[i].start,
-                    end: next.end,
+                    end: tokens[i + used - 1].end,
                     kind: clock,
                 });
-                i += 2;
+                i += used;
                 continue;
             }
             out.push(tokens[i].clone());
@@ -637,151 +859,196 @@ impl<'a> Scanner<'a> {
         out
     }
 
-    fn clock(&self, hours: &Token, minutes: Option<&Token>) -> Option<TokenKind> {
-        let minutes = minutes?;
-        let (
-            TokenKind::Figure {
-                int: h,
-                frac: hf,
-                grouped: false,
-            },
-            TokenKind::Figure {
-                int: m,
-                frac: mf,
-                grouped: false,
-            },
-        ) = (&hours.kind, &minutes.kind)
-        else {
+    /// `HH:MM`, or `HH:MM:SS` with an optional fraction of a second, from the first token, and
+    /// how many tokens it takes. A field that follows another clock field (`05` in `9:05:15`)
+    /// starts no clock, and four fields are no time.
+    fn clock(&self, tokens: &[Token]) -> Option<(TokenKind, usize)> {
+        let [hours, minutes, rest @ ..] = tokens else {
             return None;
         };
-        if self.get(hours.end) != Some(':')
-            || minutes.start != hours.end + 1
-            || !hf.is_empty()
-            || !mf.is_empty()
+        let joined = |field: &Token, next: &Token| {
+            self.get(field.end) == Some(':') && next.start == field.end + 1
+        };
+        let more = |field: &Token| {
+            self.get(field.end) == Some(':') && self.get(field.end + 1).is_some_and(is_digit)
+        };
+        if self.before(hours.start) == Some(':')
+            && hours
+                .start
+                .checked_sub(1)
+                .and_then(|colon| self.before(colon))
+                .is_some_and(is_digit)
         {
             return None;
         }
-        if self.get(minutes.end) == Some(':') && self.get(minutes.end + 1).is_some_and(is_digit) {
+        if !joined(hours, minutes) {
             return None;
         }
-        let hours_value = clock_value(h, 1..=2, 24)?;
-        let minutes_value = clock_value(m, 2..=2, 59)?;
-        Some(TokenKind::Clock {
-            hours: hours_value,
-            minutes: minutes_value,
-        })
+        let hours_value = clock_value(whole(hours)?, 1..=2, 24)?;
+        let minutes_value = clock_value(whole(minutes)?, 2..=2, 59)?;
+        if !more(minutes) {
+            return Some((
+                TokenKind::Clock {
+                    hours: hours_value,
+                    minutes: minutes_value,
+                    seconds: None,
+                },
+                2,
+            ));
+        }
+        let seconds = rest.first().filter(|seconds| joined(minutes, seconds))?;
+        let TokenKind::Figure {
+            int,
+            grouped: false,
+            ..
+        } = &seconds.kind
+        else {
+            return None;
+        };
+        let seconds_value = clock_value(int, 2..=2, 59)?;
+        if more(seconds) {
+            return None;
+        }
+        Some((
+            TokenKind::Clock {
+                hours: hours_value,
+                minutes: minutes_value,
+                seconds: Some(seconds_value),
+            },
+            3,
+        ))
     }
 
-    /// Reads one lexed figure with what surrounds it, and the amount in words after it.
-    fn figure(&mut self, token: &Token) {
+    /// Reads `tokens[i]` with what surrounds it, and the amount in words after it. Returns how
+    /// many tokens it read: more than one when the later parts of a compound amount follow.
+    fn figure(&mut self, tokens: &[Token], i: usize) -> usize {
+        let Some(token) = tokens.get(i) else {
+            return 1;
+        };
         let (int, frac) = match &token.kind {
             TokenKind::Figure { int, frac, .. } => (int.clone(), frac.clone()),
             TokenKind::Code => {
                 let role = self.role_without_value(token);
-                self.push_fixed(token.start..token.end, role, Flags::default());
-                return;
+                // A code's scale words are part of it: `1'250 ล้าน` is one code.
+                let end = match role {
+                    NumberRole::Code => self.scale_end(token.end).unwrap_or(token.end),
+                    _ => token.end,
+                };
+                self.push_fixed(token.start..end, role, Flags::default());
+                return 1;
             }
-            TokenKind::Clock { hours, minutes } => {
-                let range = token.start..token.end;
-                let role = if self.in_date(&range) {
-                    NumberRole::DatePart
-                } else {
-                    NumberRole::Time
-                };
-                let flags = if role == NumberRole::Time {
-                    Flags::TIME
-                } else {
-                    Flags::default()
-                };
-                match Decimal::try_new(i64::from(hours * 100 + minutes), 2) {
-                    Ok(value) => {
-                        let number = Number {
-                            value,
-                            scale: Scale(0),
-                            unit: None,
-                            form: Form::Digits,
-                            decimals: 2,
-                            role,
-                        };
-                        self.push(range, number, flags);
-                    }
-                    Err(_) => self.push_fixed(range, NumberRole::Code, Flags::default()),
-                }
-                return;
+            TokenKind::Clock {
+                hours,
+                minutes,
+                seconds,
+            } => {
+                self.clock_found(token, *hours, *minutes, *seconds);
+                return 1;
             }
         };
         let mut flags = Flags::default();
         // Before the digits: a symbol unit and a minus, in either order ($-5, -$5).
         let mut start = token.start;
-        let mut unit = self.prefix_symbol(start);
-        if unit.is_some() {
-            start -= 1;
+        let mut unit = None;
+        if let Some((symbol, width)) = self.prefix_symbol(start) {
+            unit = Some(symbol);
+            start -= width;
         }
-        let minus = self.free_before(start) == Some('-') && !self.figure_before(start - 1);
+        let minus = self.minus_before(start);
         if minus {
             start -= 1;
             if unit.is_none()
-                && let Some(symbol) = self.prefix_symbol(start)
+                && let Some((symbol, width)) = self.prefix_symbol(start)
             {
                 unit = Some(symbol);
-                start -= 1;
+                start -= width;
             }
         }
-        // After them: a symbol unit written with no space, as in 12.5%.
+        // After them: a symbol unit written with no space, as in 12.5%; a unit before wins.
         let mut end = token.end;
         let suffix = self.get(end).and_then(symbol_unit);
         if let Some(symbol) = &suffix {
-            unit = Some(symbol.clone());
+            unit.get_or_insert(symbol.clone());
             end += 1;
         }
         let (bare_start, bare_end) = (start, end);
-        // Accounting parentheses, unless the figure is a list marker such as (1).
-        let list_marker = !minus
+        // Accounting parentheses. One or two bare digits in them are a list marker, as (1),
+        // unless a scale word or a unit follows: (5) ล้านบาท is -5,000,000.
+        let parens = !minus && self.free_before(start) == Some('(') && self.get(end) == Some(')');
+        let list_marker = parens
             && frac.is_empty()
             && int.len() <= 2
             && token.end - token.start == int.len()
-            && (start, end) == (token.start, token.end);
-        let parens = !minus && self.free_before(start) == Some('(') && self.get(end) == Some(')');
-        let negative = minus || (parens && !list_marker);
-        if parens && !list_marker {
+            && (start, end) == (token.start, token.end)
+            && !self.amount_after(end + 1);
+        let accounting = parens && !list_marker;
+        if accounting {
             flags |= Flags::PAREN_NEGATIVE;
             start -= 1;
             end += 1;
         }
-        // Scale words, and the number words a Mixed number goes on with.
-        let mut exponent: u32 = 0;
-        let mut mixed_total = None;
-        let reads_on = suffix.is_none() && !(parens && list_marker);
+        // A unit word before the figure (THB 1,250, ร้อยละ 12.5), and a sign word before that
+        // or before the figure.
+        let word_before = if unit.is_none() && !parens {
+            self.unit_before(start)
+        } else {
+            None
+        };
+        let sign = if minus || parens {
+            None
+        } else {
+            self.sign_word(
+                word_before
+                    .as_ref()
+                    .map_or(start, |(_, word_start)| *word_start),
+            )
+        };
+        let unit_word_before = word_before.is_some();
+        if let Some((before, _)) = word_before {
+            unit = Some(before);
+        }
+        let negative = minus || accounting || matches!(sign, Some((Sign::Negative, _)));
+        let ambiguous = matches!(sign, Some((Sign::Ambiguous, _)));
+        if let Some((_, sign_start)) = sign {
+            start = sign_start;
+        }
+        let reads_on = suffix.is_none() && !list_marker;
+        let decimals = i64::try_from(frac.len()).unwrap_or(i64::MAX);
+        let Some((figure, _, _)) = digits(&int, &frac, false, 0) else {
+            // Coordinator ruling 2: a figure no Decimal holds is a code over its whole span.
+            let end = if reads_on {
+                self.scale_end(end).unwrap_or(end)
+            } else {
+                end
+            };
+            self.push_fixed(start..end, NumberRole::Code, Flags::default());
+            return 1;
+        };
+        // Scale words, the number words a Mixed number goes on with, and the later parts of a
+        // compound amount.
+        let mut groups = Vec::new();
+        let mut consumed = 1;
         if reads_on {
-            let next = self.space(end);
-            match self.thai_scale(next, &int, &frac) {
-                Some(ScaleRead::Scale {
-                    end: scale_end,
-                    exponent: scale,
-                }) => {
-                    end = scale_end;
-                    exponent = scale;
+            match self.group(end, figure, decimals) {
+                GroupRead::None => {}
+                GroupRead::Unreadable(code_end) => {
+                    self.push_fixed(start..code_end, NumberRole::Code, Flags::default());
+                    return 1;
                 }
-                Some(ScaleRead::Mixed {
-                    end: scale_end,
-                    exponent: scale,
-                    total,
-                }) => {
-                    end = scale_end;
-                    exponent = scale;
-                    mixed_total = Some(total);
-                }
-                Some(ScaleRead::Unholdable { end: words_end }) => {
-                    self.push_fixed(start..words_end, NumberRole::Code, Flags::default());
-                    return;
-                }
-                None => {
-                    if let Some((scale_end, scale)) = self.english_scale(next) {
-                        end = scale_end;
-                        exponent = scale;
+                GroupRead::Read(group) => {
+                    groups.push(group);
+                    match self.compound(tokens, i, &mut groups) {
+                        Ok(more) => consumed += more,
+                        Err((code_end, more)) => {
+                            self.push_fixed(start..code_end, NumberRole::Code, Flags::default());
+                            return 1 + more;
+                        }
                     }
                 }
             }
+        }
+        if let Some(last) = groups.last() {
+            end = last.end;
         }
         // A unit word after them. An English scale may still follow it (1 THB million); the
         // span then runs over the unit word to the end of the scale.
@@ -789,43 +1056,78 @@ impl<'a> Scanner<'a> {
         if reads_on && let Some((after, word_end)) = self.unit_after(self.space(end)) {
             unit.get_or_insert(after);
             tail = word_end;
-            if exponent == 0
+            if groups.is_empty()
                 && let Some((scale_end, scale)) = self.english_scale(self.space(word_end))
             {
-                exponent = scale;
+                let Some(value) = power_of_ten(scale).and_then(|power| figure.checked_mul(power))
+                else {
+                    self.push_fixed(start..scale_end, NumberRole::Code, Flags::default());
+                    return consumed;
+                };
+                groups.push(Group {
+                    end: scale_end,
+                    value,
+                    place: i64::from(scale) - decimals,
+                    scale,
+                    words: false,
+                    terms: Vec::new(),
+                    digit_last: false,
+                });
                 end = scale_end;
                 tail = scale_end;
             }
         }
-        if unit.is_none()
-            && let Some((before, _)) = self.unit_before(start)
-        {
-            unit = Some(before);
-        }
-        let range = start..end;
-        let number = match mixed_total {
-            Some(total) => {
-                mixed(total, negative, exponent, frac.len()).map(|number| (number, Form::Mixed))
-            }
-            None => digits(&int, &frac, negative, exponent).map(|number| (number, Form::Digits)),
+        // Letters glued to the figure, unless a scale or unit word starts right there or they
+        // follow a symbol unit (12.5%YoY).
+        let left = if unit_word_before || sign.is_some() || accounting {
+            bare_start
+        } else {
+            self.letters_before(bare_start)
         };
-        let Some(((value, scale, decimals), form)) = number else {
-            // Ruling 2: a figure no Decimal holds is a code over its whole span, never dropped.
-            self.push_fixed(range, NumberRole::Code, Flags::default());
+        let right = if suffix.is_none() && end == bare_end && tail == bare_end {
+            self.letters_after(bare_end)
+        } else {
+            bare_end
+        };
+        let built = if let [group] = groups.as_slice()
+            && !group.words
+        {
+            digits(&int, &frac, negative, group.scale).map(|number| (number, Form::Digits))
+        } else if let Some(first) = groups.first() {
+            groups
+                .iter()
+                .try_fold(Decimal::ZERO, |sum, group| sum.checked_add(group.value))
+                .and_then(|total| mixed(total, negative, first.scale, frac.len()))
+                .map(|number| (number, Form::Mixed))
+        } else {
+            digits(&int, &frac, negative, 0).map(|number| (number, Form::Digits))
+        };
+        let Some(((value, scale, decimals), form)) = built else {
+            self.push_fixed(start..end, NumberRole::Code, Flags::default());
             self.amount_in_words(tail);
-            return;
+            return consumed;
         };
         let role = if self.in_date(&(token.start..token.end)) {
             NumberRole::DatePart
-        } else if self.stray_dot(start) {
+        } else if let Some(stray) = self.stray(bare_start) {
+            start = start.min(stray);
             NumberRole::Code
-        } else if unit.is_some() || exponent > 0 {
+        } else if left < bare_start || right > bare_end {
+            end = end.max(right);
+            // An ordinal marker glued on (`item5`) is no code: the letters are the marker.
+            if self.ordinal_marker(start) {
+                NumberRole::Ordinal
+            } else {
+                start = start.min(left);
+                NumberRole::Code
+            }
+        } else if unit.is_some() || !groups.is_empty() {
             NumberRole::Quantity
         } else if self.ordinal_marker(start) {
             NumberRole::Ordinal
         } else if self.time_after(&int, &frac, token.end) {
             NumberRole::Time
-        } else if self.touches_code(bare_start, bare_end) {
+        } else if self.slash_touches(bare_start, bare_end) {
             NumberRole::Code
         } else {
             NumberRole::Quantity
@@ -836,28 +1138,231 @@ impl<'a> Scanner<'a> {
         if role == NumberRole::Time {
             flags |= Flags::TIME;
         }
-        self.push(
-            range,
-            Number {
-                value,
-                scale: Scale(scale),
-                unit,
-                form,
-                decimals,
-                role,
-            },
-            flags,
-        );
-        self.amount_in_words(tail);
+        let number = Number {
+            value,
+            scale: Scale(scale),
+            unit,
+            form,
+            decimals,
+            role,
+        };
+        let (conf, alts) = if ambiguous && role == NumberRole::Quantity {
+            (0.5, vec![(negated(&number), 0.5)])
+        } else {
+            (1.0, Vec::new())
+        };
+        self.push_item(start..end, number, flags, conf, alts);
+        self.amount_in_words(tail.max(end));
+        consumed
     }
 
-    /// A symbol unit right before `start` that no earlier figure took as its own suffix.
-    fn prefix_symbol(&self, start: usize) -> Option<Unit> {
+    /// The later parts of a compound amount after `groups` (`3 ล้าน 9 แสน`, `1ล้าน2แสน`,
+    /// `3 ล้าน เก้าแสน`): each a figure with a scale word of its own (the token after
+    /// `tokens[i]` and the parts read so far), or Thai number words that start with a digit word
+    /// and hold a power word, with one space at most before it. Returns how many more tokens it
+    /// read. `Err` is one code over the whole run, to its end and with the tokens it took: a part
+    /// that does not fit below the one before or that the grammar does not read as their sum,
+    /// ครึ่ง beside a scale word, or a digit word that a Thai letter continues.
+    fn compound(
+        &self,
+        tokens: &[Token],
+        i: usize,
+        groups: &mut Vec<Group>,
+    ) -> Result<usize, (usize, usize)> {
+        let mut more = 0;
+        while let Some(last) = groups.last() {
+            let after = last.end;
+            let thai = !last.terms.is_empty();
+            if thai {
+                let half = [after, self.space(after)]
+                    .into_iter()
+                    .find(|at| has_at(self.t, *at, KHRUENG));
+                if let Some(half) = half {
+                    return Err((half + char_len(KHRUENG), more));
+                }
+            }
+            if last.digit_last && self.glued_word(after) {
+                return Err((after, more));
+            }
+            let at = self.space(after);
+            let (next, used) = match tokens.get(i + 1 + more).filter(|token| token.start == at) {
+                Some(token) => {
+                    let TokenKind::Figure { int, frac, .. } = &token.kind else {
+                        return Ok(more);
+                    };
+                    if self.in_date(&(token.start..token.end))
+                        || self.get(token.end).and_then(symbol_unit).is_some()
+                    {
+                        return Ok(more);
+                    }
+                    let Some((figure, _, _)) = digits(int, frac, false, 0) else {
+                        return Ok(more);
+                    };
+                    let decimals = i64::try_from(frac.len()).unwrap_or(i64::MAX);
+                    match self.group(token.end, figure, decimals) {
+                        GroupRead::None => return Ok(more),
+                        GroupRead::Unreadable(end) => return Err((end, more + 1)),
+                        GroupRead::Read(group) => (group, 1),
+                    }
+                }
+                None if thai => match self.word_group(at) {
+                    GroupRead::None => return Ok(more),
+                    GroupRead::Unreadable(end) => return Err((end, more)),
+                    GroupRead::Read(group) => (group, 0),
+                },
+                None => return Ok(more),
+            };
+            // A Thai part and an English one do not join.
+            if next.terms.is_empty() == thai {
+                return Ok(more);
+            }
+            if !fits(groups, &next) {
+                return Err((next.end, more + used));
+            }
+            groups.push(next);
+            more += used;
+        }
+        Ok(more)
+    }
+
+    /// The scale part after a figure that ends at `end`: Thai scale and number words, or an
+    /// English scale.
+    fn group(&self, end: usize, figure: Decimal, decimals: i64) -> GroupRead {
+        let at = self.space(end);
+        match self.thai_group(at, figure, decimals) {
+            GroupRead::None => {}
+            read => return read,
+        }
+        let Some((scale_end, exponent)) = self.english_scale(at) else {
+            return GroupRead::None;
+        };
+        match power_of_ten(exponent).and_then(|power| figure.checked_mul(power)) {
+            Some(value) => GroupRead::Read(Group {
+                end: scale_end,
+                value,
+                place: i64::from(exponent) - decimals,
+                scale: exponent,
+                words: false,
+                terms: Vec::new(),
+                digit_last: false,
+            }),
+            None => GroupRead::Unreadable(scale_end),
+        }
+    }
+
+    /// Thai words after a figure: its own scale (one power word, then ล้าน words; an ordinary word
+    /// such as พันตรี or ล้านนา ends it), and the number words a Mixed number goes on with, read by
+    /// the grammar with the figure as the first digit. Words after the scale that start with a
+    /// power word, follow a figure with decimals, or read otherwise than the grammar says make the
+    /// run unreadable.
+    fn thai_group(&self, at: usize, figure: Decimal, decimals: i64) -> GroupRead {
+        let mut words = Vec::new();
+        let mut own = 0;
+        let mut next = at;
+        while let Some((word, end)) = word_at(self.t, next) {
+            if self.taken[next..end].iter().any(|slot| *slot) {
+                break;
+            }
+            let scale_word = match word {
+                Word::Power(_) => words.is_empty(),
+                Word::Lan => true,
+                _ => false,
+            };
+            if own == words.len() && scale_word {
+                if self.ordinary[next] {
+                    break;
+                }
+                own += 1;
+            }
+            words.push(word);
+            next = end;
+        }
+        if own == 0 {
+            return GroupRead::None;
+        }
+        let rest = &words[own..];
+        let rest_unreadable = matches!(rest.first(), Some(Word::Power(_) | Word::Lan))
+            || (decimals > 0 && !rest.is_empty());
+        let mut terms = vec![Term::Figure(figure, decimals)];
+        terms.extend(words.iter().map(|word| Term::Word(*word)));
+        if rest_unreadable || regrouped(&terms) {
+            return GroupRead::Unreadable(next);
+        }
+        let Ok((value, place)) = numeral(&terms) else {
+            return GroupRead::Unreadable(next);
+        };
+        let scale = words[..own]
+            .iter()
+            .map(|word| match word {
+                Word::Power(power @ 3..=5) => u32::from(*power),
+                Word::Lan => 6,
+                _ => 0,
+            })
+            .sum();
+        GroupRead::Read(Group {
+            end: next,
+            value,
+            place,
+            scale,
+            words: !rest.is_empty() || matches!(words.first(), Some(Word::Power(1 | 2))),
+            terms,
+            digit_last: matches!(words.last(), Some(Word::Digit(_))),
+        })
+    }
+
+    /// Thai number words at `at` that start with a digit word and hold a power word or ล้าน: a
+    /// later part of a compound amount (`3 ล้าน เก้าแสน`).
+    fn word_group(&self, at: usize) -> GroupRead {
+        let (words, end) = self.word_run(at);
+        if self.ordinary.get(at) != Some(&false)
+            || !matches!(words.first(), Some(Word::Digit(_)))
+            || !words
+                .iter()
+                .any(|word| matches!(word, Word::Power(_) | Word::Lan))
+        {
+            return GroupRead::None;
+        }
+        let terms = terms(&words);
+        match numeral(&terms) {
+            Ok((value, place)) if !regrouped(&terms) => GroupRead::Read(Group {
+                end,
+                value,
+                place,
+                scale: 0,
+                words: true,
+                terms,
+                digit_last: matches!(words.last(), Some(Word::Digit(_))),
+            }),
+            _ => GroupRead::Unreadable(end),
+        }
+    }
+
+    /// Where the scale or number words after a figure that ends at `end` end, read or not.
+    fn scale_end(&self, end: usize) -> Option<usize> {
+        let at = self.space(end);
+        let scale_first =
+            word_at(self.t, at).is_some_and(|(word, _)| matches!(word, Word::Power(_) | Word::Lan));
+        if scale_first && self.ordinary.get(at) == Some(&false) {
+            let (_, words_end) = self.word_run(at);
+            return (words_end > at).then_some(words_end);
+        }
+        self.english_scale(at).map(|(scale_end, _)| scale_end)
+    }
+
+    /// A symbol unit right before `start` that no earlier figure took as its own suffix, and
+    /// how many code points it takes: 3 for US$.
+    fn prefix_symbol(&self, start: usize) -> Option<(Unit, usize)> {
         let at = start.checked_sub(1)?;
         if self.taken[at] {
             return None;
         }
-        self.symbol_before_figure(at)
+        let unit = self.symbol_before_figure(at)?;
+        let us = self.get(at) == Some('$')
+            && has_before(self.t, at, "us")
+            && at
+                .checked_sub(2)
+                .is_some_and(|us| !self.taken[us] && !self.taken[us + 1]);
+        Some((unit, if us { 3 } else { 1 }))
     }
 
     /// The unit of a symbol at `at` written before a figure: ฿, or $ unless letters name
@@ -879,12 +1384,75 @@ impl<'a> Scanner<'a> {
         (!self.taken[at]).then(|| self.get(at)).flatten()
     }
 
+    /// A free `-` right before `start` is a minus, unless a figure stands right before the
+    /// dash: its digit, or the end of a number read just before (`5%-3%`, `1 ล้าน-2 ล้าน`).
+    fn minus_before(&self, start: usize) -> bool {
+        let Some(dash) = start.checked_sub(1) else {
+            return false;
+        };
+        self.free_before(start) == Some('-')
+            && !self.before(dash).is_some_and(is_digit)
+            && self.ends.get(dash) != Some(&true)
+    }
+
+    /// A sign word right before `head`, with one space at most between: ติดลบ or `minus` makes
+    /// the number negative; ลบ alone also means "delete", so it makes the number ambiguous.
+    /// Returns where the word starts.
+    fn sign_word(&self, head: usize) -> Option<(Sign, usize)> {
+        let end = if self.before(head) == Some(' ') {
+            head - 1
+        } else {
+            head
+        };
+        let word = |text: &str| {
+            let start = end.checked_sub(char_len(text))?;
+            (has_before(self.t, end, text) && !self.taken[start..end].iter().any(|slot| *slot))
+                .then_some(start)
+        };
+        if let Some(start) = word(TID_LOP) {
+            return Some((Sign::Negative, start));
+        }
+        if let Some(start) =
+            word("minus").filter(|start| !self.before(*start).is_some_and(is_latin_letter))
+        {
+            return Some((Sign::Negative, start));
+        }
+        word(LOP).map(|start| (Sign::Ambiguous, start))
+    }
+
+    /// A scale word or a unit at `at` (one space allowed) that is not the next figure's own.
+    fn amount_after(&self, at: usize) -> bool {
+        let at = self.space(at);
+        let thai_scale = word_at(self.t, at).is_some_and(|(word, end)| {
+            matches!(word, Word::Power(_) | Word::Lan)
+                && self.ordinary.get(at) == Some(&false)
+                && !self.taken[at..end].iter().any(|slot| *slot)
+        });
+        thai_scale || self.english_scale(at).is_some() || self.unit_after(at).is_some()
+    }
+
     fn push(&mut self, range: Range<usize>, number: Number, flags: Flags) {
+        self.push_item(range, number, flags, 1.0, Vec::new());
+    }
+
+    fn push_item(
+        &mut self,
+        range: Range<usize>,
+        number: Number,
+        flags: Flags,
+        conf: f32,
+        alts: Vec<(Number, f32)>,
+    ) {
         self.take(&range);
+        if let Some(end) = self.ends.get_mut(range.end) {
+            *end = true;
+        }
         self.items.push(Item {
             range,
             number,
             flags,
+            conf,
+            alts,
         });
     }
 
@@ -918,17 +1486,38 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// A figure ends right before `at`, perhaps with one space between: then a dash at `at`
-    /// joins a range and is no minus.
-    fn figure_before(&self, at: usize) -> bool {
-        let prev = self.before(at);
-        if prev == Some(' ') {
-            return at
-                .checked_sub(1)
-                .and_then(|p| self.before(p))
-                .is_some_and(is_digit);
+    /// A clock time: `Time`, or `DatePart` inside a date. Its value is `HH.MM`, or `HH.MMSS`
+    /// with seconds.
+    fn clock_found(&mut self, token: &Token, hours: u32, minutes: u32, seconds: Option<u32>) {
+        let range = token.start..token.end;
+        let role = if self.in_date(&range) {
+            NumberRole::DatePart
+        } else {
+            NumberRole::Time
+        };
+        let flags = if role == NumberRole::Time {
+            Flags::TIME
+        } else {
+            Flags::default()
+        };
+        let (mantissa, decimals) = match seconds {
+            Some(seconds) => (hours * 10_000 + minutes * 100 + seconds, 4),
+            None => (hours * 100 + minutes, 2),
+        };
+        match Decimal::try_new(i64::from(mantissa), decimals) {
+            Ok(value) => {
+                let number = Number {
+                    value,
+                    scale: Scale(0),
+                    unit: None,
+                    form: Form::Digits,
+                    decimals,
+                    role,
+                };
+                self.push(range, number, flags);
+            }
+            Err(_) => self.push_fixed(range, NumberRole::Code, Flags::default()),
         }
-        prev.is_some_and(is_digit)
     }
 
     /// The digits lie inside a date `find_dates` returns, or overlap a day number written
@@ -950,56 +1539,6 @@ impl<'a> Scanner<'a> {
                 .is_some_and(|part| part.start < range.end)
     }
 
-    /// Thai scale words after a figure, and the number words a `Mixed` number goes on with.
-    fn thai_scale(&self, at: usize, int: &[u8], frac: &[u8]) -> Option<ScaleRead> {
-        let mut words = Vec::new();
-        let mut ends = Vec::new();
-        let mut next = at;
-        while let Some((word, end)) = word_at(self.t, next) {
-            if NOT_SCALES.iter().any(|not| has_at(self.t, next, not))
-                || self.taken[next..end].iter().any(|slot| *slot)
-            {
-                break;
-            }
-            words.push(word);
-            ends.push(end);
-            next = end;
-        }
-        let scales = words
-            .iter()
-            .take_while(|word| matches!(word, Word::Power(3..=5) | Word::Lan))
-            .count();
-        let exponent: u32 = words[..scales]
-            .iter()
-            .map(|word| {
-                if let Word::Power(power) = word {
-                    u32::from(*power)
-                } else {
-                    6
-                }
-            })
-            .sum();
-        if words.len() > scales && matches!(words.first(), Some(Word::Power(_) | Word::Lan)) {
-            let end = *ends.last()?;
-            let Some((lead, _, _)) = digits(int, frac, false, 0) else {
-                return Some(ScaleRead::Unholdable { end });
-            };
-            match integer(&words, Some(lead)) {
-                Ok(total) => {
-                    return Some(ScaleRead::Mixed {
-                        end,
-                        exponent,
-                        total,
-                    });
-                }
-                Err(WordsError::Overflow) => return Some(ScaleRead::Unholdable { end }),
-                Err(WordsError::Invalid) => {}
-            }
-        }
-        let end = *ends.get(scales.checked_sub(1)?)?;
-        Some(ScaleRead::Scale { end, exponent })
-    }
-
     fn english_scale(&self, at: usize) -> Option<(usize, u32)> {
         let mut exponent = 0;
         let mut end = None;
@@ -1017,8 +1556,10 @@ impl<'a> Scanner<'a> {
         end.map(|end| (end, exponent))
     }
 
+    /// A unit word or symbol at `at`. A currency word or symbol that a figure follows (one space
+    /// at most) is that figure's own: in `USD 100 THB 3,500` the THB is 3,500's.
     fn unit_after(&self, at: usize) -> Option<(Unit, usize)> {
-        UNITS_AFTER
+        let (unit, end) = UNITS_AFTER
             .iter()
             .find_map(|(word, unit)| {
                 let end = at + char_len(word);
@@ -1029,10 +1570,18 @@ impl<'a> Scanner<'a> {
             .or_else(|| {
                 let symbol = symbol_unit(self.get(at)?)?;
                 Some((symbol, at + 1))
-            })
+            })?;
+        let prefix = matches!(self.get(at), Some('$' | '\u{0E3F}'))
+            || has_at(self.t, at, "thb")
+            || has_at(self.t, at, "usd");
+        if prefix && self.get(self.space(end)).is_some_and(is_digit) {
+            return None;
+        }
+        Some((unit, end))
     }
 
-    /// A unit word right before the figure, with one space between: `THB 1,250`, `ร้อยละ 12.5`.
+    /// A unit word right before the figure, with one space between: `THB 1,250`, `ร้อยละ 12.5`;
+    /// or a symbol, with one space, that no earlier figure took as its suffix.
     fn unit_before(&self, start: usize) -> Option<(Unit, usize)> {
         let end = if self.before(start) == Some(' ') {
             start - 1
@@ -1052,19 +1601,53 @@ impl<'a> Scanner<'a> {
                 if end == start {
                     return None;
                 }
-                let symbol = self.symbol_before_figure(end.checked_sub(1)?)?;
-                Some((symbol, end - 1))
+                let at = end.checked_sub(1)?;
+                if self.taken[at] {
+                    return None;
+                }
+                let symbol = self.symbol_before_figure(at)?;
+                Some((symbol, at))
             })
     }
 
-    /// A dot right before the figure that belongs to nothing: `.5` is no figure we can read.
-    fn stray_dot(&self, head: usize) -> bool {
-        self.before(head) == Some('.')
-            && !self.ordinal_marker(head)
-            && !head
-                .checked_sub(1)
-                .and_then(|dot| self.before(dot))
-                .is_some_and(is_digit)
+    /// A dot or comma right before the figure that belongs to nothing (`.5`, `x,250`): what was
+    /// written is not this figure, so it is a code from that mark and the letters glued before
+    /// it. Returns where the code starts.
+    fn stray(&self, head: usize) -> Option<usize> {
+        let mark = head.checked_sub(1)?;
+        if self.taken[mark] {
+            return None;
+        }
+        let before = self.before(mark);
+        let stray = match self.get(mark) {
+            Some('.') => !self.ordinal_marker(head) && !before.is_some_and(is_digit),
+            Some(',') => before.is_none_or(char::is_alphabetic),
+            _ => false,
+        };
+        stray.then(|| self.letters_before(mark))
+    }
+
+    /// Where the run of non-Thai letters that no figure took starts, going back from `at`.
+    fn letters_before(&self, at: usize) -> usize {
+        let mut start = at;
+        while let Some(prev) = start.checked_sub(1)
+            && !self.taken[prev]
+            && self.get(prev).is_some_and(code_letter)
+        {
+            start = prev;
+        }
+        crate::found::work(at - start + 1);
+        start
+    }
+
+    /// Where the run of non-Thai letters that no figure took ends, going on from `at`.
+    fn letters_after(&self, at: usize) -> usize {
+        let mut end = at;
+        while self.taken.get(end) == Some(&false) && self.get(end).is_some_and(code_letter) {
+            end += 1;
+        }
+        crate::found::work(end - at + 1);
+        end
     }
 
     fn ordinal_marker(&self, head: usize) -> bool {
@@ -1084,24 +1667,64 @@ impl<'a> Scanner<'a> {
         })
     }
 
-    /// `HH.MM น.`: a figure of one or two digits, two decimals, and the Thai hour after it.
+    /// `HH.MM น.`: a figure of one or two digits and two decimals read as a time, with the Thai
+    /// hour after it or after the end of a range (`09.00 - 12.00 น.`, `09.00 ถึง 12.00 น.`).
     fn time_after(&self, int: &[u8], frac: &[u8], end: usize) -> bool {
-        frac.len() == 2
-            && clock_value(int, 1..=2, 24).is_some()
-            && clock_value(frac, 2..=2, 59).is_some()
-            && has_at(self.t, self.space(end), NA_DOT)
+        if frac.len() != 2
+            || clock_value(int, 1..=2, 24).is_none()
+            || clock_value(frac, 2..=2, 59).is_none()
+        {
+            return false;
+        }
+        let next = self.space(end);
+        if has_at(self.t, next, NA_DOT) {
+            return true;
+        }
+        let range_end = if self.get(next) == Some('-') {
+            Some(next + 1)
+        } else if has_at(self.t, next, THUENG) {
+            Some(next + char_len(THUENG))
+        } else {
+            None
+        };
+        range_end
+            .and_then(|at| self.hhmm_end(self.space(at)))
+            .is_some_and(|after| has_at(self.t, self.space(after), NA_DOT))
     }
 
-    /// A Latin (or other non-Thai) letter or a slash touches the figure.
-    fn touches_code(&self, head: usize, end: usize) -> bool {
-        let code_neighbour = |c: char| c == '/' || (c.is_alphabetic() && !is_thai(c));
-        self.before(head).is_some_and(code_neighbour) || self.get(end).is_some_and(code_neighbour)
+    /// An `HH.MM` time at `at`: where it ends.
+    fn hhmm_end(&self, at: usize) -> Option<usize> {
+        let hours_end = digits_end(self.t, at);
+        if self.get(hours_end) != Some('.') {
+            return None;
+        }
+        let minutes_end = digits_end(self.t, hours_end + 1);
+        clock_value(&self.digits_with_commas(at..hours_end), 1..=2, 24)?;
+        clock_value(
+            &self.digits_with_commas(hours_end + 1..minutes_end),
+            2..=2,
+            59,
+        )?;
+        Some(minutes_end)
+    }
+
+    /// A slash touches the figure, as in `0401/123`.
+    fn slash_touches(&self, head: usize, end: usize) -> bool {
+        self.before(head) == Some('/') || self.get(end) == Some('/')
+    }
+
+    /// A Thai letter at `at` that continues the word before it: no unit word starts there.
+    fn glued_word(&self, at: usize) -> bool {
+        self.get(at).is_some_and(is_thai)
+            && !UNITS_AFTER.iter().any(|(word, _)| {
+                word.chars().next().is_some_and(is_thai) && has_at(self.t, at, word)
+            })
     }
 
     /// Number words in parentheses right after a figure, restating it.
     fn amount_in_words(&mut self, tail: usize) {
         let open = self.space(tail);
-        if self.get(open) != Some('(') {
+        if self.get(open) != Some('(') || self.taken.get(open) != Some(&false) {
             return;
         }
         let start = open + 1;
@@ -1117,7 +1740,7 @@ impl<'a> Scanner<'a> {
         if self.get(close) != Some(')') {
             return;
         }
-        self.push_words(start..end, &words, false, unit, Flags::AMOUNT_IN_WORDS);
+        self.word_number(start, &words, end, Some(unit));
     }
 
     /// The longest run of number words from `at` that no figure, date or percent word took.
@@ -1137,53 +1760,128 @@ impl<'a> Scanner<'a> {
         (words, next)
     }
 
-    /// A number in words over `range`, if it is a complete numeral with a power word or ล้าน.
-    fn push_words(
-        &mut self,
-        range: Range<usize>,
-        words: &[Word],
-        negative: bool,
-        unit: Option<Unit>,
-        flags: Flags,
-    ) {
-        if !words
-            .iter()
-            .any(|word| matches!(word, Word::Power(_) | Word::Lan))
-        {
+    /// Number words `words` over `at..end`: alone, or restating the figure before them in
+    /// parentheses (`amount` then holds the unit written inside them). A `Quantity` when they
+    /// start with a digit word, form a complete numeral with a power word or ล้าน and stand
+    /// before a unit, after ร้อยละ or in those parentheses; a percent after ร้อยละ with no power
+    /// word too. Any other run with a power word or ล้าน is one code; a run without one is no
+    /// number.
+    fn word_number(&mut self, at: usize, words: &[Word], end: usize, amount: Option<Option<Unit>>) {
+        let (lop, body) = match words.split_first() {
+            Some((Word::Lop, rest)) => (true, rest),
+            _ => (false, words),
+        };
+        let Some(first) = body.first() else {
             return;
-        }
-        let decimals = words
-            .iter()
-            .position(|word| *word == Word::Chut)
-            .map_or(0, |point| words.len() - point - 1);
-        match words_value(words) {
-            Ok(mut value) if decimals <= 27 => {
-                if negative && !value.is_zero() {
-                    value.set_sign_negative(!value.is_sign_negative());
+        };
+        let in_parens = amount.is_some();
+        let mut start = at;
+        let mut end = end;
+        // A leading ลบ (negative after ติด, else ambiguous), a minus, or a sign word before.
+        let sign = if lop {
+            let tid = at.checked_sub(char_len(TID)).filter(|tid| {
+                has_before(self.t, at, TID) && !self.taken[*tid..at].iter().any(|slot| *slot)
+            });
+            match tid {
+                Some(tid) => {
+                    start = tid;
+                    Some(Sign::Negative)
                 }
-                let decimals = u32::try_from(decimals).unwrap_or(0);
+                None => Some(Sign::Ambiguous),
+            }
+        } else if self.minus_before(at) {
+            start = at - 1;
+            Some(Sign::Negative)
+        } else if !in_parens && let Some((sign, sign_start)) = self.sign_word(at) {
+            start = sign_start;
+            Some(sign)
+        } else {
+            None
+        };
+        let power = |word: &Word| matches!(word, Word::Power(_) | Word::Lan);
+        let has_power = body.iter().any(power);
+        let power_first = power(first);
+        let after_percent = !in_parens && {
+            let before = if self.before(start) == Some(' ') {
+                start - 1
+            } else {
+                start
+            };
+            has_before(self.t, before, ROI_LA)
+        };
+        let glued = matches!(body.last(), Some(Word::Digit(_))) && self.glued_word(end);
+        // ครึ่ง beside power words makes the run one code with it.
+        let half_before = power_first
+            && start.checked_sub(char_len(KHRUENG)).is_some_and(|half| {
+                has_before(self.t, start, KHRUENG)
+                    && !self.taken[half..start].iter().any(|slot| *slot)
+            });
+        let half_after = body.last().is_some_and(power)
+            && has_at(self.t, end, KHRUENG)
+            && !self.taken[end..end + char_len(KHRUENG)]
+                .iter()
+                .any(|slot| *slot);
+        if half_before {
+            start -= char_len(KHRUENG);
+        }
+        if half_after {
+            end += char_len(KHRUENG);
+        }
+        let point = body.iter().position(|word| *word == Word::Chut);
+        let places = point.map_or(0, |point| body.len() - point - 1);
+        let digits_after_point = point.is_none_or(|point| {
+            body[point + 1..]
+                .iter()
+                .all(|word| matches!(word, Word::Digit(_) | Word::Sun))
+        });
+        let value = words_value(body)
+            .ok()
+            .filter(|_| digits_after_point && places <= 27 && !regrouped(&terms(body)));
+        let unit = match amount {
+            Some(unit) => unit,
+            None if after_percent => Some(Unit::Percent),
+            None => self.unit_after(self.space(end)).map(|(unit, _)| unit),
+        };
+        let readable = !half_before && !half_after && !glued;
+        let quantity = readable
+            && match (has_power, power_first) {
+                (false, _) | (true, true) => after_percent,
+                (true, false) => in_parens || after_percent || unit.is_some(),
+            };
+        match value {
+            Some(mut value) if quantity => {
+                if sign == Some(Sign::Negative) && !value.is_zero() {
+                    value.set_sign_negative(true);
+                }
                 let number = Number {
                     value,
                     scale: Scale(0),
                     unit,
                     form: Form::Words,
-                    decimals,
+                    decimals: u32::try_from(places).unwrap_or(0),
                     role: NumberRole::Quantity,
                 };
-                self.push(range, number, flags | Flags::WORDS);
+                let mut flags = Flags::WORDS;
+                if in_parens {
+                    flags |= Flags::AMOUNT_IN_WORDS;
+                }
+                let (conf, alts) = if sign == Some(Sign::Ambiguous) {
+                    (0.5, vec![(negated(&number), 0.5)])
+                } else {
+                    (1.0, Vec::new())
+                };
+                self.push_item(start..end, number, flags, conf, alts);
             }
-            Ok(_) | Err(WordsError::Overflow) => {
-                self.push_fixed(range, NumberRole::Code, Flags::WORDS)
-            }
-            Err(WordsError::Invalid) => {}
+            _ if has_power => self.push_fixed(start..end, NumberRole::Code, Flags::WORDS),
+            _ => {}
         }
     }
 
-    /// Number words standing alone: read only before a unit or percent word, or after ร้อยละ.
+    /// Number words that no figure, date or percent word took, and that start no ordinary word.
     fn words(&mut self) {
         let mut at = 0;
         while at < self.t.len() {
-            if self.taken[at] || word_at(self.t, at).is_none() {
+            if self.taken[at] || self.ordinary[at] || word_at(self.t, at).is_none() {
                 at += 1;
                 continue;
             }
@@ -1192,29 +1890,72 @@ impl<'a> Scanner<'a> {
                 at += 1;
                 continue;
             }
-            let unit = self.unit_after(self.space(end)).map(|(unit, _)| unit);
-            let after_percent = {
-                let before = if self.before(at) == Some(' ') {
-                    at - 1
-                } else {
-                    at
-                };
-                has_before(self.t, before, ROI_LA)
-            };
-            let unit = if after_percent {
-                Some(Unit::Percent)
-            } else {
-                unit
-            };
-            // A minus right before the words, as before a figure: a dash after a figure is a range.
-            let minus = self.free_before(at) == Some('-') && !self.figure_before(at - 1);
-            let start = if minus { at - 1 } else { at };
-            if unit.is_some() {
-                self.push_words(start..end, &words, minus, unit, Flags::default());
-            }
+            self.word_number(at, &words, end, None);
             at = end;
         }
     }
+}
+
+/// A figure written as one field: no thousands separator, no decimal part.
+fn whole(token: &Token) -> Option<&[u8]> {
+    match &token.kind {
+        TokenKind::Figure {
+            int,
+            frac,
+            grouped: false,
+        } if frac.is_empty() => Some(int),
+        _ => None,
+    }
+}
+
+/// `next` writes only places below the lowest one of the part before it, and for Thai parts the
+/// grammar reads all of them as their sum (so `3 ล้าน 5 ล้าน` and `3 พันล้าน 5 ร้อยล้าน` do not
+/// join).
+fn fits(groups: &[Group], next: &Group) -> bool {
+    let Some(last) = groups.last() else {
+        return false;
+    };
+    let below = u32::try_from(last.place)
+        .ok()
+        .and_then(power_of_ten)
+        .is_some_and(|limit| next.value < limit);
+    if !below || next.terms.is_empty() {
+        return below;
+    }
+    let parts = || groups.iter().chain([next]);
+    let terms: Vec<Term> = parts()
+        .flat_map(|group| group.terms.iter().copied())
+        .collect();
+    let sum = parts().try_fold(Decimal::ZERO, |sum, group| sum.checked_add(group.value));
+    matches!((numeral(&terms), sum), (Ok((whole, _)), Some(sum)) if whole == sum)
+}
+
+/// The number with its sign turned negative: the other reading after a bare ลบ.
+fn negated(number: &Number) -> Number {
+    let mut negated = number.clone();
+    if !negated.value.is_zero() {
+        negated.value.set_sign_negative(true);
+    }
+    negated
+}
+
+/// A letter that makes a figure it touches a code: any letter but a Thai one.
+fn code_letter(c: char) -> bool {
+    c.is_alphabetic() && !is_thai(c)
+}
+
+/// A number word, an English scale word or a unit (word or symbol) starts at `at`: what may
+/// follow an amount, never a two-digit year.
+pub(crate) fn amount_word_at(t: &[char], at: usize) -> bool {
+    word_at(t, at).is_some()
+        || ENGLISH_SCALES.iter().any(|(word, _)| {
+            has_at(t, at, word)
+                && !t
+                    .get(at + char_len(word))
+                    .is_some_and(|c| is_latin_letter(*c))
+        })
+        || UNITS_AFTER.iter().any(|(word, _)| has_at(t, at, word))
+        || t.get(at).copied().and_then(symbol_unit).is_some()
 }
 
 /// A clock field: `len` digits and no more than `max`.
@@ -1276,12 +2017,29 @@ mod tests {
     #[test]
     fn tables_are_written_as_normalize_th_writes_them() {
         let mut words: Vec<&str> = WORDS.iter().map(|(word, _)| *word).collect();
-        words.extend(NOT_SCALES);
+        words.extend(ORDINARY_WORDS);
         words.extend(ORDINAL_MARKERS);
         words.extend(UNITS_AFTER.iter().map(|(word, _)| *word));
-        words.extend([ROI_LA, BAHT_THUAN, NA_DOT]);
+        words.extend([
+            ROI_LA, BAHT_THUAN, NA_DOT, KHRUENG, TID, TID_LOP, LOP, THUENG,
+        ]);
         for word in words {
             assert_eq!(crate::normalize_th(word).text, word, "{word:?}");
+        }
+    }
+
+    /// Every ordinary word is no number alone, and no scale after a figure.
+    #[test]
+    fn ordinary_words_hold_no_number() {
+        let ctx = Ctx {
+            anchor: chrono::NaiveDate::from_ymd_opt(2025, 11, 1),
+        };
+        for word in ORDINARY_WORDS {
+            assert!(find_numbers(word, &ctx).unwrap().is_empty(), "{word:?}");
+            let after = find_numbers(&format!("1 {word}"), &ctx).unwrap();
+            assert_eq!(after.len(), 1, "{word:?}: {after:?}");
+            assert_eq!(after[0].value.scale, Scale(0), "{word:?}");
+            assert_eq!(after[0].value.form, Form::Digits, "{word:?}");
         }
     }
 
@@ -1332,6 +2090,24 @@ mod work_tests {
             "FY2569 Q2 ",
             "1/1/1",
             "9",
+            "1 \u{0E25}\u{0E49}\u{0E32}\u{0E19} 2 \u{0E41}\u{0E2A}\u{0E19} ",
+            "1\u{0E25}\u{0E49}\u{0E32}\u{0E19}",
+            "a1",
+            "1a",
+            "x,1",
+            "1'",
+            "1\u{2009}",
+            "\u{0E25}\u{0E1A} 1 ",
+            "\u{0E15}\u{0E34}\u{0E14}\u{0E25}\u{0E1A}",
+            "\u{0E04}\u{0E23}\u{0E36}\u{0E48}\u{0E07}\u{0E25}\u{0E49}\u{0E32}\u{0E19}",
+            "1:",
+            "1-",
+            "\u{0E1B}\u{0E35} 2567-2569 ",
+            "1-31 \u{0E15}.\u{0E04}. 2568 ",
+            "\u{0E15}.\u{0E04}.-",
+            "q1-",
+            "\u{0E44}\u{0E15}\u{0E23}\u{0E21}\u{0E32}\u{0E2A} 2 \u{0E1B}\u{0E35} 2568 ",
+            "\u{0E40}\u{0E23}\u{0E35}\u{0E22}\u{0E1A}\u{0E23}\u{0E49}\u{0E2D}\u{0E22}",
         ];
         for fragment in fragments {
             let len = fragment.chars().count();

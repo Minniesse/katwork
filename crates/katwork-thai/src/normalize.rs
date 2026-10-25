@@ -189,11 +189,14 @@ fn offset(index: usize) -> u32 {
 /// One pass runs the steps below in order; passes repeat until one changes nothing, at most
 /// eight times, and the offset map follows every step of every pass.
 ///
-/// 1. U+FEFF, U+200B, U+200C, U+200D, U+2060 and U+00AD are removed.
+/// 1. U+FEFF, U+200B, U+200C, U+200D, U+2060 and U+00AD are removed, and so is every other
+///    `Default_Ignorable_Code_Point`, U+FFF9–U+FFFB and every control that is not `White_Space`:
+///    none of them is seen, so none may split a figure, a date or a word.
 /// 2. NFC, chunk by chunk at code points of canonical combining class 0 with `NFC_QC=Yes`.
 /// 3. Compatibility forms other than SARA AM: `Zs` to U+0020, full-width ASCII to ASCII, the
 ///    ligatures U+FB00–U+FB04 and U+FB06 to their letters, U+2019 to `'`, U+2212, U+2012 and
-///    U+2013 to `-`; nikhahit, tone marks and aa become the tone marks and SARA AM.
+///    U+2013 to `-`, and so the hyphens and minus signs that look the same (U+2010, U+2011,
+///    U+FE63, U+02D7, U+2796); nikhahit, tone marks and aa become the tone marks and SARA AM.
 /// 4. PyThaiNLP's reordering: `เเ` to `แ`, a tone mark or thanthakhat before an above or below
 ///    vowel moves after it, nikhahit with tone marks and aa becomes the tone marks and SARA AM, a
 ///    tone mark after a follow vowel moves before it, `ๅ` after anything but ฤ and ฦ becomes `า`,
@@ -290,10 +293,39 @@ fn pass(chars: &[Ch]) -> Vec<Ch> {
     tidy(&chars)
 }
 
-fn is_invisible(c: char) -> bool {
+/// What step 1 removes: the six code points the plan names, every other Default_Ignorable code
+/// point, the interlinear annotation controls, and every control that is not White_Space. None
+/// of them is seen, so none may split a figure, a date or a word.
+pub(crate) fn is_invisible(c: char) -> bool {
     matches!(
         c,
         '\u{FEFF}' | '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{00AD}'
+    ) || is_default_ignorable(c)
+        || matches!(c, '\u{FFF9}'..='\u{FFFB}')
+        || (c.is_control() && !c.is_whitespace())
+}
+
+/// Unicode's Default_Ignorable_Code_Point (DerivedCoreProperties.txt).
+fn is_default_ignorable(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFF8}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
     )
 }
 
@@ -364,13 +396,16 @@ fn ligature(c: char) -> Option<&'static str> {
 }
 
 /// The compatibility mappings step 3 applies to one code point: space separators, full-width
-/// ASCII, the right single quotation mark and the dashes that stand for a minus.
+/// ASCII, the right single quotation mark and the dashes that stand for a minus (the plan's
+/// U+2212, U+2012 and U+2013, and the hyphens and minus signs that look the same: U+2010,
+/// U+2011, U+FE63, U+02D7 and U+2796).
 fn compatible(c: char) -> char {
     match c {
         c if is_space_separator(c) => ' ',
         '\u{FF01}'..='\u{FF5E}' => char::from_u32(u32::from(c) - 0xFEE0).unwrap_or(c),
         '\u{2019}' => '\'',
-        '\u{2212}' | '\u{2012}' | '\u{2013}' => '-',
+        '\u{2212}' | '\u{2012}' | '\u{2013}' | '\u{2010}' | '\u{2011}' | '\u{FE63}'
+        | '\u{02D7}' | '\u{2796}' => '-',
         c => c,
     }
 }
@@ -591,6 +626,20 @@ fn lower_latin(c: char) -> char {
 mod tests {
     use super::*;
 
+    /// A run of tone marks costs pythainlp_compat linear work: doubling the run at most doubles
+    /// the scans (plus a little).
+    #[test]
+    fn pythainlp_compat_is_linear_on_a_tone_mark_run() {
+        let work_of = |marks: usize| {
+            let text = format!("\u{0E01}{}", "\u{0E48}".repeat(marks));
+            crate::found::WORK.with(|work| work.set(0));
+            assert!(!pythainlp_compat(&text).is_empty());
+            crate::found::WORK.with(|work| work.get())
+        };
+        let (small, large) = (work_of(10_000), work_of(20_000));
+        assert!(large <= small * 22 / 10, "{small} then {large}");
+    }
+
     #[test]
     fn code_points_below_u0300_start_nfc_chunks() {
         for c in (0..0x300).filter_map(char::from_u32) {
@@ -685,7 +734,9 @@ mod pythainlp {
 
     fn end_of(text: &[char], from: usize, member: impl Fn(char) -> bool) -> usize {
         text.get(from..).map_or(from, |rest| {
-            from + rest.iter().take_while(|c| member(**c)).count()
+            let run = rest.iter().take_while(|c| member(**c)).count();
+            crate::found::work(run + 1);
+            from + run
         })
     }
 
@@ -797,7 +848,12 @@ mod pythainlp {
         let mut am = Vec::with_capacity(text.len());
         let mut i = 0;
         while let Some(&c) = text.get(i) {
-            let aa = end_of(&text, i + 1, is_tonemark);
+            // The nikhahit is tested first, so a run of tone marks is scanned once, not once per mark.
+            let aa = if c == '\u{0E4D}' {
+                end_of(&text, i + 1, is_tonemark)
+            } else {
+                i
+            };
             if c == '\u{0E4D}' && text.get(aa) == Some(&'\u{0E32}') {
                 am.extend_from_slice(&text[i + 1..aa]);
                 am.push('\u{0E33}');

@@ -2,10 +2,11 @@
 
 use std::ops::Range;
 
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 
 use crate::found::{
-    View, char_len, check_len, digits_end, has_at, is_digit, is_latin_letter, is_thai,
+    View, char_len, check_len, digits_end, foreign_separator, has_at, has_before, is_digit,
+    is_latin_letter, is_numeral, is_thai,
 };
 use crate::{Flags, Found, TooLong};
 
@@ -95,6 +96,10 @@ const CONF_ACADEMIC: f32 = 0.5;
 const CONF_OTHER_ERA: f32 = 0.5;
 const CONF_TWO_DIGIT: f32 = 0.6;
 const CONF_PRE_1941: f32 = 0.7;
+/// A range: neither endpoint is the date of what the range covers.
+const CONF_RANGE: f32 = 0.5;
+/// A quarter of a year that is not fiscal: which months it covers is unknown.
+const CONF_QUARTER_OF_YEAR: f32 = 0.5;
 
 // Markers, as normalize_th writes them.
 const PI: &str = "\u{0E1B}\u{0E35}"; // ปี
@@ -104,6 +109,17 @@ const FISCAL_SHORT: &str = "\u{0E1B}\u{0E35}\u{0E07}\u{0E1A}"; // ปีงบ
 const QUARTER: &str = "\u{0E44}\u{0E15}\u{0E23}\u{0E21}\u{0E32}\u{0E2A}"; // ไตรมาส
 const THI: &str = "\u{0E17}\u{0E35}\u{0E48}"; // ที่
 const KHONG: &str = "\u{0E02}\u{0E2D}\u{0E07}"; // ของ
+const THUENG: &str = "\u{0E16}\u{0E36}\u{0E07}"; // ถึง (จนถึง ends with it)
+const LAE: &str = "\u{0E41}\u{0E25}\u{0E30}"; // และ
+
+/// Words after a bare ปี and two digits that make them a length of time, not a year.
+const DURATIONS: [&str; 5] = [
+    "\u{0E40}\u{0E14}\u{0E37}\u{0E2D}\u{0E19}", // เดือน
+    "\u{0E27}\u{0E31}\u{0E19}",                 // วัน
+    "\u{0E2A}\u{0E31}\u{0E1B}\u{0E14}\u{0E32}\u{0E2B}\u{0E4C}", // สัปดาห์
+    "\u{0E0A}\u{0E31}\u{0E48}\u{0E27}\u{0E42}\u{0E21}\u{0E07}", // ชั่วโมง
+    PI,
+];
 
 /// Year markers other than the fiscal ones, longest first.
 const YEAR_MARKERS: [(&str, PeriodKind); 8] = [
@@ -243,6 +259,9 @@ pub(crate) struct Hit {
     conf: f32,
     flags: Flags,
     alts: Vec<(DateValue, f32)>,
+    /// The year that ends a marked year or a fiscal year, which a bare year may continue as a
+    /// range.
+    year: Option<YearToken>,
 }
 
 /// What `find_numbers` needs from the dates: their spans, the day numbers written before a
@@ -259,23 +278,33 @@ pub(crate) struct Scan {
 /// era marker (พ.ศ., ค.ศ., ร.ศ., จ.ศ. and their spellings before the year; `BE`, `B.E.`, `AD`,
 /// `CE` in capitals before or after it) any year from 1000 to 9999 is read in that era. A year
 /// is a date only with a marker (ปี and its compounds, `FY`, `CY`, `calendar year`, an era), a
-/// month name or a numeric day and month; `2,567` with a separator never is. A two-digit year
-/// is BE 25yy or CE 20yy, whichever is nearer the anchor in days (BE on a tie), with the other
-/// in `alts`. Thai month names (full, abbreviated with or without dots, truncated) and English
-/// ones count only as whole tokens next to a day or a year. Numeric dates are day first
+/// month name or a numeric day and month; `2,567` with a separator never is, and neither is a
+/// number that a numeral of any script touches, directly or across a separator or a thin space.
+/// A two-digit year is BE 25yy or CE 20yy, whichever is nearer the anchor in days (BE on a tie),
+/// with the other in `alts`; after a bare ปี, two digits that a figure precedes or that a
+/// duration, number, scale or unit word follows are no year (`ครบ 3 ปี 12 เดือน`,
+/// `ต่อปี 25 ล้านบาท`). Thai month names (full, abbreviated with or without dots, truncated) and
+/// English ones count only as whole tokens next to a day or a year. Numeric dates are day first
 /// (`d/m/y`, `d.m.y`, `d-m-y`), or year first as `yyyy-mm-dd` and `yyyy/mm/dd`. A date is
 /// checked after conversion to CE, so 29 February needs a CE leap year.
 ///
 /// A fiscal year runs 1 October to 30 September and is named by the year it ends in, which is
 /// the Thai government's year (Budget Procedure Act B.E. 2561, section 4); a company's fiscal
-/// year need not follow it. Its quarters start in October. A quarter with no fiscal year beside
-/// it is not read.
+/// year need not follow it. Its quarters start in October. A quarter with no year beside it is
+/// not read; a quarter beside a year that is not fiscal (`ไตรมาส 2 ปี 2568`, `ปี 2568 ไตรมาส 2`,
+/// `Q2 CY2025`, `Q2 2025`, `ไตรมาส 2/2568`) is one reading of that year over both, at 0.5.
+///
+/// A range is one reading over the whole range at 0.5, its start as the value and its end in
+/// `alts`: two dates joined by `-`, ถึง, `to`, `through` or `until` (and by และ or `and` when both
+/// are years), a bare year after a marked one (`ปี 2567-2569`, `FY2024-2026`, `ปี 2567/68`), a
+/// bare day, month, or day and month before a date (`1-31 ต.ค. 2568`, `ต.ค.-ธ.ค. 2568`,
+/// `Oct 1-15, 2025`), and a range of quarters (`ไตรมาส 1-2 ปีงบประมาณ 2569`, `Q1-Q2 FY2026`).
 ///
 /// Confidence: 0.9 for a marked four-digit year or a date with a month name, and for a numeric
 /// date that is year first or whose day is above 12; 0.6 for other numeric dates and every
-/// two-digit year; 0.85 for fiscal years and quarters; 0.5 for academic years and the ร.ศ. and
-/// จ.ศ. eras; at most 0.7 for a BE year before 2484 (`PRE_1941`). The lowest rule that applies
-/// wins.
+/// two-digit year; 0.85 for fiscal years and quarters; 0.5 for academic years, the ร.ศ. and
+/// จ.ศ. eras, ranges and a quarter of a year that is not fiscal; at most 0.7 for a BE year
+/// before 2484 (`PRE_1941`). The lowest rule that applies wins.
 ///
 /// The text is read through [`crate::normalize_th`], and Latin era markers are matched in the
 /// original capitals. Spans are code points of `text`; a text longer than
@@ -306,6 +335,7 @@ pub(crate) fn scan(view: &View, anchor: NaiveDate) -> Scan {
             day_parts: Vec::new(),
             months: Vec::new(),
         },
+        day_months: Vec::new(),
     };
     let mut at = 0;
     while at < scanner.t.len() {
@@ -321,6 +351,7 @@ pub(crate) fn scan(view: &View, anchor: NaiveDate) -> Scan {
             None => at += 1,
         }
     }
+    scanner.ranges();
     scanner.out
 }
 
@@ -329,6 +360,8 @@ struct Scanner<'v> {
     t: &'v [char],
     anchor: NaiveDate,
     out: Scan,
+    /// Each day written before a month name with no year: its span, day and month.
+    day_months: Vec<(Range<usize>, u32, u32)>,
 }
 
 /// A year as written, with the marker that gave its era.
@@ -374,12 +407,18 @@ impl Scanner<'_> {
     }
 
     fn push(&mut self, range: Range<usize>, reading: Reading) {
+        self.push_year(range, reading, None);
+    }
+
+    /// A hit whose span ends with `year`, a year a bare year may continue as a range.
+    fn push_year(&mut self, range: Range<usize>, reading: Reading, year: Option<YearToken>) {
         self.out.hits.push(Hit {
             range,
             value: reading.value,
             conf: reading.conf,
             flags: reading.flags,
             alts: reading.alts,
+            year,
         });
     }
 
@@ -395,19 +434,35 @@ impl Scanner<'_> {
         self.get(at).is_none_or(|next| !is_latin_letter(next))
     }
 
-    /// A digit run that starts at `at` and is not part of a longer figure.
+    /// A digit run that starts at `at` and is not part of a longer figure: no numeral (of any
+    /// script) touches it, directly or across a separator or a thin space.
     fn number(&self, at: usize) -> Option<(u32, usize, usize)> {
         if !self.get(at).is_some_and(is_digit) {
             return None;
         }
-        let before = at.checked_sub(1).and_then(|prev| self.get(prev));
+        let joins = |at: usize| {
+            self.get(at)
+                .is_some_and(|c| c == ',' || c == '.' || foreign_separator(c))
+                || self.view.group_space(at)
+        };
+        let before = at.checked_sub(1);
         let before_that = at.checked_sub(2).and_then(|prev| self.get(prev));
-        if before.is_some_and(is_digit)
-            || (matches!(before, Some(',' | '.')) && before_that.is_some_and(is_digit))
+        if before
+            .and_then(|prev| self.get(prev))
+            .is_some_and(is_numeral)
+            || (before.is_some_and(joins) && before_that.is_some_and(is_numeral))
         {
             return None;
         }
         let (value, end) = self.field(at, 1..=4)?;
+        let after = self.get(end);
+        if after.is_some_and(is_numeral)
+            || (after.is_some_and(|c| c != ',' && c != '.')
+                && joins(end)
+                && self.get(end + 1).is_some_and(is_numeral))
+        {
+            return None;
+        }
         Some((value, end - at, end))
     }
 
@@ -584,28 +639,111 @@ impl Scanner<'_> {
         }
     }
 
-    /// `ไตรมาส N [ของ] <fiscal year>` and `QN FY <year>`.
-    fn quarter_first(&mut self, at: usize) -> Option<usize> {
-        let after_marker = if has_at(self.t, at, QUARTER) {
+    /// `ไตรมาส`, `ไตรมาสที่` or `Q` at `at`: where the quarter number starts.
+    fn quarter_marker(&self, at: usize) -> Option<usize> {
+        if has_at(self.t, at, QUARTER) {
             let mut next = at + char_len(QUARTER);
             if has_at(self.t, next, THI) {
                 next += char_len(THI);
             }
-            self.space(next)
+            Some(self.space(next))
         } else if self.get(at) == Some('q') && self.latin_start(at) {
-            at + 1
+            Some(at + 1)
         } else {
-            return None;
-        };
-        let quarter = self.quarter_number(after_marker)?;
-        let mut next = self.space(after_marker + 1);
+            None
+        }
+    }
+
+    /// A quarter number at `at`, perhaps with a range to another (`1-2`, `1 ถึง 2`, `Q1-Q2`):
+    /// the first, the last when there is a range, and where they end.
+    fn quarters(&self, at: usize) -> Option<(u32, Option<u32>, usize)> {
+        let first = self.quarter_number(at)?;
+        let end = at + 1;
+        let last = self.connector_end(end, true).and_then(|to| {
+            let number = self.quarter_marker(to).unwrap_or(to);
+            self.quarter_number(number).map(|last| (last, number + 1))
+        });
+        Some(match last {
+            Some((last, last_end)) => (first, Some(last), last_end),
+            None => (first, None, end),
+        })
+    }
+
+    /// `ไตรมาส N [ของ] <fiscal year>` and `QN FY <year>`, also for a range of quarters. A quarter
+    /// beside a year that is not fiscal (`ไตรมาส 2 ปี 2568`, `Q2 CY2025`, `Q2 2025`,
+    /// `ไตรมาส 2/2568`) is one reading of that year at 0.5: which months the quarter covers
+    /// depends on the kind of year, and that is unknown.
+    fn quarter_first(&mut self, at: usize) -> Option<usize> {
+        let number = self.quarter_marker(at)?;
+        let (first, last, quarters_end) = self.quarters(number)?;
+        if self.get(quarters_end) == Some('/') {
+            let year = self.year(quarters_end + 1, &[2, 4])?;
+            let reading = self.read(year, None, CONF_MARKED, |ce, era| {
+                Some(DateValue::Year {
+                    year: ce,
+                    era,
+                    period: PeriodKind::Unknown,
+                })
+            })?;
+            self.push(at..year.end, quarter_of_year(reading));
+            return Some(year.end);
+        }
+        let mut next = self.space(quarters_end);
         if has_at(self.t, next, KHONG) {
             next = self.space(next + char_len(KHONG));
         }
-        let (era, year) = self.fiscal_year(next)?;
-        let reading = self.read(year, era, CONF_FISCAL, |ce, _| quarter_period(ce, quarter))?;
-        self.push(at..year.end, with_flags(reading, Flags::FISCAL));
-        Some(year.end)
+        if let Some((era, year)) = self.fiscal_year(next) {
+            let reading = self.read(year, era, CONF_FISCAL, |ce, _| quarter_period(ce, first))?;
+            let mut reading = with_flags(reading, Flags::FISCAL);
+            if let Some(last) = last {
+                let end = self.read(year, era, CONF_FISCAL, |ce, _| quarter_period(ce, last))?;
+                reading = as_range(reading, end.value);
+            }
+            self.push(at..year.end, reading);
+            return Some(year.end);
+        }
+        let (reading, end) = self.year_of_quarter(next)?;
+        self.push(at..end, quarter_of_year(reading));
+        Some(end)
+    }
+
+    /// The year beside a quarter that is not fiscal: a year marker or an era marker and a year,
+    /// or a bare four-digit year.
+    fn year_of_quarter(&self, at: usize) -> Option<(Reading, usize)> {
+        let marker = YEAR_MARKERS.iter().find(|(marker, _)| {
+            has_at(self.t, at, marker)
+                && (!marker.starts_with(|c: char| c.is_ascii_alphabetic()) || self.latin_start(at))
+        });
+        let (era, year, period) = match marker {
+            Some((marker, period)) => {
+                let (era, year) = self.era_and_year(self.space(at + char_len(marker)))?;
+                (era, year, *period)
+            }
+            None if self.era_before(at).is_some() => {
+                let (era, year) = self.era_and_year(at)?;
+                (era, year, PeriodKind::Unknown)
+            }
+            None => (None, self.year(at, &[4])?, PeriodKind::Unknown),
+        };
+        if era == Some(Era::Unknown) {
+            return None;
+        }
+        let reading = self.read(year, era, CONF_MARKED, |ce, era| {
+            Some(DateValue::Year {
+                year: ce,
+                era,
+                period,
+            })
+        })?;
+        Some((reading, year.end))
+    }
+
+    /// `ไตรมาส N` or `QN` (or a range of quarters) after a year, one space between: where it
+    /// ends.
+    fn trailing_quarter(&self, end: usize) -> Option<usize> {
+        let number = self.quarter_marker(self.space(end))?;
+        self.quarters(number)
+            .map(|(_, _, quarters_end)| quarters_end)
     }
 
     fn quarter_number(&self, at: usize) -> Option<u32> {
@@ -638,17 +776,24 @@ impl Scanner<'_> {
                 next += char_len(THI);
             }
             let next = self.space(next);
-            if let Some(quarter) = self.quarter_number(next) {
+            if let Some((first, last, quarters_end)) = self.quarters(next) {
                 if let Some(reading) =
-                    self.read(year, era, CONF_FISCAL, |ce, _| quarter_period(ce, quarter))
+                    self.read(year, era, CONF_FISCAL, |ce, _| quarter_period(ce, first))
                 {
-                    self.push(at..next + 1, with_flags(reading, Flags::FISCAL));
+                    let mut reading = with_flags(reading, Flags::FISCAL);
+                    if let Some(last) = last
+                        && let Some(end) =
+                            self.read(year, era, CONF_FISCAL, |ce, _| quarter_period(ce, last))
+                    {
+                        reading = as_range(reading, end.value);
+                    }
+                    self.push(at..quarters_end, reading);
                 }
-                return Some(next + 1);
+                return Some(quarters_end);
             }
         }
         if let Some(reading) = self.read(year, era, CONF_FISCAL, |ce, _| fiscal_period(ce)) {
-            self.push(at..year.end, with_flags(reading, Flags::FISCAL));
+            self.push_year(at..year.end, with_flags(reading, Flags::FISCAL), Some(year));
         }
         Some(year.end)
     }
@@ -663,6 +808,26 @@ impl Scanner<'_> {
             return None;
         }
         let (era, year) = self.era_and_year(self.space(at + char_len(marker)))?;
+        // Two digits after a bare ปี are a length of time or an amount, not a year, when a figure
+        // stands before ปี or a duration, number, scale or unit word follows them: ครบ 3 ปี 12
+        // เดือน, ต่อปี 25 ล้านบาท.
+        if *marker == PI && year.digits == 2 && era.is_none() {
+            let before = if at > 0 && self.get(at - 1) == Some(' ') {
+                at - 1
+            } else {
+                at
+            };
+            let after = self.space(year.end);
+            if before
+                .checked_sub(1)
+                .and_then(|prev| self.get(prev))
+                .is_some_and(is_numeral)
+                || crate::numbers::amount_word_at(self.t, after)
+                || DURATIONS.iter().any(|word| has_at(self.t, after, word))
+            {
+                return None;
+            }
+        }
         let base = if *period == PeriodKind::Academic {
             CONF_ACADEMIC
         } else {
@@ -679,8 +844,22 @@ impl Scanner<'_> {
                 })
             })?
         };
-        self.push(at..year.end, reading);
-        Some(year.end)
+        Some(self.push_year_or_quarter(at, year, reading))
+    }
+
+    /// Pushes a year that ends at `year`; a quarter written after it makes it one reading of the
+    /// year at 0.5 over both (`ปี 2568 ไตรมาส 2`). Returns where the reading ends.
+    fn push_year_or_quarter(&mut self, at: usize, year: YearToken, reading: Reading) -> usize {
+        match self.trailing_quarter(year.end) {
+            Some(end) => {
+                self.push(at..end, quarter_of_year(reading));
+                end
+            }
+            None => {
+                self.push_year(at..year.end, reading, Some(year));
+                year.end
+            }
+        }
     }
 
     /// An era marker and a year: `พ.ศ. 2567`, `ร.ศ. 130`, `จ.ศ. 1387`, `B.E. 2567`, `AD 2024`.
@@ -698,8 +877,7 @@ impl Scanner<'_> {
                 })
             })?
         };
-        self.push(at..year.end, reading);
-        Some(year.end)
+        Some(self.push_year_or_quarter(at, year, reading))
     }
 
     /// A year and a Latin era marker after it: `2567 B.E.`, `2024 AD`.
@@ -737,6 +915,7 @@ impl Scanner<'_> {
         };
         let Some((era, year)) = year else {
             self.out.day_parts.push(at..end);
+            self.day_months.push((at..month_end, day, month));
             return Some(month_end);
         };
         if era == Some(Era::Unknown) {
@@ -814,7 +993,15 @@ impl Scanner<'_> {
         if self.get(at).is_some_and(is_latin_letter) {
             if let Some((day, _, day_end)) = self.number(next).filter(|(_, digits, _)| *digits <= 2)
             {
-                let mut year_at = day_end;
+                // Oct 1-15, 2025: a range of days.
+                let (last, days_end) = match self
+                    .connector_end(day_end, false)
+                    .and_then(|to| self.number(to).filter(|(_, digits, _)| *digits <= 2))
+                {
+                    Some((last, _, last_end)) => (Some(last), last_end),
+                    None => (None, day_end),
+                };
+                let mut year_at = days_end;
                 if self.get(year_at) == Some(',') {
                     year_at += 1;
                 }
@@ -825,13 +1012,29 @@ impl Scanner<'_> {
                             NaiveDate::from_ymd_opt(ce, month, day)
                                 .map(|date| DateValue::Day { date, era })
                         }) {
+                            let reading = match (last, reading.value) {
+                                (Some(last), DateValue::Day { date, era }) => {
+                                    let end = date
+                                        .with_day(last)
+                                        .map(|date| DateValue::Day { date, era });
+                                    match end {
+                                        Some(end) => as_range(reading, end),
+                                        None => Reading {
+                                            conf: reading.conf.min(CONF_RANGE),
+                                            ..reading
+                                        },
+                                    }
+                                }
+                                _ => reading,
+                            };
                             self.push(at..year.end, reading);
                         }
                         Some(year.end)
                     }
                     None => {
-                        self.out.day_parts.push(next..day_end);
-                        Some(day_end)
+                        self.out.day_parts.push(next..days_end);
+                        self.day_months.push((at..days_end, day, month));
+                        Some(days_end)
                     }
                 };
             }
@@ -936,11 +1139,258 @@ impl Scanner<'_> {
         }
         has_at(self.t, next, second).then_some(next + char_len(second))
     }
+
+    /// A range connector at `at`, one space allowed before and after it: where the right part
+    /// starts. `-`, `—`, `~`, ถึง (จนถึง ends with it), `to`, `through` and `until`; และ and `and`
+    /// too when `and` is true.
+    fn connector_end(&self, at: usize, and: bool) -> Option<usize> {
+        let from = self.space(at);
+        let end = if matches!(self.get(from), Some('-' | '\u{2014}' | '~')) {
+            from + 1
+        } else if let Some(word) = [THUENG, LAE]
+            .into_iter()
+            .filter(|word| and || *word != LAE)
+            .find(|word| has_at(self.t, from, word))
+        {
+            from + char_len(word)
+        } else {
+            let word = ["to", "through", "until", "and"]
+                .into_iter()
+                .filter(|word| and || *word != "and")
+                .find(|word| {
+                    has_at(self.t, from, word)
+                        && self.latin_start(from)
+                        && self.latin_end(from + char_len(word))
+                })?;
+            from + char_len(word)
+        };
+        Some(self.space(end))
+    }
+
+    /// A range connector right before `right_start`, one space allowed on each side: where the
+    /// left part ends. The connectors of `connector_end`, without และ and `and`.
+    fn connector_before(&self, right_start: usize) -> Option<usize> {
+        let back = |at: usize| {
+            if at > 0 && self.get(at - 1) == Some(' ') {
+                at - 1
+            } else {
+                at
+            }
+        };
+        let at = back(right_start);
+        let start = if at > 0 && matches!(self.get(at - 1), Some('-' | '\u{2014}' | '~')) {
+            at - 1
+        } else if has_before(self.t, at, THUENG) {
+            at - char_len(THUENG)
+        } else {
+            let word = ["to", "through", "until"].into_iter().find(|word| {
+                has_before(self.t, at, word)
+                    && self.latin_start(at - char_len(word))
+                    && self.latin_end(at)
+            })?;
+            at - char_len(word)
+        };
+        Some(back(start))
+    }
+
+    /// Joins ranges: two dates with a connector between, a bare year after a marked one
+    /// (`ปี 2567-2569`, `FY2024-2026`, `ปี 2567/68`), and a bare day, month, or day and month
+    /// before a date (`1-31 ต.ค. 2568`, `ต.ค.-ธ.ค. 2568`). Each is one reading over the whole range
+    /// at 0.5, its start as the value and its end as the alternative, so neither endpoint reads
+    /// as the date of what the range covers.
+    fn ranges(&mut self) {
+        let mut hits = std::mem::take(&mut self.out.hits).into_iter().peekable();
+        let mut out: Vec<Hit> = Vec::with_capacity(hits.len());
+        while let Some(mut hit) = hits.next() {
+            crate::found::work(1);
+            if let Some(year) = hit.year {
+                let next_start = hits.peek().map_or(usize::MAX, |next| next.range.start);
+                if let Some((end, value)) = self
+                    .year_after(&hit, year)
+                    .filter(|(end, _)| *end <= next_start)
+                {
+                    hit = into_range(hit, end, value, CONF_RANGE, Flags::default());
+                }
+            }
+            if let Some(prev) = out.last() {
+                let years = is_year(&prev.value) && is_year(&hit.value);
+                if self.connector_end(prev.range.end, years) == Some(hit.range.start)
+                    && let Some(prev) = out.pop()
+                {
+                    out.push(into_range(
+                        prev,
+                        hit.range.end,
+                        hit.value,
+                        hit.conf,
+                        hit.flags,
+                    ));
+                    continue;
+                }
+            }
+            let floor = out.last().map_or(0, |prev| prev.range.end);
+            if let Some((start, value)) = self.left_part(&hit, floor) {
+                out.push(Hit {
+                    range: start..hit.range.end,
+                    value,
+                    conf: CONF_RANGE.min(hit.conf),
+                    flags: hit.flags,
+                    alts: vec![(hit.value, CONF_RANGE)],
+                    year: None,
+                });
+                continue;
+            }
+            out.push(hit);
+        }
+        self.out.hits = out;
+        // A bare day before a day and month with no year is a date part too: 15-16 ต.ค.
+        let mut parts = Vec::new();
+        for (range, _, _) in &self.day_months {
+            if let Some(start) = self
+                .connector_before(range.start)
+                .and_then(|left_end| self.bare_day(left_end, 0).map(|(start, _)| start..left_end))
+            {
+                parts.push(start);
+            }
+        }
+        if !parts.is_empty() {
+            self.out.day_parts.extend(parts);
+            self.out.day_parts.sort_by_key(|part| part.start);
+        }
+    }
+
+    /// A bare year after the marked year `year` that ends `hit`, joined by a connector or a
+    /// slash: where it ends and the reading of the range's end. Two digits continue the century
+    /// of four (`2567-69`), and no amount word may follow them.
+    fn year_after(&self, hit: &Hit, year: YearToken) -> Option<(usize, DateValue)> {
+        let at = if self.get(year.end) == Some('/') {
+            year.end + 1
+        } else {
+            self.connector_end(year.end, true)?
+        };
+        let next = self.year(at, &[2, 4])?;
+        if crate::numbers::amount_word_at(self.t, self.space(next.end)) {
+            return None;
+        }
+        let delta = if next.digits == 2 && year.digits == 4 {
+            let mut written = year.written - year.written.rem_euclid(100) + next.written;
+            if written <= year.written {
+                written += 100;
+            }
+            Some(written - year.written).filter(|delta| (1..=20).contains(delta))
+        } else {
+            Some(next.written - year.written).filter(|delta| (1..=100).contains(&delta.abs()))
+        }?;
+        Some((next.end, shift_years(&hit.value, delta)?))
+    }
+
+    /// A bare day, a month name, or a day and month with no year, before `hit` with a connector
+    /// between and after `floor` (the end of the hit before): where it starts and its reading,
+    /// in the year of `hit` (the year before when its month comes later).
+    fn left_part(&self, hit: &Hit, floor: usize) -> Option<(usize, DateValue)> {
+        let (year, end_month, era) = match hit.value {
+            DateValue::Day { date, era } => (date.year(), date.month(), era),
+            DateValue::Month { year, month, era } => (year, month, era),
+            _ => return None,
+        };
+        let left_end = self.connector_before(hit.range.start)?;
+        let in_year = |month: u32| if month > end_month { year - 1 } else { year };
+        let day_month = self
+            .day_months
+            .get(
+                self.day_months
+                    .partition_point(|(range, _, _)| range.end < left_end),
+            )
+            .filter(|(range, _, _)| range.end == left_end && range.start >= floor);
+        if let Some((range, day, month)) = day_month {
+            let date = NaiveDate::from_ymd_opt(in_year(*month), *month, *day)?;
+            return Some((range.start, DateValue::Day { date, era }));
+        }
+        let months = &self.out.months;
+        let month_name = months
+            .get(months.partition_point(|range| range.end < left_end))
+            .filter(|range| range.end == left_end && range.start >= floor);
+        if let Some(range) = month_name {
+            let (month, _) = self.month_at(range.start)?;
+            let year = in_year(month);
+            return Some((range.start, DateValue::Month { year, month, era }));
+        }
+        if !matches!(hit.value, DateValue::Day { .. }) {
+            return None;
+        }
+        let (start, day) = self.bare_day(left_end, floor)?;
+        let date = NaiveDate::from_ymd_opt(year, end_month, day)?;
+        Some((start, DateValue::Day { date, era }))
+    }
+
+    /// A day number of one or two digits that ends at `end`, after `floor`: where it starts and
+    /// its value.
+    fn bare_day(&self, end: usize, floor: usize) -> Option<(usize, u32)> {
+        let start = (floor.max(end.saturating_sub(2))..end)
+            .find(|start| self.t[*start..end].iter().all(|c| is_digit(*c)))?;
+        let (day, _, day_end) = self.number(start)?;
+        (day_end == end).then_some((start, day))
+    }
 }
 
 fn with_flags(mut reading: Reading, flags: Flags) -> Reading {
     reading.flags |= flags;
     reading
+}
+
+/// A reading of a range: its start, with its end as the alternative, both at 0.5 at most.
+fn as_range(mut reading: Reading, end: DateValue) -> Reading {
+    reading.conf = reading.conf.min(CONF_RANGE);
+    reading.alts = vec![(end, CONF_RANGE)];
+    reading
+}
+
+/// A quarter of a year that is not fiscal: the year is read, but which months the quarter
+/// covers depends on the kind of year, so the reading drops to 0.5.
+fn quarter_of_year(mut reading: Reading) -> Reading {
+    reading.conf = reading.conf.min(CONF_QUARTER_OF_YEAR);
+    reading
+}
+
+/// `left` stretched to `end` as a range whose end reads `right`.
+fn into_range(left: Hit, end: usize, right: DateValue, right_conf: f32, right_flags: Flags) -> Hit {
+    Hit {
+        range: left.range.start..end,
+        value: left.value,
+        conf: CONF_RANGE.min(left.conf).min(right_conf),
+        flags: left.flags | right_flags,
+        alts: vec![(right, CONF_RANGE)],
+        year: None,
+    }
+}
+
+fn is_year(value: &DateValue) -> bool {
+    matches!(value, DateValue::Year { .. } | DateValue::Period { .. })
+}
+
+/// The same kind of value `delta` years later (earlier when negative); a fiscal period stays a
+/// fiscal year.
+fn shift_years(value: &DateValue, delta: i32) -> Option<DateValue> {
+    Some(match *value {
+        DateValue::Year { year, era, period } => DateValue::Year {
+            year: year.checked_add(delta)?,
+            era,
+            period,
+        },
+        DateValue::Month { year, month, era } => DateValue::Month {
+            year: year.checked_add(delta)?,
+            month,
+            era,
+        },
+        DateValue::Day { date, era } => DateValue::Day {
+            date: NaiveDate::from_ymd_opt(
+                date.year().checked_add(delta)?,
+                date.month(),
+                date.day(),
+            )?,
+            era,
+        },
+        DateValue::Period { label, .. } => fiscal_period(label.checked_add(delta)?)?,
+    })
 }
 
 /// `จ.ศ. N`: kept as written, because KatWork does not convert the Chula Sakarat era.

@@ -136,13 +136,18 @@ impl View {
         let source = self.source(range);
         self.slice(&source)
             .chars()
-            .filter(|c| {
-                !matches!(
-                    c,
-                    '\u{FEFF}' | '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{00AD}'
-                )
-            })
+            .filter(|c| !crate::normalize::is_invisible(*c))
             .collect()
+    }
+
+    /// A space that was a figure, punctuation, thin or hair space or a narrow no-break space in
+    /// the input: one that can sit between the digit groups of one figure.
+    pub(crate) fn group_space(&self, at: usize) -> bool {
+        self.chars.get(at) == Some(&' ')
+            && self
+                .written(&(at..at + 1))
+                .chars()
+                .any(|c| matches!(c, '\u{2007}'..='\u{200A}' | '\u{202F}'))
     }
 
     fn slice(&self, range: &Range<u32>) -> String {
@@ -226,6 +231,29 @@ pub(crate) fn is_digit(c: char) -> bool {
     c.is_ascii_digit()
 }
 
+/// A decimal digit, or another numeric code point (a digit of a script `normalize_th` does not
+/// fold, a superscript, a fraction): something a written figure can hold.
+pub(crate) fn is_numeral(c: char) -> bool {
+    c.is_ascii_digit() || (!c.is_ascii() && c.is_numeric())
+}
+
+/// A separator that can sit between the digit groups of one written figure but that the grammar
+/// does not read: the apostrophe (U+2019 included, which step 3 folds to it), the middle dot,
+/// U+02BC, the Arabic decimal and thousands separators, U+201A, U+2027, U+FE50 and U+FE52.
+pub(crate) fn foreign_separator(c: char) -> bool {
+    matches!(
+        c,
+        '\'' | '\u{00B7}'
+            | '\u{02BC}'
+            | '\u{066B}'
+            | '\u{066C}'
+            | '\u{201A}'
+            | '\u{2027}'
+            | '\u{FE50}'
+            | '\u{FE52}'
+    )
+}
+
 /// A Thai consonant, vowel or mark: a code point that continues a Thai word.
 pub(crate) fn is_thai(c: char) -> bool {
     matches!(c, '\u{0E01}'..='\u{0E4E}')
@@ -233,6 +261,15 @@ pub(crate) fn is_thai(c: char) -> bool {
 
 pub(crate) fn is_latin_letter(c: char) -> bool {
     c.is_ascii_alphabetic()
+}
+
+/// Where a run of numerals (`is_numeral`) starting at `from` ends.
+pub(crate) fn numerals_end(chars: &[char], from: usize) -> usize {
+    let end = chars.get(from..).map_or(from, |rest| {
+        from + rest.iter().take_while(|c| is_numeral(**c)).count()
+    });
+    work(end - from + 1);
+    end
 }
 
 /// Where a digit run starting at `from` ends.

@@ -41,13 +41,15 @@ impl Rng {
     }
 }
 
-/// Thai consonants, vowels, every Thai mark, digits, spaces and the invisible characters step 1 removes.
+/// Thai consonants, vowels, every Thai mark, digits, spaces, the invisible characters step 1
+/// removes, and the compatibility forms step 3 maps (and some it leaves alone).
 const THAI_SOUP: &[char] = &[
     'ก', 'ข', 'น', 'ท', 'ฤ', 'ฦ', 'ร', 'อ', '\u{0E30}', '\u{0E31}', '\u{0E32}', '\u{0E33}',
     '\u{0E34}', '\u{0E35}', '\u{0E36}', '\u{0E37}', '\u{0E38}', '\u{0E39}', '\u{0E3A}', '\u{0E40}',
     '\u{0E41}', '\u{0E44}', '\u{0E45}', '\u{0E47}', '\u{0E48}', '\u{0E49}', '\u{0E4A}', '\u{0E4B}',
     '\u{0E4C}', '\u{0E4D}', '\u{0E4E}', '๑', '5', ' ', ' ', '\t', '\u{00A0}', '\u{200B}',
-    '\u{200D}', '\u{00AD}', 'A', 'b',
+    '\u{200D}', '\u{00AD}', 'A', 'b', '\u{FB01}', '\u{FF04}', '\u{FF05}', '\u{FF08}', '\u{FF09}',
+    '\u{FF0D}', '\u{2010}', '\u{2018}', '\u{2019}', '\u{2013}', '\u{2063}', '\u{001C}', '\u{00B2}',
 ];
 
 fn grapheme_bounds(text: &str) -> Vec<u32> {
@@ -359,9 +361,9 @@ fn compat_is_pythainlp_not_normalize_th() {
         pythainlp_compat(input),
         "ก\u{200D}ข\u{2060}ค\u{FEFF}ง\u{00AD}จ\tฉ\u{00A0}ช"
     );
-    // normalize_th removes all six invisible characters and folds every White_Space run to one space;
-    // U+001C is not White_Space, so it stays.
-    assert_eq!(normalize_th(input).text, "\u{001C}กขคงจ ฉ ช\u{001C}");
+    // normalize_th removes the invisible and control characters (U+001C among them) and folds
+    // every White_Space run to one space.
+    assert_eq!(normalize_th(input).text, "กขคงจ ฉ ช");
     // PyThaiNLP removes a space before a mark only after a consonant no vowel precedes; normalize_th always does.
     let spaced = "\u{0E40}ก \u{0E48}";
     assert_eq!(pythainlp_compat(spaced), "\u{0E40}ก ");
@@ -445,6 +447,8 @@ fn nfkc_is_never_applied() {
     // Step 3 recomposes SARA AM, so the forms only NFKC would fold are what show it was applied.
     for kept in [
         "m\u{00B2}",
+        // A superscript with a combining mark is a chunk of two code points.
+        "m\u{00B2}\u{0323}",
         "\u{2460}",
         "\u{2122}",
         "\u{00BD}",
@@ -506,4 +510,120 @@ fn normalize_output_is_frozen_for_version_1() {
 }
 
 /// The fingerprint of version 1, recorded when the rules were written.
-const FROZEN_V1: u64 = 0x2624_977a_a19d_5acd;
+const FROZEN_V1: u64 = 0x068f_43bd_1713_10ab;
+
+/// Fix round 1: every Default_Ignorable code point and every control that is not White_Space
+/// goes in step 1, so none can split a figure or a word.
+#[test]
+fn invisible_and_control_characters_are_removed() {
+    let invisible = [
+        '\u{2061}',
+        '\u{2062}',
+        '\u{2063}',
+        '\u{2064}',
+        '\u{034F}',
+        '\u{FE00}',
+        '\u{FE0F}',
+        '\u{E0100}',
+        '\u{180B}',
+        '\u{180E}',
+        '\u{17B4}',
+        '\u{206A}',
+        '\u{1D173}',
+        '\u{200E}',
+        '\u{200F}',
+        '\u{061C}',
+        '\u{3164}',
+        '\u{FFF9}',
+        '\u{0001}',
+        '\u{001C}',
+        '\u{007F}',
+        '\u{0080}',
+        '\u{202A}',
+        '\u{2066}',
+        '\u{E0041}',
+        '\u{115F}',
+        '\u{FFA0}',
+    ];
+    for c in invisible {
+        assert_eq!(match_key(&format!("1{c}250")).text, "1250", "{c:?}");
+        assert_eq!(normalize_th(&format!("ก{c}ข")).text, "กข", "{c:?}");
+    }
+    // Controls that are White_Space still become spaces.
+    assert_eq!(normalize_th("ก\tข\u{000B}ค\u{0085}ง").text, "ก ข ค ง");
+}
+
+/// Fix round 1: the hyphens and minus signs that look like a hyphen-minus fold to it.
+#[test]
+fn dash_like_minus_signs_fold_to_hyphen_minus() {
+    for dash in [
+        '\u{2010}', '\u{2011}', '\u{FE63}', '\u{02D7}', '\u{2796}', '\u{2212}', '\u{2012}',
+        '\u{2013}',
+    ] {
+        assert_eq!(match_key(&format!("{dash}5")).text, "-5", "{dash:?}");
+    }
+    // An em dash is punctuation, not a minus.
+    assert_eq!(match_key("\u{2014}5").text, "\u{2014}5");
+}
+
+/// Fix round 1: every ligature step 3 maps, and the one it leaves.
+#[test]
+fn ligatures_fold_to_their_letters() {
+    for (ligature, letters) in [
+        ('\u{FB00}', "ff"),
+        ('\u{FB01}', "fi"),
+        ('\u{FB02}', "fl"),
+        ('\u{FB03}', "ffi"),
+        ('\u{FB04}', "ffl"),
+        ('\u{FB06}', "st"),
+    ] {
+        assert_eq!(
+            match_key(&format!("a{ligature}b")).text,
+            format!("a{letters}b"),
+            "{ligature:?}"
+        );
+    }
+    assert_eq!(match_key("\u{FB05}").text, "\u{FB05}");
+}
+
+/// Fix round 1: on unspaced Thai without nikhahit or phinthu, normalize_th reaches the fixed
+/// point PyThaiNLP's own rules reach. The plan's step order differs from PyThaiNLP's only around
+/// SARA AM (recomposed in step 3, before step 4's mark swap) and phinthu (which NFC moves), and
+/// only for spaces, invisible characters and digits, which this alphabet leaves out.
+#[test]
+fn normalize_th_agrees_with_pythainlp_on_unspaced_thai() {
+    let alphabet: Vec<char> = "\u{0E01}\u{0E02}\u{0E19}\u{0E17}\u{0E24}\u{0E26}\u{0E23}\u{0E2D}\u{0E30}\u{0E31}\u{0E32}\u{0E33}\u{0E34}\u{0E35}\u{0E36}\u{0E37}\u{0E38}\u{0E39}\u{0E40}\u{0E41}\u{0E44}\u{0E45}\u{0E47}\u{0E48}\u{0E49}\u{0E4A}\u{0E4B}\u{0E4C}\u{0E4E}"
+        .chars()
+        .collect();
+    let mut rng = Rng(400);
+    let mut differences = Vec::new();
+    for _ in 0..20_000 {
+        let input = rng.string(&alphabet, 10);
+        let mut oracle = input.clone();
+        for _ in 0..8 {
+            let next = pythainlp_compat(&oracle);
+            if next == oracle {
+                break;
+            }
+            oracle = next;
+        }
+        let normalized = normalize_th(&input);
+        if normalized.stable() && normalized.text != oracle {
+            differences.push(format!(
+                "{input:?}: {:?} against {oracle:?}",
+                normalized.text
+            ));
+        }
+    }
+    assert!(
+        differences.is_empty(),
+        "{} differ:\n{}",
+        differences.len(),
+        differences
+            .iter()
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
