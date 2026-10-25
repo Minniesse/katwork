@@ -353,7 +353,7 @@ The alpha computer for each Kat has these parts:
 | **WordCraft** | DOCX; saves DOCX and PDF | Drafting and editing documents. A Kat's edits to an existing document are tracked changes under its AI author name. It renders the labelled preview of each DOCX output. |
 | **GridCraft** | XLSX and CSV | Editing workbooks. Its check runs on every XLSX output before it is saved (below), and it is a reader challenger behind KatWork's package guard; umya-spreadsheet stays the reader until GridCraft wins its challenge. |
 | **PdfCraft** | PDF | Reading, annotating, combining, filling and redacting PDFs; its text extraction is a reader challenger. Its OCR cannot read Thai, so Thai scans go through KatWork's `OcrEngine` (`docs/adr/0008-thai-ocr-engines.md`). |
-| **DeckCraft** | PPTX; saves PPTX and PDF | Slides. KatWork reads PPTX for evidence. |
+| **DeckCraft** | PPTX; saves PPTX and PDF | Slides. KatWork reads PPTX for evidence; in sub-project 2a no PPTX text is a full-quality source, so a claim citing a deck stays unverified (founder decision, 2026-10-25). |
 | **DesignCraft** | its own format; saves PDF | Page layout. |
 | **VectorCraft** | its own format; saves SVG, PDF and PNG | Vector art, diagrams and charts. |
 | **FigCraft** | its own format; saves PDF, PNG and SVG | Interface design. |
@@ -653,6 +653,7 @@ This spec covers the whole alpha. Implementation planning splits it into sub-pro
    - One `katwork-craft` container per workspace, replacing 2a's shared container with a throwaway user per session; a Craft web origin per session, with no reuse, instead of 2a's one.
    - The UI plane: an app running windowed on a virtual display, with its screencast and an agent cursor, for what the MCP servers cannot do.
    - Citing what KatWork cannot read yet: CAD drawings, audio, video and image content beyond OCR's text; DWG open and save.
+   - Precise PPTX visibility, for example a render-based check, so that a claim citing a deck can pass; in 2a all PPTX text is suspect (founder decision, 2026-10-25).
    - Long renders and exports as background jobs; per-role tiers of the app policies (read, write and outward) and approvals for outward Craft actions.
    - Following the forks' upstream PRs, and moving each fork back to its upstream once its changes land.
    - Carried requirements (all §9.1):
