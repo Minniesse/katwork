@@ -655,9 +655,12 @@ fn clean_context(view: &View, items: &mut [Item], hits: &mut [Hit], months: &[Ra
 }
 
 /// `number` with the scale and unit of the figure it is joined to, when it has none of its own:
-/// the other reading of the bare end of `10-15 ล้านบาท`.
+/// the other reading of the bare end of `10-15 ล้านบาท`. A scale or a unit it has that differs
+/// from the other's says it is no part of the same amount (`5% to 1,250 million`).
 fn carried(number: &Number, partner: &Number) -> Option<Number> {
-    if partner.role != NumberRole::Quantity {
+    let agrees = (number.scale.0 == 0 || number.scale == partner.scale)
+        && (number.unit.is_none() || number.unit == partner.unit);
+    if partner.role != NumberRole::Quantity || !agrees {
         return None;
     }
     let mut carried = number.clone();

@@ -2178,6 +2178,21 @@ fn ranges_and_lists_of_figures_are_not_read_with_confidence() {
     // A list word between two figures with a subject between them joins nothing.
     let facts = format!("{RAYDAI} 100 {LAN}{BAHT} {LAE}{KAMRAI} 20 {LAN}{BAHT}");
     assert_eq!(confident(&facts), vec![dec("100000000"), dec("20000000")]);
+    // Ends whose own scales or units differ lend each other nothing: a percent is no part of an
+    // amount in millions (mutant C-AGREES).
+    for text in [
+        "revenue rose 5% to 1,250 million".to_owned(),
+        format!("{KAMRAI} 270 {LAN}{BAHT} {HUE}{ROI_LA} 21.6"),
+    ] {
+        let found = quantities(&text);
+        assert_eq!(found.len(), 2, "{text:?}: {found:?}");
+        assert!(
+            found
+                .iter()
+                .all(|found| found.conf < 0.8 && found.alts.is_empty()),
+            "{text:?}: {found:?}"
+        );
+    }
 }
 
 const JONTHUENG: &str = "จนถ\u{0E36}ง"; // จนถึง
