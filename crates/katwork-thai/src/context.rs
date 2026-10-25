@@ -6,8 +6,9 @@
 //!
 //! [`SIGNALS`] is the one list of signals; each says how near it must stand ([`Place`]).
 //! Joining and opening signals count only next to the reading, with at most one space, and a
-//! filler word such as วันที่ or เดือน, between; sign and period signals count within [`NEAR`]
-//! code points of it. A signal inside a quantity or a date (the ไตรมาส of `ไตรมาส 2 ปีงบประมาณ
+//! filler word such as วันที่ or เดือน, between; ระหว่าง and `between` count only when a range or
+//! list connector follows the reading as well (the founder's answer: on their own they mean
+//! "during" or "among"); sign and period signals count within [`NEAR`] code points of it. A signal inside a quantity or a date (the ไตรมาส of `ไตรมาส 2 ปีงบประมาณ
 //! 2569`, the ติดลบ of `ติดลบ 5%`) belongs to that reading's own pattern and counts for nothing.
 
 use std::ops::Range;
@@ -49,6 +50,10 @@ pub(crate) enum Place {
     Leads,
     /// Right before the reading: `ตั้งแต่วันที่ 1 ต.ค.`, `from 2024`.
     Opens,
+    /// As `Opens`, and only when a range or list connector follows the reading before the next
+    /// clause: `ระหว่างปี 2567 ถึง 2568`, `between 2024 and 2025`, but not `ระหว่างปี 2568`
+    /// (during 2568).
+    Frames,
     /// Within [`NEAR`] code points before the reading: `ติดลบที่ร้อยละ 6.1`.
     Before,
     /// Within [`NEAR`] code points before or after the reading: `งวด 9 เดือนแรกของปี 2568`.
@@ -97,9 +102,9 @@ pub(crate) const SIGNALS: [Signal; 56] = [
     signal(
         "\u{0E23}\u{0E30}\u{0E2B}\u{0E27}\u{0E48}\u{0E32}\u{0E07}",
         Kind::Range,
-        Place::Opens,
+        Place::Frames,
     ), // ระหว่าง
-    signal("between", Kind::Range, Place::Opens),
+    signal("between", Kind::Range, Place::Frames),
     signal("from", Kind::Range, Place::Opens),
     signal("to", Kind::Range, Place::Leads),
     signal("through", Kind::Range, Place::Leads),
@@ -338,6 +343,7 @@ impl<'t> Context<'t> {
             for occurrence in self.ending_at(at).filter(|found| applies(found)) {
                 match occurrence.signal.place {
                     Place::Opens | Place::Leads => near.capped = true,
+                    Place::Frames => near.capped |= self.connector_after(extent.end),
                     Place::Joins => {
                         let far = self.back(occurrence.start);
                         if self.ends.get(far) == Some(&true) {
@@ -380,6 +386,16 @@ impl<'t> Context<'t> {
         self.found[first..]
             .iter()
             .take_while(move |found| found.start == at)
+    }
+
+    /// A range or list connector right after a reading that ends at `end`, one space at most
+    /// between: what makes ระหว่าง or `between` before the reading frame a range or a list. Past
+    /// a space and a word, Thai is in its next clause (`ระหว่างปี 2568 รายได้และกำไรเพิ่มขึ้น`).
+    fn connector_after(&self, end: usize) -> bool {
+        self.starting_at(self.forward(end)).any(|found| {
+            matches!(found.signal.kind, Kind::Range | Kind::List)
+                && matches!(found.signal.place, Place::Joins | Place::Leads)
+        })
     }
 
     /// `at` with one space before it skipped.
@@ -516,6 +532,18 @@ mod tests {
                     figures_capped(&format!("{figure} {text} {other}")),
                     figures_capped(&format!("{figure} {plain} {other}")),
                 ),
+                (_, Place::Frames) => {
+                    // A connector with no reading after it caps nothing alone; after a figure
+                    // that ระหว่าง or `between` opens, it makes them count.
+                    let connector = "\u{0E41}\u{0E25}\u{0E30}"; // และ
+                    assert!(!figures_capped(&format!(
+                        "{plain} {figure} {connector}{plain}"
+                    )));
+                    (
+                        figures_capped(&format!("{text} {figure} {connector}{plain}")),
+                        figures_capped(&format!("{text} {figure} {plain}")),
+                    )
+                }
                 (_, _) => (
                     figures_capped(&format!("{text} {figure}")),
                     figures_capped(&format!("{plain} {figure}")),

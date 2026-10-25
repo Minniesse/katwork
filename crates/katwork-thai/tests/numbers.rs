@@ -2004,6 +2004,25 @@ fn power_led_words_that_restate_the_figure_are_amount_in_words() {
     }
 }
 
+const KHA_PRAP: &str = "ค\u{0E48}\u{0E32}ปร\u{0E31}บ"; // ค่าปรับ
+
+/// The founder's answer (round 2b): outside the amount-in-words parentheses, number words that
+/// start with a power word stay one code of value 0, even with a unit after them, so a claim
+/// about them is never checked.
+#[test]
+fn power_led_words_outside_the_parentheses_stay_one_code() {
+    for (text, code) in [
+        (format!("{KHA_PRAP}{SIP}{BAHT}"), SIP.to_owned()),
+        (format!("{RAKHA}{SIP}{HA}{BAHT}"), format!("{SIP}{HA}")),
+        (format!("{RAKHA} {ROI}{BAHT}"), ROI.to_owned()),
+    ] {
+        let found = only(&text);
+        assert_eq!(found.value.role, NumberRole::Code, "{text:?}: {found:?}");
+        assert_eq!(found.value.value, Decimal::ZERO, "{text:?}");
+        assert_eq!(span(&text, &found), code, "{text:?}");
+    }
+}
+
 /// Fix round 2: a Latin abbreviation of a scale one space after a figure makes it one code with
 /// it (`$5 M`, `5 mln`); a lone lowercase letter is no scale and no code.
 #[test]
@@ -2277,14 +2296,14 @@ fn every_signal_the_founder_named_caps_a_reading() {
         format!("{RAYDAI}{JONTHUENG} 1,250 {LAN}{BAHT}"),
         format!("{RAYDAI}{PAI_JONTHUENG} 1,250 {LAN}{BAHT}"),
         format!("{RAYDAI}{JONKRATHANG} 1,250 {LAN}{BAHT}"),
-        format!("{RAYDAI}{RAWANG} 1,250 {LAN}{BAHT}"),
+        format!("{RAYDAI}{RAWANG} 1,250 {LAN}{BAHT} {KAP}{PI}{KORN}"),
         format!("{RAYDAI}{TANGTAE} 1,250 {LAN}{BAHT}"),
         format!("{RAYDAI}{JAK} 1,250 {LAN}{BAHT}"),
         format!("{KAMRAI}{TID_LOP}{YU_THI} 5%"),
         format!("{LOP} {YU_THI} 5%"),
         format!("1,250 {LAN}{BAHT} {LAE} 2,500 {LAN}{BAHT}"),
         format!("1,250 {LAN}{BAHT} {HUE} 2,500 {LAN}{BAHT}"),
-        "between 1,250".to_owned(),
+        "between 1,250 and the target".to_owned(),
         "from 1,250".to_owned(),
         "to 1,250".to_owned(),
         "through 1,250".to_owned(),
@@ -2330,6 +2349,45 @@ fn every_signal_the_founder_named_caps_a_reading() {
         vec![dec("1250000000")]
     );
     assert_eq!(only_date(&format!("{PI} 2568")).conf, 0.9);
+}
+
+const KAP: &str = "ก\u{0E31}บ"; // กับ
+const KORN: &str = "ก\u{0E48}อน"; // ก่อน
+const BORISAT: &str = "บร\u{0E34}ษ\u{0E31}ท"; // บริษัท
+
+/// The founder's answer (round 2b): ระหว่าง and `between` cap a reading only when a range or
+/// list connector follows it before the next clause; alone they mean "during" or "among", and
+/// the reading stays plain. A connector with no reading after it caps nothing by itself.
+#[test]
+fn between_caps_a_reading_only_with_a_connector_after_it() {
+    let capped = |text: &str| {
+        let numbers = quantities(text);
+        let dates = find_dates(text, &ctx()).unwrap();
+        assert!(!(numbers.is_empty() && dates.is_empty()), "{text:?}");
+        numbers.iter().all(|found| found.conf <= 0.6) && dates.iter().all(|found| found.conf <= 0.6)
+    };
+    for text in [
+        format!("{RAWANG}{PI} 2567 {THUENG} 2568"),
+        format!("{RAWANG}{PI} 2567 {LAE} 2568"),
+        "between 2024 and 2025".to_owned(),
+        format!("{RAYDAI}{RAWANG} 1,250 {LAN}{BAHT} {KAP}{PI}{KORN}"),
+        "between 1,250 and the target".to_owned(),
+    ] {
+        assert!(capped(&text), "{text:?}: {:?}", numbers(&text));
+    }
+    // Alone, or with the connector in the next clause, they cap nothing.
+    for text in [
+        format!("{RAWANG}{PI} 2568"),
+        format!("{RAWANG}{PI} 2568 {RAYDAI}{LAE}{KAMRAI}{BORISAT}"),
+    ] {
+        assert_eq!(only_date(&text).conf, 0.9, "{text:?}");
+    }
+    assert_eq!(confident("during 2568"), vec![dec("2568")]);
+    assert_eq!(confident(&format!("between 3 {BORISAT}")), vec![dec("3")]);
+    assert_eq!(
+        confident(&format!("{RAYDAI} 1,250 {LAN}{BAHT} {KAP}{PI}{KORN}")),
+        vec![dec("1250000000")]
+    );
 }
 
 fn only_date(text: &str) -> Found<katwork_thai::DateValue> {
