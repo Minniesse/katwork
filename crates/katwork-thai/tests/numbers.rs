@@ -270,8 +270,12 @@ fn ordinals_times_and_codes_are_not_quantities() {
         code.iter().all(|f| f.value.role == NumberRole::Code),
         "{code:?}"
     );
-    assert_eq!(code[0].value.value, dec("401"));
-    assert_eq!(code[1].value.value, dec("123"));
+    // Fix round 2: every code has value 0, so nothing reads it as an amount.
+    assert_eq!(
+        code.iter().map(|f| f.raw.as_str()).collect::<Vec<_>>(),
+        ["0401", "123"]
+    );
+    assert!(code.iter().all(|f| f.value.value.is_zero()), "{code:?}");
     for text in [
         "No. 5",
         "no.5",
@@ -703,6 +707,29 @@ fn scanners_never_panic_and_keep_spans_valid() {
         "#",
         "\u{0E48}",
         "\u{0E31}",
+        // Fix round 2: what the round's rules read.
+        "\u{FFFD}",
+        "\u{0096}",
+        "\u{001F}",
+        "\u{3164}",
+        "O",
+        "st",
+        "USD",
+        "THB",
+        "M",
+        "mln",
+        "1/2",
+        "->",
+        "and",
+        "between",
+        "\u{0E16}\u{0E36}\u{0E07}",
+        "\u{0E41}\u{0E25}\u{0E30}",
+        "\u{0E15}\u{0E34}\u{0E14}\u{0E25}\u{0E1A}",
+        "\u{0E19}\u{0E32}\u{0E2C}\u{0E34}\u{0E01}\u{0E32}",
+        "\u{0E07}\u{0E27}\u{0E14}",
+        "\u{0E15}\u{0E49}\u{0E19}",
+        "Jan",
+        "q2",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -811,22 +838,16 @@ fn effective(text: &str) -> Vec<Decimal> {
 /// splits one visible figure into a head and a confident tail.
 #[test]
 fn unknown_separators_and_unfolded_digits_never_split_a_figure() {
-    for invisible in [
-        '\u{2063}',
-        '\u{200E}',
-        '\u{FE0F}',
-        '\u{0001}',
-        '\u{3164}',
-        '\u{FFF9}',
-        '\u{E0100}',
-    ] {
+    for invisible in ['\u{2063}', '\u{200E}', '\u{FE0F}', '\u{FFF9}', '\u{E0100}'] {
         let text = format!("{RAYDAI} 1{invisible}250 {LAN}{BAHT}");
         let found = only(&text);
         assert_eq!(found.value.effective(), dec("1250000000"), "{text:?}");
     }
+    // Fix round 2: a control or a Hangul filler is seen (a mark or a gap), so it makes a code.
     for separator in [
-        '\u{2009}', '\u{200A}', '\u{202F}', '\u{2007}', '\u{FE50}', '\u{201A}', '\u{00B7}', '\'',
-        '\u{2019}', '\u{066B}', '\u{066C}',
+        '\u{2009}', '\u{200A}', '\u{202F}', '\u{2007}', '\u{2008}', '\u{FE50}', '\u{FE52}',
+        '\u{201A}', '\u{2027}', '\u{00B7}', '\'', '\u{2019}', '\u{02BC}', '\u{066B}', '\u{066C}',
+        '\u{0001}', '\u{0096}', '\u{3164}', '\u{FFA0}', '\u{115F}',
     ] {
         let text = format!("{RAYDAI} 1{separator}250 {LAN}{BAHT}");
         let found = only(&text);
@@ -1414,4 +1435,890 @@ fn overflowing_mixed_number_is_one_code() {
     let found = only(&text);
     assert_eq!(found.value.role, NumberRole::Code);
     assert_eq!(span(&text, &found), text);
+}
+
+// Fix round 2: the clean-context rule (a founder decision). A quantity reads at 1.0 only when it
+// matches a pattern the reader knows exactly and no signal of a range, a list, a fraction or a
+// sign stands near it; otherwise at most 0.6, with the readings the signal suggests in `alts`.
+// What the reader cannot read at all is one code.
+
+const THUENG: &str = "ถ\u{0E36}ง"; // ถึง
+const LAE: &str = "\u{0E41}ล\u{0E30}"; // และ
+const RAWANG: &str = "ร\u{0E30}หว\u{0E48}\u{0E32}ง"; // ระหว่าง
+const YU_THI: &str = "อย\u{0E39}\u{0E48}ท\u{0E35}\u{0E48}"; // อยู่ที่
+const PRAMAN: &str = "ปร\u{0E30}ม\u{0E32}ณ"; // ประมาณ
+const SETTHAKIT: &str = "\u{0E40}ศรษฐก\u{0E34}จ"; // เศรษฐกิจ
+const KHAYAI: &str = "ขย\u{0E32}ยต\u{0E31}ว"; // ขยายตัว
+const PHOEM: &str = "\u{0E40}พ\u{0E34}\u{0E48}มข\u{0E36}\u{0E49}น"; // เพิ่มขึ้น
+const PANPHON: &str = "ป\u{0E31}นผล"; // ปันผล
+const PER_SHARE: &str = "บ\u{0E32}ทต\u{0E48}อห\u{0E38}\u{0E49}น"; // บาทต่อหุ้น
+const FEE: &str = "ค\u{0E48}\u{0E32}ธรรม\u{0E40}น\u{0E35}ยม"; // ค่าธรรมเนียม
+const SALARY: &str = "\u{0E40}ง\u{0E34}น\u{0E40}ด\u{0E37}อน"; // เงินเดือน
+const NALIKA: &str = "น\u{0E32}ฬ\u{0E34}ก\u{0E32}"; // นาฬิกา
+const SUE: &str = "ซ\u{0E37}\u{0E49}อ"; // ซื้อ
+const CHIN: &str = "ช\u{0E34}\u{0E49}น"; // ชิ้น
+const YOTKHAI: &str = "ยอดข\u{0E32}ย"; // ยอดขาย
+const KHA_CHAI: &str = "ค\u{0E48}\u{0E32}\u{0E43}ช\u{0E49}จ\u{0E48}\u{0E32}ย"; // ค่าใช้จ่าย
+const PHONPRAKOP: &str = "ผลปร\u{0E30}กอบก\u{0E32}ร"; // ผลประกอบการ
+const TAE: &str = "\u{0E41}ต\u{0E48}"; // แต่
+const CHAMNUAN: &str = "จ\u{0E33}นวน"; // จำนวน
+const SUNG_THUENG: &str = "ส\u{0E39}งถ\u{0E36}ง"; // สูงถึง
+const KUEAP: &str = "\u{0E40}ก\u{0E37}อบ"; // เกือบ
+const NGOEN_FOE: &str = "\u{0E40}ง\u{0E34}น\u{0E40}ฟ\u{0E49}อ"; // เงินเฟ้อ
+const ET: &str = "\u{0E40}อ\u{0E47}ด"; // เอ็ด
+const PHANTRI: &str = "พ\u{0E31}นตร\u{0E35}"; // พันตรี
+
+/// The values of the quantities read at 0.8 or more.
+fn confident(text: &str) -> Vec<Decimal> {
+    quantities(text)
+        .iter()
+        .filter(|found| found.conf >= 0.8)
+        .map(|found| found.value.effective())
+        .collect()
+}
+
+/// Fix round 2 (a regression of round 1): a control step 1 deletes is seen as a mark or a gap,
+/// so inside or right before a figure it makes the run one code, never a join of two figures or
+/// a dropped minus; the information separators U+001C-U+001F are spaces and keep figures apart.
+#[test]
+fn controls_inside_a_figure_make_a_code_and_separators_keep_figures_apart() {
+    // U+0096 is an en dash decoded with the wrong code page.
+    for (text, code) in [
+        (
+            format!("{YOTKHAI} 10\u{0096}15 {LAN}{BAHT}"),
+            format!("10\u{0096}15 {LAN}"),
+        ),
+        (format!("{GROWTH} \u{0096}5%"), "\u{0096}5%".to_owned()),
+        (
+            format!("{PI} 2567\u{0096}2569"),
+            "2567\u{0096}2569".to_owned(),
+        ),
+        (
+            format!("{PI} 2567\u{0007}2568"),
+            "2567\u{0007}2568".to_owned(),
+        ),
+        (
+            format!("{RAYDAI} 1\u{0001}250 {LAN}{BAHT}"),
+            format!("1\u{0001}250 {LAN}"),
+        ),
+        (
+            format!("{RAYDAI} 1\u{3164}250 {LAN}{BAHT}"),
+            format!("1\u{3164}250 {LAN}"),
+        ),
+    ] {
+        let found = only(&text);
+        assert_eq!(found.value.role, NumberRole::Code, "{text:?}");
+        assert_eq!(span(&text, &found), code, "{text:?}");
+    }
+    let year = format!("{PI} 2567\u{001F}1,250 {LAN}{BAHT}");
+    assert_eq!(confident(&year), vec![dec("1250000000")]);
+    assert_eq!(values("1,250\u{001F}300"), vec![dec("1250"), dec("300")]);
+    assert_eq!(values("100\u{001C}200"), vec![dec("100"), dec("200")]);
+}
+
+/// Fix round 2: digits joined by a code point that is no boundary the reader knows are one
+/// code, by a rule rather than a list, U+FFFD first; a glyph the text layer could not name
+/// touching a figure makes it a code too.
+#[test]
+fn separators_nobody_listed_never_split_a_figure() {
+    for separator in [
+        '\u{FFFD}',
+        '\u{FFFC}',
+        '\u{E000}',
+        '\u{F0000}',
+        '\u{00B8}',
+        '\u{2024}',
+        '\u{2219}',
+        '\u{22C5}',
+        '\u{0326}',
+        '\u{0332}',
+        '\u{0E48}',
+        '\u{0E31}',
+        '\u{2E31}',
+        '\u{30FB}',
+        '\u{FF65}',
+        '\u{2032}',
+        '`',
+        '\u{00B4}',
+        '\u{2018}',
+        '\u{02CC}',
+        '\u{3001}',
+        '\u{060C}',
+        '\u{FF64}',
+        '\u{2026}',
+        '\u{2044}',
+        '\u{2215}',
+        '\u{00D7}',
+    ] {
+        let text = format!("{RAYDAI} 1{separator}250 {LAN}{BAHT}");
+        let found = only(&text);
+        assert_eq!(found.value.role, NumberRole::Code, "{text:?}");
+        assert_eq!(
+            span(&text, &found),
+            format!("1{separator}250 {LAN}"),
+            "{text:?}"
+        );
+    }
+    for written in ["\u{FFFD},250", "1,\u{FFFD}50", "\u{FFFD}250", "250\u{FFFD}"] {
+        let text = format!("{RAYDAI} {written} {LAN}{BAHT}");
+        let found = only(&text);
+        assert_eq!(found.value.role, NumberRole::Code, "{text:?}");
+        assert_eq!(span(&text, &found), format!("{written} {LAN}"), "{text:?}");
+    }
+    // Two glyphs in a row: each code takes only its own (round 2's random-text harness).
+    let pair = numbers("1\u{FFFD}\u{FFFD}-5");
+    assert_eq!(pair.len(), 2, "{pair:?}");
+    assert!(pair[0].end <= pair[1].start, "{pair:?}");
+    // White space, ASCII punctuation, a dash, an arrow and Thai text are boundaries.
+    for text in [
+        "10 15".to_owned(),
+        "5+5".to_owned(),
+        "5;5".to_owned(),
+        "10\u{2014}15".to_owned(),
+        "10\u{2192}15".to_owned(),
+        format!("5{KHON}10{KHON}"),
+    ] {
+        let found = numbers(&text);
+        assert_eq!(found.len(), 2, "{text:?}: {found:?}");
+        assert!(
+            found
+                .iter()
+                .all(|found| found.value.role == NumberRole::Quantity),
+            "{text:?}: {found:?}"
+        );
+    }
+}
+
+/// Fix round 2: a code the lexer makes takes in its minus, accounting parentheses, sign word
+/// and scale words, as a figure does, so a quote that drops them cuts it.
+#[test]
+fn codes_keep_their_sign_parentheses_and_scale() {
+    for (text, code) in [
+        (
+            format!("{KHAT_THUN} \u{2212}1'250 {LAN}{BAHT}"),
+            format!("\u{2212}1'250 {LAN}"),
+        ),
+        (
+            format!("{KHAT_THUN} -1\u{2009}250 {LAN}{BAHT}"),
+            format!("-1\u{2009}250 {LAN}"),
+        ),
+        (
+            format!("{KHAT_THUN} (1\u{2009}250) {LAN}{BAHT}"),
+            format!("(1\u{2009}250) {LAN}"),
+        ),
+        (
+            format!("{KHAT_THUN} {TID_LOP} 1'250 {LAN}{BAHT}"),
+            format!("{TID_LOP} 1'250 {LAN}"),
+        ),
+        ("SKU-12AB34".to_owned(), "SKU-12AB34".to_owned()),
+    ] {
+        let found = only(&text);
+        assert_eq!(found.value.role, NumberRole::Code, "{text:?}");
+        assert_eq!(span(&text, &found), code, "{text:?}");
+    }
+    // An ordinary word after a code is not its scale (mutant F-MASKSCALE-scaleend).
+    let rank = format!("1'250 {PHANTRI}");
+    assert_eq!(span(&rank, &only(&rank)), "1'250");
+}
+
+/// Fix round 2: digit groups with letters between them and nothing else are one code, so a
+/// lookalike letter cannot leave a confident tail (`12O5 ล้านบาท` is no 5,000,000).
+#[test]
+fn digit_groups_with_letters_between_them_are_one_code() {
+    for (text, code) in [
+        (format!("{RAYDAI} 12O5 {LAN}{BAHT}"), format!("12O5 {LAN}")),
+        (format!("{RAYDAI} 1l50 {LAN}{BAHT}"), format!("1l50 {LAN}")),
+        (
+            format!("รห\u{0E31}ส AB12CD34 {LAN}{BAHT}"),
+            format!("AB12CD34 {LAN}"),
+        ),
+        ("A1B2".to_owned(), "A1B2".to_owned()),
+        ("2Q68".to_owned(), "2Q68".to_owned()),
+        ("1H25".to_owned(), "1H25".to_owned()),
+        ("9M2025".to_owned(), "9M2025".to_owned()),
+        ("1920x1080".to_owned(), "1920x1080".to_owned()),
+        ("INV2025A001".to_owned(), "INV2025A001".to_owned()),
+    ] {
+        let found = only(&text);
+        assert_eq!(found.value.role, NumberRole::Code, "{text:?}");
+        assert_eq!(span(&text, &found), code, "{text:?}");
+    }
+    let model = format!("ร\u{0E38}\u{0E48}น A1B2 {RAKHA} 5 {LAN}{BAHT}");
+    assert_eq!(confident(&model), vec![dec("5000000")]);
+}
+
+/// Fix round 2: a fraction before a scale word or a unit is one code: the reader has no grammar
+/// for it, so its denominator never reads as the amount.
+#[test]
+fn fractions_before_a_scale_or_a_unit_are_one_code() {
+    for (text, code) in [
+        (format!("{BUDGET} 3/4 {LAN}{BAHT}"), format!("3/4 {LAN}")),
+        (format!("{RAKHA} 1/2 {BAHT}"), "1/2".to_owned()),
+        ("rate 1/2%".to_owned(), "1/2%".to_owned()),
+        (
+            format!("{BUDGET} 3\u{2044}4 {LAN}{BAHT}"),
+            format!("3\u{2044}4 {LAN}"),
+        ),
+        (
+            format!("{BUDGET} 3\u{2215}4 {LAN}{BAHT}"),
+            format!("3\u{2215}4 {LAN}"),
+        ),
+        ("growth 5 1/2%".to_owned(), "5 1/2%".to_owned()),
+        ("1 1/2 million baht".to_owned(), "1 1/2 million".to_owned()),
+        ("THB 3/4 million".to_owned(), "3/4 million".to_owned()),
+    ] {
+        let found = only(&text);
+        assert_eq!(found.value.role, NumberRole::Code, "{text:?}");
+        assert_eq!(span(&text, &found), code, "{text:?}");
+    }
+    // Spaced, it is two figures joined by a slash: neither reads at 0.8.
+    let spaced = format!("3 / 4 {LAN}{BAHT}");
+    assert_eq!(quantities(&spaced).len(), 2);
+    assert!(confident(&spaced).is_empty(), "{:?}", numbers(&spaced));
+}
+
+/// Fix round 2: a comma makes the figure after it a code only after a glyph the text layer could
+/// not name or one lone letter (`x,250`); after a word or a Thai letter it is a list or a CSV
+/// field.
+#[test]
+fn a_stray_comma_needs_a_lone_letter() {
+    for text in [
+        format!("{RAKHA} 100 {BAHT},250 {BAHT}"),
+        format!("{CHAMNUAN} 3 {KHON},5 {KHON}"),
+        "revenue,1250".to_owned(),
+        format!("{RAYDAI}รวม,1250"),
+        format!("{RAYDAI},1250"),
+    ] {
+        assert!(
+            numbers(&text)
+                .iter()
+                .all(|found| found.value.role == NumberRole::Quantity),
+            "{text:?}: {:?}",
+            numbers(&text)
+        );
+    }
+    for text in ["x,250", "l,250", "item A,250", "\u{FFFD},250"] {
+        assert_eq!(only(text).value.role, NumberRole::Code, "{text:?}");
+    }
+}
+
+/// Fix round 2: a comma group that is not three digits, before a scale word or a unit, is one
+/// code; a list of figures with nothing after it keeps its figures.
+#[test]
+fn a_comma_group_that_is_not_three_digits_before_a_scale_is_a_code() {
+    for (text, code) in [
+        (format!("{RAKHA} 1,25 {LAN}{BAHT}"), format!("1,25 {LAN}")),
+        (format!("1,5 {LAN}"), format!("1,5 {LAN}")),
+        (format!("1234,567 {BAHT}"), "1234,567".to_owned()),
+    ] {
+        let found = only(&text);
+        assert_eq!(found.value.role, NumberRole::Code, "{text:?}");
+        assert_eq!(span(&text, &found), code, "{text:?}");
+    }
+    assert_eq!(values("1,2,3"), vec![dec("1"), dec("2"), dec("3")]);
+    assert_eq!(values("1234,567"), vec![dec("1234"), dec("567")]);
+}
+
+/// Fix round 2: นาฬิกา, the word น. abbreviates, makes a time as น. does; hours stop at 24 at
+/// the end of a range too (mutants I, M6b and N-CLOCK-24).
+#[test]
+fn the_thai_hour_word_makes_a_time() {
+    for text in [
+        format!("{WELA} 09.30 {NALIKA}"),
+        format!("{WELA} 09.00 - 12.00 {NALIKA}"),
+        format!("{WELA} 09.00 {THUENG} 12.00 {NALIKA}"),
+        "24:00".to_owned(),
+        format!("{WELA} 23.00 - 24.00 น."),
+    ] {
+        let found = numbers(&text);
+        assert!(
+            !found.is_empty()
+                && found
+                    .iter()
+                    .all(|found| found.value.role == NumberRole::Time),
+            "{text:?}: {found:?}"
+        );
+    }
+    let late = numbers(&format!("{WELA} 09.00 - 25.00 น."));
+    assert!(
+        late.iter()
+            .all(|found| found.value.role != NumberRole::Time),
+        "{late:?}"
+    );
+}
+
+/// Fix round 2: an amount written in parts split by one space (a line break included) joins
+/// as one number when each part writes only places below the one before it, or is one code;
+/// so is a figure with a scale followed by a figure written as an amount. No part is read alone.
+#[test]
+fn amounts_written_in_parts_join_or_become_one_code() {
+    for (text, amount, written) in [
+        (
+            format!("{RAKHA} {SAM}{LAN} {HA}{SAEN}{BAHT}"),
+            "3500000",
+            format!("{SAM}{LAN} {HA}{SAEN}"),
+        ),
+        (
+            format!("{RAKHA} {SAM}{LAN}\n{HA}{SAEN}{BAHT}"),
+            "3500000",
+            format!("{SAM}{LAN}\n{HA}{SAEN}"),
+        ),
+        (
+            format!("{RAKHA} {NUENG}{LAN} 2 {SAEN}{BAHT}"),
+            "1200000",
+            format!("{NUENG}{LAN} 2 {SAEN}"),
+        ),
+        (
+            format!("{SONG}{MUEN} {HA}{PHAN}{BAHT}"),
+            "25000",
+            format!("{SONG}{MUEN} {HA}{PHAN}"),
+        ),
+        (
+            format!("{RAYDAI} 1 {LAN} 250,000 {BAHT}"),
+            "1250000",
+            format!("1 {LAN} 250,000"),
+        ),
+        (
+            format!("3 {LAN} 9 {SAEN} 2,500 {BAHT}"),
+            "3902500",
+            format!("3 {LAN} 9 {SAEN} 2,500"),
+        ),
+        (
+            format!("1 {LAN} 250 {BAHT}"),
+            "1000250",
+            format!("1 {LAN} 250"),
+        ),
+    ] {
+        let found = only(&text);
+        assert_eq!(found.value.effective(), dec(amount), "{text:?}");
+        assert_eq!(found.value.unit, thb(), "{text:?}");
+        assert_eq!(span(&text, &found), written, "{text:?}");
+    }
+    // The figure written as an amount sets the precision: to the baht, not to 50,000.
+    assert_eq!(
+        only(&format!("1 {LAN} 250,000 {BAHT}")).value.half_ulp(),
+        dec("0.5")
+    );
+    for (text, code) in [
+        (
+            format!("{SAM}{LAN} {SAM}{LAN}{BAHT}"),
+            format!("{SAM}{LAN} {SAM}{LAN}"),
+        ),
+        (
+            format!("{NUENG}{PHAN} 2 {SAEN}{BAHT}"),
+            format!("{NUENG}{PHAN} 2 {SAEN}"),
+        ),
+        (format!("1 {PHAN} 2,500 {BAHT}"), format!("1 {PHAN} 2,500")),
+    ] {
+        let found = only(&text);
+        assert_eq!(found.value.role, NumberRole::Code, "{text:?}");
+        assert_eq!(span(&text, &found), code, "{text:?}");
+    }
+    // A small bare figure still never joins: ซื้อ 3 ล้าน 5 ชิ้น is three million and five pieces.
+    let pieces = format!("{SUE} 3 {LAN} 5 {CHIN}");
+    assert_eq!(effective(&pieces), vec![dec("3000000"), dec("5")]);
+    // In the amount-in-words parentheses, spaces inside them and between the parts.
+    for words in [
+        format!("({NUENG}{PHAN} {SONG}{ROI} {BAHT})"),
+        format!("( {NUENG}{PHAN}{SONG}{ROI}{BAHT}{THUAN} )"),
+        format!("({NUENG}{PHAN} {SONG}{ROI}{BAHT}{THUAN})"),
+    ] {
+        let text = format!("{KHA_CHAI} 1,200 {BAHT} {words}");
+        let found = numbers(&text);
+        assert_eq!(found.len(), 2, "{text:?}: {found:?}");
+        assert_eq!(found[1].value.value, dec("1200"), "{text:?}");
+        assert!(found[1].flags.contains(Flags::AMOUNT_IN_WORDS), "{text:?}");
+    }
+}
+
+/// Fix round 2 (a regression of round 1): a currency word or symbol between two figures is the
+/// first figure's, unless the second has no unit of its own and the first already has one, or it
+/// is a symbol written against the second. Two currencies on one figure are not read as one.
+#[test]
+fn a_currency_between_two_figures_is_the_first_ones_unless_the_second_has_none() {
+    let usd = || Some(Unit::Currency("USD"));
+    let units = |text: &str| {
+        numbers(text)
+            .into_iter()
+            .map(|found| found.value.unit)
+            .collect::<Vec<_>>()
+    };
+    for (text, expected) in [
+        (format!("{RAKHA} 100 USD 3,500 {BAHT}"), vec![usd(), thb()]),
+        ("Price 100 USD 3,500 THB".to_owned(), vec![usd(), thb()]),
+        (format!("{FEE} 10 USD 350 {BAHT}"), vec![usd(), thb()]),
+        (format!("{RAKHA} 100 $ 3,500 {BAHT}"), vec![usd(), thb()]),
+        (
+            "100 USD 200 THB 300 USD".to_owned(),
+            vec![usd(), thb(), usd()],
+        ),
+        (format!("5,000 USD 150 {BAHT}"), vec![usd(), thb()]),
+        (
+            "10 THB 5 percent 7 percent".to_owned(),
+            vec![thb(), Some(Unit::Percent), Some(Unit::Percent)],
+        ),
+        ("1,250 THB\n35 USD".to_owned(), vec![thb(), usd()]),
+        (
+            "1,250 THB 35 USD 50 THB".to_owned(),
+            vec![thb(), usd(), thb()],
+        ),
+        ("Fee 100 THB 35 USD".to_owned(), vec![thb(), usd()]),
+        (
+            "1,250 THB 12.5 percent".to_owned(),
+            vec![thb(), Some(Unit::Percent)],
+        ),
+        (format!("$100 USD 3,500 {BAHT}"), vec![usd(), thb()]),
+        ("USD 100 THB 3,500".to_owned(), vec![usd(), thb()]),
+        (
+            "THB 1,250 million USD 35 million".to_owned(),
+            vec![thb(), usd()],
+        ),
+        ("5 $10".to_owned(), vec![None, usd()]),
+        ("5\u{0E3F} 10".to_owned(), vec![thb(), None]),
+        ("USD 100, THB 3,500".to_owned(), vec![usd(), thb()]),
+        ("1 THB million".to_owned(), vec![thb()]),
+    ] {
+        assert_eq!(units(&text), expected, "{text:?}");
+    }
+    // The figure that keeps its currency stays a quantity, not an ordinal after ที่.
+    let after_marker = format!("{YU_THI} 1,250 THB 2568");
+    let found = numbers(&after_marker);
+    assert_eq!(found[0].value.role, NumberRole::Quantity, "{found:?}");
+    assert_eq!(found[0].value.unit, thb());
+    assert_eq!(
+        values("(1) USD 500 registration fee"),
+        vec![dec("1"), dec("500")]
+    );
+    // The same currency written twice is one: `$100 USD` reads at 1.0.
+    let dollars = format!("$100 USD 3,500 {BAHT}");
+    assert!(numbers(&dollars).iter().all(|found| found.conf == 1.0));
+    for text in ["USD 100 THB".to_owned(), format!("USD 100 {BAHT}")] {
+        let found = only(&text);
+        assert_eq!(found.value.unit, usd(), "{text:?}");
+        assert!(found.conf < 0.8, "{text:?}");
+        assert_eq!(found.alts.len(), 1, "{text:?}");
+        assert_eq!(found.alts[0].0.unit, thb(), "{text:?}");
+    }
+}
+
+/// Fix round 2: a percent or a currency symbol inside accounting parentheses may restate a rise
+/// in prose, so it reads as the negative at most 0.6 with the positive beside it, unless it is
+/// the whole text (a table cell); the plan's `(1,250)` and round 1's `(5) ล้านบาท` stay sure.
+#[test]
+fn a_parenthesised_percent_in_prose_is_no_sure_negative() {
+    for text in [
+        format!("{RAYDAI}{PHOEM} 100 {LAN}{BAHT} (5%)"),
+        format!("{PHOEM} (5.2%) "),
+        format!("{PANPHON} 0.75 {PER_SHARE} (5.0%)"),
+        "Thailand (45%), Vietnam (30%)".to_owned(),
+        "fee ($12) waived".to_owned(),
+    ] {
+        let found: Vec<_> = numbers(&text)
+            .into_iter()
+            .filter(|found| found.flags.contains(Flags::PAREN_NEGATIVE))
+            .collect();
+        assert!(!found.is_empty(), "{text:?}");
+        for found in found {
+            assert!(found.value.value.is_sign_negative(), "{text:?}");
+            assert!(found.conf < 0.8, "{text:?}");
+            assert_eq!(found.alts.len(), 1, "{text:?}");
+            assert_eq!(found.alts[0].0.value, -found.value.value, "{text:?}");
+        }
+    }
+    for (text, value) in [
+        ("(5%)".to_owned(), "-5"),
+        ("($12)".to_owned(), "-12"),
+        (format!("{RAYDAI} (1,250)"), "-1250"),
+        (format!("{KHAT_THUN} (5) {LAN}{BAHT}"), "-5"),
+        ("revenue $(1,250)".to_owned(), "-1250"),
+    ] {
+        let found = only(&text);
+        assert_eq!(found.value.value, dec(value), "{text:?}");
+        assert_eq!(found.conf, 1.0, "{text:?}");
+    }
+    // The currency before the parentheses is the figure's (round-1 review, P3).
+    assert_eq!(only("THB (1,250)").value.unit, thb());
+    assert_eq!(only("$(1,250)").value.unit, Some(Unit::Currency("USD")));
+}
+
+/// Fix round 2: a power word followed by one digit word reads by the grammar at most 0.6, the
+/// everyday reading one place lower beside it (หนึ่งหมื่นห้า is 10,005 by the grammar and 15,000
+/// in speech); เอ็ด only ever means units, and a power word at the end leaves no doubt.
+#[test]
+fn a_digit_word_after_a_power_word_is_read_two_ways() {
+    for (text, grammar, spoken) in [
+        (format!("{SALARY}{NUENG}{MUEN}{HA}{BAHT}"), "10005", "15000"),
+        (format!("{RAKHA}{SONG}{PHAN}{HA}{BAHT}"), "2005", "2500"),
+        (format!("{RAKHA}{SAM}{ROI}{HA}{BAHT}"), "305", "350"),
+        (format!("{RAKHA} 3 {LAN}{HA}{BAHT}"), "3000005", "3500000"),
+        (format!("{RAKHA} 2 {MUEN}{HA}{BAHT}"), "20005", "25000"),
+        (
+            format!("{RAKHA} 1 {LAN}{SONG} {BAHT}"),
+            "1000002",
+            "1200000",
+        ),
+    ] {
+        let found = only(&text);
+        assert_eq!(found.value.effective(), dec(grammar), "{text:?}");
+        assert!(found.conf < 0.8, "{text:?}");
+        assert_eq!(found.alts.len(), 1, "{text:?}");
+        assert_eq!(found.alts[0].0.effective(), dec(spoken), "{text:?}");
+    }
+    for (text, value) in [
+        (format!("3 {LAN}{HA}{SAEN} {BAHT}"), "3500000"),
+        (format!("{HA}{SIP}{ET}{LAN}{BAHT}"), "51000000"),
+        (format!("{SONG}{ROI}{ET}{BAHT}"), "201"),
+        (format!("{HA}{SIP}{HA} {BAHT}"), "55"),
+    ] {
+        let found = only(&text);
+        assert_eq!(found.value.effective(), dec(value), "{text:?}");
+        assert_eq!(found.conf, 1.0, "{text:?}");
+    }
+}
+
+/// Fix round 2: in the amount-in-words parentheses, words that start with a power word restate
+/// the figure when they equal it (สิบล้านบาทถ้วน); one that does not, and a bare unit header, stay
+/// a code.
+#[test]
+fn power_led_words_that_restate_the_figure_are_amount_in_words() {
+    for (figure, words) in [
+        ("10,000,000", format!("{SIP}{LAN}{BAHT}{THUAN}")),
+        ("15", format!("{SIP}{HA}{BAHT}{THUAN}")),
+        ("100", format!("{ROI}{BAHT}")),
+    ] {
+        let text = format!("{figure} {BAHT} ({words})");
+        let found = numbers(&text);
+        assert_eq!(found.len(), 2, "{text:?}: {found:?}");
+        assert!(found[1].flags.contains(Flags::AMOUNT_IN_WORDS), "{text:?}");
+        assert_eq!(found[1].value.value, found[0].value.value, "{text:?}");
+    }
+    for text in [
+        format!("1,000,000 {BAHT} ({SIP}{LAN}{BAHT}{THUAN})"),
+        format!("1,250 ({LAN}{BAHT})"),
+        format!("{LAI}{SIP}{LAN}{BAHT}"),
+    ] {
+        let words = numbers(&text);
+        let last = words.last().unwrap();
+        assert_eq!(last.value.role, NumberRole::Code, "{text:?}: {words:?}");
+        assert!(!last.flags.contains(Flags::AMOUNT_IN_WORDS), "{text:?}");
+    }
+}
+
+/// Fix round 2: a Latin abbreviation of a scale one space after a figure makes it one code with
+/// it (`$5 M`, `5 mln`); a lone lowercase letter is no scale and no code.
+#[test]
+fn latin_scale_abbreviations_make_a_code() {
+    for (text, code) in [
+        ("fee $5 M", "$5 M"),
+        ("revenue THB 250 M", "250 M"),
+        ("revenue THB 1.2 bln", "1.2 bln"),
+        ("fee $5 mil", "$5 mil"),
+        ("profit 5 mln baht", "5 mln"),
+        ("Revenue 1,250 MB", "1,250 MB"),
+        ("cost 7 K", "7 K"),
+    ] {
+        let found = only(text);
+        assert_eq!(found.value.role, NumberRole::Code, "{text:?}");
+        assert_eq!(span(text, &found), code, "{text:?}");
+    }
+    for text in ["2 m", "2 b", "5 mbps"] {
+        assert_eq!(only(text).value.role, NumberRole::Quantity, "{text:?}");
+    }
+    // A letter glued to digits is no abbreviation, and a code never starts on a word a figure
+    // before it took (round 2's random-text harness).
+    for (text, code) in [("2568 M1q2", "M1q2"), ("1 million2b3", "2b3")] {
+        let found = numbers(text);
+        assert_eq!(found.len(), 2, "{text:?}: {found:?}");
+        assert!(found[0].end <= found[1].start, "{text:?}: {found:?}");
+        assert_eq!(found[1].raw, code, "{text:?}");
+    }
+}
+
+/// Fix round 2 (round-1 review, P3): every code has value 0, scale 0 and no unit, however it was
+/// made; a ลบ that ends a Thai word is no sign; `minus` right after a number is a subtraction or
+/// a sign, so the figure is ambiguous.
+#[test]
+fn codes_read_no_value_and_sign_words_stand_alone() {
+    for text in [
+        "fee $5M",
+        "COVID19",
+        "x,250 baht",
+        "revenue Bt1,250 million",
+        "fee $5 M",
+    ] {
+        let found = only(text);
+        assert_eq!(found.value.role, NumberRole::Code, "{text:?}");
+        assert!(found.value.value.is_zero(), "{text:?}");
+        assert_eq!(found.value.scale, Scale(0), "{text:?}");
+        assert_eq!(found.value.unit, None, "{text:?}");
+    }
+    let fainted = only("สลบ 5");
+    assert_eq!(fainted.value.value, dec("5"));
+    assert_eq!(fainted.conf, 1.0);
+    assert_eq!(span("สลบ 5", &fainted), "5");
+    let subtraction = numbers("100 minus 30");
+    assert_eq!(subtraction[1].value.value, dec("30"));
+    assert_eq!(subtraction[1].conf, 0.5);
+    assert_eq!(subtraction[1].alts[0].0.value, dec("-30"));
+    assert_eq!(
+        only("GDP contracted minus 2.5 percent").value.value,
+        dec("-2.5")
+    );
+}
+
+/// Fix round 2 (mutants F-REGROUPED-group, F-REGROUPED-wordgroup and F-MASKSCALE-amountafter):
+/// the grammar-against-sum check holds for figure-led parts and for the later parts of a
+/// compound, and an ordinary word is no scale after a list marker or a figure.
+#[test]
+fn regrouped_parts_and_ordinary_words_stay_unread() {
+    for text in [
+        format!("3 {PHAN}{LAN}{HA}{ROI}{LAN}{BAHT}"),
+        format!("2 {MUEN}{LAN}{HA}{PHAN}{LAN}{BAHT}"),
+        format!("1 {LAN}{LAN}{LAN} {SAM}{PHAN}{LAN}{HA}{ROI}{LAN}{BAHT}"),
+        format!("{NUENG}{LAN}{LAN}{LAN} {SAM}{PHAN}{LAN}{HA}{ROI}{LAN}{BAHT}"),
+        // The part before adds nothing, so only the later part's own check sees the regrouping.
+        format!("0 {LAN}{LAN}{LAN} {SAM}{PHAN}{LAN}{HA}{ROI}{LAN}{BAHT}"),
+    ] {
+        assert_eq!(only(&text).value.role, NumberRole::Code, "{text:?}");
+    }
+    let marker = format!("(1) {PHANTRI}");
+    let found = only(&marker);
+    assert_eq!(found.value.value, dec("1"));
+    assert!(!found.flags.contains(Flags::PAREN_NEGATIVE));
+    let rank = format!("3 {LAN} {PHANTRI}");
+    let found = only(&rank);
+    assert_eq!(found.value.effective(), dec("3000000"));
+    assert_eq!(span(&rank, &found), format!("3 {LAN}"));
+}
+
+/// Fix round 2: a sign word near a figure, with words between (ติดลบที่, ติดลบอยู่ที่ประมาณ),
+/// leaves it positive at 0.6 with the negative beside it; right before it, it makes it negative.
+#[test]
+fn a_sign_word_near_a_figure_makes_it_ambiguous() {
+    for text in [
+        format!("{SETTHAKIT}{KHAYAI}{TID_LOP}{THI}{ROI_LA} 6.1"),
+        format!("{SETTHAKIT}{TID_LOP}{THUENG}{ROI_LA} 6.1"),
+        format!("{KAMRAI}{TID_LOP}{YU_THI} 5 {LAN}{BAHT}"),
+        format!("{PHONPRAKOP}{TID_LOP} {CHAMNUAN} 5 {LAN}{BAHT}"),
+        format!("{KAMRAI}{TID_LOP}{YU_THI}{PRAMAN} 5 {LAN}{BAHT}"),
+        format!("{SETTHAKIT}{TID_LOP}{SUNG_THUENG}{ROI_LA} 6.1"),
+        format!("{NGOEN_FOE}{TID_LOP}{KUEAP}{ROI_LA} 1"),
+        format!("{PHONPRAKOP}{TID_LOP} {TAE}{RAYDAI} 5 {LAN}{BAHT}"),
+        format!("{LOP}{THI} 5 {LAN}{BAHT}"),
+    ] {
+        let found = only(&text);
+        assert!(!found.value.value.is_sign_negative(), "{text:?}");
+        assert!(found.conf < 0.8, "{text:?}");
+        assert!(
+            found
+                .alts
+                .iter()
+                .any(|(alt, _)| alt.value == -found.value.value),
+            "{text:?}: {found:?}"
+        );
+    }
+    let attached = format!("{SETTHAKIT}{TID_LOP}{ROI_LA} 6.1");
+    let found = only(&attached);
+    assert_eq!(found.value.value, dec("-6.1"));
+    assert_eq!(found.conf, 1.0);
+    // A sign word inside another figure's span is that figure's alone.
+    let two = format!("{KAMRAI}{TID_LOP} 5% {RAYDAI} 10%");
+    assert_eq!(confident(&two), vec![dec("-5"), dec("10")]);
+    // "Near" is 15 code points of the normalized text, counted to the unit word before.
+    for (gap, capped) in [(14, true), (15, false)] {
+        let text = format!("{TID_LOP}{} 5 {LAN}{BAHT}", "ก".repeat(gap));
+        let found = only(&text);
+        assert_eq!(found.conf < 0.8, capped, "{gap}: {found:?}");
+    }
+}
+
+/// Fix round 2: a range of figures caps both ends, and the bare end gets the scale and unit of
+/// the other as its other reading (`10-15 ล้านบาท` may be 10,000,000 to 15,000,000); a list of
+/// figures caps each item.
+#[test]
+fn ranges_and_lists_of_figures_are_not_read_with_confidence() {
+    for (text, bare, carried) in [
+        (format!("{RAYDAI} 10-15 {LAN}{BAHT}"), "10", "10000000"),
+        (
+            format!("{RAYDAI}{RAWANG} 10 {THUENG} 15 {LAN}{BAHT}"),
+            "10",
+            "10000000",
+        ),
+        (format!("{SALARY} 25,000 - 30,000 {BAHT}"), "25000", "25000"),
+        ("growth 3-5%".to_owned(), "3", "3"),
+        (format!("{ROI_LA} 3-5"), "5", "5"),
+    ] {
+        let found = quantities(&text);
+        assert_eq!(found.len(), 2, "{text:?}: {found:?}");
+        assert!(found.iter().all(|found| found.conf < 0.8), "{text:?}");
+        let end = found
+            .iter()
+            .find(|found| found.value.value == dec(bare))
+            .unwrap();
+        assert!(
+            end.alts
+                .iter()
+                .any(|(alt, _)| alt.effective() == dec(carried) && alt.unit.is_some()),
+            "{text:?}: {end:?}"
+        );
+    }
+    for text in [
+        "total 3,451 and 200".to_owned(),
+        format!("1,100 {LAN}{BAHT}, 1,250 {LAN}{BAHT} {LAE} 1,400 {LAN}{BAHT}"),
+        format!("5 {LAE} 6 {LAN}{BAHT}"),
+        "$5-6M".to_owned(),
+        "10,20,30".to_owned(),
+    ] {
+        assert!(
+            confident(&text).is_empty(),
+            "{text:?}: {:?}",
+            numbers(&text)
+        );
+    }
+    // A list word between two figures with a subject between them joins nothing.
+    let facts = format!("{RAYDAI} 100 {LAN}{BAHT} {LAE}{KAMRAI} 20 {LAN}{BAHT}");
+    assert_eq!(confident(&facts), vec![dec("100000000"), dec("20000000")]);
+}
+
+const JONTHUENG: &str = "จนถ\u{0E36}ง"; // จนถึง
+const PAI_JONTHUENG: &str = "\u{0E44}ปจนถ\u{0E36}ง"; // ไปจนถึง
+const JONKRATHANG: &str = "จนกร\u{0E30}ท\u{0E31}\u{0E48}ง"; // จนกระทั่ง
+const TANGTAE: &str = "ต\u{0E31}\u{0E49}ง\u{0E41}ต\u{0E48}"; // ตั้งแต่
+const JAK: &str = "จ\u{0E32}ก"; // จาก
+const NGUAT: &str = "งวด"; // งวด
+const MONTHS_FIRST: &str = "\u{0E40}ด\u{0E37}อน\u{0E41}รก"; // เดือนแรก
+const MONTHS_LAST: &str = "\u{0E40}ด\u{0E37}อนหล\u{0E31}ง"; // เดือนหลัง
+const QUARTER: &str = "\u{0E44}ตรม\u{0E32}ส"; // ไตรมาส
+const FISCAL_SHORT: &str = "ป\u{0E35}งบ"; // ปีงบ
+const HUE: &str = "หร\u{0E37}อ"; // หรือ
+
+/// Minutes in the demo's style: a meeting date, a fiscal year's revenue, expenses and profit,
+/// a margin, an approved budget, a forecast written as a range, and a due date.
+const MINUTES: &str = "บ\u{0E31}นท\u{0E36}กก\u{0E32}รปร\u{0E30}ช\u{0E38}มคณ\u{0E30}กรรมก\u{0E32}ร คร\u{0E31}\u{0E49}งท\u{0E35}\u{0E48} 5/2568 ว\u{0E31}นท\u{0E35}\u{0E48} 1 ต.ค. 2568 \u{0E40}วล\u{0E32} 13.30 น. ท\u{0E35}\u{0E48}ปร\u{0E30}ช\u{0E38}มร\u{0E31}บทร\u{0E32}บผลก\u{0E32}รด\u{0E33}\u{0E40}น\u{0E34}นง\u{0E32}นป\u{0E35}งบปร\u{0E30}ม\u{0E32}ณ 2568 ร\u{0E32}ย\u{0E44}ด\u{0E49}รวม 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท ค\u{0E48}\u{0E32}\u{0E43}ช\u{0E49}จ\u{0E48}\u{0E32}ยรวม 980 ล\u{0E49}\u{0E32}นบ\u{0E32}ท \u{0E41}ล\u{0E30}ก\u{0E33}\u{0E44}รส\u{0E38}ทธ\u{0E34} 270 ล\u{0E49}\u{0E32}นบ\u{0E32}ท อ\u{0E31}ตร\u{0E32}ก\u{0E33}\u{0E44}รร\u{0E49}อยล\u{0E30} 21.6 ท\u{0E35}\u{0E48}ปร\u{0E30}ช\u{0E38}มม\u{0E35}มต\u{0E34}อน\u{0E38}ม\u{0E31}ต\u{0E34}งบลงท\u{0E38}นป\u{0E35}งบปร\u{0E30}ม\u{0E32}ณ 2569 จ\u{0E33}นวน 410 ล\u{0E49}\u{0E32}นบ\u{0E32}ท \u{0E41}ล\u{0E30}ค\u{0E32}ดว\u{0E48}\u{0E32}ร\u{0E32}ย\u{0E44}ด\u{0E49}ป\u{0E35}งบปร\u{0E30}ม\u{0E32}ณ 2569 จ\u{0E30}\u{0E40}ต\u{0E34}บ\u{0E42}ตร\u{0E49}อยล\u{0E30} 5-7 \u{0E43}ห\u{0E49}ฝ\u{0E48}\u{0E32}ยบ\u{0E31}ญช\u{0E35}ส\u{0E48}งร\u{0E32}ยง\u{0E32}นภ\u{0E32}ย\u{0E43}นว\u{0E31}นท\u{0E35}\u{0E48} 15 ต.ค. 2568";
+
+/// Fix round 2 (the opposite failure): in minutes like the demo's, every plain figure and date
+/// keeps its confidence; only the forecast range drops below 0.8, with its other reading.
+#[test]
+fn demo_minutes_keep_their_plain_figures_confident() {
+    let found = numbers(MINUTES);
+    let sure: Vec<(String, Decimal)> = found
+        .iter()
+        .filter(|found| found.value.role == NumberRole::Quantity && found.conf >= 0.8)
+        .map(|found| (found.raw.clone(), found.value.effective()))
+        .collect();
+    assert_eq!(
+        sure,
+        [
+            (format!("1,250 {LAN}"), dec("1250000000")),
+            (format!("980 {LAN}"), dec("980000000")),
+            (format!("270 {LAN}"), dec("270000000")),
+            ("21.6".to_owned(), dec("21.6")),
+            (format!("410 {LAN}"), dec("410000000")),
+        ]
+    );
+    let range: Vec<_> = found
+        .iter()
+        .filter(|found| found.value.role == NumberRole::Quantity && found.conf < 0.8)
+        .collect();
+    assert_eq!(
+        range
+            .iter()
+            .map(|found| found.raw.as_str())
+            .collect::<Vec<_>>(),
+        ["5", "7"]
+    );
+    assert_eq!(range[1].alts[0].0.unit, Some(Unit::Percent));
+    let dates = find_dates(MINUTES, &ctx()).unwrap();
+    assert_eq!(
+        dates
+            .iter()
+            .map(|found| (found.raw.as_str(), found.conf))
+            .collect::<Vec<_>>(),
+        [
+            ("1 ต.ค. 2568", 0.9),
+            ("ป\u{0E35}งบปร\u{0E30}ม\u{0E32}ณ 2568", 0.85),
+            ("ป\u{0E35}งบปร\u{0E30}ม\u{0E32}ณ 2569", 0.85),
+            ("ป\u{0E35}งบปร\u{0E30}ม\u{0E32}ณ 2569", 0.85),
+            ("15 ต.ค. 2568", 0.9),
+        ]
+    );
+}
+
+/// Fix round 2: every signal the founder named, placed where it counts, keeps the reading near
+/// it below 0.8 (a figure for ranges, lists, fractions and signs; a year for periods).
+#[test]
+fn every_signal_the_founder_named_caps_a_reading() {
+    let figure = |text: &str| {
+        let found = quantities(text);
+        assert!(!found.is_empty(), "{text:?}: {:?}", numbers(text));
+        found.iter().all(|found| found.conf < 0.8)
+    };
+    let date = |text: &str| {
+        let found = find_dates(text, &ctx()).unwrap();
+        !found.is_empty() && found.iter().all(|found| found.conf < 0.8)
+    };
+    for text in [
+        format!("{RAYDAI}{THUENG} 1,250 {LAN}{BAHT}"),
+        format!("{RAYDAI}{JONTHUENG} 1,250 {LAN}{BAHT}"),
+        format!("{RAYDAI}{PAI_JONTHUENG} 1,250 {LAN}{BAHT}"),
+        format!("{RAYDAI}{JONKRATHANG} 1,250 {LAN}{BAHT}"),
+        format!("{RAYDAI}{RAWANG} 1,250 {LAN}{BAHT}"),
+        format!("{RAYDAI}{TANGTAE} 1,250 {LAN}{BAHT}"),
+        format!("{RAYDAI}{JAK} 1,250 {LAN}{BAHT}"),
+        format!("{KAMRAI}{TID_LOP}{YU_THI} 5%"),
+        format!("{LOP} {YU_THI} 5%"),
+        format!("1,250 {LAN}{BAHT} {LAE} 2,500 {LAN}{BAHT}"),
+        format!("1,250 {LAN}{BAHT} {HUE} 2,500 {LAN}{BAHT}"),
+        "between 1,250".to_owned(),
+        "from 1,250".to_owned(),
+        "to 1,250".to_owned(),
+        "through 1,250".to_owned(),
+        "thru 1,250".to_owned(),
+        "till 1,250".to_owned(),
+        "until 1,250".to_owned(),
+        "up to 1,250".to_owned(),
+        "1,250 and 2,500".to_owned(),
+        "1,250 or 2,500".to_owned(),
+        "1,250-2,500".to_owned(),
+        "1,250 / 2,500".to_owned(),
+        "1,250 -> 2,500".to_owned(),
+        "1,250 \u{2192} 2,500".to_owned(),
+        "1,250, 2,500".to_owned(),
+    ] {
+        assert!(figure(&text), "{text:?}: {:?}", numbers(&text));
+    }
+    for text in [
+        format!("{TANGTAE} 31 ต.ค. 2568"),
+        format!("{JONKRATHANG} 31 ต.ค. 2568"),
+        format!("{THUENG}{WAN}{THI} 31 ต.ค. 2568"),
+        format!("{NGUAT} {PI} 2568"),
+        format!("{KHRUENG}{PI}\u{0E41}รก {PI} 2568"),
+        format!("6 {MONTHS_FIRST} {PI} 2568"),
+        format!("6 {MONTHS_LAST} {PI} 2568"),
+        format!("{QUARTER} {PI} 2568"),
+        format!("{FISCAL_SHORT} {PI} 2568"),
+        "H1 FY2026".to_owned(),
+        "FY2026 H2".to_owned(),
+        "FY2026 Q1".to_owned(),
+        "FY2026 Q2".to_owned(),
+        "FY2026 Q3".to_owned(),
+        "FY2026 Q4".to_owned(),
+        "1 Oct 2025 - 31 Dec 2025".to_owned(),
+        format!("{PI} 2567 / {PI} 2568"),
+        "1 Oct 2025, 2 Oct 2025".to_owned(),
+    ] {
+        assert!(date(&text), "{text:?}: {:?}", find_dates(&text, &ctx()));
+    }
+    // A plain neighbour keeps both confident.
+    assert_eq!(
+        confident(&format!("{RAYDAI} 1,250 {LAN}{BAHT}")),
+        vec![dec("1250000000")]
+    );
+    assert_eq!(only_date(&format!("{PI} 2568")).conf, 0.9);
+}
+
+fn only_date(text: &str) -> Found<katwork_thai::DateValue> {
+    let mut found = find_dates(text, &ctx()).unwrap();
+    assert_eq!(found.len(), 1, "{text:?}: {found:?}");
+    found.remove(0)
 }

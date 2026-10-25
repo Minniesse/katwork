@@ -98,6 +98,26 @@ impl Normalized {
             _ => self.original_range(start, end),
         }
     }
+
+    /// The input code points a step deleted right before code point `at` of the text: between
+    /// the one before it and it (from the start of the input for the first one).
+    pub(crate) fn gap_before(&self, at: usize) -> Range<u32> {
+        let map = &self.map;
+        let start = at
+            .checked_sub(1)
+            .and_then(|prev| map.from.get(prev))
+            .map_or(0, |prev| prev.1);
+        let end = map
+            .from
+            .get(at)
+            .map_or_else(|| map.input_len(), |this| this.0);
+        start..end.max(start)
+    }
+
+    /// The start of the input's grapheme cluster that holds code point `at` of the input.
+    pub(crate) fn cluster_start(&self, at: u32) -> u32 {
+        self.map.floor(at)
+    }
 }
 
 impl OffsetMap {
@@ -190,13 +210,16 @@ fn offset(index: usize) -> u32 {
 /// eight times, and the offset map follows every step of every pass.
 ///
 /// 1. U+FEFF, U+200B, U+200C, U+200D, U+2060 and U+00AD are removed, and so is every other
-///    `Default_Ignorable_Code_Point`, U+FFF9–U+FFFB and every control that is not `White_Space`:
-///    none of them is seen, so none may split a figure, a date or a word.
+///    `Default_Ignorable_Code_Point`, U+FFF9–U+FFFB and every control that is neither
+///    `White_Space` nor an information separator (U+001C–U+001F), so a match key sees through
+///    them. The scanners still read the controls and the Hangul fillers in the input: beside a
+///    digit they are no part of a figure (see [`crate::find_numbers`]).
 /// 2. NFC, chunk by chunk at code points of canonical combining class 0 with `NFC_QC=Yes`.
-/// 3. Compatibility forms other than SARA AM: `Zs` to U+0020, full-width ASCII to ASCII, the
-///    ligatures U+FB00–U+FB04 and U+FB06 to their letters, U+2019 to `'`, U+2212, U+2012 and
-///    U+2013 to `-`, and so the hyphens and minus signs that look the same (U+2010, U+2011,
-///    U+FE63, U+02D7, U+2796); nikhahit, tone marks and aa become the tone marks and SARA AM.
+/// 3. Compatibility forms other than SARA AM: `Zs` and the information separators U+001C–U+001F
+///    (which Python counts as white space) to U+0020, full-width ASCII to ASCII, the ligatures
+///    U+FB00–U+FB04 and U+FB06 to their letters, U+2019 to `'`, U+2212, U+2012 and U+2013 to
+///    `-`, and so the hyphens and minus signs that look the same (U+2010, U+2011, U+FE63, U+02D7,
+///    U+2796); nikhahit, tone marks and aa become the tone marks and SARA AM.
 /// 4. PyThaiNLP's reordering: `เเ` to `แ`, a tone mark or thanthakhat before an above or below
 ///    vowel moves after it, nikhahit with tone marks and aa becomes the tone marks and SARA AM, a
 ///    tone mark after a follow vowel moves before it, `ๅ` after anything but ฤ and ฦ becomes `า`,
@@ -294,15 +317,21 @@ fn pass(chars: &[Ch]) -> Vec<Ch> {
 }
 
 /// What step 1 removes: the six code points the plan names, every other Default_Ignorable code
-/// point, the interlinear annotation controls, and every control that is not White_Space. None
-/// of them is seen, so none may split a figure, a date or a word.
+/// point, the interlinear annotation controls, and every control that is neither White_Space
+/// nor an information separator, which step 3 turns into a space.
 pub(crate) fn is_invisible(c: char) -> bool {
     matches!(
         c,
         '\u{FEFF}' | '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{00AD}'
     ) || is_default_ignorable(c)
         || matches!(c, '\u{FFF9}'..='\u{FFFB}')
-        || (c.is_control() && !c.is_whitespace())
+        || (c.is_control() && !c.is_whitespace() && !is_information_separator(c))
+}
+
+/// U+001C–U+001F, the file, group, record and unit separators: controls that separate fields,
+/// as a space does (Python's `isspace` counts them).
+fn is_information_separator(c: char) -> bool {
+    matches!(c, '\u{001C}'..='\u{001F}')
 }
 
 /// Unicode's Default_Ignorable_Code_Point (DerivedCoreProperties.txt).
@@ -395,13 +424,13 @@ fn ligature(c: char) -> Option<&'static str> {
     }
 }
 
-/// The compatibility mappings step 3 applies to one code point: space separators, full-width
-/// ASCII, the right single quotation mark and the dashes that stand for a minus (the plan's
-/// U+2212, U+2012 and U+2013, and the hyphens and minus signs that look the same: U+2010,
-/// U+2011, U+FE63, U+02D7 and U+2796).
+/// The compatibility mappings step 3 applies to one code point: space separators and the
+/// information separators, full-width ASCII, the right single quotation mark and the dashes that
+/// stand for a minus (the plan's U+2212, U+2012 and U+2013, and the hyphens and minus signs that
+/// look the same: U+2010, U+2011, U+FE63, U+02D7 and U+2796).
 fn compatible(c: char) -> char {
     match c {
-        c if is_space_separator(c) => ' ',
+        c if is_space_separator(c) || is_information_separator(c) => ' ',
         '\u{FF01}'..='\u{FF5E}' => char::from_u32(u32::from(c) - 0xFEE0).unwrap_or(c),
         '\u{2019}' => '\'',
         '\u{2212}' | '\u{2012}' | '\u{2013}' | '\u{2010}' | '\u{2011}' | '\u{FE63}'
@@ -639,6 +668,38 @@ mod tests {
         let (small, large) = (work_of(10_000), work_of(20_000));
         assert!(large <= small * 22 / 10, "{small} then {large}");
     }
+
+    /// FNV-1a over what steps 1 and 3 do to every scalar value, so a change to either set moves
+    /// this fingerprint: step 1's set decides match keys, which Task 6 stores under
+    /// `NORMALIZE_VERSION`.
+    #[test]
+    fn step_one_and_step_three_sets_are_frozen_for_version_1() {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut feed = |value: u32| {
+            for byte in value.to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        for c in (0..=0x10_FFFF).filter_map(char::from_u32) {
+            let mapped = compatible(c);
+            if is_invisible(c) || mapped != c || ligature(c).is_some() {
+                feed(u32::from(c));
+                feed(if is_invisible(c) {
+                    u32::MAX
+                } else {
+                    u32::from(mapped)
+                });
+            }
+        }
+        assert_eq!(
+            hash, STEP_SETS_V1,
+            "step 1 or step 3 changed (fingerprint {hash:#018x}): bump NORMALIZE_VERSION with it"
+        );
+    }
+
+    /// The fingerprint of steps 1 and 3 in version 1.
+    const STEP_SETS_V1: u64 = 0x446d_1b5d_22d2_6010;
 
     #[test]
     fn code_points_below_u0300_start_nfc_chunks() {

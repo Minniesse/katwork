@@ -361,8 +361,8 @@ fn compat_is_pythainlp_not_normalize_th() {
         pythainlp_compat(input),
         "ก\u{200D}ข\u{2060}ค\u{FEFF}ง\u{00AD}จ\tฉ\u{00A0}ช"
     );
-    // normalize_th removes the invisible and control characters (U+001C among them) and folds
-    // every White_Space run to one space.
+    // normalize_th removes the invisible characters, turns U+001C into a space as the other
+    // White_Space at the ends, and folds every White_Space run to one space.
     assert_eq!(normalize_th(input).text, "กขคงจ ฉ ช");
     // PyThaiNLP removes a space before a mark only after a consonant no vowel precedes; normalize_th always does.
     let spaced = "\u{0E40}ก \u{0E48}";
@@ -509,11 +509,13 @@ fn normalize_output_is_frozen_for_version_1() {
     );
 }
 
-/// The fingerprint of version 1, recorded when the rules were written.
-const FROZEN_V1: u64 = 0x068f_43bd_1713_10ab;
+/// The fingerprint of version 1, recorded when the rules were written (fix round 2 turned the
+/// information separators into spaces before any match key was stored).
+const FROZEN_V1: u64 = 0xf496_6090_9bf8_506f;
 
-/// Fix round 1: every Default_Ignorable code point and every control that is not White_Space
-/// goes in step 1, so none can split a figure or a word.
+/// Fix round 1: every Default_Ignorable code point and every control that is neither White_Space
+/// nor an information separator goes in step 1, so none can split a word in a match key (the
+/// scanners still see the controls and the Hangul fillers: tests/numbers.rs).
 #[test]
 fn invisible_and_control_characters_are_removed() {
     let invisible = [
@@ -536,7 +538,7 @@ fn invisible_and_control_characters_are_removed() {
         '\u{3164}',
         '\u{FFF9}',
         '\u{0001}',
-        '\u{001C}',
+        '\u{001B}',
         '\u{007F}',
         '\u{0080}',
         '\u{202A}',
@@ -551,6 +553,49 @@ fn invisible_and_control_characters_are_removed() {
     }
     // Controls that are White_Space still become spaces.
     assert_eq!(normalize_th("ก\tข\u{000B}ค\u{0085}ง").text, "ก ข ค ง");
+    // Fix round 2: so do the information separators, which separate fields as a space does.
+    for separator in '\u{001C}'..='\u{001F}' {
+        assert_eq!(
+            normalize_th(&format!("1{separator}250")).text,
+            "1 250",
+            "{separator:?}"
+        );
+        assert_eq!(
+            normalize_th(&format!("ก {separator} ข")).text,
+            "ก ข",
+            "{separator:?}"
+        );
+    }
+}
+
+/// Fix round 2: step 1 removes every code point of every Default_Ignorable range, both ends and
+/// the middle, and U+FFF9-U+FFFB, so a narrower set fails here as well as in the fingerprint.
+#[test]
+fn every_default_ignorable_range_is_removed() {
+    let ranges = [
+        ('\u{00AD}', '\u{00AD}'),
+        ('\u{034F}', '\u{034F}'),
+        ('\u{061C}', '\u{061C}'),
+        ('\u{115F}', '\u{1160}'),
+        ('\u{17B4}', '\u{17B5}'),
+        ('\u{180B}', '\u{180F}'),
+        ('\u{200B}', '\u{200F}'),
+        ('\u{202A}', '\u{202E}'),
+        ('\u{2060}', '\u{206F}'),
+        ('\u{3164}', '\u{3164}'),
+        ('\u{FE00}', '\u{FE0F}'),
+        ('\u{FEFF}', '\u{FEFF}'),
+        ('\u{FFA0}', '\u{FFA0}'),
+        ('\u{FFF0}', '\u{FFFB}'),
+        ('\u{1BCA0}', '\u{1BCA3}'),
+        ('\u{1D173}', '\u{1D17A}'),
+        ('\u{E0000}', '\u{E0FFF}'),
+    ];
+    for (first, last) in ranges {
+        for c in first..=last {
+            assert_eq!(normalize_th(&format!("ก{c}ข")).text, "กข", "{c:?}");
+        }
+    }
 }
 
 /// Fix round 1: the hyphens and minus signs that look like a hyphen-minus fold to it.

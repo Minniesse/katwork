@@ -999,20 +999,24 @@ fn ranges_are_one_low_confidence_reading() {
     assert_eq!(quantities(&budget), vec![format!("1,250 {LAN}")]);
     let sales = format!("{YOTKHAI} 1-31 ต.ค. 2568 รวม 1,250");
     assert_eq!(quantities(&sales), vec!["1,250".to_owned()]);
-    // A figure after a marked year with no range between keeps the year confident.
+    // A figure after a marked year is no range, but a dash joining them is a signal of one: the
+    // clean-context rule (fix round 2) keeps the year below 0.8. A minus is part of its figure.
     let figure = format!("{PI} 2567 - 5 {LAN}{BAHT}");
-    assert!(only(&figure).conf >= 0.8);
+    assert_eq!(only(&figure).conf, 0.6);
     assert_eq!(quantities(&figure), vec![format!("5 {LAN}")]);
     let growth = format!("{PI} 2567 -25%");
     assert!(only(&growth).conf >= 0.8);
-    // ถึง also means "reached": a figure with an amount word after it ends no range.
+    // ถึง also means "reached": a figure with an amount word after it ends no range, though the
+    // ถึง still keeps the year below 0.8.
     let reached = format!("{YOTKHAI}{PI} 2567 {THUENG} 2570 {LAN}{BAHT}");
-    assert!(only(&reached).conf >= 0.8, "{:?}", dates(&reached));
+    assert!(only(&reached).value == year(2024), "{:?}", dates(&reached));
+    assert_eq!(only(&reached).conf, 0.6);
     assert_eq!(quantities(&reached), vec![format!("2570 {LAN}")]);
-    // Two days joined by และ stay two dates; a bare day before a day with no year is a part.
+    // Two days joined by และ stay two dates, each one item of a list, below 0.8; a bare day
+    // before a day with no year is a part.
     let both = format!("1 ต.ค. 2568 {LAE} 2 ต.ค. 2568");
     assert_eq!(dates(&both).len(), 2, "{:?}", dates(&both));
-    assert!(dates(&both).iter().all(|found| found.conf >= 0.8));
+    assert!(dates(&both).iter().all(|found| found.conf < 0.8));
     let days = "ปร\u{0E30}ช\u{0E38}ม 15-16 ต.ค.";
     assert!(quantities(days).is_empty(), "{:?}", quantities(days));
 }
@@ -1151,4 +1155,432 @@ fn near_dates_are_not_dates() {
             .iter()
             .all(|found| !matches!(found.value, DateValue::Day { .. }))
     );
+}
+
+// Fix round 2: the clean-context rule (a founder decision). A date reads at 0.8 or more only when
+// it matches a pattern the reader knows exactly and no signal of a range, a list, a fraction or
+// (for a year, month or period) a part of it stands near it; otherwise at most 0.6. Ranges and
+// lists the reader recognizes are one reading at 0.5 with the other items in `alts`.
+
+const JONTHUENG: &str = "จนถ\u{0E36}ง"; // จนถึง
+const PAI_JONTHUENG: &str = "\u{0E44}ปจนถ\u{0E36}ง"; // ไปจนถึง
+const JONKRATHANG: &str = "จนกร\u{0E30}ท\u{0E31}\u{0E48}ง"; // จนกระทั่ง
+const RAWANG: &str = "ร\u{0E30}หว\u{0E48}\u{0E32}ง"; // ระหว่าง
+const JAK: &str = "จ\u{0E32}ก"; // จาก
+const KAP: &str = "ก\u{0E31}บ"; // กับ
+const NGUAT: &str = "งวด"; // งวด
+const MONTHS_FIRST: &str = "\u{0E40}ด\u{0E37}อน\u{0E41}รก"; // เดือนแรก
+const KHONG: &str = "ของ"; // ของ
+const KHRUENG_PI: &str = "คร\u{0E36}\u{0E48}งป\u{0E35}\u{0E41}รก"; // ครึ่งปีแรก
+const TON_PI: &str = "ต\u{0E49}นป\u{0E35}"; // ต้นปี
+const SIN_PI: &str = "ส\u{0E34}\u{0E49}นป\u{0E35}"; // สิ้นปี
+const SIP_HA: &str = "ส\u{0E34}บห\u{0E49}\u{0E32}"; // สิบห้า
+const TRAIMAT_RAEK: &str = "\u{0E44}ตรม\u{0E32}ส\u{0E41}รก"; // ไตรมาสแรก
+const ABROM: &str = "อบรมต\u{0E48}อ"; // อบรมต่อ
+const CHUAMONG: &str = "ช\u{0E31}\u{0E48}ว\u{0E42}มง"; // ชั่วโมง
+const SANYA: &str = "ส\u{0E31}ญญ\u{0E32}"; // สัญญา
+const CHABAP: &str = "ฉบ\u{0E31}บ"; // ฉบับ
+const ROI_LA: &str = "ร\u{0E49}อยล\u{0E30}"; // ร้อยละ
+const HANG: &str = "ห\u{0E49}\u{0E32}งสรรพส\u{0E34}นค\u{0E49}\u{0E32}"; // ห้างสรรพสินค้า
+const HAENG: &str = "\u{0E41}ห\u{0E48}ง"; // แห่ง
+const SAMAT: &str = "ส\u{0E32}ม\u{0E32}รถ"; // สามารถ
+const PHAYNAI: &str = "ภ\u{0E32}ย\u{0E43}น"; // ภายใน
+const TO_PI: &str = "ต\u{0E48}อป\u{0E35}"; // ต่อปี
+const SONG_RAI: &str = "ส\u{0E48}งร\u{0E32}ยง\u{0E32}น"; // ส่งรายงาน
+const KHA_CHAI: &str = "ค\u{0E48}\u{0E32}\u{0E43}ช\u{0E49}จ\u{0E48}\u{0E32}ย"; // ค่าใช้จ่าย
+
+/// One reading below 0.8 whose value is `start` and whose alternatives hold `others`, with no
+/// digit of it read as a quantity.
+fn one_low_reading(text: &str, start: DateValue, others: &[DateValue]) {
+    let found = only(text);
+    assert!(found.conf < 0.8, "{text:?}: {found:?}");
+    assert_eq!(found.value, start, "{text:?}");
+    let alts: Vec<DateValue> = found.alts.iter().map(|(alt, _)| *alt).collect();
+    assert_eq!(alts, others, "{text:?}");
+    assert!(
+        quantities(text).is_empty(),
+        "{text:?}: {:?}",
+        quantities(text)
+    );
+}
+
+/// Fix round 2: a range written with a filler word (ถึงวันที่, ถึงเดือน), a longer connector
+/// (จนถึง, ไปจนถึง, จนกระทั่ง, `till`, `thru`, `up to and including`, an arrow) or a frame
+/// (ระหว่าง … กับ, `between … and`) is one reading at 0.5, as the plain forms are.
+#[test]
+fn ranges_with_fillers_and_long_connectors_are_one_reading() {
+    let october = on(2025, 10, 1);
+    let december = on(2025, 12, 31);
+    for text in [
+        format!("{TANGTAE}{WAN}{THI} 1 ต.ค. 2568 {THUENG}{WAN}{THI} 31 ธ.ค. 2568"),
+        format!("{RAWANG}{WAN}{THI} 1 ต.ค. 2568 {THUENG}{WAN}{THI} 31 ธ.ค. 2568"),
+        format!("{JAK}{WAN}{THI} 1 ต.ค. 2568 {THUENG}{WAN}{THI} 31 ธ.ค. 2568"),
+        format!("{TANGTAE} 1 ต.ค. 2568 {JONTHUENG} 31 ธ.ค. 2568"),
+        format!("1 ต.ค. 2568 {PAI_JONTHUENG} 31 ธ.ค. 2568"),
+        format!("1 ต.ค. 2568 {JONKRATHANG} 31 ธ.ค. 2568"),
+        format!("{TANGTAE} 1 ต.ค. 2568 {THUENG}{WAN}{THI} 31 ธ.ค. 2568"),
+        format!("{TANGTAE}{WAN}{THI} 1 ต.ค. 2568 - {WAN}{THI} 31 ธ.ค. 2568"),
+        format!("{RAWANG} 1 ต.ค. 2568 {KAP} 31 ธ.ค. 2568"),
+        format!("{WAN}{THI} 1 ต.ค. {THUENG}{WAN}{THI} 31 ธ.ค. 2568"),
+    ] {
+        one_low_reading(&text, october, &[december]);
+    }
+    let (october_ce, december_ce) = (on_ce(2025, 10, 1), on_ce(2025, 12, 31));
+    for text in [
+        "between 1 Oct 2025 and 31 Dec 2025",
+        "from 1 October 2025 till 31 December 2025",
+        "from 1 October 2025 thru 31 December 2025",
+        "1 October 2025 -> 31 December 2025",
+        "1 October 2025 \u{2192} 31 December 2025",
+        "1 October 2025 up to and including 31 December 2025",
+    ] {
+        one_low_reading(text, october_ce, &[december_ce]);
+    }
+    one_low_reading(
+        "between 1 and 15 October 2025",
+        on_ce(2025, 10, 1),
+        &[on_ce(2025, 10, 15)],
+    );
+    one_low_reading(
+        &format!("{TANGTAE}{WAN}{THI} 1 {THUENG}{WAN}{THI} 15 {TULAKHOM} 2568"),
+        on(2025, 10, 1),
+        &[on(2025, 10, 15)],
+    );
+    one_low_reading(
+        &format!("{TANGTAE}{MONTH_WORD}{TULAKHOM} 2568 {THUENG}{MONTH_WORD}{THANWAKHOM} 2568"),
+        month(2025, 10),
+        &[month(2025, 12)],
+    );
+    one_low_reading(
+        &format!("{TANGTAE}{MONTH_WORD} ต.ค. {THUENG}{MONTH_WORD} ธ.ค. 2568"),
+        month(2025, 10),
+        &[month(2025, 12)],
+    );
+    one_low_reading(
+        &format!("{PI} 2567 {JONTHUENG} 2569"),
+        year(2024),
+        &[year(2026)],
+    );
+    one_low_reading(
+        &format!("{TANGTAE}{FISCAL} 2567 {JONTHUENG}{FISCAL} 2569"),
+        fiscal_year(2024),
+        &[fiscal_year(2026)],
+    );
+    // A right part with no year still keeps the left one below 0.8.
+    let open = dates("15 ต.ค. 2568 - 15 พ.ย.");
+    assert!(open.iter().all(|found| found.conf < 0.8), "{open:?}");
+}
+
+/// Fix round 2: numeric dates joined by a dash with no space, or an ISO interval, are one range
+/// at 0.5; a date continued by any other figure still gives no date.
+#[test]
+fn numeric_dates_joined_with_no_space_are_one_range() {
+    for text in [
+        "1/10/2568-31/12/2568",
+        "1.10.2568-31.12.2568",
+        "01-10-2568-31-12-2568",
+    ] {
+        one_low_reading(text, on(2025, 10, 1), &[on(2025, 12, 31)]);
+    }
+    let short = only("01/10/68-31/12/68");
+    assert_eq!(short.value, on(2025, 10, 1));
+    assert!(short.conf < 0.8);
+    one_low_reading(
+        "2025-10-01/2025-12-31",
+        on_ce(2025, 10, 1),
+        &[on_ce(2025, 12, 31)],
+    );
+    for text in ["1/2/2568,3", "1/2/3/4", "1/10/2568-1234"] {
+        assert!(
+            dates(text).iter().all(|found| found.conf < 0.8),
+            "{text:?}: {:?}",
+            dates(text)
+        );
+    }
+}
+
+/// Fix round 2: years listed after one marker (commas, และ, `and`, spaces between) are one
+/// reading at 0.5 with every other year in `alts`, and none of them is a quantity.
+#[test]
+fn lists_of_years_are_one_reading() {
+    let list = format!("{RAYDAI}{PI} 2566, 2567 {LAE} 2568 รวม 3,750 {LAN}{BAHT}");
+    let found = only(&list);
+    assert_eq!(found.value, year(2023));
+    assert_eq!(
+        found.alts.iter().map(|(alt, _)| *alt).collect::<Vec<_>>(),
+        [year(2024), year(2025)]
+    );
+    assert!(found.conf < 0.8);
+    assert_eq!(quantities(&list), vec![format!("3,750 {LAN}")]);
+    for text in [
+        format!("{PI} 2566 2567 {LAE} 2568"),
+        format!("{PI} 2566, 2567, 2568"),
+        format!("พ.ศ. 2566, 2567 {LAE} 2568"),
+        format!("{PI} 2566 {LAE} 2567 {LAE} 2568"),
+    ] {
+        one_low_reading(&text, year(2023), &[year(2024), year(2025)]);
+    }
+    for text in [
+        format!("{FISCAL} 2566, 2567 {LAE} 2568"),
+        "FY2023, FY2024 and FY2025".to_owned(),
+        "FY2023, 2024 and 2025".to_owned(),
+        "FY2023 & FY2024 or FY2025".to_owned(),
+    ] {
+        one_low_reading(
+            &text,
+            fiscal_year(2023),
+            &[fiscal_year(2024), fiscal_year(2025)],
+        );
+    }
+    // Two years with only a space between, and no connector after, stay apart.
+    let pair = format!("{PI} 2566 2567");
+    assert_eq!(only(&pair).raw, format!("{PI} 2566"));
+}
+
+/// Fix round 2: a word naming part of a year near a year, a month or a period (a quarter, a
+/// half, N months, the start or end of the year) keeps it below 0.8; the plan's fiscal quarter,
+/// with its own ไตรมาส, and a day stay confident.
+#[test]
+fn period_words_near_a_year_keep_it_below_0_8() {
+    for text in [
+        "FY2026 Q2 revenue 3,450".to_owned(),
+        format!("{FISCAL} 2569 Q2 {RAYDAI} 3,450"),
+        "Q2/FY2026 revenue 3,450".to_owned(),
+        "FY2026 1Q revenue 3,450".to_owned(),
+        "2Q FY2026".to_owned(),
+        "Q2 of FY2026".to_owned(),
+        "FY2026 H1".to_owned(),
+        "FY2026 first quarter".to_owned(),
+        "FY2026 second half".to_owned(),
+        format!("{RAYDAI}{NGUAT} 9 {MONTHS_FIRST}{KHONG}{PI} 2568 1,250 {LAN}{BAHT}"),
+        format!("{KHRUENG_PI}{KHONG}{PI} 2568 {RAYDAI} 1,250 {LAN}{BAHT}"),
+        format!("{RAYDAI} 6 {MONTHS_FIRST}{PI} 2568"),
+        format!("{TRAIMAT_RAEK}{KHONG}{PI} 2568"),
+        format!("{TON_PI} 2568"),
+        format!("{SIN_PI} 2568"),
+        format!("{QUARTER} 1, 2 {LAE} 3 {FISCAL} 2569"),
+    ] {
+        let found = dates(&text);
+        assert!(!found.is_empty(), "{text:?}");
+        assert!(
+            found.iter().all(|found| found.conf < 0.8),
+            "{text:?}: {found:?}"
+        );
+    }
+    for (text, conf) in [
+        // A sign word is no signal for a date; a Latin period word inside a word is none.
+        (
+            format!("ผลปร\u{0E30}กอบก\u{0E32}รต\u{0E34}ดลบ\u{0E43}น{PI} 2568"),
+            0.9,
+        ),
+        (format!("FAQ2 {PI} 2568"), 0.9),
+        // ต้น, กลาง, ปลาย and สิ้น are parts of a year only before ปี or เดือน: ต้นทุน is cost.
+        (
+            format!("\u{0E15}\u{0E49}\u{0E19}\u{0E17}\u{0E38}\u{0E19}{PI} 2568"),
+            0.9,
+        ),
+        (format!("{QUARTER} 2 {FISCAL} 2569"), 0.85),
+        ("Q2 FY2026".to_owned(), 0.85),
+        (format!("{FISCAL} 2569"), 0.85),
+        (format!("{PI} 2568"), 0.9),
+        (
+            format!("{SONG_RAI}{KHA_CHAI}{QUARTER} 4 {PHAYNAI}{WAN}{THI} 31 ต.ค. 2568"),
+            0.9,
+        ),
+    ] {
+        assert_eq!(only(&text).conf, conf, "{text:?}");
+    }
+}
+
+/// Fix round 2: a day the reader cannot read before a month name (a numeral it does not fold, a
+/// separator, a lookalike letter, number words) leaves the month below 0.8 rather than read
+/// alone; an English ordinal day and `25-Jan-2025` are days.
+#[test]
+fn a_day_the_reader_cannot_read_leaves_the_month_below_0_8() {
+    for day in [
+        "\u{0ED1}\u{0ED5}".to_owned(),
+        "\u{0ED1}5".to_owned(),
+        "1'5".to_owned(),
+        "1\u{2009}5".to_owned(),
+        "1\u{00B7}5".to_owned(),
+        "15x".to_owned(),
+        "1O".to_owned(),
+        "l5".to_owned(),
+        "I5".to_owned(),
+        "1\u{FFFD}5".to_owned(),
+        "\u{FFFD}5".to_owned(),
+        "1\u{0096}5".to_owned(),
+        SIP_HA.to_owned(),
+    ] {
+        let text = format!("{YOTKHAI} {day} ต.ค. 2568");
+        let found = dates(&text);
+        assert!(
+            found.iter().all(|found| found.conf < 0.8),
+            "{text:?}: {found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .all(|found| !matches!(found.value, DateValue::Day { .. })),
+            "{text:?}: {found:?}"
+        );
+    }
+    for (text, date) in [
+        ("1st October 2025", on_ce(2025, 10, 1)),
+        ("the 3rd of October 2025", on_ce(2025, 10, 3)),
+        ("October 1st, 2025", on_ce(2025, 10, 1)),
+        ("31st December 2025", on_ce(2025, 12, 31)),
+        ("22nd Dec 2025", on_ce(2025, 12, 22)),
+        ("11th October 2025", on_ce(2025, 10, 11)),
+        ("25-Jan-2025", on_ce(2025, 1, 25)),
+        ("15Oct 2025", on_ce(2025, 10, 15)),
+    ] {
+        let found = only(text);
+        assert_eq!(found.value, date, "{text:?}");
+        assert_eq!(found.conf, 0.9, "{text:?}");
+    }
+    let wrong_suffix = dates("1th October 2025");
+    assert!(wrong_suffix.iter().all(|found| found.conf < 0.8));
+    let short = only("Jan-25");
+    assert_eq!(short.value, month_ce(2025, 1));
+    assert!(short.conf < 0.8);
+    assert_eq!(only("Jan-2025").value, month_ce(2025, 1));
+    // A dash right after a month name is no minus.
+    for text in ["Jan-25", "Oct-5"] {
+        assert!(
+            find_numbers(text, &ctx())
+                .unwrap()
+                .iter()
+                .all(|found| !found.value.value.is_sign_negative()),
+            "{text:?}"
+        );
+    }
+}
+
+/// Fix round 2 (a regression of round 1): a control inside or before a date number keeps it
+/// from being read; an information separator is a space, so the year before it is read.
+#[test]
+fn controls_keep_date_numbers_apart() {
+    assert!(dates(&format!("{PI} 2567\u{0096}2569")).is_empty());
+    let day = dates("ประชุม 1\u{0096}5 ต.ค. 2568");
+    assert!(
+        day.iter()
+            .all(|found| !matches!(found.value, DateValue::Day { .. }) && found.conf < 0.8),
+        "{day:?}"
+    );
+    let year = format!("{PI} 2567\u{001F}1,250 {LAN}{BAHT}");
+    assert_eq!(only(&year).value, self::year(2024));
+    assert_eq!(only(&year).conf, 0.9);
+    let budget = format!("{FISCAL} 2569\u{001F}1,250 {LAN}{BAHT}");
+    assert_eq!(only(&budget).value, fiscal_year(2026));
+    // A control right before a date number keeps it from being read too.
+    assert!(dates(&format!("{PI} \u{0096}2568")).is_empty());
+    let before_day = dates("\u{0096}15 ต.ค. 2568");
+    assert!(
+        before_day
+            .iter()
+            .all(|found| !matches!(found.value, DateValue::Day { .. }) && found.conf < 0.8),
+        "{before_day:?}"
+    );
+}
+
+/// Fix round 2 (round-1 review, P3): a bare four-digit year after a quarter with an amount word
+/// after it is the amount; after a bare ปี, two digits before ร้อยละ, สามารถ or a word that begins
+/// with a digit word are still a year.
+#[test]
+fn a_year_before_an_amount_word_is_the_amount_and_only_then() {
+    let amount = format!("{QUARTER} 2 2568 {LAN}{BAHT}");
+    assert!(dates(&amount).is_empty(), "{:?}", dates(&amount));
+    assert_eq!(
+        quantities(&amount),
+        vec!["2".to_owned(), format!("2568 {LAN}")]
+    );
+    for text in [
+        format!("{YOTKHAI}{PI} 68 {ROI_LA} 5"),
+        format!("{PHAYNAI}{PI} 68 {SAMAT}"),
+        format!("{PI} 68 {HANG} 3 {HAENG}"),
+    ] {
+        let found = only(&text);
+        assert_eq!(found.value, year(2025), "{text:?}");
+        assert!(found.flags.contains(Flags::TWO_DIGIT_YEAR), "{text:?}");
+    }
+    assert!(dates(&format!("{RAYDAI}{TO_PI} 25 {LAN}{BAHT}")).is_empty());
+}
+
+/// Fix round 2: the rule branches round 1 left untested (mutants A1, A2, B, G, X, Y, Z,
+/// D-CONN-wordboundary, D-QUARTER-q5, D-RANGE-year-before, D-YEAR-delta, D-PIGUARD-figure,
+/// D-PIGUARD-duration, D-TWODIGIT-ce and W-written).
+#[test]
+fn round_one_rule_branches_each_have_a_case() {
+    for text in [
+        format!("{PI} 2567\u{2014}2569"),
+        format!("{PI} 2567 ~ 2569"),
+        format!("{PI} 2567 {JONTHUENG} 2569"),
+    ] {
+        one_low_reading(&text, year(2024), &[year(2026)]);
+    }
+    for text in ["ต.ค.\u{2014}ธ.ค. 2568", "ต.ค. ~ ธ.ค. 2568"] {
+        one_low_reading(text, month(2025, 10), &[month(2025, 12)]);
+    }
+    for text in ["FY2024 through FY2026", "FY2024 until FY2026"] {
+        one_low_reading(text, fiscal_year(2024), &[fiscal_year(2026)]);
+    }
+    // `to` inside a word is no connector, so the bare year before it lists nothing.
+    let tonight = dates("FY2024 tonight FY2026");
+    assert_eq!(tonight.len(), 2, "{tonight:?}");
+    assert!(tonight.iter().all(|found| found.conf >= 0.8));
+    let total = only("FY2026 2025 total");
+    assert_eq!((total.conf, total.alts.len()), (0.85, 0), "{total:?}");
+    // A range's left month after its end month is in the year before.
+    one_low_reading("ต.ค.-ก.ย. 2568", month(2024, 10), &[month(2025, 9)]);
+    // Two digits continue a range only 1 to 20 years on; four digits within 100 years.
+    assert!(only(&format!("{PI} 2567-90")).alts.is_empty());
+    assert_eq!(only(&format!("{PI} 2567-2667")).alts.len(), 1);
+    assert!(only(&format!("{PI} 2567-2668")).alts.is_empty());
+    // After a bare ปี, two digits are no year after a figure or before a duration.
+    for text in [
+        format!("{ABROM}{PI} 40 {CHUAMONG}"),
+        format!("{SANYA} 3 {PI} 10 {CHABAP}"),
+        format!("{PI} 10 {MONTH_WORD}"),
+        format!("5 {PI} 10"),
+    ] {
+        assert!(dates(&text).is_empty(), "{text:?}: {:?}", dates(&text));
+    }
+    let slash = only(&format!("{QUARTER} 2/68"));
+    assert_eq!(slash.value, year(2025));
+    assert!(slash.conf < 0.8);
+    assert!(dates("Q5 2025").is_empty());
+    let century = only("ค.ศ. 25");
+    assert_eq!(
+        century.value,
+        DateValue::Year {
+            year: 2025,
+            era: Era::Ce,
+            period: PeriodKind::Unknown
+        }
+    );
+    // A Latin era marker split by an invisible character is still read in capitals.
+    assert_eq!(only("B\u{200E}E 2567").value, year(2024));
+}
+
+/// Fix round 2 (mutant D14): with no anchor, two-digit years are read nearest today, which
+/// some year of every century tells apart from any other anchor more than a day away.
+#[test]
+fn no_anchor_reads_two_digit_years_nearest_today() {
+    let today = Ctx {
+        anchor: Some(chrono::Utc::now().date_naive()),
+    };
+    let year_ago = Ctx {
+        anchor: today
+            .anchor
+            .and_then(|day| day.checked_sub_days(chrono::Days::new(365))),
+    };
+    let mut told_apart = false;
+    for yy in 0..100 {
+        let text = format!("1 ต.ค. {yy:02}");
+        let found = find_dates(&text, &Ctx { anchor: None }).unwrap();
+        assert_eq!(found, find_dates(&text, &today).unwrap(), "{text:?}");
+        told_apart |= found != find_dates(&text, &year_ago).unwrap();
+    }
+    assert!(told_apart);
 }

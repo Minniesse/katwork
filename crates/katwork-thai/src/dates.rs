@@ -4,9 +4,10 @@ use std::ops::Range;
 
 use chrono::{Datelike, NaiveDate};
 
+use crate::context::CONF_CAP;
 use crate::found::{
-    View, char_len, check_len, digits_end, foreign_separator, has_at, has_before, is_digit,
-    is_latin_letter, is_numeral, is_thai,
+    View, char_len, check_len, code_letter, digits_end, foreign_separator, has_at, has_before,
+    is_digit, is_latin_letter, is_numeral, is_thai, unknown_glyph,
 };
 use crate::{Flags, Found, TooLong};
 
@@ -109,8 +110,43 @@ const FISCAL_SHORT: &str = "\u{0E1B}\u{0E35}\u{0E07}\u{0E1A}"; // ปีงบ
 const QUARTER: &str = "\u{0E44}\u{0E15}\u{0E23}\u{0E21}\u{0E32}\u{0E2A}"; // ไตรมาส
 const THI: &str = "\u{0E17}\u{0E35}\u{0E48}"; // ที่
 const KHONG: &str = "\u{0E02}\u{0E2D}\u{0E07}"; // ของ
-const THUENG: &str = "\u{0E16}\u{0E36}\u{0E07}"; // ถึง (จนถึง ends with it)
+const THUENG: &str = "\u{0E16}\u{0E36}\u{0E07}"; // ถึง
 const LAE: &str = "\u{0E41}\u{0E25}\u{0E30}"; // และ
+
+/// Words that join the two ends of a range, longest first.
+const RANGE_WORDS: [&str; 4] = [
+    "\u{0E44}\u{0E1B}\u{0E08}\u{0E19}\u{0E16}\u{0E36}\u{0E07}", // ไปจนถึง
+    "\u{0E08}\u{0E19}\u{0E01}\u{0E23}\u{0E30}\u{0E17}\u{0E31}\u{0E48}\u{0E07}", // จนกระทั่ง
+    "\u{0E08}\u{0E19}\u{0E16}\u{0E36}\u{0E07}",                 // จนถึง
+    THUENG,
+];
+
+/// Latin words that join the two ends of a range, longest first.
+const LATIN_RANGE_WORDS: [&str; 7] = [
+    "up to and including",
+    "through",
+    "up to",
+    "until",
+    "thru",
+    "till",
+    "to",
+];
+
+const BETWEEN: &str = "\u{0E23}\u{0E30}\u{0E2B}\u{0E27}\u{0E48}\u{0E32}\u{0E07}"; // ระหว่าง
+
+/// Words that join the items of a list, which count where a list is read.
+const LIST_WORDS: [&str; 3] = [
+    LAE,
+    "\u{0E2B}\u{0E23}\u{0E37}\u{0E2D}", // หรือ
+    "\u{0E01}\u{0E31}\u{0E1A}",         // กับ
+];
+
+/// Words that may stand between a connector and the date it joins: `ถึงวันที่ 31 ธ.ค.`.
+const FILLERS: [&str; 3] = [
+    "\u{0E27}\u{0E31}\u{0E19}\u{0E17}\u{0E35}\u{0E48}", // วันที่
+    "\u{0E40}\u{0E14}\u{0E37}\u{0E2D}\u{0E19}",         // เดือน
+    "\u{0E27}\u{0E31}\u{0E19}",                         // วัน
+];
 
 /// Words after a bare ปี and two digits that make them a length of time, not a year.
 const DURATIONS: [&str; 5] = [
@@ -255,13 +291,15 @@ const ENGLISH_MONTHS: [(&str, &str); 12] = [
 /// A date the scanner read, in normalized code points.
 pub(crate) struct Hit {
     pub(crate) range: Range<usize>,
-    value: DateValue,
-    conf: f32,
+    pub(crate) value: DateValue,
+    pub(crate) conf: f32,
     flags: Flags,
     alts: Vec<(DateValue, f32)>,
     /// The year that ends a marked year or a fiscal year, which a bare year may continue as a
     /// range.
     year: Option<YearToken>,
+    /// A range or list `ranges` made: a later item adds its value to `alts`.
+    joined: bool,
 }
 
 /// What `find_numbers` needs from the dates: their spans, the day numbers written before a
@@ -294,17 +332,27 @@ pub(crate) struct Scan {
 /// not read; a quarter beside a year that is not fiscal (`ไตรมาส 2 ปี 2568`, `ปี 2568 ไตรมาส 2`,
 /// `Q2 CY2025`, `Q2 2025`, `ไตรมาส 2/2568`) is one reading of that year over both, at 0.5.
 ///
-/// A range is one reading over the whole range at 0.5, its start as the value and its end in
-/// `alts`: two dates joined by `-`, ถึง, `to`, `through` or `until` (and by และ or `and` when both
-/// are years), a bare year after a marked one (`ปี 2567-2569`, `FY2024-2026`, `ปี 2567/68`), a
-/// bare day, month, or day and month before a date (`1-31 ต.ค. 2568`, `ต.ค.-ธ.ค. 2568`,
-/// `Oct 1-15, 2025`), and a range of quarters (`ไตรมาส 1-2 ปีงบประมาณ 2569`, `Q1-Q2 FY2026`).
+/// A range or a list is one reading over the whole of it at 0.5, its first date as the value and
+/// the others in `alts`: two dates joined by a dash, `~`, an arrow, ถึง, จนถึง, ไปจนถึง,
+/// จนกระทั่ง, `to`, `through`, `thru`, `till`, `until` or `up to (and including)`, with a filler
+/// word such as วันที่ or เดือน after it (and by และ, หรือ, กับ, a comma, `&`, `and` or `or` when
+/// both are years or ระหว่าง or `between` stands before them); numeric dates joined by a dash with
+/// no space and ISO intervals (`1/10/2568-31/12/2568`, `2025-10-01/2025-12-31`); bare years after
+/// a marked one (`ปี 2567-2569`, `FY2024-2026`, `ปี 2567/68`, `ปี 2566, 2567 และ 2568`); a bare
+/// day, month, or day and month before a date (`1-31 ต.ค. 2568`, `ต.ค.-ธ.ค. 2568`,
+/// `15 และ 16 ต.ค. 2568`, `Oct 1-15, 2025`); and a range of quarters
+/// (`ไตรมาส 1-2 ปีงบประมาณ 2569`, `Q1-Q2 FY2026`). English ordinal days (`1st October 2025`,
+/// `October 1st, 2025`) and `25-Jan-2025` are days; `Jan-2025` is a month.
 ///
 /// Confidence: 0.9 for a marked four-digit year or a date with a month name, and for a numeric
 /// date that is year first or whose day is above 12; 0.6 for other numeric dates and every
 /// two-digit year; 0.85 for fiscal years and quarters; 0.5 for academic years, the ร.ศ. and
-/// จ.ศ. eras, ranges and a quarter of a year that is not fiscal; at most 0.7 for a BE year
-/// before 2484 (`PRE_1941`). The lowest rule that applies wins.
+/// จ.ศ. eras, ranges, lists and a quarter of a year that is not fiscal; at most 0.7 for a BE
+/// year before 2484 (`PRE_1941`); at most 0.6 under the clean-context rule (see the crate
+/// documentation): a signal of a range, a list or a fraction near any date, or of a part of a
+/// year (ไตรมาส, ปีงบ, งวด, ครึ่ง, เดือนแรก, ต้นปี, `Q2`, `H1`, `half`) near a year, month or
+/// period, and a month whose name follows a day the reader could not read (`໑໕ ต.ค. 2568`,
+/// `15x ต.ค.`, `สิบห้า ต.ค.`). The lowest rule that applies wins.
 ///
 /// The text is read through [`crate::normalize_th`], and Latin era markers are matched in the
 /// original capitals. Spans are code points of `text`; a text longer than
@@ -312,7 +360,7 @@ pub(crate) struct Scan {
 pub fn find_dates(text: &str, ctx: &Ctx) -> Result<Vec<Found<DateValue>>, TooLong> {
     check_len(text)?;
     let view = View::new(text);
-    let scan = scan(&view, anchor(ctx));
+    let (_, scan) = crate::numbers::read(&view, anchor(ctx));
     Ok(scan
         .hits
         .into_iter()
@@ -419,6 +467,7 @@ impl Scanner<'_> {
             flags: reading.flags,
             alts: reading.alts,
             year,
+            joined: false,
         });
     }
 
@@ -435,7 +484,9 @@ impl Scanner<'_> {
     }
 
     /// A digit run that starts at `at` and is not part of a longer figure: no numeral (of any
-    /// script) touches it, directly or across a separator or a thin space.
+    /// script) touches it, directly or across a separator or a thin space, no glyph the text
+    /// layer could not name touches it, and no control or filler step 1 deleted stands inside it
+    /// or right before it.
     fn number(&self, at: usize) -> Option<(u32, usize, usize)> {
         if !self.get(at).is_some_and(is_digit) {
             return None;
@@ -449,17 +500,19 @@ impl Scanner<'_> {
         let before_that = at.checked_sub(2).and_then(|prev| self.get(prev));
         if before
             .and_then(|prev| self.get(prev))
-            .is_some_and(is_numeral)
+            .is_some_and(|c| is_numeral(c) || unknown_glyph(c))
             || (before.is_some_and(joins) && before_that.is_some_and(is_numeral))
+            || self.view.broken_before(at)
         {
             return None;
         }
         let (value, end) = self.field(at, 1..=4)?;
         let after = self.get(end);
-        if after.is_some_and(is_numeral)
+        if after.is_some_and(|c| is_numeral(c) || unknown_glyph(c))
             || (after.is_some_and(|c| c != ',' && c != '.')
                 && joins(end)
                 && self.get(end + 1).is_some_and(is_numeral))
+            || (at + 1..end).any(|inside| self.view.broken_before(inside))
         {
             return None;
         }
@@ -723,7 +776,14 @@ impl Scanner<'_> {
                 let (era, year) = self.era_and_year(at)?;
                 (era, year, PeriodKind::Unknown)
             }
-            None => (None, self.year(at, &[4])?, PeriodKind::Unknown),
+            None => {
+                let year = self.year(at, &[4])?;
+                // A bare four digits before an amount word are the amount: ไตรมาส 2 2568 ล้านบาท.
+                if crate::numbers::amount_word_at(self.t, self.space(year.end)) {
+                    return None;
+                }
+                (None, year, PeriodKind::Unknown)
+            }
         };
         if era == Some(Era::Unknown) {
             return None;
@@ -898,15 +958,37 @@ impl Scanner<'_> {
     /// A day, then a month name or a numeric month, then a year.
     fn day_first(&mut self, at: usize) -> Option<usize> {
         let (day, digits, end) = self.number(at)?;
+        if digits <= 2
+            && let Some(end) = self.dashed(at, day, end)
+        {
+            return Some(end);
+        }
         if matches!(self.get(end), Some('/' | '.' | '-')) {
             return self.numeric(at);
         }
         if digits > 2 {
             return None;
         }
-        let month_at = self.space(end);
+        // A letter glued before the day (`l5`, `A15`) leaves no day the reader can read; after
+        // it, only an English ordinal suffix (`1st October`, `the 3rd of October`) or a month
+        // name (`15Oct 2025`) may follow.
+        if at
+            .checked_sub(1)
+            .and_then(|prev| self.get(prev))
+            .is_some_and(code_letter)
+        {
+            return None;
+        }
+        let ordinal = self.ordinal_suffix(day, end);
+        let mut month_at = self.space(ordinal.unwrap_or(end));
+        if ordinal.is_some() && has_at(self.t, month_at, "of") && self.latin_end(month_at + 2) {
+            month_at = self.space(month_at + 2);
+        }
         let (month, month_end) = self.month_at(month_at)?;
         let english = self.get(month_at).is_some_and(is_latin_letter);
+        if ordinal.is_some() && !english {
+            return None;
+        }
         let year_at = self.space(month_end);
         let year = if english {
             self.year(year_at, &[2, 4]).map(|year| (None, year))
@@ -929,8 +1011,41 @@ impl Scanner<'_> {
         Some(year.end)
     }
 
+    /// An English ordinal suffix right after the day `day` that ends at `end` (`1st`, `2nd`,
+    /// `3rd`, `11th`, `22nd`): where it ends.
+    fn ordinal_suffix(&self, day: u32, end: usize) -> Option<usize> {
+        let suffix = match (day % 10, day % 100) {
+            (_, 11..=13) => "th",
+            (1, _) => "st",
+            (2, _) => "nd",
+            (3, _) => "rd",
+            _ => "th",
+        };
+        (has_at(self.t, end, suffix) && self.latin_end(end + 2)).then_some(end + 2)
+    }
+
+    /// `25-Jan-2025` or `25-ต.ค.-2568`: a day, a month name and a year joined by dashes.
+    fn dashed(&mut self, at: usize, day: u32, end: usize) -> Option<usize> {
+        if self.get(end) != Some('-') {
+            return None;
+        }
+        let (month, month_end) = self.month_at(end + 1)?;
+        if self.get(month_end) != Some('-') {
+            return None;
+        }
+        let year = self.year(month_end + 1, &[2, 4])?;
+        if let Some(reading) = self.read(year, None, CONF_MARKED, |ce, era| {
+            NaiveDate::from_ymd_opt(ce, month, day).map(|date| DateValue::Day { date, era })
+        }) {
+            self.push(at..year.end, reading);
+        }
+        Some(year.end)
+    }
+
     /// `d/m/y`, `d.m.y` and `d-m-y` with a two- or four-digit year, or `yyyy-mm-dd` and
-    /// `yyyy/mm/dd`.
+    /// `yyyy/mm/dd`. A second complete date after a dash ends a range (`1/10/2568-31/12/2568`),
+    /// and so does one after a slash when this one is `yyyy-mm-dd`; `ranges` joins them. Any
+    /// other figure that continues the date (`1/2/2568,3`, `1/2/3/4`) leaves no date.
     fn numeric(&mut self, at: usize) -> Option<usize> {
         let (first, first_digits, first_end) = self.number(at)?;
         let sep = self.get(first_end)?;
@@ -942,7 +1057,12 @@ impl Scanner<'_> {
         let third_end = digits_end(self.t, third_at);
         let continued = matches!(self.get(third_end), Some('/' | '.' | '-' | ','))
             && self.get(third_end + 1).is_some_and(is_digit);
-        if continued {
+        let range = match self.get(third_end) {
+            Some('-') => self.numeric_shape(third_end + 1),
+            Some('/') => first_digits == 4 && sep == '-' && self.numeric_shape(third_end + 1),
+            _ => false,
+        };
+        if continued && !range {
             return None;
         }
         let (third, _) = self.field(third_at, 1..=4)?;
@@ -986,13 +1106,82 @@ impl Scanner<'_> {
         Some(third_end)
     }
 
+    /// A whole numeric date at `at`: the shape `numeric` reads, without what follows it.
+    fn numeric_shape(&self, at: usize) -> bool {
+        let Some((_, first_digits, first_end)) = self.number(at) else {
+            return false;
+        };
+        let Some(sep) = self
+            .get(first_end)
+            .filter(|sep| matches!(sep, '/' | '.' | '-'))
+        else {
+            return false;
+        };
+        let Some((_, second_end)) = self.field(first_end + 1, 1..=2) else {
+            return false;
+        };
+        let third_digits = digits_end(self.t, second_end + 1) - (second_end + 1);
+        self.get(second_end) == Some(sep)
+            && ((first_digits == 4 && (1..=2).contains(&third_digits))
+                || ((1..=2).contains(&first_digits) && matches!(third_digits, 2 | 4)))
+    }
+
+    /// A day the reader could not read right before the month name at `at` (one space allowed,
+    /// and `of`): a numeral, letters glued to one (`1st`, `15x`), number words (`สิบห้า`), or a
+    /// glyph the text layer could not name. A month read alone there would read one day's
+    /// figure as the month's, so it stays below 0.8.
+    fn day_unread(&self, at: usize) -> bool {
+        let back = |at: usize| {
+            if at > 0 && self.get(at - 1) == Some(' ') {
+                at - 1
+            } else {
+                at
+            }
+        };
+        let mut end = back(at);
+        if has_before(self.t, end, "of") && self.latin_start(end - 2) {
+            end = back(end - 2);
+        }
+        let mut letters = end;
+        while letters > 0 && self.get(letters - 1).is_some_and(code_letter) {
+            letters -= 1;
+        }
+        let before = letters.checked_sub(1).and_then(|prev| self.get(prev));
+        if letters < end {
+            return before.is_some_and(is_numeral);
+        }
+        before.is_some_and(|c| is_numeral(c) || unknown_glyph(c))
+            || crate::numbers::number_word_ends_at(self.t, end)
+    }
+
     /// A month name, then an optional era marker and a year; or, in English, a day and a year.
     fn month_first(&mut self, at: usize) -> Option<usize> {
         let (month, month_end) = self.month_at(at)?;
         let next = self.space(month_end);
         if self.get(at).is_some_and(is_latin_letter) {
+            // `Jan-25`, `Jan-2025`: a month and a year joined by a dash.
+            if self.get(month_end) == Some('-')
+                && let Some(year) = self.year(month_end + 1, &[2, 4])
+            {
+                if let Some(reading) = self.read(year, None, CONF_MARKED, |ce, era| {
+                    Some(DateValue::Month {
+                        year: ce,
+                        month,
+                        era,
+                    })
+                }) {
+                    self.push(at..year.end, reading);
+                }
+                return Some(year.end);
+            }
             if let Some((day, _, day_end)) = self.number(next).filter(|(_, digits, _)| *digits <= 2)
             {
+                // `October 1st, 2025`; another letter glued to the day leaves no date.
+                let day_end = match self.ordinal_suffix(day, day_end) {
+                    Some(suffix_end) => suffix_end,
+                    None if self.get(day_end).is_some_and(code_letter) => return None,
+                    None => day_end,
+                };
                 // Oct 1-15, 2025: a range of days.
                 let (last, days_end) = match self
                     .connector_end(day_end, false)
@@ -1046,6 +1235,7 @@ impl Scanner<'_> {
                     era,
                 })
             })?;
+            let reading = self.unread_day_caps(at, reading);
             self.push(at..year.end, reading);
             return Some(year.end);
         }
@@ -1060,9 +1250,22 @@ impl Scanner<'_> {
                 era,
             })
         }) {
+            let reading = self.unread_day_caps(at, reading);
             self.push(at..year.end, reading);
         }
         Some(year.end)
+    }
+
+    /// A month whose name at `at` follows a day the reader could not read, capped below 0.8.
+    fn unread_day_caps(&self, at: usize, reading: Reading) -> Reading {
+        if self.day_unread(at) {
+            Reading {
+                conf: reading.conf.min(CONF_CAP),
+                ..reading
+            }
+        } else {
+            reading
+        }
     }
 
     /// A month name at `at` as a whole token, longest alias first: its month and end.
@@ -1140,36 +1343,48 @@ impl Scanner<'_> {
         has_at(self.t, next, second).then_some(next + char_len(second))
     }
 
-    /// A range connector at `at`, one space allowed before and after it: where the right part
-    /// starts. `-`, `—`, `~`, ถึง (จนถึง ends with it), `to`, `through` and `until`; และ and `and`
-    /// too when `and` is true.
-    fn connector_end(&self, at: usize, and: bool) -> Option<usize> {
+    /// A connector at `at`, one space allowed before and after it and a filler word (วันที่,
+    /// เดือน, วัน) after it: where the right part starts. Range connectors: `-`, `—`, `~`, `→`,
+    /// `->`, ถึง, จนถึง, ไปจนถึง, จนกระทั่ง, `to`, `through`, `thru`, `till`, `until`, `up to` and
+    /// `up to and including`; when `lists` is true, list connectors too: และ, หรือ, กับ, `,`, `&`,
+    /// `and` and `or`.
+    fn connector_end(&self, at: usize, lists: bool) -> Option<usize> {
         let from = self.space(at);
-        let end = if matches!(self.get(from), Some('-' | '\u{2014}' | '~')) {
+        let latin = |word: &str| {
+            has_at(self.t, from, word)
+                && self.latin_start(from)
+                && self.latin_end(from + char_len(word))
+        };
+        let end = if has_at(self.t, from, "->") {
+            from + 2
+        } else if matches!(self.get(from), Some('-' | '\u{2014}' | '~' | '\u{2192}')) {
             from + 1
-        } else if let Some(word) = [THUENG, LAE]
-            .into_iter()
-            .filter(|word| and || *word != LAE)
-            .find(|word| has_at(self.t, from, word))
-        {
+        } else if let Some(word) = RANGE_WORDS.iter().find(|word| has_at(self.t, from, word)) {
+            from + char_len(word)
+        } else if let Some(word) = LATIN_RANGE_WORDS.iter().find(|word| latin(word)) {
+            from + char_len(word)
+        } else if !lists {
+            return None;
+        } else if matches!(self.get(from), Some(',' | '&')) {
+            from + 1
+        } else if let Some(word) = LIST_WORDS.iter().find(|word| has_at(self.t, from, word)) {
             from + char_len(word)
         } else {
-            let word = ["to", "through", "until", "and"]
-                .into_iter()
-                .filter(|word| and || *word != "and")
-                .find(|word| {
-                    has_at(self.t, from, word)
-                        && self.latin_start(from)
-                        && self.latin_end(from + char_len(word))
-                })?;
+            let word = ["and", "or"].into_iter().find(|word| latin(word))?;
             from + char_len(word)
         };
-        Some(self.space(end))
+        let next = self.space(end);
+        Some(
+            FILLERS
+                .iter()
+                .find(|filler| has_at(self.t, next, filler))
+                .map_or(next, |filler| self.space(next + char_len(filler))),
+        )
     }
 
-    /// A range connector right before `right_start`, one space allowed on each side: where the
-    /// left part ends. The connectors of `connector_end`, without และ and `and`.
-    fn connector_before(&self, right_start: usize) -> Option<usize> {
+    /// A connector right before `right_start`, one space allowed on each side and a filler word
+    /// before the right part: where the left part ends. The connectors of `connector_end`.
+    fn connector_before(&self, right_start: usize, lists: bool) -> Option<usize> {
         let back = |at: usize| {
             if at > 0 && self.get(at - 1) == Some(' ') {
                 at - 1
@@ -1177,27 +1392,43 @@ impl Scanner<'_> {
                 at
             }
         };
-        let at = back(right_start);
-        let start = if at > 0 && matches!(self.get(at - 1), Some('-' | '\u{2014}' | '~')) {
+        let mut at = back(right_start);
+        if let Some(filler) = FILLERS.iter().find(|filler| has_before(self.t, at, filler)) {
+            at = back(at - char_len(filler));
+        }
+        let latin = |word: &str| {
+            has_before(self.t, at, word)
+                && self.latin_start(at - char_len(word))
+                && self.latin_end(at)
+        };
+        let start = if has_before(self.t, at, "->") {
+            at - 2
+        } else if at > 0 && matches!(self.get(at - 1), Some('-' | '\u{2014}' | '~' | '\u{2192}')) {
             at - 1
-        } else if has_before(self.t, at, THUENG) {
-            at - char_len(THUENG)
+        } else if let Some(word) = RANGE_WORDS.iter().find(|word| has_before(self.t, at, word)) {
+            at - char_len(word)
+        } else if let Some(word) = LATIN_RANGE_WORDS.iter().find(|word| latin(word)) {
+            at - char_len(word)
+        } else if !lists {
+            return None;
+        } else if at > 0 && matches!(self.get(at - 1), Some(',' | '&')) {
+            at - 1
+        } else if let Some(word) = LIST_WORDS.iter().find(|word| has_before(self.t, at, word)) {
+            at - char_len(word)
         } else {
-            let word = ["to", "through", "until"].into_iter().find(|word| {
-                has_before(self.t, at, word)
-                    && self.latin_start(at - char_len(word))
-                    && self.latin_end(at)
-            })?;
+            let word = ["and", "or"].into_iter().find(|word| latin(word))?;
             at - char_len(word)
         };
         Some(back(start))
     }
 
-    /// Joins ranges: two dates with a connector between, a bare year after a marked one
-    /// (`ปี 2567-2569`, `FY2024-2026`, `ปี 2567/68`), and a bare day, month, or day and month
-    /// before a date (`1-31 ต.ค. 2568`, `ต.ค.-ธ.ค. 2568`). Each is one reading over the whole range
-    /// at 0.5, its start as the value and its end as the alternative, so neither endpoint reads
-    /// as the date of what the range covers.
+    /// Joins ranges and lists: two dates with a range connector between (and a list connector
+    /// when both are years), an ISO interval (`2025-10-01/2025-12-31`), bare years after a marked
+    /// one (`ปี 2567-2569`, `FY2024-2026`, `ปี 2567/68`, `ปี 2566, 2567 และ 2568`), and a bare day,
+    /// month, or day and month before a date (`1-31 ต.ค. 2568`, `ต.ค.-ธ.ค. 2568`,
+    /// `15 และ 16 ต.ค. 2568`). Each is one reading over the whole range or list at 0.5, its first
+    /// date as the value and the others as the alternatives, so no item reads as the date of
+    /// what they cover together.
     fn ranges(&mut self) {
         let mut hits = std::mem::take(&mut self.out.hits).into_iter().peekable();
         let mut out: Vec<Hit> = Vec::with_capacity(hits.len());
@@ -1205,25 +1436,28 @@ impl Scanner<'_> {
             crate::found::work(1);
             if let Some(year) = hit.year {
                 let next_start = hits.peek().map_or(usize::MAX, |next| next.range.start);
-                if let Some((end, value)) = self
-                    .year_after(&hit, year)
+                if let Some((end, values)) = self
+                    .years_after(&hit, year)
                     .filter(|(end, _)| *end <= next_start)
                 {
-                    hit = into_range(hit, end, value, CONF_RANGE, Flags::default());
+                    hit = into_list(hit, end, values);
                 }
             }
             if let Some(prev) = out.last() {
-                let years = is_year(&prev.value) && is_year(&hit.value);
-                if self.connector_end(prev.range.end, years) == Some(hit.range.start)
+                // A list connector joins years, and any two dates after ระหว่าง or `between`.
+                let lists = (is_year(&prev.value) && is_year(&hit.value))
+                    || self.between_before(prev.range.start);
+                let days = matches!(
+                    (prev.value, hit.value),
+                    (DateValue::Day { .. }, DateValue::Day { .. })
+                );
+                let interval = days
+                    && self.get(prev.range.end) == Some('/')
+                    && hit.range.start == prev.range.end + 1;
+                if (interval || self.connector_end(prev.range.end, lists) == Some(hit.range.start))
                     && let Some(prev) = out.pop()
                 {
-                    out.push(into_range(
-                        prev,
-                        hit.range.end,
-                        hit.value,
-                        hit.conf,
-                        hit.flags,
-                    ));
+                    out.push(into_range(prev, &hit));
                     continue;
                 }
             }
@@ -1236,6 +1470,7 @@ impl Scanner<'_> {
                     flags: hit.flags,
                     alts: vec![(hit.value, CONF_RANGE)],
                     year: None,
+                    joined: true,
                 });
                 continue;
             }
@@ -1246,7 +1481,7 @@ impl Scanner<'_> {
         let mut parts = Vec::new();
         for (range, _, _) in &self.day_months {
             if let Some(start) = self
-                .connector_before(range.start)
+                .connector_before(range.start, true)
                 .and_then(|left_end| self.bare_day(left_end, 0).map(|(start, _)| start..left_end))
             {
                 parts.push(start);
@@ -1258,29 +1493,61 @@ impl Scanner<'_> {
         }
     }
 
-    /// A bare year after the marked year `year` that ends `hit`, joined by a connector or a
-    /// slash: where it ends and the reading of the range's end. Two digits continue the century
-    /// of four (`2567-69`), and no amount word may follow them.
-    fn year_after(&self, hit: &Hit, year: YearToken) -> Option<(usize, DateValue)> {
-        let at = if self.get(year.end) == Some('/') {
-            year.end + 1
-        } else {
-            self.connector_end(year.end, true)?
-        };
-        let next = self.year(at, &[2, 4])?;
-        if crate::numbers::amount_word_at(self.t, self.space(next.end)) {
-            return None;
-        }
-        let delta = if next.digits == 2 && year.digits == 4 {
-            let mut written = year.written - year.written.rem_euclid(100) + next.written;
-            if written <= year.written {
-                written += 100;
+    /// ระหว่าง or `between` right before `start` (one space and a filler word allowed): the
+    /// two dates after it, joined by และ, กับ or `and`, are the ends of a range.
+    fn between_before(&self, start: usize) -> bool {
+        let back = |at: usize| {
+            if at > 0 && self.get(at - 1) == Some(' ') {
+                at - 1
+            } else {
+                at
             }
-            Some(written - year.written).filter(|delta| (1..=20).contains(delta))
-        } else {
-            Some(next.written - year.written).filter(|delta| (1..=100).contains(&delta.abs()))
-        }?;
-        Some((next.end, shift_years(&hit.value, delta)?))
+        };
+        let mut at = back(start);
+        if let Some(filler) = FILLERS.iter().find(|filler| has_before(self.t, at, filler)) {
+            at = back(at - char_len(filler));
+        }
+        has_before(self.t, at, BETWEEN)
+            || (has_before(self.t, at, "between")
+                && self.latin_start(at - char_len("between"))
+                && self.latin_end(at))
+    }
+
+    /// Bare years after the marked year `year` that ends `hit`: a range (`ปี 2567-2569`,
+    /// `ปี 2567/68`, `ปี 2567 จนถึง 2569`) or a list (`ปี 2566, 2567 และ 2568`, with a space for a
+    /// comma too). Where the last ends and the reading of each. No amount word may follow one
+    /// (`ยอดขายปี 2567 ถึง 2570 ล้านบาท` reached an amount), and a year after a plain space joins
+    /// only when another connector follows it.
+    fn years_after(&self, hit: &Hit, year: YearToken) -> Option<(usize, Vec<DateValue>)> {
+        let mut values = Vec::new();
+        let mut end = year.end;
+        loop {
+            let (at, spaced) = if self.get(end) == Some('/') {
+                (end + 1, false)
+            } else if let Some(at) = self.connector_end(end, true) {
+                (at, false)
+            } else if self.get(end) == Some(' ') {
+                (end + 1, true)
+            } else {
+                break;
+            };
+            let Some(next) = self.year(at, &[2, 4]) else {
+                break;
+            };
+            if crate::numbers::amount_word_at(self.t, self.space(next.end))
+                || (spaced && self.connector_end(next.end, true).is_none())
+            {
+                break;
+            }
+            let Some(value) =
+                continued_delta(year, next).and_then(|delta| shift_years(&hit.value, delta))
+            else {
+                break;
+            };
+            values.push(value);
+            end = next.end;
+        }
+        (!values.is_empty()).then_some((end, values))
     }
 
     /// A bare day, a month name, or a day and month with no year, before `hit` with a connector
@@ -1292,7 +1559,7 @@ impl Scanner<'_> {
             DateValue::Month { year, month, era } => (year, month, era),
             _ => return None,
         };
-        let left_end = self.connector_before(hit.range.start)?;
+        let left_end = self.connector_before(hit.range.start, true)?;
         let in_year = |month: u32| if month > end_month { year - 1 } else { year };
         let day_month = self
             .day_months
@@ -1351,15 +1618,50 @@ fn quarter_of_year(mut reading: Reading) -> Reading {
     reading
 }
 
-/// `left` stretched to `end` as a range whose end reads `right`.
-fn into_range(left: Hit, end: usize, right: DateValue, right_conf: f32, right_flags: Flags) -> Hit {
+/// `left` stretched over `right` as a range or list that ends with it: `right` is one more
+/// alternative of a list `left` already began, else the only one (a two-digit year's other
+/// century is not repeated there).
+fn into_range(left: Hit, right: &Hit) -> Hit {
+    let mut alts = if left.joined { left.alts } else { Vec::new() };
+    alts.push((right.value, CONF_RANGE));
     Hit {
-        range: left.range.start..end,
+        range: left.range.start..right.range.end,
         value: left.value,
-        conf: CONF_RANGE.min(left.conf).min(right_conf),
-        flags: left.flags | right_flags,
-        alts: vec![(right, CONF_RANGE)],
+        conf: CONF_RANGE.min(left.conf).min(right.conf),
+        flags: left.flags | right.flags,
+        alts,
         year: None,
+        joined: true,
+    }
+}
+
+/// `hit` stretched to `end` over the years `values` after it.
+fn into_list(hit: Hit, end: usize, values: Vec<DateValue>) -> Hit {
+    Hit {
+        range: hit.range.start..end,
+        conf: CONF_RANGE.min(hit.conf),
+        alts: values
+            .into_iter()
+            .map(|value| (value, CONF_RANGE))
+            .collect(),
+        year: None,
+        joined: true,
+        ..hit
+    }
+}
+
+/// How many years `next` is after `first` when it may continue it in a range or a list: two
+/// digits continue the century of four (`2567-69`) and are 1 to 20 years on; four digits are
+/// within 100 years either way.
+fn continued_delta(first: YearToken, next: YearToken) -> Option<i32> {
+    if next.digits == 2 && first.digits == 4 {
+        let mut written = first.written - first.written.rem_euclid(100) + next.written;
+        if written <= first.written {
+            written += 100;
+        }
+        Some(written - first.written).filter(|delta| (1..=20).contains(delta))
+    } else {
+        Some(next.written - first.written).filter(|delta| (1..=100).contains(&delta.abs()))
     }
 }
 
