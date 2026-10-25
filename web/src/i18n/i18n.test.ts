@@ -36,6 +36,7 @@ const REASON_CODES = [
   'kat_paused_stopped',
   'mention_needs_space',
   'extra_mention_ignored',
+  'review_before_rerun',
 ];
 
 // API error codes the routes and guards can return (KatError::code) that a page shows.
@@ -105,6 +106,13 @@ describe('catalogues', () => {
     expect(en['reason.kat_paused_stopped']).toBe('Stopped because this Kat was paused. Send the request again after it resumes, or ask another Kat.');
     expect(th['reason.workspace_paused_stopped']).toBe('งานหยุดแล้ว เพราะ Kats ในเวิร์กสเปซนี้ถูกหยุดไว้ชั่วคราว โปรดส่งคำขออีกครั้งเมื่อเปิดใช้แล้ว');
     expect(th['reason.kat_paused_stopped']).toBe('งานหยุดแล้ว เพราะ Kat ที่รับงานนี้ถูกหยุดไว้ชั่วคราว โปรดส่งคำขออีกครั้งเมื่อเปิดใช้แล้ว หรือขอให้ Kat อื่นช่วยแทน');
+  });
+
+  test('review_before_rerun_copy_asks_for_a_review', () => {
+    expect(en).toHaveProperty(['reason.review_before_rerun']);
+    expect(th).toHaveProperty(['reason.review_before_rerun']);
+    expect(en['reason.review_before_rerun']).toContain('Check what changed');
+    expect(th['reason.review_before_rerun']).toContain('โปรดตรวจ');
   });
 
   test('thai_copy_names_a_space_one_way_and_asks_politely', () => {

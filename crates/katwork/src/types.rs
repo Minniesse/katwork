@@ -172,10 +172,11 @@ wire_enum!(ReasonCode {
     KatPausedStopped => "kat_paused_stopped",
     MentionNeedsSpace => "mention_needs_space",
     ExtraMentionIgnored => "extra_mention_ignored",
+    ReviewBeforeRerun => "review_before_rerun",
 });
 
 impl ReasonCode {
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 31] = [
         Self::ProviderUnavailable,
         Self::ProviderRateLimited,
         Self::ProviderQuota,
@@ -206,5 +207,6 @@ impl ReasonCode {
         Self::KatPausedStopped,
         Self::MentionNeedsSpace,
         Self::ExtraMentionIgnored,
+        Self::ReviewBeforeRerun,
     ];
 }
