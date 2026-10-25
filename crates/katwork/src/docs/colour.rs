@@ -2,9 +2,15 @@
 //! theme shared by the DOCX and XLSX readers.
 use quick_xml::{events::Event, name::ResolveResult};
 
-use super::{DocError, DocLimits, deadline, xml_guard};
+use super::{
+    DocError, DocLimits, deadline,
+    xml_guard::{self, ElementBudget},
+};
 
 const DRAWINGML: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
+const MC: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+/// The elements from the theme part's root to its colour scheme.
+const SCHEME_PATH: [&str; 3] = ["theme", "themeElements", "clrScheme"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Rgb {
@@ -131,22 +137,21 @@ impl SchemeSlot {
         })
     }
 
-    /// The slot named by an `a:clrScheme` child (`dk1`) or by `w:clrSchemeMapping`'s values
-    /// (`dark1`).
+    /// The slot an `a:clrScheme` child names (`dk1` to `folHlink`).
     pub(crate) fn from_name(name: &str) -> Option<SchemeSlot> {
         Some(match name {
-            "dk1" | "dark1" => SchemeSlot::Dk1,
-            "lt1" | "light1" => SchemeSlot::Lt1,
-            "dk2" | "dark2" => SchemeSlot::Dk2,
-            "lt2" | "light2" => SchemeSlot::Lt2,
+            "dk1" => SchemeSlot::Dk1,
+            "lt1" => SchemeSlot::Lt1,
+            "dk2" => SchemeSlot::Dk2,
+            "lt2" => SchemeSlot::Lt2,
             "accent1" => SchemeSlot::Accent1,
             "accent2" => SchemeSlot::Accent2,
             "accent3" => SchemeSlot::Accent3,
             "accent4" => SchemeSlot::Accent4,
             "accent5" => SchemeSlot::Accent5,
             "accent6" => SchemeSlot::Accent6,
-            "hlink" | "hyperlink" => SchemeSlot::Hlink,
-            "folHlink" | "followedHyperlink" => SchemeSlot::FolHlink,
+            "hlink" => SchemeSlot::Hlink,
+            "folHlink" => SchemeSlot::FolHlink,
             _ => return None,
         })
     }
@@ -182,49 +187,68 @@ impl ThemeColours {
         }
     }
 
-    /// Reads the first `a:clrScheme` of a theme part, after `xml_guard::scan`.
-    pub fn parse(theme_xml: &[u8], limits: &DocLimits) -> Result<ThemeColours, DocError> {
-        xml_guard::scan(theme_xml, limits, None)?;
+    /// Reads the colour scheme at `a:theme/a:themeElements/a:clrScheme`, after `xml_guard::scan`
+    /// (which takes the part's elements from `budget`). A part holding any markup-compatibility
+    /// element, a second scheme on that path, or an element of another namespace inside the
+    /// scheme leaves every slot unknown: which colours Word takes from it is not known then.
+    pub fn parse(
+        theme_xml: &[u8],
+        limits: &DocLimits,
+        budget: &mut ElementBudget,
+    ) -> Result<ThemeColours, DocError> {
+        xml_guard::scan(theme_xml, limits, None, budget)?;
         let mut reader = xml_guard::reader(theme_xml);
         let mut scheme = Scheme::default();
-        // The depth of the scheme's slot elements once its start tag is read.
-        let (mut depth, mut slots, mut done) = (0u32, None::<u32>, false);
+        // How many of the open elements, from the root, are the scheme's path so far.
+        let (mut depth, mut on_path) = (0usize, 0usize);
+        let (mut schemes, mut uncertain) = (0u32, false);
         for events in 0u64.. {
             if events.is_multiple_of(1024) {
                 deadline::check()?;
             }
             let (namespace, event) = reader.read_resolved_event().map_err(xml_guard::map_error)?;
-            let drawingml = matches!(namespace, ResolveResult::Bound(ns) if ns.0 == DRAWINGML);
+            let (drawingml, compatibility) = match namespace {
+                ResolveResult::Bound(ns) => (ns.0 == DRAWINGML, ns.0 == MC),
+                _ => (false, false),
+            };
             match &event {
                 Event::Start(start) | Event::Empty(start) => {
                     let empty = matches!(event, Event::Empty(_));
                     let name = start.local_name();
                     let local = name.as_ref();
-                    match slots {
-                        None if !done && drawingml && local == "clrScheme" => {
-                            slots = (!empty).then_some(depth + 1);
-                            done = empty;
-                        }
-                        Some(at) if depth == at => {
-                            scheme.open(SchemeSlot::from_name(local).filter(|_| drawingml));
-                            if empty {
-                                scheme.close();
+                    uncertain |= compatibility;
+                    if on_path == SCHEME_PATH.len() {
+                        // Inside the scheme: slots, their colours, then colour transforms.
+                        uncertain |= !drawingml;
+                        match depth - on_path {
+                            0 => {
+                                scheme.open(SchemeSlot::from_name(local).filter(|_| drawingml));
+                                if empty {
+                                    scheme.close();
+                                }
                             }
+                            1 => {
+                                let attribute = match (drawingml, local) {
+                                    (true, "srgbClr") => Some("val"),
+                                    (true, "sysClr") => Some("lastClr"),
+                                    _ => None,
+                                };
+                                let colour = attribute
+                                    .and_then(|attribute| unqualified(start, attribute))
+                                    .and_then(|value| parse_hex(&value));
+                                scheme.colour(colour);
+                            }
+                            // A colour transform (`a:lumMod`, `a:tint` ...) changes the colour.
+                            _ => scheme.plain = false,
                         }
-                        Some(at) if depth == at + 1 => {
-                            let attribute = match (drawingml, local) {
-                                (true, "srgbClr") => Some("val"),
-                                (true, "sysClr") => Some("lastClr"),
-                                _ => None,
-                            };
-                            let colour = attribute
-                                .and_then(|attribute| unqualified(start, attribute))
-                                .and_then(|value| parse_hex(&value));
-                            scheme.colour(colour);
+                    } else if depth == on_path && drawingml && local == SCHEME_PATH[on_path] {
+                        on_path += 1;
+                        if on_path == SCHEME_PATH.len() {
+                            schemes += 1;
                         }
-                        // A colour transform (`a:lumMod`, `a:tint` ...) changes the colour.
-                        Some(at) if depth > at + 1 => scheme.plain = false,
-                        _ => {}
+                        if empty {
+                            on_path -= 1;
+                        }
                     }
                     if !empty {
                         depth += 1;
@@ -232,15 +256,19 @@ impl ThemeColours {
                 }
                 Event::End(_) => {
                     depth -= 1;
-                    match slots {
-                        Some(at) if depth == at => scheme.close(),
-                        Some(at) if depth + 1 == at => (slots, done) = (None, true),
-                        _ => {}
+                    if on_path == SCHEME_PATH.len() && depth == on_path {
+                        scheme.close();
                     }
+                    on_path = on_path.min(depth);
                 }
                 Event::Eof => break,
                 _ => {}
             }
+        }
+        if uncertain || schemes > 1 {
+            return Ok(ThemeColours {
+                colours: [None; 12],
+            });
         }
         Ok(ThemeColours {
             colours: scheme.colours,

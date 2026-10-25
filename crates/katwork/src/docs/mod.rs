@@ -213,13 +213,27 @@ pub enum TextLayer {
     Absent,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtractWarning {
-    HiddenContent { ordinal: u32, why: &'static str },
-    SuspectTextLayer { page: u32, why: &'static str },
-    NoTextLayer { page: u32 },
-    ActiveContentIgnored { what: &'static str },
-    EmbeddedContentIgnored { what: &'static str },
+    /// Hidden text left out of the block at `at` (for DOCX, the paragraph, named by its part and
+    /// ordinal, since ordinals restart in each part).
+    HiddenContent {
+        at: Locator,
+        why: &'static str,
+    },
+    SuspectTextLayer {
+        page: u32,
+        why: &'static str,
+    },
+    NoTextLayer {
+        page: u32,
+    },
+    ActiveContentIgnored {
+        what: &'static str,
+    },
+    EmbeddedContentIgnored {
+        what: &'static str,
+    },
     FullCalcOnLoad,
 }
 

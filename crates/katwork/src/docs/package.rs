@@ -119,13 +119,19 @@ impl Package {
 struct EndRecord {
     entries: u64,
     directory_offset: u64,
+    directory_size: u64,
+    /// Where the directory must end: at the ZIP64 end record when there is one, else at the end
+    /// record.
+    directory_end: u64,
 }
 
 /// Opens an OOXML package: one end record ending exactly at the end of the file, at most
 /// `max_zip_entries` entries (refused before the directory is parsed), no bytes before the
-/// archive, local headers that agree with the directory, no overlapping entries, unique ASCII
-/// names under ASCII case folding with no `..`, `\` or leading `/`, no encryption, only stored
-/// and deflated entries, and at most `max_unzipped_bytes` actually inflated.
+/// archive, a directory whose headers fill exactly the size the end record gives (no gap, no
+/// header past the counted ones), local headers that agree with the directory, no overlapping
+/// entries, unique ASCII names under ASCII case folding with no `..`, `\` or leading `/`, no
+/// encryption, only stored and deflated entries, and at most `max_unzipped_bytes` actually
+/// inflated.
 pub fn open_package(bytes: &[u8], limits: &DocLimits) -> Result<Package, DocError> {
     if bytes.len() as u64 > limits.max_input_bytes {
         return Err(DocError::TooLarge("input"));
@@ -133,6 +139,11 @@ pub fn open_package(bytes: &[u8], limits: &DocLimits) -> Result<Package, DocErro
     let end = end_record(bytes)?;
     if end.entries > u64::from(limits.max_zip_entries) || end.entries > u64::from(u16::MAX) {
         return Err(DocError::TooComplex("zip_entries"));
+    }
+    // A reader that walks the directory by its size would see other headers than the count
+    // gives: bytes left over, or a header past the counted ones.
+    if end.directory_offset.checked_add(end.directory_size) != Some(end.directory_end) {
+        return Err(DocError::Malformed("zip_directory"));
     }
     let config = Config {
         archive_offset: ArchiveOffset::Known(0),
@@ -152,6 +163,9 @@ pub fn open_package(bytes: &[u8], limits: &DocLimits) -> Result<Package, DocErro
     }
     let mut folded = HashSet::with_capacity(archive.len());
     let mut names = Vec::with_capacity(archive.len());
+    // Where the next central header must start: the headers follow one another from the
+    // directory's start, and the last ends where the directory does.
+    let mut next = end.directory_offset;
     for at in 0..archive.len() {
         if at % 1024 == 1023 {
             deadline::check()?;
@@ -170,10 +184,18 @@ pub fn open_package(bytes: &[u8], limits: &DocLimits) -> Result<Package, DocErro
         if method != CompressionMethod::STORE && method != CompressionMethod::DEFLATE {
             return Err(DocError::Malformed("zip_method"));
         }
-        if has_unicode_path(bytes, entry.central_header_start())? {
+        if entry.central_header_start() != next {
+            return Err(DocError::Malformed("zip_directory"));
+        }
+        let (header_end, unicode_path) = central_header(bytes, next)?;
+        if unicode_path {
             return Err(DocError::Malformed("zip_name"));
         }
+        next = header_end;
         names.push((name, entry.size(), entry.compressed_size()));
+    }
+    if next != end.directory_end {
+        return Err(DocError::Malformed("zip_directory"));
     }
     archive
         .validate_header_consistency()
@@ -201,17 +223,25 @@ pub fn open_package(bytes: &[u8], limits: &DocLimits) -> Result<Package, DocErro
     Ok(Package { entries, index })
 }
 
-/// Finds the one end record, refusing a second one (a decoy in the comment included) anywhere
-/// from the central directory on, and follows a ZIP64 locator when the counts overflow.
+/// Finds the one end record, refusing a second one (a decoy in the comment included) from the
+/// central directory's start or the scan window's start (the last 64 KiB and 22 bytes),
+/// whichever is later, and follows a ZIP64 locator when a count, the directory size or its
+/// offset overflows (the markers the `zip` crate follows it on).
 fn end_record(bytes: &[u8]) -> Result<EndRecord, DocError> {
     let malformed = DocError::Malformed("zip_end_record");
     if bytes.len() < END_LEN {
         return Err(DocError::Malformed("zip"));
     }
     let floor = bytes.len().saturating_sub(END_LEN + usize::from(u16::MAX));
-    let signatures: Vec<usize> = (floor..=bytes.len() - END_LEN)
-        .filter(|&at| &bytes[at..at + 4] == END)
-        .collect();
+    let mut signatures = Vec::new();
+    for at in floor..=bytes.len() - END_LEN {
+        if (at - floor) % 1024 == 1023 {
+            deadline::check()?;
+        }
+        if &bytes[at..at + 4] == END {
+            signatures.push(at);
+        }
+    }
     let mut ending_here = signatures
         .iter()
         .copied()
@@ -221,13 +251,18 @@ fn end_record(bytes: &[u8]) -> Result<EndRecord, DocError> {
     };
     let (disk, directory_disk) = (u16_at(bytes, at + 4), u16_at(bytes, at + 6));
     let (disk_entries, entries) = (u16_at(bytes, at + 8), u16_at(bytes, at + 10));
-    let directory_offset = u32_at(bytes, at + 16);
+    let (directory_size, directory_offset) = (u32_at(bytes, at + 12), u32_at(bytes, at + 16));
     let mut record = EndRecord {
         entries: u64::from(entries),
         directory_offset: u64::from(directory_offset),
+        directory_size: u64::from(directory_size),
+        directory_end: at as u64,
     };
-    let mut directory_end = at;
-    if entries == u16::MAX || disk_entries == u16::MAX || directory_offset == u32::MAX {
+    if entries == u16::MAX
+        || disk_entries == u16::MAX
+        || directory_size == u32::MAX
+        || directory_offset == u32::MAX
+    {
         // The ZIP64 locator sits right before the end record and points at the ZIP64 record.
         let locator = at.checked_sub(20).ok_or(malformed)?;
         if &bytes[locator..locator + 4] != ZIP64_LOCATOR || u32_at(bytes, locator + 4) != 0 {
@@ -243,12 +278,13 @@ fn end_record(bytes: &[u8]) -> Result<EndRecord, DocError> {
             return Err(malformed);
         }
         record.entries = u64_at(bytes, zip64 + 32);
+        record.directory_size = u64_at(bytes, zip64 + 40);
         record.directory_offset = u64_at(bytes, zip64 + 48);
-        directory_end = zip64;
+        record.directory_end = zip64 as u64;
     } else if disk != 0 || directory_disk != 0 || disk_entries != entries {
         return Err(malformed);
     }
-    if record.directory_offset > directory_end as u64 {
+    if record.directory_offset > record.directory_end {
         return Err(malformed);
     }
     if signatures
@@ -274,9 +310,10 @@ fn entry_name(raw: &[u8]) -> Result<String, DocError> {
     Ok(name.to_owned())
 }
 
-/// Whether the central header at `header` carries a Unicode Path extra field, which would give
-/// the entry a second name that other readers use.
-fn has_unicode_path(bytes: &[u8], header: u64) -> Result<bool, DocError> {
+/// Where the central header at `header` ends (its name, extra field and comment included), and
+/// whether it carries a Unicode Path extra field, which would give the entry a second name that
+/// other readers use.
+fn central_header(bytes: &[u8], header: u64) -> Result<(u64, bool), DocError> {
     let malformed = DocError::Malformed("zip_directory");
     let header = usize::try_from(header).map_err(|_| malformed)?;
     if header.checked_add(46).is_none_or(|end| end > bytes.len()) {
@@ -284,17 +321,22 @@ fn has_unicode_path(bytes: &[u8], header: u64) -> Result<bool, DocError> {
     }
     let name_len = usize::from(u16_at(bytes, header + 28));
     let extra_len = usize::from(u16_at(bytes, header + 30));
+    let comment_len = usize::from(u16_at(bytes, header + 32));
     let start = header + 46 + name_len;
     let extra = bytes.get(start..start + extra_len).ok_or(malformed)?;
+    let end = start + extra_len + comment_len;
+    if end > bytes.len() {
+        return Err(malformed);
+    }
     let mut fields = extra;
     while fields.len() >= 4 {
         let (id, len) = (u16_at(fields, 0), usize::from(u16_at(fields, 2)));
         if id == UNICODE_PATH {
-            return Ok(true);
+            return Ok((end as u64, true));
         }
         fields = fields.get(4 + len..).unwrap_or_default();
     }
-    Ok(false)
+    Ok((end as u64, false))
 }
 
 /// Inflates entry `at` in 64 KiB chunks through a reader capped at `remaining` plus one byte,

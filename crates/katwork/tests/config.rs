@@ -1239,3 +1239,32 @@ fn doc_workers_is_one_to_sixteen() {
         assert_eq!(error.to_string(), "config_invalid (KATWORK_DOC_WORKERS)");
     }
 }
+
+#[test]
+fn doc_max_xml_elements_is_bounded() {
+    let elements = |value: Option<&str>| {
+        Config::from_lookup(|name| {
+            if name == "KATWORK_DOC_MAX_XML_ELEMENTS" {
+                value.map(str::to_owned)
+            } else {
+                lookup(name)
+            }
+        })
+    };
+    let default = katwork::docs::DocLimits::default().max_xml_elements;
+    for (value, expected) in [
+        (None, default),
+        (Some(""), default),
+        (Some("1000"), 1_000),
+        (Some("20000000"), 20_000_000),
+    ] {
+        assert_eq!(elements(value).unwrap().doc_max_xml_elements, expected);
+    }
+    for value in ["999", "20000001", "-1", "+1000", "1e6", "1,000"] {
+        let error = elements(Some(value)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "config_invalid (KATWORK_DOC_MAX_XML_ELEMENTS)"
+        );
+    }
+}

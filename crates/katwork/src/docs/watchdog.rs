@@ -61,9 +61,10 @@ impl Watchdog {
     }
 }
 
-/// Ticks `watchdog` every `period` on its own thread, and returns after the first tick that
-/// fired (in the server that tick never returns: it exits the process).
-pub fn spawn(mut watchdog: Watchdog, period: Duration) -> JoinHandle<()> {
+/// Ticks `watchdog` every `period` on its own thread, which returns after the first tick that
+/// fired (in the server that tick never returns: it exits the process). A thread that cannot be
+/// spawned is this function's error, so the server does not start without its watchdog.
+pub fn spawn(mut watchdog: Watchdog, period: Duration) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("doc-watchdog".into())
         .spawn(move || {
@@ -74,5 +75,4 @@ pub fn spawn(mut watchdog: Watchdog, period: Duration) -> JoinHandle<()> {
                 }
             }
         })
-        .expect("spawn the document pool watchdog")
 }

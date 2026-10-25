@@ -190,7 +190,12 @@ impl DocPool {
         };
         tokio::select! {
             biased;
-            result = result_rx => result.unwrap_or(Err(DocError::Internal)),
+            // A job that saw its deadline pass (it checks the earlier of the two) stopped for the
+            // same reason the timer below would have fired.
+            result = result_rx => match result.unwrap_or(Err(DocError::Internal)) {
+                Err(DocError::Timeout) => Err(stop),
+                other => other,
+            },
             () = token.cancelled() => Err(DocError::Cancelled),
             () = tokio::time::sleep_until(tokio::time::Instant::from_std(stop_at)) => Err(stop),
         }

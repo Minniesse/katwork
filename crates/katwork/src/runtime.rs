@@ -25,7 +25,7 @@ impl Core {
     pub fn start(pool: PgPool, config: Arc<Config>) -> Result<Self, KatError> {
         let registry = Arc::new(Registry::from_config(&config));
         let mailer = crate::auth::mailer::from_config(&config);
-        let docs = Arc::new(DocPool::new(config.doc_workers, doc_limits())?);
+        let docs = Arc::new(DocPool::new(config.doc_workers, doc_limits(&config))?);
         Ok(Self {
             events: crate::events::EventHub::new(),
             shutdown: tokio_util::sync::CancellationToken::new(),
@@ -54,8 +54,11 @@ impl Core {
     }
 }
 
-fn doc_limits() -> DocLimits {
-    let limits = DocLimits::default();
+fn doc_limits(config: &Config) -> DocLimits {
+    let limits = DocLimits {
+        max_xml_elements: config.doc_max_xml_elements,
+        ..DocLimits::default()
+    };
     // The smoke stack wedges the pool on purpose and needs the watchdog to fire in seconds.
     #[cfg(feature = "smoke-fixtures")]
     let limits = match std::env::var("KATWORK_SMOKE_DOC_CALL_TIMEOUT_MS")

@@ -232,7 +232,7 @@ async fn run() -> Result<(), KatError> {
             let transport = config.transport.clone();
             let core = Arc::new(Core::start(pool, config)?);
             core.registry.log_tiers();
-            katwork_server::spawn_doc_watchdog(&core);
+            katwork_server::spawn_doc_watchdog(&core)?;
             #[cfg(feature = "smoke-fixtures")]
             if let Some(marker) = std::env::var_os("KATWORK_SMOKE_WEDGE_ONCE") {
                 katwork::docs::pool::smoke::wedge_once(&core.docs, std::path::Path::new(&marker))?;

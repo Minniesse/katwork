@@ -30,7 +30,10 @@ checks that the committed seeds are exactly the files listed, with these hashes.
 | `docx/hidden-runs.docx` | `dbf55d840673fba619137e42b5944b0fd2d9bb045a473b999a0633e09473df25` | vanished, white, tiny and highlighted runs |
 | `docx/styles.docx` | `e4c59326ed12a79f86f5052efb3d94802092ae9afa372cc372a301c5b2cc2b27` | default, based-on, character and paragraph styles |
 | `docx/theme.docx` | `6b055c273eb8d9864fb924f8e3c76a8235c495ec628db70fdc3107c8c94a7a64` | a theme, its scheme mapping, a page colour and themed shading |
-| `docx/alternate-content.docx` | `ef522df7b2547d2f85b352fbad71c7b5420bd8a7ad46cc3acbbbdf9c56c6aa9b` | a text box in mc:Choice and mc:Fallback |
+| `docx/alternate-content.docx` | `df18fb654edfbfb9f5d45fe15adf7e943ad18dbf1de75764642d1ce7ef20b9e7` | a text box in mc:Choice and mc:Fallback |
+| `docx/shapes.docx` | `f488a5abeec539213baf2f11c2fbdae80f39883658cb268d8b975ad12a6590ed` | text boxes with fills, a hidden shape, a VML shapetype and a nested table |
+| `docx/fields.docx` | `fe2620fa01c0fb8c35f965e2adff3bda78d6a56a1e381bde5f92aac94894f1e8` | fields Word recomputes, a hyperlink, a data-bound control and symbols |
+| `docx/uncertain.docx` | `4b68fc8faab395ba7533212e1f91be3f9c70451090ca6aea9fd56416dc44cc04` | a choice the reader does not understand, undecided properties and tracked table changes |
 | `docx/entities.docx` | `a5309df9e78c6fea173572a491a2a02e9814895e564c34c90e36ab03506a0413` | entity and character references |
 | `docx/notes.docx` | `5541c4c15c536ac3c6fbb4ef69888a8e80c4317fea47a2a7f369aa1a4970c1b3` | a header, a footer, footnotes and endnotes |
 | `docx/strict.docx` | `8a23951a689ec0c902730a14a06f21274225f872f243ea4585154697b941c643` | a Strict OOXML main part |

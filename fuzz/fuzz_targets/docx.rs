@@ -10,6 +10,7 @@ fn limits() -> DocLimits {
         max_unzipped_bytes: 4 << 20,
         max_zip_entries: 64,
         max_xml_depth: 32,
+        max_xml_elements: 100_000,
         ..DocLimits::default()
     }
 }

@@ -108,7 +108,7 @@ fn decode(bytes: &[u8]) -> Result<Cow<'_, str>, DocError> {
         let mut text = String::with_capacity(rest.len());
         let units = rest.as_chunks::<2>().0.iter().map(|&pair| unit(pair));
         for (index, decoded) in char::decode_utf16(units).enumerate() {
-            if index % 65_536 == 65_535 {
+            if index % 1024 == 1023 {
                 deadline::check()?;
             }
             text.push(decoded.map_err(|_| malformed)?);

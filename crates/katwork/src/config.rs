@@ -9,6 +9,9 @@ pub struct Config {
     pub lock_timeout: Duration,
     /// `KATWORK_DOC_WORKERS`: the document pool's threads, 1 to 16.
     pub doc_workers: usize,
+    /// `KATWORK_DOC_MAX_XML_ELEMENTS`: the XML elements one document may hold across its parts
+    /// (`DocLimits::max_xml_elements`), 1,000 to 20,000,000.
+    pub doc_max_xml_elements: u64,
     pub database_url: String,
     pub secret: String,
     pub demo: bool,
@@ -417,6 +420,16 @@ impl Config {
                 .filter(|workers| (1..=16).contains(workers))
                 .ok_or(invalid("KATWORK_DOC_WORKERS"))?,
         };
+        let doc_max_xml_elements = match optional("KATWORK_DOC_MAX_XML_ELEMENTS") {
+            None => crate::docs::DocLimits::default().max_xml_elements,
+            Some(value) => value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+                .then(|| value.parse::<u64>().ok())
+                .flatten()
+                .filter(|elements| (1_000..=20_000_000).contains(elements))
+                .ok_or(invalid("KATWORK_DOC_MAX_XML_ELEMENTS"))?,
+        };
         let smtp = if let Some(host) = optional("SMTP_HOST") {
             if host.contains('@') {
                 return Err(invalid("SMTP_HOST"));
@@ -457,6 +470,7 @@ impl Config {
         Ok(Self {
             lock_timeout,
             doc_workers,
+            doc_max_xml_elements,
             local,
             database_url,
             secret,

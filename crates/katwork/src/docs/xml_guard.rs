@@ -17,10 +17,39 @@ pub struct XmlStats {
     pub counted: u64,
 }
 
+/// What is left of one package's `max_xml_elements`. Every part `scan` passes takes its elements
+/// from the same budget, so a package of many parts is held to the total one part would be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElementBudget {
+    left: u64,
+}
+
+impl ElementBudget {
+    pub fn new(limits: &DocLimits) -> ElementBudget {
+        ElementBudget {
+            left: limits.max_xml_elements,
+        }
+    }
+
+    fn take(&mut self) -> Result<(), DocError> {
+        self.left = self
+            .left
+            .checked_sub(1)
+            .ok_or(DocError::TooComplex("xml_elements"))?;
+        Ok(())
+    }
+}
+
 /// Checks that `part` is one well-formed UTF-8 XML document with no DTD, at most
 /// `max_xml_depth` deep, whose entity references are the five predefined ones or character
-/// references to XML `Char`s, and counts the elements named `count`.
-pub fn scan(part: &[u8], limits: &DocLimits, count: Option<&[u8]>) -> Result<XmlStats, DocError> {
+/// references to XML `Char`s, and whose elements fit in what is left of `budget`; counts the
+/// elements named `count`.
+pub fn scan(
+    part: &[u8],
+    limits: &DocLimits,
+    count: Option<&[u8]>,
+    budget: &mut ElementBudget,
+) -> Result<XmlStats, DocError> {
     if part.starts_with(&[0xFF, 0xFE])
         || part.starts_with(&[0xFE, 0xFF])
         || part.starts_with(&[0, b'<'])
@@ -46,11 +75,13 @@ pub fn scan(part: &[u8], limits: &DocLimits, count: Option<&[u8]>) -> Result<Xml
             }
             Event::DocType(_) => return Err(DocError::Malformed("doctype")),
             Event::Start(start) => {
+                budget.take()?;
                 element(&reader, &start, limits, depth, &mut roots)?;
                 stats.count(&start, count);
                 depth += 1;
             }
             Event::Empty(start) => {
+                budget.take()?;
                 element(&reader, &start, limits, depth, &mut roots)?;
                 stats.count(&start, count);
             }

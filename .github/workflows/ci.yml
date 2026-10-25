@@ -107,8 +107,33 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+      # The fuzz crate has its own lock file: every package it shares with the product must be at
+      # a version the product's lock holds, so the parsers fuzzed are the ones the server runs.
+      - name: The fuzz lock matches the product's
+        run: |
+          python3 - <<'PY'
+          import sys, tomllib
+
+          def versions(path):
+              found = {}
+              with open(path, "rb") as file:
+                  for package in tomllib.load(file).get("package", []):
+                      found.setdefault(package["name"], set()).add(package["version"])
+              return found
+
+          product, fuzz = versions("Cargo.lock"), versions("fuzz/Cargo.lock")
+          drift = sorted(
+              f"{name} {sorted(fuzz[name] - product[name])}, product {sorted(product[name])}"
+              for name in fuzz.keys() & product.keys()
+              if not fuzz[name] <= product[name]
+          )
+          for line in drift:
+              print("fuzz/Cargo.lock drifted:", line)
+          sys.exit(1 if drift else 0)
+          PY
       # A workflow skipped by a paths filter would leave this required check pending, so the job
-      # always runs and fuzzes only when the readers or the fuzz crate changed.
+      # always runs and fuzzes only when the readers, the fuzz crate or the locked versions
+      # changed.
       - name: Check whether the readers changed
         id: changed
         env:
@@ -116,8 +141,8 @@ jobs:
         run: |
           if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
             echo "run=true" >> "$GITHUB_OUTPUT"
-          elif git diff --quiet "$BASE" HEAD -- crates/katwork/src/docs fuzz; then
-            echo 'SKIP fuzz-smoke: crates/katwork/src/docs and fuzz are unchanged.'
+          elif git diff --quiet "$BASE" HEAD -- crates/katwork/src/docs fuzz Cargo.lock; then
+            echo 'SKIP fuzz-smoke: crates/katwork/src/docs, fuzz and Cargo.lock are unchanged.'
             echo "run=false" >> "$GITHUB_OUTPUT"
           else
             echo "run=true" >> "$GITHUB_OUTPUT"

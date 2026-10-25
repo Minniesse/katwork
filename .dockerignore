@@ -1,6 +1,9 @@
 .git
 .superpowers
 target
+fuzz/target
+fuzz/artifacts
+fuzz/coverage
 node_modules
 **/node_modules
 **/dist
