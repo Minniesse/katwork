@@ -1,6 +1,6 @@
 # 0011. Craft apps in KatWork: Kats drive them behind a policy proxy, people watch and take over through one bridge
 
-- Status: Proposed (2026-10-24), with the sub-project 2a plan's Craft round (founder decisions R23–R28, R33 and R34); it becomes Accepted when the founder approves that round
+- Status: Proposed (2026-10-24), with the sub-project 2a plan's Craft round (founder decisions R23–R28, R33 and R34, and R35, decided by the coordinator under the founder's delegation of 2026-10-25); it becomes Accepted when the founder approves that round
 - Decision owner: Founder
 - Spec: §1.2, §2, §5.2, §9, §9.1, §10, §13, §17, §18, §19 items 2 and 7; amends §1.2's "live Kat control" non-goal and §9.1, and extends `docs/adr/0007-evidence-model-and-source-refs.md` (claims carried across versions, the `not_checked` outcome)
 
