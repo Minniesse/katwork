@@ -1,13 +1,15 @@
 //! KatWork's DOCX reader (`docx-accepted` version 1): the accepted view (tracked changes
 //! accepted) of the main part, then its headers, footers, footnotes and endnotes, with hidden
-//! runs excluded. Where what Word draws cannot be decided, the text counts as hidden; where a
-//! hidden run, a picture or a symbol the reader cannot decode is left out between two visible
-//! stretches of a paragraph, U+FFFC stands in the gap, so the stretches never join into a
-//! figure or a date Word does not show.
+//! runs excluded. Where what Word draws cannot be decided, the text counts as hidden; where
+//! markup is written twice, each reading of it is judged and the text is hidden if any hides
+//! it. Where a hidden run, a picture, an equation or a symbol the reader cannot decode is left
+//! out between two visible stretches of a paragraph, or text Word draws is left out at either
+//! end, U+FFFC stands in the gap, so no figure or date Word does not show is formed.
 use std::{
-    cell::RefCell,
+    cell::{OnceCell, RefCell},
     collections::{BTreeMap, HashMap, HashSet},
     rc::Rc,
+    sync::Arc,
 };
 
 use quick_xml::{
@@ -27,6 +29,7 @@ use super::{
 
 const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const W14: &str = "http://schemas.microsoft.com/office/word/2010/wordml";
+const W15: &str = "http://schemas.microsoft.com/office/word/2012/wordml";
 const W16SE: &str = "http://schemas.microsoft.com/office/word/2015/wordml/symex";
 const MC: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
 const WP: &str = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
@@ -46,7 +49,7 @@ const STRICT: &str = "http://purl.oclc.org/ooxml/";
 /// however much it looks like Word's.
 const UNDERSTOOD: [&str; 19] = [
     W14,
-    "http://schemas.microsoft.com/office/word/2012/wordml",
+    W15,
     W16SE,
     "http://schemas.microsoft.com/office/word/2016/wordml/cid",
     "http://schemas.microsoft.com/office/word/2018/wordml",
@@ -72,13 +75,13 @@ const MAX_STYLE_CHAIN: usize = 16;
 const MAX_PARAGRAPH_RUNS: usize = 65_536;
 /// Styles one styles part may define; more is refused before the style map grows further.
 const MAX_STYLES: usize = 65_536;
-/// The characters of a field's instruction kept to read its type.
+/// The longest field type read: a longer first word names no type the reader knows, and leaves
+/// the field undecided.
 const MAX_FIELD_CODE: usize = 64;
 /// `w:tblLook` when a table has none: Word's default (first row, first column, no column bands).
 const WORD_TABLE_LOOK: u16 = 0x04A0;
-/// What stands where the reader left out something Word draws between two visible stretches of
-/// a paragraph: Task 1's scanners read no figure or date across it, and neither `normalize_th`
-/// nor `match_key` removes it.
+/// What stands where the reader left out something Word draws: Task 1's scanners read no figure
+/// or date across it, and neither `normalize_th` nor `match_key` removes it.
 const GAP: char = '\u{FFFC}';
 /// Word's largest page side, 22 inches, in EMU: a shape that far off its anchor is off the page
 /// wherever the anchor lands.
@@ -121,11 +124,13 @@ const LAYOUT_COMPUTED: [&str; 12] = [
     "AUTONUMOUT",
     "LISTNUM",
 ];
+/// Fields Word draws from their code or form data rather than from the result the file holds.
+const DRAWN_FROM_CODE: [&str; 5] = ["EQ", "MACROBUTTON", "GOTOBUTTON", "SYMBOL", "FORMDROPDOWN"];
 /// Why text is hidden when it sits where Word's choice cannot be decided (an unknown namespace,
 /// a markup-compatibility branch Word may take differently).
 const UNKNOWN_NAMESPACE: &str = "unknown_namespace";
 /// Why text is hidden when the markup around it is one Word would not read as the reader does
-/// (a property written twice, a run outside a run's place, a style based on another kind).
+/// (a container written twice, a run outside a run's place, a style based on another kind).
 const UNDECIDED: &str = "undecided";
 
 /// Which story a part tells: field results in headers and footers are recomputed on every page.
@@ -141,7 +146,8 @@ pub(super) fn read(bytes: &[u8], limits: &DocLimits) -> Result<Extracted, DocErr
     let mut budget = ElementBudget::new(limits);
     let root_rels = relationships(&package, "", limits, &mut budget)?
         .ok_or(DocError::Malformed("docx_rels"))?;
-    if root_rels.iter().any(|rel| rel.kind.starts_with(STRICT)) {
+    let strict = |rels: &[Relationship]| rels.iter().any(|rel| rel.kind.starts_with(STRICT));
+    if strict(&root_rels) {
         return Err(DocError::Unsupported("strict_ooxml"));
     }
     let office_document = format!("{RELATIONSHIP}officeDocument");
@@ -154,6 +160,10 @@ pub(super) fn read(bytes: &[u8], limits: &DocLimits) -> Result<Extracted, DocErr
         .filter(|name| package.part(name).is_some())
         .ok_or(DocError::Malformed("docx_main_part"))?;
     let rels = relationships(&package, &main_name, limits, &mut budget)?.unwrap_or_default();
+    // A Strict part named from a transitional package: the reader would pass it over.
+    if strict(&rels) {
+        return Err(DocError::Unsupported("strict_ooxml"));
+    }
 
     let mut warnings = Warnings::new(limits.max_blocks);
     if package.part("word/vbaProject.bin").is_some()
@@ -226,6 +236,7 @@ pub(super) fn read(bytes: &[u8], limits: &DocLimits) -> Result<Extracted, DocErr
         page_seen: false,
         blocks: Vec::new(),
         warnings,
+        props_twice: false,
         last_beneath: None,
     };
     let main_xml = package.part(&main_name).unwrap_or_default();
@@ -334,11 +345,16 @@ fn relationships(
                         if found.len() as u64 >= u64::from(limits.max_zip_entries) {
                             return Err(DocError::TooComplex("relationships"));
                         }
-                        let mode = walker.attr(&start, None, "TargetMode")?;
+                        // A mode that is neither leaves where the part is undecided.
+                        let external = match walker.attr(&start, None, "TargetMode")?.as_deref() {
+                            None | Some("Internal") => false,
+                            Some("External") => true,
+                            Some(_) => return Err(DocError::Malformed("docx_rels")),
+                        };
                         found.push(Relationship {
                             kind,
                             target: walker.attr(&start, None, "Target")?,
-                            external: mode.is_some_and(|mode| mode != "Internal"),
+                            external,
                             base: base.clone(),
                         });
                     }
@@ -482,11 +498,13 @@ impl<'i> Walker<'i> {
         }
     }
 
+    /// Character data; directly in `mc:AlternateContent`, outside its branches, it is markup Word
+    /// does not read there.
     fn text(&self, text: String) -> Item<'i> {
         Item::Text {
             text,
             skipped: self.skipped > 0,
-            hidden: self.hidden > 0,
+            hidden: self.hidden > 0 || self.in_alternate(),
         }
     }
 
@@ -878,7 +896,7 @@ enum Pattern {
     Nil,
     Solid,
     Percent(u8),
-    /// Stripes, crosses, or a value that is missing or unknown: both of its colours show.
+    /// Stripes, crosses, or a value that is unknown: both of its colours show.
     Other,
 }
 
@@ -901,7 +919,8 @@ impl Shading {
                 .and_then(|digits| digits.parse::<u8>().ok())
                 .filter(|&percent| percent <= 100)
                 .map_or(Pattern::Other, Pattern::Percent),
-            None => Pattern::Other,
+            // Word draws the fill of a `w:shd` with no pattern, as for `clear`.
+            None => Pattern::Clear,
         };
         Ok(Shading {
             pattern,
@@ -940,8 +959,8 @@ impl Highlight {
     }
 }
 
-/// Sets `bit` in `seen`; true when it was set already (a property written twice in one place,
-/// which Word's schema does not allow, so which one Word takes is not known).
+/// Sets `bit` in `seen`; true when it was set already: a property written twice in one place,
+/// which Word's schema does not allow.
 fn repeated(seen: &mut u32, bit: Option<u32>) -> bool {
     let Some(bit) = bit else {
         return false;
@@ -952,12 +971,93 @@ fn repeated(seen: &mut u32, bit: Option<u32>) -> bool {
     again
 }
 
+/// A style id, interned when the styles part is read. Ids the styles part does not define are
+/// never interned: a reference to one names no style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct StyleId(u32);
+
+/// The longest style id the styles part may define; a longer one is refused.
+const MAX_STYLE_ID: usize = 256;
+
+/// How the reader takes what Word's choice is not known for, each way judged: a style id defined
+/// twice (`styles_first`: its first definition, else its last), a property written twice in one
+/// place (`props_first`: the first value, else the last), and a table style band size that is
+/// missing or 0 (`bands_off`: no banding, else bands of one). Text is hidden when any reading
+/// hides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+struct Reading {
+    styles_first: bool,
+    props_first: bool,
+    bands_off: bool,
+}
+
+/// One value as each reading of a value written twice sees it: `first` is kept only when the
+/// first value differs from the last.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct Twice<T> {
+    last: T,
+    first: Option<T>,
+}
+
+impl<T: Copy + PartialEq> Twice<T> {
+    /// Sets the value; `again` when it was written before in the same place. True when the
+    /// readings now differ.
+    fn set(&mut self, value: T, again: bool) -> bool {
+        if again && self.first.is_none() && self.last != value {
+            self.first = Some(self.last);
+        }
+        self.last = value;
+        self.first.is_some()
+    }
+
+    fn at(&self, reading: Reading) -> T {
+        match self.first {
+            Some(first) if reading.props_first => first,
+            _ => self.last,
+        }
+    }
+}
+
+/// Properties that keep, besides the last value of each, the first value of any written twice.
+trait TwoReadings: Clone + PartialEq + Sized {
+    fn first_mut(&mut self) -> &mut Option<Box<Self>>;
+    fn first_ref(&self) -> Option<&Self>;
+
+    /// The properties as `reading` takes them.
+    fn at(&self, reading: Reading) -> &Self {
+        match self.first_ref() {
+            Some(first) if reading.props_first => first,
+            _ => self,
+        }
+    }
+
+    /// Applies `apply` to both readings, or, for a property written again (`again`), to the last
+    /// only, keeping what the first reading saw. True when the readings now differ.
+    fn write(&mut self, again: bool, apply: impl Fn(&mut Self)) -> bool {
+        if again && self.first_ref().is_none() {
+            let mut first = self.clone();
+            *first.first_mut() = None;
+            apply(self);
+            let mut last = self.clone();
+            *last.first_mut() = None;
+            if last != first {
+                *self.first_mut() = Some(Box::new(first));
+            }
+        } else {
+            apply(self);
+            if !again && let Some(first) = self.first_mut() {
+                apply(first);
+            }
+        }
+        self.first_ref().is_some()
+    }
+}
+
 /// Run properties as one level of the cascade sets them. `undecided`: why a property sits where
-/// what Word applies cannot be decided (an unknown namespace, an uncertain branch, a property
-/// written twice).
-#[derive(Debug, Clone, Default)]
+/// what Word applies cannot be decided (an unknown namespace, an uncertain branch).
+#[derive(Debug, Clone, Default, PartialEq)]
 struct RunProps {
-    style: Option<String>,
+    style: Option<StyleId>,
     vanish: Option<Toggle>,
     spec_vanish: Option<Toggle>,
     web_hidden: Option<Toggle>,
@@ -969,6 +1069,17 @@ struct RunProps {
     highlight: Option<Highlight>,
     shading: Option<Shading>,
     undecided: Option<&'static str>,
+    first: Option<Box<RunProps>>,
+}
+
+impl TwoReadings for RunProps {
+    fn first_mut(&mut self) -> &mut Option<Box<Self>> {
+        &mut self.first
+    }
+
+    fn first_ref(&self) -> Option<&Self> {
+        self.first.as_deref()
+    }
 }
 
 impl RunProps {
@@ -976,7 +1087,7 @@ impl RunProps {
         macro_rules! later_wins {
             ($($field:ident),+) => {$(
                 if later.$field.is_some() {
-                    self.$field = later.$field.clone();
+                    self.$field = later.$field;
                 }
             )+};
         }
@@ -994,6 +1105,13 @@ impl RunProps {
             shading
         );
         self.undecided = self.undecided.or(later.undecided);
+    }
+
+    fn undecide(&mut self, why: &'static str) {
+        self.undecided = self.undecided.or(Some(why));
+        if let Some(first) = &mut self.first {
+            first.undecided = first.undecided.or(Some(why));
+        }
     }
 
     fn bit(local: &str) -> Option<u32> {
@@ -1015,53 +1133,72 @@ impl RunProps {
         .map(|at| at as u32)
     }
 
-    /// Reads property `local`; one already set in this element leaves the run undecided.
+    /// Reads property `local`. One written twice in this element keeps both values, one per
+    /// reading; true when the readings now differ.
     fn read(
         &mut self,
         walker: &Walker,
         start: &BytesStart,
         local: &str,
         seen: &mut u32,
-    ) -> Result<(), DocError> {
-        if repeated(seen, Self::bit(local)) {
-            self.undecided = self.undecided.or(Some(UNDECIDED));
-        }
+        ids: &mut dyn FnMut(String) -> Result<Option<StyleId>, DocError>,
+    ) -> Result<bool, DocError> {
+        let again = repeated(seen, Self::bit(local));
         let val = || walker.w(start, "val");
+        let mut value = RunProps::default();
         match local {
-            "rStyle" => self.style = val()?,
-            "vanish" => self.vanish = Some(Toggle::parse(val()?.as_deref())),
-            "specVanish" => self.spec_vanish = Some(Toggle::parse(val()?.as_deref())),
-            "webHidden" => self.web_hidden = Some(Toggle::parse(val()?.as_deref())),
-            "cs" => self.cs = Some(Toggle::parse(val()?.as_deref())),
-            "rtl" => self.rtl = Some(Toggle::parse(val()?.as_deref())),
-            "sz" => self.size = Some(Size::parse(val()?.as_deref())),
-            "szCs" => self.size_cs = Some(Size::parse(val()?.as_deref())),
+            "rStyle" => value.style = val()?.map(&mut *ids).transpose()?.flatten(),
+            "vanish" => value.vanish = Some(Toggle::parse(val()?.as_deref())),
+            "specVanish" => value.spec_vanish = Some(Toggle::parse(val()?.as_deref())),
+            "webHidden" => value.web_hidden = Some(Toggle::parse(val()?.as_deref())),
+            "cs" => value.cs = Some(Toggle::parse(val()?.as_deref())),
+            "rtl" => value.rtl = Some(Toggle::parse(val()?.as_deref())),
+            "sz" => value.size = Some(Size::parse(val()?.as_deref())),
+            "szCs" => value.size_cs = Some(Size::parse(val()?.as_deref())),
             "color" => {
-                self.colour = Some(ColourSpec::read(
+                value.colour = Some(ColourSpec::read(
                     walker,
                     start,
                     ["val", "themeColor", "themeTint", "themeShade"],
                 )?)
             }
-            "highlight" => self.highlight = Some(Highlight::parse(val()?.as_deref())),
-            "shd" => self.shading = Some(Shading::read(walker, start)?),
-            _ => {}
+            "highlight" => value.highlight = Some(Highlight::parse(val()?.as_deref())),
+            "shd" => value.shading = Some(Shading::read(walker, start)?),
+            _ => return Ok(self.first.is_some()),
         }
-        Ok(())
+        // A style the styles part does not define is written, and names none.
+        let unnamed = local == "rStyle" && value.style.is_none();
+        Ok(self.write(again, |props| {
+            if unnamed {
+                props.style = None;
+            }
+            props.overlay(&value);
+        }))
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct ParaProps {
-    style: Option<String>,
+    style: Option<StyleId>,
     shading: Option<Shading>,
     undecided: Option<&'static str>,
+    first: Option<Box<ParaProps>>,
+}
+
+impl TwoReadings for ParaProps {
+    fn first_mut(&mut self) -> &mut Option<Box<Self>> {
+        &mut self.first
+    }
+
+    fn first_ref(&self) -> Option<&Self> {
+        self.first.as_deref()
+    }
 }
 
 impl ParaProps {
     fn overlay(&mut self, later: &ParaProps) {
         if later.style.is_some() {
-            self.style = later.style.clone();
+            self.style = later.style;
         }
         if later.shading.is_some() {
             self.shading = later.shading;
@@ -1069,32 +1206,57 @@ impl ParaProps {
         self.undecided = self.undecided.or(later.undecided);
     }
 
+    fn undecide(&mut self, why: &'static str) {
+        self.undecided = self.undecided.or(Some(why));
+        if let Some(first) = &mut self.first {
+            first.undecided = first.undecided.or(Some(why));
+        }
+    }
+
     fn read(
         &mut self,
         walker: &Walker,
         start: &BytesStart,
         local: &str,
         seen: &mut u32,
-    ) -> Result<(), DocError> {
+        ids: &mut dyn FnMut(String) -> Result<Option<StyleId>, DocError>,
+    ) -> Result<bool, DocError> {
         let bit = ["pStyle", "shd"].iter().position(|name| *name == local);
-        if repeated(seen, bit.map(|at| at as u32)) {
-            self.undecided = self.undecided.or(Some(UNDECIDED));
-        }
+        let again = repeated(seen, bit.map(|at| at as u32));
+        let mut value = ParaProps::default();
         match local {
-            "pStyle" => self.style = walker.w(start, "val")?,
-            "shd" => self.shading = Some(Shading::read(walker, start)?),
-            _ => {}
+            "pStyle" => value.style = walker.w(start, "val")?.map(ids).transpose()?.flatten(),
+            "shd" => value.shading = Some(Shading::read(walker, start)?),
+            _ => return Ok(self.first.is_some()),
         }
-        Ok(())
+        let unnamed = local == "pStyle" && value.style.is_none();
+        Ok(self.write(again, |props| {
+            if unnamed {
+                props.style = None;
+            }
+            props.overlay(&value);
+        }))
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct CellProps {
     shading: Option<Shading>,
-    /// A `w:vMerge` or `w:hMerge` continuation: Word lays out none of the cell's paragraphs.
+    /// A `w:vMerge` or `w:hMerge` continuation, or a tracked merge into the cell above
+    /// (`w:cellMerge w:vMerge="cont"`): Word lays out none of the cell's paragraphs.
     merged: bool,
     undecided: Option<&'static str>,
+    first: Option<Box<CellProps>>,
+}
+
+impl TwoReadings for CellProps {
+    fn first_mut(&mut self) -> &mut Option<Box<Self>> {
+        &mut self.first
+    }
+
+    fn first_ref(&self) -> Option<&Self> {
+        self.first.as_deref()
+    }
 }
 
 impl CellProps {
@@ -1105,33 +1267,66 @@ impl CellProps {
         self.undecided = self.undecided.or(later.undecided);
     }
 
+    fn undecide(&mut self, why: &'static str) {
+        self.undecided = self.undecided.or(Some(why));
+        if let Some(first) = &mut self.first {
+            first.undecided = first.undecided.or(Some(why));
+        }
+    }
+
     fn read(
         &mut self,
         walker: &Walker,
         start: &BytesStart,
         local: &str,
         seen: &mut u32,
-    ) -> Result<(), DocError> {
-        let bit = ["shd", "vMerge", "hMerge", "cellDel"]
+    ) -> Result<bool, DocError> {
+        let bit = ["shd", "vMerge", "hMerge", "cellDel", "cellMerge"]
             .iter()
             .position(|name| *name == local);
-        if repeated(seen, bit.map(|at| at as u32)) {
-            self.undecided = self.undecided.or(Some(UNDECIDED));
+        let again = repeated(seen, bit.map(|at| at as u32));
+        // What the property sets: a shading, a merge continuation, nothing (a merge restart),
+        // or a value that does not parse.
+        enum Set {
+            Shading(Shading),
+            Continued,
+            Keep,
+            Bad,
         }
-        match local {
-            "shd" => self.shading = Some(Shading::read(walker, start)?),
-            "vMerge" | "hMerge" => match walker.w(start, "val")?.as_deref() {
-                None | Some("continue") => self.merged = true,
-                Some("restart") => {}
-                Some(_) => self.undecided = self.undecided.or(Some(UNDECIDED)),
-            },
-            _ => {}
-        }
-        Ok(())
+        let merge = |value: Option<&str>, continued: &[Option<&str>], restart: &[Option<&str>]| {
+            if continued.contains(&value) {
+                Set::Continued
+            } else if restart.contains(&value) {
+                Set::Keep
+            } else {
+                Set::Bad
+            }
+        };
+        let set = match local {
+            "shd" => Set::Shading(Shading::read(walker, start)?),
+            "vMerge" | "hMerge" => merge(
+                walker.w(start, "val")?.as_deref(),
+                &[None, Some("continue")],
+                &[Some("restart")],
+            ),
+            // A tracked change to a vertical merge: the accepted view takes its revised state.
+            "cellMerge" => merge(
+                walker.w(start, "vMerge")?.as_deref(),
+                &[Some("cont")],
+                &[None, Some("rest")],
+            ),
+            _ => return Ok(self.first.is_some()),
+        };
+        Ok(self.write(again, |props| match &set {
+            Set::Shading(shading) => props.shading = Some(*shading),
+            Set::Continued => props.merged = true,
+            Set::Keep => {}
+            Set::Bad => props.undecided = props.undecided.or(Some(UNDECIDED)),
+        }))
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct Props {
     run: RunProps,
     para: ParaProps,
@@ -1139,16 +1334,16 @@ struct Props {
 }
 
 impl Props {
-    fn overlay(&mut self, later: &Props) {
-        self.run.overlay(&later.run);
-        self.para.overlay(&later.para);
-        self.cell.overlay(&later.cell);
+    fn overlay(&mut self, later: &Props, reading: Reading) {
+        self.run.overlay(later.run.at(reading));
+        self.para.overlay(later.para.at(reading));
+        self.cell.overlay(later.cell.at(reading));
     }
 
     fn undecided(&mut self, why: &'static str) {
-        self.run.undecided = self.run.undecided.or(Some(why));
-        self.para.undecided = self.para.undecided.or(Some(why));
-        self.cell.undecided = self.cell.undecided.or(Some(why));
+        self.run.undecide(why);
+        self.para.undecide(why);
+        self.cell.undecide(why);
     }
 }
 
@@ -1271,31 +1466,50 @@ impl Region {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct Style {
     kind: StyleKind,
-    based_on: Option<String>,
+    based_on: Twice<Option<StyleId>>,
     props: Props,
+    /// The regions that set something; `region_seen` has a bit for each region written.
     regions: Vec<(Region, Props)>,
-    row_band: Option<u32>,
-    column_band: Option<u32>,
+    region_seen: u16,
+    row_band: Twice<Option<u32>>,
+    column_band: Twice<Option<u32>>,
 }
 
-/// A style with its `w:basedOn` chain folded in, outermost first.
+/// A style with its `w:basedOn` chain folded in, outermost first, as one reading takes it.
 #[derive(Debug, Default)]
 struct Merged {
     props: Props,
     regions: HashMap<Region, Props>,
+    /// Band sizes; 0 when none is set or it is 0, which `Reading::bands_off` reads.
     row_band: u32,
     column_band: u32,
+}
+
+/// The definitions of one style id: its last, and its first when it was defined twice
+/// differently.
+#[derive(Debug)]
+struct Defined {
+    last: Box<Style>,
+    first: Option<Box<Style>>,
 }
 
 #[derive(Default)]
 struct Styles {
     defaults: Props,
-    styles: HashMap<String, Box<Style>>,
-    defaults_by_kind: HashMap<StyleKind, String>,
-    merged: RefCell<HashMap<(StyleKind, String), Rc<Merged>>>,
+    ids: HashMap<Box<str>, StyleId>,
+    styles: HashMap<StyleId, Defined>,
+    /// The default style of each kind: by its first `w:default` and by its last.
+    defaults_by_kind: HashMap<StyleKind, (StyleId, StyleId)>,
+    /// A style id is defined twice differently, or two styles of a kind are its default.
+    twice: bool,
+    /// A property is written twice in one place with two values.
+    props_twice: bool,
+    /// A table style sets a band region, which a missing band size leaves undecided.
+    banded: bool,
+    merged: RefCell<HashMap<(StyleKind, StyleId, Reading), Rc<Merged>>>,
 }
 
 impl Styles {
@@ -1325,13 +1539,22 @@ impl Styles {
             Other,
         }
         let mut styles = Styles::default();
+        let mut ids = std::mem::take(&mut styles.ids);
+        let mut intern = |id: String| -> Result<Option<StyleId>, DocError> {
+            if id.len() > MAX_STYLE_ID {
+                return Err(DocError::TooComplex("style_id"));
+            }
+            let next = StyleId(ids.len() as u32);
+            Ok(Some(*ids.entry(id.into_boxed_str()).or_insert(next)))
+        };
         let mut walker = Walker::new(xml, limits, budget, document_namespace)?;
         let mut nodes: Vec<Node> = Vec::new();
         // The style being read (its id and whether it may be a default), and its region.
-        let mut style: Option<(String, Style, bool)> = None;
+        let mut style: Option<(StyleId, Style, bool)> = None;
         let mut region: Option<(Region, Props)> = None;
         // The children seen so far of the defaults, the style, the region and the property
-        // element being read: one written twice is undecided.
+        // element being read: a container written twice is undecided, a property written twice
+        // read both ways.
         let (mut defaults_seen, mut style_seen, mut region_seen, mut props_seen) =
             (0u32, 0u32, 0u32, 0u32);
         loop {
@@ -1362,13 +1585,17 @@ impl Styles {
                                     Node::ParaDefault
                                 }
                             }
-                            (Some(Node::RunDefault), "rPr") => {
+                            (Some(Node::RunDefault), "rPr") | (Some(Node::ParaDefault), "pPr") => {
+                                let run = local == "rPr";
+                                if repeated(&mut defaults_seen, Some(2 + u32::from(run))) {
+                                    styles.defaults.undecided(UNDECIDED);
+                                }
                                 props_seen = 0;
-                                Node::Run(Into::Defaults)
-                            }
-                            (Some(Node::ParaDefault), "pPr") => {
-                                props_seen = 0;
-                                Node::Para(Into::Defaults)
+                                if run {
+                                    Node::Run(Into::Defaults)
+                                } else {
+                                    Node::Para(Into::Defaults)
+                                }
                             }
                             (Some(Node::Root), "style") => {
                                 let kind = match walker.w(&start, "type")?.as_deref() {
@@ -1378,7 +1605,11 @@ impl Styles {
                                     Some("numbering") => Some(StyleKind::Numbering),
                                     Some(_) => None,
                                 };
-                                let id = walker.w(&start, "styleId")?;
+                                let id = walker
+                                    .w(&start, "styleId")?
+                                    .map(&mut intern)
+                                    .transpose()?
+                                    .flatten();
                                 let default = walker
                                     .w(&start, "default")?
                                     .is_some_and(|value| Toggle::parse(Some(&value)) == Toggle::On);
@@ -1390,26 +1621,31 @@ impl Styles {
                                     }
                                     let style = Style {
                                         kind,
-                                        based_on: None,
+                                        based_on: Twice::default(),
                                         props,
                                         regions: Vec::new(),
-                                        row_band: None,
-                                        column_band: None,
+                                        region_seen: 0,
+                                        row_band: Twice::default(),
+                                        column_band: Twice::default(),
                                     };
                                     (id, style, default)
                                 });
                                 Node::Style
                             }
                             (Some(Node::Style), "basedOn") => {
+                                let base = walker
+                                    .w(&start, "val")?
+                                    .map(&mut intern)
+                                    .transpose()?
+                                    .flatten();
+                                let again = repeated(&mut style_seen, Some(0));
                                 if let Some((_, style, _)) = &mut style {
                                     // A base Word may not apply is never applied, never dropped:
                                     // the style is undecided.
                                     if hidden {
                                         style.props.undecided(UNKNOWN_NAMESPACE);
-                                    } else if repeated(&mut style_seen, Some(0)) {
-                                        style.props.undecided(UNDECIDED);
                                     } else {
-                                        style.based_on = walker.w(&start, "val")?;
+                                        styles.props_twice |= style.based_on.set(base, again);
                                     }
                                 }
                                 Node::Other
@@ -1469,18 +1705,20 @@ impl Styles {
                                     if hidden {
                                         props.undecided(UNKNOWN_NAMESPACE);
                                     }
-                                    match parent {
+                                    styles.props_twice |= match parent {
                                         Some(Node::Run(_)) => props.run.read(
                                             &walker,
                                             &start,
                                             local,
                                             &mut props_seen,
+                                            &mut intern,
                                         )?,
                                         Some(Node::Para(_)) => props.para.read(
                                             &walker,
                                             &start,
                                             local,
                                             &mut props_seen,
+                                            &mut intern,
                                         )?,
                                         _ => props.cell.read(
                                             &walker,
@@ -1488,7 +1726,7 @@ impl Styles {
                                             local,
                                             &mut props_seen,
                                         )?,
-                                    }
+                                    };
                                 }
                                 Node::Other
                             }
@@ -1506,12 +1744,13 @@ impl Styles {
                                 if let Some((_, style, _)) = &mut style {
                                     if hidden {
                                         style.props.undecided(UNKNOWN_NAMESPACE);
-                                    } else if again {
-                                        style.props.undecided(UNDECIDED);
-                                    } else if row {
-                                        style.row_band = size;
                                     } else {
-                                        style.column_band = size;
+                                        let band = if row {
+                                            &mut style.row_band
+                                        } else {
+                                            &mut style.column_band
+                                        };
+                                        styles.props_twice |= band.set(size, again);
                                     }
                                 }
                                 Node::Other
@@ -1543,17 +1782,8 @@ impl Styles {
                 }
                 Item::End => match nodes.pop() {
                     Some(Node::Style) => {
-                        if let Some((id, mut style, default)) = style.take() {
-                            // Two styles with one id: which one Word uses is not known.
-                            if styles.styles.contains_key(&id) {
-                                style.props.undecided(UNDECIDED);
-                            } else if styles.styles.len() >= MAX_STYLES {
-                                return Err(DocError::TooComplex("styles"));
-                            }
-                            if default {
-                                styles.defaults_by_kind.insert(style.kind, id.clone());
-                            }
-                            styles.styles.insert(id, Box::new(style));
+                        if let Some((id, style, default)) = style.take() {
+                            styles.define(id, style, default)?;
                         }
                     }
                     Some(Node::Region) => {
@@ -1561,41 +1791,125 @@ impl Styles {
                             (region.take(), &mut style)
                         {
                             // A region written twice in one style: which Word uses is not known.
-                            if style.regions.iter().any(|(known, _)| *known == found) {
+                            // One that sets nothing is not kept.
+                            let bit = 1 << found as u16;
+                            if style.region_seen & bit != 0 {
                                 style.props.undecided(UNDECIDED);
-                            } else {
+                            } else if props != Props::default() {
                                 style.regions.push((found, props));
                             }
+                            style.region_seen |= bit;
                         }
                     }
                     _ => {}
                 },
                 Item::Text { .. } => {}
-                Item::Eof => return Ok(styles),
+                Item::Eof => {
+                    styles.ids = ids;
+                    return Ok(styles);
+                }
             }
         }
     }
 
-    /// The style `id` names when it is one of `kind`, else the default style of `kind`.
-    fn resolve<'a>(&'a self, id: Option<&'a str>, kind: StyleKind) -> Option<&'a str> {
-        id.filter(|id| self.styles.get(*id).is_some_and(|style| style.kind == kind))
-            .or_else(|| self.defaults_by_kind.get(&kind).map(String::as_str))
+    /// Keeps a style read from the styles part. An id defined twice keeps its first definition
+    /// besides its last (Word is seen to take the last whole; the standard keeps the first's
+    /// id), unless the two are the same.
+    fn define(&mut self, id: StyleId, style: Style, default: bool) -> Result<(), DocError> {
+        let banded = [
+            Region::Band1Horz,
+            Region::Band2Horz,
+            Region::Band1Vert,
+            Region::Band2Vert,
+        ]
+        .iter()
+        .any(|&region| style.region_seen & (1 << region as u16) != 0);
+        self.banded |= banded;
+        let kind = style.kind;
+        match self.styles.get_mut(&id) {
+            Some(defined) => {
+                if *defined.last != style {
+                    if defined.first.is_none() {
+                        defined.first = Some(defined.last.clone());
+                    }
+                    *defined.last = style;
+                    self.twice = true;
+                }
+            }
+            None => {
+                if self.styles.len() >= MAX_STYLES {
+                    return Err(DocError::TooComplex("styles"));
+                }
+                self.styles.insert(
+                    id,
+                    Defined {
+                        last: Box::new(style),
+                        first: None,
+                    },
+                );
+            }
+        }
+        if default {
+            let entry = self.defaults_by_kind.entry(kind).or_insert((id, id));
+            if entry.1 != id {
+                entry.1 = id;
+                self.twice = true;
+            }
+        }
+        Ok(())
     }
 
-    /// `id`'s properties with its `w:basedOn` chain folded in, outermost first. A chain stops at
-    /// a cycle or a missing style; one that reaches a style of another kind is undecided, and
-    /// one longer than 16 styles is `TooComplex`.
-    fn merged(&self, id: &str, kind: StyleKind) -> Result<Rc<Merged>, DocError> {
-        let key = (kind, id.to_owned());
+    /// A style id the body names, if the styles part interned it.
+    fn find(&self, id: &str) -> Option<StyleId> {
+        self.ids.get(id).copied()
+    }
+
+    /// The definition of `id` that `reading` takes.
+    fn style(&self, id: StyleId, reading: Reading) -> Option<&Style> {
+        let defined = self.styles.get(&id)?;
+        Some(match &defined.first {
+            Some(first) if reading.styles_first => first,
+            _ => &defined.last,
+        })
+    }
+
+    /// The style `id` names when it is one of `kind`, else the default style of `kind`.
+    fn resolve(&self, id: Option<StyleId>, kind: StyleKind, reading: Reading) -> Option<StyleId> {
+        id.filter(|id| {
+            self.style(*id, reading)
+                .is_some_and(|style| style.kind == kind)
+        })
+        .or_else(|| {
+            self.defaults_by_kind
+                .get(&kind)
+                .map(|&(first, last)| if reading.styles_first { first } else { last })
+        })
+    }
+
+    /// `id`'s properties with its `w:basedOn` chain folded in, outermost first, as `reading`
+    /// takes them. A chain stops at a cycle or a missing style; one that reaches a style of
+    /// another kind is undecided, and one longer than 16 styles is `TooComplex`.
+    fn merged(
+        &self,
+        id: StyleId,
+        kind: StyleKind,
+        reading: Reading,
+    ) -> Result<Rc<Merged>, DocError> {
+        let reading = Reading {
+            bands_off: false,
+            ..reading
+        };
+        let key = (kind, id, reading);
         if let Some(found) = self.merged.borrow().get(&key) {
             return Ok(found.clone());
         }
+        deadline::check()?;
         let mut chain = Vec::new();
         let mut seen = HashSet::new();
         let mut next = Some(id);
         let mut crossed = false;
         while let Some(id) = next {
-            let Some(style) = self.styles.get(id) else {
+            let Some(style) = self.style(id, reading) else {
                 break;
             };
             if style.kind != kind {
@@ -1609,20 +1923,24 @@ impl Styles {
                 return Err(DocError::TooComplex("style_chain"));
             }
             chain.push(style);
-            next = style.based_on.as_deref();
+            next = style.based_on.at(reading);
         }
-        let mut merged = Merged {
-            row_band: 1,
-            column_band: 1,
-            ..Merged::default()
-        };
+        let mut merged = Merged::default();
         for style in chain.iter().rev() {
-            merged.props.overlay(&style.props);
+            merged.props.overlay(&style.props, reading);
             for (region, props) in &style.regions {
-                merged.regions.entry(*region).or_default().overlay(props);
+                merged
+                    .regions
+                    .entry(*region)
+                    .or_default()
+                    .overlay(props, reading);
             }
-            merged.row_band = style.row_band.unwrap_or(merged.row_band).max(1);
-            merged.column_band = style.column_band.unwrap_or(merged.column_band).max(1);
+            if let Some(size) = style.row_band.at(reading) {
+                merged.row_band = size;
+            }
+            if let Some(size) = style.column_band.at(reading) {
+                merged.column_band = size;
+            }
         }
         if crossed {
             merged.props.undecided(UNDECIDED);
@@ -1683,29 +2001,38 @@ impl Settings {
                         let bit = ["displayBackgroundShape", "clrSchemeMapping", "updateFields"]
                             .iter()
                             .position(|known| *known == local);
-                        // Written twice, or where Word may not read it: undecided.
-                        let undecided = repeated(&mut seen, bit.map(|at| at as u32)) || hidden;
+                        // Where Word may not read it, undecided; written twice, each value is a
+                        // reading, and a setting read two ways takes the one that hides more.
+                        let again = repeated(&mut seen, bit.map(|at| at as u32));
                         match local {
                             // Where it is undecided, both page colours count, as when it is off.
                             "displayBackgroundShape" => {
-                                settings.display_background = !undecided
+                                let on = !hidden
                                     && Toggle::parse(walker.w(&start, "val")?.as_deref())
                                         == Toggle::On;
+                                settings.display_background =
+                                    on && (!again || settings.display_background);
                             }
                             "clrSchemeMapping" => {
                                 for (at, (attribute, ..)) in MAPPED.iter().enumerate() {
-                                    if let Some(value) = walker.w(&start, attribute)? {
-                                        settings.mapping[at] = match scheme_index(&value) {
-                                            Some(slot) if !undecided => Mapping::Slot(slot),
-                                            _ => Mapping::Bad,
-                                        };
-                                    } else if undecided {
-                                        settings.mapping[at] = Mapping::Bad;
-                                    }
+                                    let value = walker.w(&start, attribute)?;
+                                    let read = match value.as_deref().map(scheme_index) {
+                                        _ if hidden => Mapping::Bad,
+                                        None => Mapping::Slot(MAPPED[at].3),
+                                        Some(Some(slot)) => Mapping::Slot(slot),
+                                        Some(None) => Mapping::Bad,
+                                    };
+                                    // Two values for a name: which slot Word takes is not known.
+                                    settings.mapping[at] = if again && settings.mapping[at] != read
+                                    {
+                                        Mapping::Bad
+                                    } else {
+                                        read
+                                    };
                                 }
                             }
                             "updateFields" => {
-                                settings.update_fields = undecided
+                                settings.update_fields |= hidden
                                     || Toggle::parse(walker.w(&start, "val")?.as_deref())
                                         != Toggle::Off;
                             }
@@ -1777,6 +2104,17 @@ enum Layer {
     Fill(Result<Vec<Rgb>, ()>),
 }
 
+/// What the reader left out at a place in a paragraph: something drawn that is not text (a
+/// picture, a note mark, a page number), or text Word draws or may draw. Between two visible
+/// stretches either leaves `GAP`; at a paragraph's start or end only left-out text does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+enum Gap {
+    #[default]
+    None,
+    Object,
+    Text,
+}
+
 /// A paragraph being read: its runs are judged when it ends, or, inside a table, when the
 /// outermost table ends and every enclosing table's shape is known.
 struct Para {
@@ -1787,9 +2125,12 @@ struct Para {
     run: Option<Box<Run>>,
     /// What lies beneath the paragraph, innermost first, shared by the paragraphs of a cell or
     /// a text box.
-    under: Rc<[Under]>,
-    /// Something Word draws was left out after the last kept run: the next starts after a gap.
-    gap: bool,
+    under: Option<Rc<Link>>,
+    /// Something was left out after the last kept run: the next starts after a gap.
+    gap: Gap,
+    /// Why content outside any run was left out (an equation, an element the reader does not
+    /// read).
+    dropped: Option<&'static str>,
     /// The paragraph has children besides its `w:pPr`; a `w:pPr` now is refused.
     content: bool,
     has_props: bool,
@@ -1805,10 +2146,12 @@ struct Run {
     /// Why text of this run was dropped as it was read (an unknown namespace, a field result
     /// Word recomputes, a data-bound control ...), the first reason.
     dropped: Option<&'static str>,
-    /// Something Word draws was left out before the run's first kept text, and after its last.
-    gap_before: bool,
-    gap_after: bool,
+    /// What was left out before the run's first kept text, and after its last.
+    gap_before: Gap,
+    gap_after: Gap,
     has_props: bool,
+    /// The run has children besides its `w:rPr`; a `w:rPr` now is refused.
+    content: bool,
 }
 
 impl Run {
@@ -1816,9 +2159,9 @@ impl Run {
         if text.is_empty() {
             return;
         }
-        if self.gap_after {
+        if self.gap_after != Gap::None {
             self.text.push(GAP);
-            self.gap_after = false;
+            self.gap_after = Gap::None;
         }
         if self.text.is_empty() {
             self.text = text;
@@ -1827,16 +2170,16 @@ impl Run {
         }
     }
 
-    fn gap(&mut self) {
+    fn gap(&mut self, gap: Gap) {
         if self.text.is_empty() {
-            self.gap_before = true;
+            self.gap_before = self.gap_before.max(gap);
         } else {
-            self.gap_after = true;
+            self.gap_after = self.gap_after.max(gap);
         }
     }
 
     fn drop_text(&mut self, why: &'static str) {
-        self.gap();
+        self.gap(Gap::Text);
         self.dropped = self.dropped.or(Some(why));
     }
 }
@@ -1852,8 +2195,8 @@ struct CellAt {
 /// A table's style, look and rows, complete once the table ends.
 #[derive(Default)]
 struct TableShape {
-    style: Option<String>,
-    look: Option<Look>,
+    style: Twice<Option<StyleId>>,
+    look: Twice<Option<Look>>,
     /// Why a table property sits where Word's choice cannot be decided.
     undecided: Option<&'static str>,
     rows: Vec<RowShape>,
@@ -1862,17 +2205,20 @@ struct TableShape {
 #[derive(Clone, Copy)]
 struct RowShape {
     cells: usize,
-    look: Option<Look>,
+    look: Twice<Option<Look>>,
 }
 
 struct Table {
     shape: Rc<RefCell<TableShape>>,
     row: Option<OpenRow>,
     has_props: bool,
+    /// What lies beneath the table: the chain of the place it sits in.
+    outer: Option<Rc<Link>>,
 }
 
 struct OpenRow {
-    /// A tracked deletion of the row (`w:trPr/w:del`): its content is excluded.
+    /// A tracked deletion of the row (`w:trPr/w:del`, `w14:conflictDel`): its content is
+    /// excluded.
     deleted: bool,
     has_props: bool,
     has_cells: bool,
@@ -1887,8 +2233,8 @@ struct OpenCell {
     /// A tracked deletion of the cell (`w:cellDel`): its content is excluded.
     deleted: bool,
     has_props: bool,
-    /// What lies beneath the cell's paragraphs, made for the first of them.
-    chain: Option<Rc<[Under]>>,
+    /// The cell's link in the chain beneath its paragraphs, made for the first of them.
+    link: Option<Rc<Link>>,
 }
 
 impl OpenCell {
@@ -1901,8 +2247,8 @@ impl OpenCell {
 
 /// A text box as its paragraphs see it.
 struct BoxInfo {
-    /// Why its text cannot be shown: a hidden or off-page shape, a fill the reader does not read,
-    /// a floating box with no fill over what the reader cannot see.
+    /// Why its text cannot be shown: a hidden, out-of-place or off-page shape, a fill the
+    /// reader does not read, a floating box with no fill over what the reader cannot see.
     hidden: Option<&'static str>,
     /// Its fill, or `None` when it has none and what lies beneath shows through.
     fill: Option<ColourSpec>,
@@ -1912,26 +2258,38 @@ struct BoxInfo {
 
 enum Container {
     Table(Table),
-    /// A text box: what is inside it is not in the table around it, and its host is the
-    /// paragraph its shape sits in.
-    TextBox {
-        info: Rc<BoxInfo>,
-        host: Option<Rc<ParaProps>>,
-        /// What lies beneath the box's paragraphs, made for the first of them.
-        chain: Option<Rc<[Under]>>,
-    },
+    /// A text box: what is inside it is not in the table around it.
+    TextBox(Rc<Link>),
+}
+
+/// One container beneath a paragraph, linked to the one around it: the paragraphs of a cell or a
+/// text box share one link, and a container nested in another adds one link to its chain.
+struct Link {
+    under: Under,
+    outer: Option<Rc<Link>>,
+    /// What this link and those around it put beneath a paragraph, per reading, kept once a
+    /// link nested in it asked.
+    outward: RefCell<Readings>,
+}
+
+impl Link {
+    fn new(under: Under, outer: Option<Rc<Link>>) -> Rc<Link> {
+        Rc::new(Link {
+            under,
+            outer,
+            outward: RefCell::new(Vec::new()),
+        })
+    }
 }
 
 /// One thing beneath a paragraph's text.
-#[derive(Clone)]
 enum Under {
     /// A table cell, with its table's shape.
     Cell(Rc<RefCell<TableShape>>, Rc<CellAt>),
     Box(Rc<BoxInfo>),
-    /// The paragraph an inline text box sits in: its own properties.
-    Host(Rc<ParaProps>),
-    /// A place Word lays no paragraph out in (in a table, outside any cell).
-    Nowhere,
+    /// The paragraph a text box sits in, and the run holding its drawing: Word lays out no
+    /// object anchored in hidden text.
+    Host(Rc<ParaProps>, Option<Rc<RunProps>>),
 }
 
 /// A fill or text colour a shape's properties set.
@@ -1948,8 +2306,9 @@ enum ShapeFill {
 struct ShapeState {
     anchored: bool,
     hidden: bool,
-    /// A shape property sits where Word's choice cannot be decided.
-    undecided: bool,
+    /// Why a shape property sits where Word's choice cannot be decided, or why the shape is out
+    /// of the place Word lays shapes out in.
+    undecided: Option<&'static str>,
     /// The fill its own properties set.
     fill: Option<ShapeFill>,
     /// The fill its style reference sets (`a:fillRef`).
@@ -1966,7 +2325,7 @@ struct ShapeState {
     vml_default: Option<ShapeFill>,
     /// A `v:shapetype`'s id, under which its fill is kept when it ends.
     shapetype: Option<String>,
-    /// Its text box was read: a fill after it is refused.
+    /// A text box in it was read: a shape property after that is refused.
     text_read: bool,
     /// The fill or font reference just opened, until its first colour is read.
     awaiting: Option<Target>,
@@ -1986,6 +2345,10 @@ impl ShapeState {
             },
             None => ShapeState::default(),
         }
+    }
+
+    fn undecide(&mut self, why: &'static str) {
+        self.undecided = self.undecided.or(Some(why));
     }
 
     /// Off the page wherever its anchor lands: an offset of a whole page or more.
@@ -2008,8 +2371,8 @@ impl ShapeState {
     }
 
     fn box_info(&self) -> BoxInfo {
-        let mut hidden = if self.undecided {
-            Some(UNKNOWN_NAMESPACE)
+        let mut hidden = if let Some(why) = self.undecided {
+            Some(why)
         } else if self.hidden {
             Some("hidden_shape")
         } else if self.off_page() {
@@ -2047,18 +2410,75 @@ impl ShapeState {
     }
 }
 
+/// A field's type: the first word of its instruction, read past leading white space.
+#[derive(Default)]
+struct FieldKind {
+    word: String,
+    /// The word has ended.
+    done: bool,
+    /// The type cannot be read: its word is longer than any type, or a field nested in the
+    /// instruction writes it.
+    lost: bool,
+}
+
+impl FieldKind {
+    fn read(instruction: &str) -> FieldKind {
+        let mut kind = FieldKind::default();
+        kind.feed(instruction);
+        kind
+    }
+
+    fn feed(&mut self, text: &str) {
+        for c in text.chars() {
+            if self.done {
+                return;
+            }
+            if c.is_whitespace() || c == '\\' {
+                // A switch before any word leaves the field with no type.
+                self.done = !self.word.is_empty() || c == '\\';
+                continue;
+            }
+            if self.word.chars().count() == MAX_FIELD_CODE {
+                self.lost = true;
+                self.done = true;
+                return;
+            }
+            self.word.push(c);
+        }
+    }
+
+    /// The type, in upper case, when it can be read.
+    fn name(&self) -> Option<String> {
+        (!self.lost && !self.word.is_empty()).then(|| self.word.to_ascii_uppercase())
+    }
+
+    /// A type whose result Word never shows, so no display stands where the field is.
+    fn never_shown(&self) -> bool {
+        self.name()
+            .is_some_and(|name| NEVER_SHOWN.contains(&name.as_str()))
+    }
+}
+
 /// An open field.
 struct Field {
     /// Still in its instruction (before `separate`).
     code: bool,
-    /// The start of its instruction, which names its type.
-    instruction: String,
+    kind: FieldKind,
     /// Why its result is not shown, once `separate` has decided it.
     hide: Option<&'static str>,
     /// `w:dirty`: Word updates it when the document opens.
     dirty: bool,
     /// A field character of it sits where Word's choice cannot be decided.
     undecided: bool,
+    /// Some of its result was read, shown or not.
+    result: bool,
+}
+
+/// An open content control: bound to a custom XML part, and past its properties.
+#[derive(Default)]
+struct Sdt {
+    bound: bool,
+    content: bool,
 }
 
 /// Where an element's content sits: among runs, paragraphs, rows or cells.
@@ -2087,8 +2507,9 @@ enum Node {
     ParaProps,
     /// A container of runs, paragraphs, rows or cells (`w:hyperlink`, `w:sdtContent` ...).
     Container(Level),
-    /// The content of a content control bound to a custom XML part.
-    BoundContent(Level),
+    /// A container whose text is dropped whole (`Part::dropping`): a data-bound control's
+    /// content, an override of the reading order.
+    Dropping(Level),
     /// A content control and where it sits (`None`: nowhere content may be).
     Sdt(Option<Level>),
     SdtProps,
@@ -2111,6 +2532,8 @@ enum Node {
     /// An element whose colour child sets a shape's fill or text colour, and that colour.
     ColourHolder(Target),
     Colour(Target),
+    /// `a:extLst`: extensions Word does not draw from.
+    Extensions,
     TextBox,
     Excluded,
     Other,
@@ -2129,7 +2552,7 @@ fn level(parent: Option<Node>) -> Option<Level> {
         Node::Body | Node::Story | Node::Cell | Node::TextBox => Some(Level::Block),
         Node::Table => Some(Level::Row),
         Node::Row => Some(Level::Cell),
-        Node::Container(level) | Node::BoundContent(level) => Some(level),
+        Node::Container(level) | Node::Dropping(level) => Some(level),
         _ => None,
     }
 }
@@ -2142,9 +2565,15 @@ enum Shown {
     Dropped(&'static str),
 }
 
+/// What a run element adds: text, or something Word draws that the reader does not read.
+enum Put {
+    Text(String),
+    Gap(Gap),
+}
+
 /// One part's walk.
-struct Part<'n> {
-    name: &'n str,
+struct Part {
+    name: Arc<str>,
     story: Story,
     ordinal: u32,
     /// Inside deleted, moved-away or embedded content.
@@ -2156,23 +2585,25 @@ struct Part<'n> {
     fields: Vec<Field>,
     /// The fills of the `v:shapetype`s defined so far, by id.
     shapetypes: HashMap<String, Option<ShapeFill>>,
-    /// The open content controls: whether each is bound to a custom XML part.
-    sdts: Vec<bool>,
-    /// Open content of bound content controls.
-    bound: u32,
+    sdts: Vec<Sdt>,
+    /// Why the text of the open content is dropped whole, innermost last.
+    dropping: Vec<&'static str>,
+    /// Open `w:drawing` and `w:pict` elements: a shape outside one is out of place.
+    objects: u32,
+    /// Open `a:extLst` elements.
+    extensions: u32,
     /// Paragraphs of the open tables, judged once the outermost one ends. Boxed, so the queue
     /// of a large table grows by pointers rather than copies of whole paragraphs.
     #[allow(clippy::vec_box)]
     pending: Vec<Box<Para>>,
-    /// The chain of a paragraph in no container.
-    no_chain: Rc<[Under]>,
-    /// The properties seen in the open `w:rPr`, `w:pPr`, `w:tcPr`, `w:trPr` or `w:tblPr`.
+    /// The properties seen in the open `w:rPr`, `w:pPr`, `w:tcPr`, `w:trPr`, `w:tblPr` or
+    /// `w:tblPrEx`.
     seen: u32,
     out: Vec<(u32, String, Option<String>)>,
     hidden: Vec<(u32, &'static str, Option<String>)>,
 }
 
-impl Part<'_> {
+impl Part {
     fn shown(&self, hidden: bool) -> Shown {
         if self
             .fields
@@ -2184,8 +2615,8 @@ impl Part<'_> {
         if hidden || self.fields.iter().any(|field| field.undecided) {
             return Shown::Dropped(UNKNOWN_NAMESPACE);
         }
-        if self.bound > 0 {
-            return Shown::Dropped("data_binding");
+        if let Some(why) = self.dropping.last() {
+            return Shown::Dropped(why);
         }
         match self.fields.iter().find_map(|field| field.hide) {
             Some(why) => Shown::Dropped(why),
@@ -2193,31 +2624,67 @@ impl Part<'_> {
         }
     }
 
-    /// Adds a run element's text (`None`: something Word draws that is not text) to the open run,
-    /// as the open fields, controls and markup allow.
-    fn put(&mut self, hidden: bool, text: Option<String>) {
+    /// Adds a run element's text, or a gap for something Word draws, to the open run as the open
+    /// fields, controls and markup allow; with no run open, a gap goes to the paragraph.
+    fn put(&mut self, hidden: bool, put: Put) {
         let shown = self.shown(hidden);
+        if matches!(&put, Put::Text(text) if text.is_empty()) {
+            return;
+        }
+        if !matches!(shown, Shown::Code) {
+            for field in self.fields.iter_mut().filter(|field| !field.code) {
+                field.result = true;
+            }
+        }
         let Some(Some(para)) = self.paragraphs.last_mut() else {
             return;
         };
-        let Some(run) = &mut para.run else {
-            return;
-        };
-        match (shown, text) {
-            (Shown::Code, _) => {}
-            (Shown::Dropped(_), Some(text)) if text.is_empty() => {}
-            (Shown::Dropped(why), _) => run.drop_text(why),
-            (Shown::Yes, Some(text)) => run.push(text),
-            (Shown::Yes, None) => run.gap(),
+        match (shown, put, &mut para.run) {
+            (Shown::Code, ..) => {}
+            (Shown::Dropped(why), _, Some(run)) => run.drop_text(why),
+            (Shown::Dropped(why), _, None) => {
+                para.gap = Gap::Text;
+                para.dropped = para.dropped.or(Some(why));
+            }
+            (Shown::Yes, Put::Text(text), Some(run)) => run.push(text),
+            (Shown::Yes, Put::Text(_), None) => {}
+            (Shown::Yes, Put::Gap(gap), Some(run)) => run.gap(gap),
+            (Shown::Yes, Put::Gap(gap), None) => para.gap = para.gap.max(gap),
         }
     }
 
-    /// Text of a field's instruction, kept for the innermost field still in its instruction.
+    /// Content of the paragraph that the reader does not read (an equation, an element of a
+    /// namespace it does not understand): a gap, and why it was left out.
+    fn drop_unread(&mut self) {
+        if !matches!(self.shown(false), Shown::Code) {
+            self.put(true, Put::Gap(Gap::Text));
+        }
+    }
+
+    /// Text of a field's instruction, read for the innermost field still in its instruction.
     fn instruction(&mut self, text: &str, hidden: bool) {
         if let Some(field) = self.fields.iter_mut().rev().find(|field| field.code) {
             field.undecided |= hidden;
-            let room = MAX_FIELD_CODE.saturating_sub(field.instruction.chars().count());
-            field.instruction.extend(text.chars().take(room));
+            field.kind.feed(text);
+        }
+    }
+
+    /// A field starts: if the innermost open field is in its instruction and has not finished
+    /// its type's word, the new field's result writes the type.
+    fn nest_field(&mut self) {
+        if let Some(outer) = self.fields.last_mut()
+            && outer.code
+            && !outer.kind.done
+        {
+            outer.kind.lost = true;
+        }
+    }
+
+    /// A field ended. One that read no result, where Word draws one (it computes it, or the
+    /// reader cannot tell), leaves a gap like a dropped run.
+    fn field_ended(&mut self, field: &Field) {
+        if !field.result && (field.undecided || !field.kind.never_shown()) {
+            self.put(false, Put::Gap(Gap::Text));
         }
     }
 
@@ -2242,62 +2709,56 @@ impl Part<'_> {
             .and_then(|row| row.cell.as_mut())
     }
 
-    /// What lies beneath a paragraph starting now, innermost first, shared by the paragraphs of
-    /// one cell or text box. Every open cell it reaches is fixed, so its properties can no longer
-    /// change.
-    fn chain(&mut self) -> Rc<[Under]> {
-        match self.containers.last_mut() {
-            None => return self.no_chain.clone(),
-            Some(Container::Table(table)) => {
+    /// What lies beneath content starting now: the link of the innermost container, which the
+    /// paragraphs of one cell or text box share. A cell it reaches is fixed, so its properties
+    /// can no longer change.
+    fn chain(&mut self) -> Option<Rc<Link>> {
+        match self.containers.last_mut()? {
+            Container::Table(table) => {
+                let shape = table.shape.clone();
+                let outer = table.outer.clone();
                 match table.row.as_mut().and_then(|row| row.cell.as_mut()) {
-                    // In a table, outside any cell: Word lays it out nowhere.
-                    None => return Rc::from(vec![Under::Nowhere]),
+                    // In a table, outside any cell, content is out of its place, and undecided
+                    // for that.
+                    None => outer,
                     Some(cell) => {
-                        if let Some(chain) = &cell.chain {
-                            return chain.clone();
+                        if cell.link.is_none() {
+                            cell.link = Some(Link::new(Under::Cell(shape, cell.shared()), outer));
                         }
+                        cell.link.clone()
                     }
                 }
             }
-            Some(Container::TextBox {
-                chain: Some(chain), ..
-            }) => return chain.clone(),
-            Some(Container::TextBox { .. }) => {}
+            Container::TextBox(link) => Some(link.clone()),
         }
-        let mut under = Vec::new();
-        for container in self.containers.iter_mut().rev() {
-            match container {
-                Container::Table(table) => {
-                    match table.row.as_mut().and_then(|row| row.cell.as_mut()) {
-                        Some(cell) => under.push(Under::Cell(table.shape.clone(), cell.shared())),
-                        None => under.push(Under::Nowhere),
-                    }
-                }
-                Container::TextBox { info, host, .. } => {
-                    under.push(Under::Box(info.clone()));
-                    if let Some(host) = host {
-                        under.push(Under::Host(host.clone()));
-                    }
-                }
-            }
-        }
-        let chain: Rc<[Under]> = Rc::from(under);
-        match self.containers.last_mut() {
-            Some(Container::Table(table)) => {
-                if let Some(cell) = table.row.as_mut().and_then(|row| row.cell.as_mut()) {
-                    cell.chain = Some(chain.clone());
-                }
-            }
-            Some(Container::TextBox { chain: slot, .. }) => *slot = Some(chain.clone()),
-            None => {}
-        }
-        chain
     }
 
     fn in_table(&self) -> bool {
         self.containers
             .iter()
             .any(|container| matches!(container, Container::Table(_)))
+    }
+
+    /// A tracked deletion of the open row: the accepted view has no such row, neither its
+    /// content nor its place. True when its content is now excluded.
+    fn delete_row(&mut self, hidden: bool) -> bool {
+        let Some(table) = self.table() else {
+            return false;
+        };
+        if hidden {
+            let mut shape = table.shape.borrow_mut();
+            shape.undecided = shape.undecided.or(Some(UNKNOWN_NAMESPACE));
+            return false;
+        }
+        match &mut table.row {
+            Some(row) if !row.deleted => {
+                row.deleted = true;
+                table.shape.borrow_mut().rows.pop();
+                self.excluded += 1;
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -2313,8 +2774,10 @@ struct Doc<'l> {
     page_seen: bool,
     blocks: Vec<Block>,
     warnings: Warnings,
-    /// The last chain judged, and what it puts beneath its paragraphs.
-    last_beneath: Option<(Rc<[Under]>, Rc<Beneath>)>,
+    /// A property was written twice with two values in the parts read so far.
+    props_twice: bool,
+    /// The last chain judged, and what it puts beneath its paragraphs under each reading.
+    last_beneath: Option<(Rc<Link>, Readings)>,
 }
 
 impl Doc<'_> {
@@ -2324,7 +2787,7 @@ impl Doc<'_> {
             check_root(xml)?;
         }
         let mut part = Part {
-            name,
+            name: Arc::from(name),
             story,
             ordinal: 0,
             excluded: 0,
@@ -2335,9 +2798,10 @@ impl Doc<'_> {
             shapetypes: HashMap::new(),
             fields: Vec::new(),
             sdts: Vec::new(),
-            bound: 0,
+            dropping: Vec::new(),
+            objects: 0,
+            extensions: 0,
             pending: Vec::new(),
-            no_chain: Rc::from(Vec::new()),
             seen: 0,
             out: Vec::new(),
             hidden: Vec::new(),
@@ -2375,15 +2839,25 @@ impl Doc<'_> {
                         continue;
                     }
                     match nodes.last() {
-                        Some(Node::Text) => part.put(hidden, Some(text)),
+                        Some(Node::Text) => part.put(hidden, Put::Text(text)),
                         Some(Node::InstrText) => part.instruction(&text, hidden),
                         Some(&Node::PosOffset(axis)) => {
                             if let Some(shape) = part.shapes.last_mut() {
                                 match text.trim().parse::<i64>() {
-                                    Ok(offset) if !hidden => shape.offset[axis] = Some(offset),
-                                    _ => shape.undecided = true,
+                                    _ if hidden => shape.undecide(UNKNOWN_NAMESPACE),
+                                    Ok(offset) => shape.offset[axis] = Some(offset),
+                                    Err(_) => shape.undecide(UNDECIDED),
                                 }
                             }
+                        }
+                        // Text of an element the reader does not read, in a paragraph: an
+                        // equation, say, which Word draws where it stands. A shape's
+                        // extensions are not drawn.
+                        _ if hidden
+                            && part.extensions == 0
+                            && !text.chars().all(char::is_whitespace) =>
+                        {
+                            part.drop_unread()
                         }
                         _ => {}
                     }
@@ -2415,12 +2889,36 @@ impl Doc<'_> {
         if skipped || part.excluded > 0 {
             return Ok(Node::Other);
         }
-        // Anything but a first `w:pPr` is the paragraph's content.
+        // Anything but a first `w:pPr` is the paragraph's content, and anything but a first
+        // `w:rPr` the run's.
         if parent == Some(Node::Paragraph)
             && !(w && local == "pPr")
             && let Some(para) = part.para()
         {
             para.content = true;
+        }
+        if parent == Some(Node::Run)
+            && !(w && local == "rPr")
+            && let Some(run) = part.run()
+        {
+            run.content = true;
+        }
+        // Markup inside text, which Word does not read there: what the run shows around it is
+        // undecided, and inside an instruction its field's type is.
+        match parent {
+            Some(Node::Text) => {
+                if let Some(run) = part.run() {
+                    run.drop_text(UNDECIDED);
+                }
+                return Ok(Node::Other);
+            }
+            Some(Node::InstrText) => {
+                if let Some(field) = part.fields.iter_mut().rev().find(|field| field.code) {
+                    field.undecided = true;
+                }
+                return Ok(Node::Other);
+            }
+            _ => {}
         }
         if !w {
             return self.open_drawing(part, walker, start, parent, namespace, local, hidden);
@@ -2448,6 +2946,9 @@ impl Doc<'_> {
                 Node::Background
             }
             (Some(Node::Document), "body") => {
+                if part.body_started {
+                    return Err(DocError::Malformed("docx_structure"));
+                }
                 part.body_started = true;
                 Node::Body
             }
@@ -2473,7 +2974,8 @@ impl Doc<'_> {
                     runs: Vec::new(),
                     run: None,
                     under,
-                    gap: false,
+                    gap: Gap::None,
+                    dropped: None,
                     content: false,
                     has_props: false,
                     shared: None,
@@ -2501,48 +3003,51 @@ impl Doc<'_> {
                 Node::Other
             }
             (Some(Node::Run), "tab" | "ptab") => {
-                part.put(hidden, Some("\t".into()));
+                part.put(hidden, Put::Text("\t".into()));
                 Node::Other
             }
             (Some(Node::Run), "br" | "cr") => {
-                part.put(hidden, Some("\n".into()));
+                part.put(hidden, Put::Text("\n".into()));
                 Node::Other
             }
             (Some(Node::Run), "noBreakHyphen") => {
-                part.put(hidden, Some("-".into()));
+                part.put(hidden, Put::Text("-".into()));
                 Node::Other
             }
             (Some(Node::Run), "sym") => {
                 let font = walker.w(start, "font")?;
                 let code = walker.w(start, "char")?;
-                let text = symbol(font.as_deref(), code.as_deref()).map(String::from);
-                part.put(hidden, text);
+                part.put(hidden, symbol_put(font.as_deref(), code.as_deref()));
                 Node::Other
             }
             (Some(Node::Run), "drawing" | "pict") => {
-                part.put(hidden, None);
+                part.put(hidden, Put::Gap(Gap::Object));
+                part.objects += 1;
                 Node::Object
             }
-            // Ruby text, note marks, page numbers and date blocks: Word draws something there.
+            // Ruby and date blocks: text Word draws there.
             (
                 Some(Node::Run),
-                "ruby"
-                | "footnoteReference"
+                "ruby" | "dayShort" | "dayLong" | "monthShort" | "monthLong" | "yearShort"
+                | "yearLong",
+            ) => {
+                part.put(hidden, Put::Gap(Gap::Text));
+                part.excluded += 1;
+                Node::Excluded
+            }
+            // Note marks, page numbers and separators: something Word draws there.
+            (
+                Some(Node::Run),
+                "footnoteReference"
                 | "endnoteReference"
                 | "footnoteRef"
                 | "endnoteRef"
                 | "pgNum"
                 | "separator"
                 | "continuationSeparator"
-                | "dayShort"
-                | "dayLong"
-                | "monthShort"
-                | "monthLong"
-                | "yearShort"
-                | "yearLong"
                 | "contentPart",
             ) => {
-                part.put(hidden, None);
+                part.put(hidden, Put::Gap(Gap::Object));
                 part.excluded += 1;
                 Node::Excluded
             }
@@ -2553,11 +3058,16 @@ impl Doc<'_> {
             (Some(Node::Run), "instrText") => Node::InstrText,
             (Some(Node::Run), "rPr") => {
                 if let Some(run) = part.run() {
+                    // Properties after the run's content: the reader has read that content
+                    // before them, as Word does not.
+                    if run.content {
+                        return Err(DocError::Malformed("docx_structure"));
+                    }
                     if run.has_props {
-                        run.props.undecided = run.props.undecided.or(Some(UNDECIDED));
+                        run.props.undecide(UNDECIDED);
                     }
                     if hidden {
-                        run.props.undecided = run.props.undecided.or(Some(UNKNOWN_NAMESPACE));
+                        run.props.undecide(UNKNOWN_NAMESPACE);
                     }
                     run.has_props = true;
                 }
@@ -2566,12 +3076,17 @@ impl Doc<'_> {
             }
             (Some(Node::RunProps), _) => {
                 let mut seen = part.seen;
+                let styles = &self.styles;
+                let mut twice = false;
                 if let Some(run) = part.run() {
                     if hidden {
-                        run.props.undecided = run.props.undecided.or(Some(UNKNOWN_NAMESPACE));
+                        run.props.undecide(UNKNOWN_NAMESPACE);
                     }
-                    run.props.read(walker, start, local, &mut seen)?;
+                    twice = run.props.read(walker, start, local, &mut seen, &mut |id| {
+                        Ok(styles.find(&id))
+                    })?;
                 }
+                self.props_twice |= twice;
                 part.seen = seen;
                 Node::Other
             }
@@ -2581,10 +3096,10 @@ impl Doc<'_> {
                         return Err(DocError::Malformed("docx_structure"));
                     }
                     if para.has_props {
-                        para.props.undecided = para.props.undecided.or(Some(UNDECIDED));
+                        para.props.undecide(UNDECIDED);
                     }
                     if hidden {
-                        para.props.undecided = para.props.undecided.or(Some(UNKNOWN_NAMESPACE));
+                        para.props.undecide(UNKNOWN_NAMESPACE);
                     }
                     para.has_props = true;
                 }
@@ -2593,31 +3108,24 @@ impl Doc<'_> {
             }
             (Some(Node::ParaProps), _) => {
                 let mut seen = part.seen;
+                let styles = &self.styles;
+                let mut twice = false;
                 if let Some(para) = part.para() {
                     if hidden {
-                        para.props.undecided = para.props.undecided.or(Some(UNKNOWN_NAMESPACE));
+                        para.props.undecide(UNKNOWN_NAMESPACE);
                     }
-                    para.props.read(walker, start, local, &mut seen)?;
+                    twice = para
+                        .props
+                        .read(walker, start, local, &mut seen, &mut |id| {
+                            Ok(styles.find(&id))
+                        })?;
                 }
+                self.props_twice |= twice;
                 part.seen = seen;
                 Node::Other
             }
             (Some(Node::RowProps), "del") => {
-                let mut excluded = false;
-                if let Some(table) = part.table() {
-                    if hidden {
-                        let mut shape = table.shape.borrow_mut();
-                        shape.undecided = shape.undecided.or(Some(UNKNOWN_NAMESPACE));
-                    } else if let Some(row) = &mut table.row
-                        && !row.deleted
-                    {
-                        // The accepted view has no such row: not its content, not its place.
-                        row.deleted = true;
-                        table.shape.borrow_mut().rows.pop();
-                        excluded = true;
-                    }
-                }
-                part.excluded += u32::from(excluded);
+                part.delete_row(hidden);
                 Node::Other
             }
             (_, "del" | "moveFrom") => {
@@ -2625,7 +3133,7 @@ impl Doc<'_> {
                 Node::Excluded
             }
             (_, "object") => {
-                part.put(hidden, None);
+                part.put(hidden, Put::Gap(Gap::Object));
                 self.warnings
                     .once(ExtractWarning::EmbeddedContentIgnored { what: "ole_object" })?;
                 part.excluded += 1;
@@ -2638,11 +3146,8 @@ impl Doc<'_> {
                 Node::Excluded
             }
             (_, "txbxContent") => {
-                let info = match part.shapes.last_mut() {
-                    Some(shape) => {
-                        shape.text_read = true;
-                        shape.box_info()
-                    }
+                let info = match part.shapes.last() {
+                    Some(shape) => shape.box_info(),
                     // Text in no shape the reader read: where Word draws it is not known.
                     None => BoxInfo {
                         hidden: Some("unknown_paint"),
@@ -2650,44 +3155,74 @@ impl Doc<'_> {
                         text_colour: None,
                     },
                 };
+                // Every shape around it is fixed now.
+                for shape in &mut part.shapes {
+                    shape.text_read = true;
+                }
                 let host = match part.paragraphs.last_mut() {
-                    Some(Some(host)) => Some(
+                    Some(Some(host)) => Some((
                         host.shared
                             .get_or_insert_with(|| Rc::new(host.props.clone()))
                             .clone(),
-                    ),
+                        host.run.as_ref().map(|run| Rc::new(run.props.clone())),
+                        host.under.clone(),
+                    )),
                     _ => None,
                 };
+                let outer = match host {
+                    Some((props, run, under)) => Some(Link::new(Under::Host(props, run), under)),
+                    None => part.chain(),
+                };
                 part.paragraphs.push(None);
-                part.containers.push(Container::TextBox {
-                    info: Rc::new(info),
-                    host,
-                    chain: None,
-                });
+                part.containers.push(Container::TextBox(Link::new(
+                    Under::Box(Rc::new(info)),
+                    outer,
+                )));
                 Node::TextBox
             }
             (_, "sdt") => {
-                part.sdts.push(false);
+                part.sdts.push(Sdt::default());
                 Node::Sdt(level(parent))
             }
-            (Some(Node::Sdt(_)), "sdtPr") => Node::SdtProps,
-            (Some(Node::SdtProps), "dataBinding") => {
-                // Word refills the control from its custom XML part when the document opens.
-                if let Some(bound) = part.sdts.last_mut() {
-                    *bound = true;
+            (Some(Node::Sdt(_)), "sdtPr") => {
+                // Properties after the control's content, which the reader read unbound.
+                if part.sdts.last().is_some_and(|sdt| sdt.content) {
+                    return Err(DocError::Malformed("docx_structure"));
                 }
+                Node::SdtProps
+            }
+            (Some(Node::SdtProps), "dataBinding") => {
+                bind(part);
                 Node::Other
             }
-            (Some(Node::Sdt(Some(level))), "sdtContent") => {
-                if part.sdts.last() == Some(&true) {
-                    part.bound += 1;
-                    Node::BoundContent(level)
-                } else {
-                    Node::Container(level)
+            (Some(Node::Sdt(level)), "sdtContent") => {
+                let bound = match part.sdts.last_mut() {
+                    Some(sdt) => {
+                        sdt.content = true;
+                        sdt.bound
+                    }
+                    None => false,
+                };
+                match (level, bound) {
+                    (Some(level), true) => {
+                        part.dropping.push("data_binding");
+                        Node::Dropping(level)
+                    }
+                    (Some(level), false) => Node::Container(level),
+                    (None, _) => Node::Other,
                 }
             }
             (_, "customXml") => level(parent).map_or(Node::Other, Node::Container),
-            (_, "hyperlink" | "smartTag" | "dir" | "bdo" | "ins" | "moveTo")
+            // A right-to-left override: Word draws its text in reverse order.
+            (_, "bdo") if level(parent) == Some(Level::Run) => {
+                if walker.w(start, "val")?.as_deref() == Some("rtl") {
+                    part.dropping.push("reversed");
+                    Node::Dropping(Level::Run)
+                } else {
+                    Node::Container(Level::Run)
+                }
+            }
+            (_, "hyperlink" | "smartTag" | "dir" | "ins" | "moveTo")
                 if level(parent) == Some(Level::Run) =>
             {
                 Node::Container(Level::Run)
@@ -2696,24 +3231,24 @@ impl Doc<'_> {
                 if part.fields.len() as u64 >= u64::from(self.limits.max_xml_depth) {
                     return Err(DocError::TooComplex("field_depth"));
                 }
-                let instruction = walker.w(start, "instr")?.unwrap_or_default();
+                let kind = FieldKind::read(&walker.w(start, "instr")?.unwrap_or_default());
                 let dirty = walker
                     .w(start, "dirty")?
                     .is_some_and(|value| Toggle::parse(Some(&value)) != Toggle::Off);
+                part.nest_field();
                 let depth = part.fields.len();
                 part.fields.push(Field {
                     code: false,
-                    instruction: String::new(),
-                    hide: self.field_hide(&instruction, dirty, part.story),
+                    hide: self.field_hide(&kind, dirty, part.story),
+                    kind,
                     dirty,
                     undecided: hidden,
+                    result: false,
                 });
                 Node::SimpleField(depth)
             }
             (_, "tbl") => {
-                if let Some(cell) = part.cell() {
-                    cell.shared();
-                }
+                let outer = part.chain();
                 let undecided = if hidden {
                     Some(UNKNOWN_NAMESPACE)
                 } else if level(parent) != Some(Level::Block) {
@@ -2728,6 +3263,7 @@ impl Doc<'_> {
                     })),
                     row: None,
                     has_props: false,
+                    outer,
                 }));
                 Node::Table
             }
@@ -2750,22 +3286,25 @@ impl Doc<'_> {
                 let style = (local == "tblStyle")
                     .then(|| walker.w(start, "val"))
                     .transpose()?
-                    .flatten();
+                    .map(|id| id.and_then(|id| self.styles.find(&id)));
                 let look = (local == "tblLook")
                     .then(|| Look::read(walker, start))
                     .transpose()?;
                 let again = repeated(&mut part.seen, Some(u32::from(local == "tblLook")));
+                let mut twice = false;
                 if let Some(table) = part.table() {
                     let mut shape = table.shape.borrow_mut();
                     if hidden {
                         shape.undecided = shape.undecided.or(Some(UNKNOWN_NAMESPACE));
                     }
-                    if again {
-                        shape.undecided = shape.undecided.or(Some(UNDECIDED));
+                    if let Some(style) = style {
+                        twice |= shape.style.set(style, again);
                     }
-                    shape.style = style.or(shape.style.take());
-                    shape.look = look.or(shape.look);
+                    if let Some(look) = look {
+                        twice |= shape.look.set(Some(look), again);
+                    }
                 }
+                self.props_twice |= twice;
                 Node::Other
             }
             (_, "tr") => match part.table() {
@@ -2778,7 +3317,7 @@ impl Doc<'_> {
                     }
                     shape.rows.push(RowShape {
                         cells: 0,
-                        look: None,
+                        look: Twice::default(),
                     });
                     drop(shape);
                     table.row = Some(OpenRow {
@@ -2791,18 +3330,24 @@ impl Doc<'_> {
                 }
                 None => Node::Other,
             },
-            (Some(Node::Row), "tblPrEx") => Node::RowExceptions,
+            (Some(Node::Row), "tblPrEx") => {
+                part.seen = 0;
+                Node::RowExceptions
+            }
             (Some(Node::RowExceptions), "tblLook") => {
                 let look = Look::read(walker, start)?;
+                let again = repeated(&mut part.seen, Some(0));
+                let mut twice = false;
                 if let Some(table) = part.table() {
                     let mut shape = table.shape.borrow_mut();
                     if hidden {
                         shape.undecided = shape.undecided.or(Some(UNKNOWN_NAMESPACE));
                     }
                     if let Some(row) = shape.rows.last_mut() {
-                        row.look = Some(look);
+                        twice = row.look.set(Some(look), again);
                     }
                 }
+                self.props_twice |= twice;
                 Node::Other
             }
             (Some(Node::Row), "trPr") => {
@@ -2849,7 +3394,7 @@ impl Doc<'_> {
                         shared: None,
                         deleted: false,
                         has_props: false,
-                        chain: None,
+                        link: None,
                     });
                     Node::Cell
                 }
@@ -2861,7 +3406,7 @@ impl Doc<'_> {
                         return Err(DocError::Malformed("docx_structure"));
                     }
                     if cell.has_props {
-                        cell.at.props.undecided = cell.at.props.undecided.or(Some(UNDECIDED));
+                        cell.at.props.undecide(UNDECIDED);
                     }
                     cell.has_props = true;
                 }
@@ -2871,17 +3416,18 @@ impl Doc<'_> {
             (Some(Node::CellProps), _) => {
                 let mut seen = part.seen;
                 let mut deleted = false;
+                let mut twice = false;
                 if let Some(cell) = part.cell() {
                     if hidden {
-                        cell.at.props.undecided =
-                            cell.at.props.undecided.or(Some(UNKNOWN_NAMESPACE));
+                        cell.at.props.undecide(UNKNOWN_NAMESPACE);
                     }
-                    cell.at.props.read(walker, start, local, &mut seen)?;
+                    twice = cell.at.props.read(walker, start, local, &mut seen)?;
                     if local == "cellDel" && !hidden && !cell.deleted {
                         cell.deleted = true;
                         deleted = true;
                     }
                 }
+                self.props_twice |= twice;
                 part.seen = seen;
                 if deleted {
                     // The accepted view has no such cell: the cells after it move up a column.
@@ -2898,8 +3444,8 @@ impl Doc<'_> {
         })
     }
 
-    /// Elements outside WordprocessingML: OLE objects, Word's symbol extension, and the frames,
-    /// shapes and fills that decide what a text box's text lies on.
+    /// Elements outside WordprocessingML: OLE objects, Word's symbol, binding and conflict
+    /// extensions, and the frames, shapes and fills that decide what a text box's text lies on.
     #[allow(clippy::too_many_arguments)]
     fn open_drawing(
         &mut self,
@@ -2914,11 +3460,36 @@ impl Doc<'_> {
         let Some(namespace) = namespace else {
             return Ok(Node::Other);
         };
+        // Extensions of shape properties (Word keeps a fill it does not draw there): passed
+        // over whole.
+        if part.extensions > 0 {
+            return Ok(Node::Other);
+        }
+        if (namespace, local) == (DRAWINGML, "extLst") {
+            part.extensions += 1;
+            return Ok(Node::Extensions);
+        }
         // A shape property where Word's choice cannot be decided leaves the shape undecided.
         if hidden && let Some(shape) = part.shapes.last_mut() {
-            shape.undecided = true;
+            shape.undecide(UNKNOWN_NAMESPACE);
         }
+        // A frame's properties after its text box was read, which the reader judged without them.
+        let late = |part: &Part| {
+            if part.shapes.last().is_some_and(|shape| shape.text_read) {
+                Err(DocError::Malformed("docx_structure"))
+            } else {
+                Ok(())
+            }
+        };
         let toggle = |value: Option<String>| value.map(|value| Toggle::parse(Some(&value)));
+        // VML writes its booleans `t` and `f`.
+        let vml_toggle = |value: Option<String>| {
+            value.map(|value| match value.as_str() {
+                "t" | "true" => Toggle::On,
+                "f" | "false" => Toggle::Off,
+                _ => Toggle::Bad,
+            })
+        };
         Ok(match (namespace, local, parent) {
             (OFFICE, "OLEObject", _) => {
                 self.warnings
@@ -2927,51 +3498,67 @@ impl Doc<'_> {
                 Node::Excluded
             }
             (W16SE, "symEx", Some(Node::Run)) => {
-                let symbol = walker
-                    .attr(start, Some(W16SE), "char")?
-                    .and_then(|hex| u32::from_str_radix(&hex, 16).ok())
-                    .and_then(char::from_u32)
-                    .filter(|c| !c.is_control());
-                part.put(hidden, symbol.map(String::from));
+                let font = walker.attr(start, Some(W16SE), "font")?;
+                let code = walker.attr(start, Some(W16SE), "char")?;
+                part.put(hidden, symbol_put(font.as_deref(), code.as_deref()));
+                Node::Other
+            }
+            (W15, "dataBinding", Some(Node::SdtProps)) => {
+                bind(part);
+                Node::Other
+            }
+            (W14, "conflictDel", Some(Node::RowProps)) => {
+                part.delete_row(hidden);
                 Node::Other
             }
             (WP, "inline" | "anchor", _) => {
                 let mut shape = ShapeState::inside(part.shapes.last());
                 shape.anchored = local == "anchor";
-                shape.undecided |= hidden;
+                if hidden {
+                    shape.undecide(UNKNOWN_NAMESPACE);
+                }
+                // A frame outside `w:drawing`, which Word does not lay out there.
+                if part.objects == 0 {
+                    shape.undecide(UNDECIDED);
+                }
                 match toggle(walker.attr(start, None, "simplePos")?) {
                     Some(Toggle::On) => shape.simple = true,
-                    Some(Toggle::Bad) => shape.undecided = true,
+                    Some(Toggle::Bad) => shape.undecide(UNDECIDED),
                     _ => {}
                 }
                 part.shapes.push(shape);
                 Node::Shape
             }
             (WP, "docPr", _) | (WPS | WPG | WPC, "cNvPr", _) => {
+                late(part)?;
                 if let Some(shape) = part.shapes.last_mut() {
                     match toggle(walker.attr(start, None, "hidden")?) {
                         Some(Toggle::On) => shape.hidden = true,
-                        Some(Toggle::Bad) => shape.undecided = true,
+                        Some(Toggle::Bad) => shape.undecide(UNDECIDED),
                         _ => {}
                     }
                 }
                 Node::Other
             }
             (WP, "simplePos", _) => {
+                late(part)?;
                 if let Some(shape) = part.shapes.last_mut()
                     && shape.simple
                 {
                     for (axis, name) in ["x", "y"].into_iter().enumerate() {
                         match walker.attr(start, None, name)?.map(|v| v.parse::<i64>()) {
                             Some(Ok(offset)) => shape.offset[axis] = Some(offset),
-                            Some(Err(_)) => shape.undecided = true,
+                            Some(Err(_)) => shape.undecide(UNDECIDED),
                             None => {}
                         }
                     }
                 }
                 Node::Other
             }
-            (WP, "positionH" | "positionV", _) => Node::Position(usize::from(local == "positionV")),
+            (WP, "positionH" | "positionV", _) => {
+                late(part)?;
+                Node::Position(usize::from(local == "positionV"))
+            }
             (WP, "posOffset", Some(Node::Position(axis))) => {
                 if part.shapes.last().is_some_and(|shape| shape.simple) {
                     Node::Other
@@ -2980,11 +3567,12 @@ impl Doc<'_> {
                 }
             }
             (WP, "extent", _) => {
+                late(part)?;
                 if let Some(shape) = part.shapes.last_mut() {
                     for (axis, name) in ["cx", "cy"].into_iter().enumerate() {
                         match walker.attr(start, None, name)?.map(|v| v.parse::<i64>()) {
                             Some(Ok(extent)) => shape.extent[axis] = extent,
-                            Some(Err(_)) => shape.undecided = true,
+                            Some(Err(_)) => shape.undecide(UNDECIDED),
                             None => {}
                         }
                     }
@@ -2992,15 +3580,20 @@ impl Doc<'_> {
                 Node::Other
             }
             (WPS, "wsp", _) | (WPG, "wgp", _) | (WPC, "wpc", _) => {
+                // A shape in no frame, which Word does not lay out.
+                let framed = part.shapes.last().is_some();
                 let mut shape = ShapeState::inside(part.shapes.last());
-                shape.undecided |= hidden;
+                if hidden {
+                    shape.undecide(UNKNOWN_NAMESPACE);
+                }
+                if !framed {
+                    shape.undecide(UNDECIDED);
+                }
                 part.shapes.push(shape);
                 Node::Shape
             }
             (WPS, "spPr", _) | (WPG, "grpSpPr", _) => {
-                if part.shapes.last().is_some_and(|shape| shape.text_read) {
-                    return Err(DocError::Malformed("docx_structure"));
-                }
+                late(part)?;
                 Node::ShapeProps
             }
             (DRAWINGML, fill, Some(Node::ShapeProps)) => {
@@ -3026,9 +3619,7 @@ impl Doc<'_> {
                 }
             }
             (WPS, "style", _) => {
-                if part.shapes.last().is_some_and(|shape| shape.text_read) {
-                    return Err(DocError::Malformed("docx_structure"));
-                }
+                late(part)?;
                 Node::ShapeStyle
             }
             (DRAWINGML, "fillRef", Some(Node::ShapeStyle)) => {
@@ -3093,7 +3684,13 @@ impl Doc<'_> {
                 let in_group = part.shapes.last().is_some_and(|outer| outer.vml);
                 let mut shape = ShapeState::inside(part.shapes.last());
                 shape.vml = true;
-                shape.undecided |= hidden;
+                if hidden {
+                    shape.undecide(UNKNOWN_NAMESPACE);
+                }
+                // A VML shape outside `w:pict`, which Word does not lay out there.
+                if part.objects == 0 && !in_group {
+                    shape.undecide(UNDECIDED);
+                }
                 let white = ShapeFill::Colour(ColourSpec::rgb(Rgb::WHITE));
                 shape.vml_default = Some(match walker.attr(start, None, "type")? {
                     None => white,
@@ -3111,7 +3708,7 @@ impl Doc<'_> {
                     &walker.attr(start, None, "style")?.unwrap_or_default(),
                     in_group,
                 );
-                let filled = toggle(walker.attr(start, None, "filled")?);
+                let filled = vml_toggle(walker.attr(start, None, "filled")?);
                 match (filled, walker.attr(start, None, "fillcolor")?) {
                     (Some(Toggle::Off), _) => shape.fill = Some(ShapeFill::None),
                     (Some(Toggle::Bad), _) => shape.fill = Some(ShapeFill::Unknown),
@@ -3126,11 +3723,9 @@ impl Doc<'_> {
                 Node::Shape
             }
             (VML, "fill", Some(Node::Shape)) => {
+                late(part)?;
                 if let Some(shape) = part.shapes.last_mut() {
-                    if shape.text_read {
-                        return Err(DocError::Malformed("docx_structure"));
-                    }
-                    let on = toggle(walker.attr(start, None, "on")?);
+                    let on = vml_toggle(walker.attr(start, None, "on")?);
                     let kind = walker.attr(start, None, "type")?;
                     let opacity = walker.attr(start, None, "opacity")?;
                     let colour = walker.attr(start, None, "color")?;
@@ -3176,12 +3771,14 @@ impl Doc<'_> {
                 if part.fields.len() as u64 >= u64::from(self.limits.max_xml_depth) {
                     return Err(DocError::TooComplex("field_depth"));
                 }
+                part.nest_field();
                 part.fields.push(Field {
                     code: true,
-                    instruction: String::new(),
+                    kind: FieldKind::default(),
                     hide: None,
                     dirty,
                     undecided: hidden,
+                    result: false,
                 });
             }
             Some("separate") => {
@@ -3189,7 +3786,7 @@ impl Doc<'_> {
                     if hidden || !field.code {
                         field.undecided = true;
                     } else {
-                        field.hide = self.field_hide(&field.instruction, field.dirty, part.story);
+                        field.hide = self.field_hide(&field.kind, field.dirty, part.story);
                     }
                     field.code = false;
                 }
@@ -3199,8 +3796,8 @@ impl Doc<'_> {
                     if let Some(field) = part.fields.last_mut() {
                         field.undecided = true;
                     }
-                } else {
-                    part.fields.pop();
+                } else if let Some(field) = part.fields.pop() {
+                    part.field_ended(&field);
                 }
             }
             _ => {
@@ -3212,21 +3809,21 @@ impl Doc<'_> {
         Ok(())
     }
 
-    /// Why a field's result is not what Word shows: a field Word never shows, one it computes as
-    /// it lays the document out or opens it, any field of a header or footer (recomputed on
-    /// every page), and any field Word updates on open (`w:updateFields`, `w:dirty`). A
-    /// hyperlink keeps its text when updated.
-    fn field_hide(&self, instruction: &str, dirty: bool, story: Story) -> Option<&'static str> {
-        let kind = instruction
-            .split(|c: char| c.is_whitespace() || c == '\\')
-            .find(|word| !word.is_empty())
-            .unwrap_or_default()
-            .to_ascii_uppercase();
+    /// Why a field's result is not what Word shows: a type the reader cannot read, a field Word
+    /// never shows, one it computes as it lays the document out or opens it, one it draws from
+    /// its code, any field of a header or footer (recomputed on every page), and any field Word
+    /// updates on open (`w:updateFields`, `w:dirty`). A hyperlink keeps its text when updated.
+    fn field_hide(&self, kind: &FieldKind, dirty: bool, story: Story) -> Option<&'static str> {
+        let Some(kind) = kind.name() else {
+            return Some(UNDECIDED);
+        };
         if kind == "HYPERLINK" {
             return None;
         }
-        (NEVER_SHOWN.contains(&kind.as_str())
-            || LAYOUT_COMPUTED.contains(&kind.as_str())
+        let kind = kind.as_str();
+        (NEVER_SHOWN.contains(&kind)
+            || LAYOUT_COMPUTED.contains(&kind)
+            || DRAWN_FROM_CODE.contains(&kind)
             || story == Story::HeaderFooter
             || self.settings.update_fields
             || dirty)
@@ -3237,9 +3834,24 @@ impl Doc<'_> {
         match node {
             Node::Paragraph => {
                 if let Some(Some(para)) = part.paragraphs.pop() {
-                    // A paragraph with no kept run shows nothing and warns of nothing.
-                    if para.runs.is_empty() {
+                    // A paragraph whose kept runs hold only white space, none of it dropped,
+                    // shows nothing and warns of nothing.
+                    let quiet = para.dropped.is_none()
+                        && para.runs.iter().all(|run| {
+                            run.dropped.is_none() && run.text.chars().all(char::is_whitespace)
+                        });
+                    if quiet {
                     } else if part.in_table() {
+                        // Each queued paragraph makes a block or a warning, and there may be
+                        // `max_blocks` of each: more cannot be read.
+                        let made = part.pending.len()
+                            + part.out.len()
+                            + part.hidden.len()
+                            + self.blocks.len()
+                            + self.warnings.list.len();
+                        if made as u64 >= 2 * u64::from(self.limits.max_blocks) {
+                            return Err(DocError::TooComplex("blocks"));
+                        }
                         let mut para = Box::new(para);
                         para.runs.shrink_to_fit();
                         part.pending.push(para);
@@ -3256,15 +3868,17 @@ impl Doc<'_> {
                         if para.runs.len() >= MAX_PARAGRAPH_RUNS {
                             return Err(DocError::TooComplex("paragraph_runs"));
                         }
-                        run.gap_before |= para.gap;
-                        para.gap = false;
+                        run.gap_before = run.gap_before.max(para.gap);
+                        para.gap = Gap::None;
                         para.runs.push(*run);
-                    } else if run.gap_before || run.gap_after {
-                        para.gap = true;
+                    } else {
+                        para.gap = para.gap.max(run.gap_before).max(run.gap_after);
                     }
                 }
             }
             Node::Excluded => part.excluded -= 1,
+            Node::Object => part.objects -= 1,
+            Node::Extensions => part.extensions -= 1,
             Node::TextBox => {
                 part.paragraphs.pop();
                 part.containers.pop();
@@ -3302,11 +3916,35 @@ impl Doc<'_> {
             Node::Sdt(_) => {
                 part.sdts.pop();
             }
-            Node::BoundContent(_) => part.bound -= 1,
-            Node::SimpleField(depth) => part.fields.truncate(depth),
+            Node::Dropping(_) => {
+                part.dropping.pop();
+            }
+            Node::SimpleField(depth) => {
+                let mut closed = part.fields.split_off(depth.min(part.fields.len()));
+                if !closed.is_empty() {
+                    let field = closed.swap_remove(0);
+                    part.field_ended(&field);
+                }
+            }
             _ => {}
         }
         Ok(())
+    }
+}
+
+/// Marks the open content control as bound to a custom XML part: Word refills it from that part
+/// when the document opens.
+fn bind(part: &mut Part) {
+    if let Some(sdt) = part.sdts.last_mut() {
+        sdt.bound = true;
+    }
+}
+
+/// What a `w:sym` or `w16se:symEx` draws: its character when the reader can tell, else a gap.
+fn symbol_put(font: Option<&str>, code: Option<&str>) -> Put {
+    match symbol(font, code) {
+        Some(symbol) => Put::Text(symbol.into()),
+        None => Put::Gap(Gap::Text),
     }
 }
 
@@ -3425,7 +4063,7 @@ fn vml_style(shape: &mut ShapeState, style: &str, in_group: bool) {
                 let axis = usize::from(name.ends_with("top"));
                 match emu() {
                     Some(offset) => shape.offset[axis] = Some(offset),
-                    None => shape.undecided = true,
+                    None => shape.undecide(UNDECIDED),
                 }
             }
             "width" | "height" if !in_group => {
@@ -3438,20 +4076,104 @@ fn vml_style(shape: &mut ShapeState, style: &str, in_group: bool) {
     }
 }
 
+/// Why the colours beneath a run cannot be listed: one does not parse, or there are more
+/// candidates than `MAX_CANDIDATES` (the run is then undecided), or the job must stop.
+#[derive(Debug, Clone)]
+enum Unlisted {
+    Paint,
+    Many,
+    Stop(DocError),
+}
+
+/// The candidate colours one place may show: past this many, what Word draws there is left
+/// undecided rather than listed.
+const MAX_CANDIDATES: usize = 64;
+
+/// Adds `colour` to `colours` unless it is there; too many is `Unlisted::Many`.
+fn add_candidate(colours: &mut Vec<Rgb>, colour: Rgb) -> Result<(), Unlisted> {
+    if !colours.contains(&colour) {
+        if colours.len() == MAX_CANDIDATES {
+            return Err(Unlisted::Many);
+        }
+        colours.push(colour);
+    }
+    Ok(())
+}
+
+/// What a link and the links around it put beneath a paragraph, as one reading takes it.
+struct Outward {
+    /// A cell's table level: what its table style gives the cell's paragraphs.
+    level: Option<TableLevel>,
+    /// This link's own layers, nearest first.
+    layers: Vec<Layer>,
+    outer: Option<Rc<Outward>>,
+    /// Why every run beneath it is hidden, and why every run beneath it is undecided: this
+    /// link's reason, else the nearest outer one's.
+    whole: Option<&'static str>,
+    undecided: Option<&'static str>,
+    /// A text box's own text colour.
+    box_colour: Option<ColourSpec>,
+    /// The colours beneath `layers` and the links around them, once a run asked.
+    colours: OnceCell<Result<Vec<Rgb>, Unlisted>>,
+}
+
+/// What a link puts beneath a paragraph, for each reading worked out so far.
+type Readings = Vec<(Reading, Rc<Outward>)>;
+
+/// One reading of a paragraph: what lies beneath it, and its own effective properties.
+struct View {
+    reading: Reading,
+    beneath: Option<Rc<Outward>>,
+    props: ParaProps,
+    style: Option<Rc<Merged>>,
+}
+
+impl View {
+    fn level(&self) -> Option<&TableLevel> {
+        self.beneath.as_ref()?.level.as_ref()
+    }
+}
+
 impl Doc<'_> {
+    /// Every reading the parts read so far leave open, the last-wins reading first.
+    fn readings(&self) -> Vec<Reading> {
+        let props = self.props_twice || self.styles.props_twice;
+        let mut readings = Vec::with_capacity(8);
+        for styles_first in [false, true] {
+            for props_first in [false, true] {
+                for bands_off in [false, true] {
+                    if (styles_first && !self.styles.twice)
+                        || (props_first && !props)
+                        || (bands_off && !self.styles.banded)
+                    {
+                        continue;
+                    }
+                    readings.push(Reading {
+                        styles_first,
+                        props_first,
+                        bands_off,
+                    });
+                }
+            }
+        }
+        readings
+    }
+
     /// A paragraph's effective properties: the defaults, its cell's table level, its style and
-    /// its own; with the merged paragraph style.
+    /// its own (as `reading` takes them); with the merged paragraph style.
     fn para_props(
         &self,
         own: &ParaProps,
         level: Option<&TableLevel>,
+        reading: Reading,
     ) -> Result<(ParaProps, Option<Rc<Merged>>), DocError> {
         let styles = &self.styles;
         let style = styles
-            .resolve(own.style.as_deref(), StyleKind::Paragraph)
-            .map(|id| styles.merged(id, StyleKind::Paragraph))
+            .resolve(own.style, StyleKind::Paragraph, reading)
+            .map(|id| styles.merged(id, StyleKind::Paragraph, reading))
             .transpose()?;
-        let mut props = styles.defaults.para.clone();
+        let mut props = ParaProps::default();
+        props.overlay(styles.defaults.para.at(reading));
         if let Some(level) = level {
             props.overlay(&level.props.para);
         }
@@ -3462,140 +4184,201 @@ impl Doc<'_> {
         Ok((props, style))
     }
 
-    /// What a chain of containers puts beneath its paragraphs: its innermost cell's table level
-    /// (table style formatting reaches a paragraph only in its own cell, not in a text box), the
-    /// layers outward to the page, and what hides or leaves undecided every run.
-    fn beneath(&self, under: &[Under]) -> Result<Beneath, DocError> {
-        let mut levels = Vec::with_capacity(under.len());
-        for item in under {
-            levels.push(match item {
-                Under::Cell(shape, cell) => Some(self.table_level(&shape.borrow(), cell)?),
-                _ => None,
-            });
+    /// A run's properties under `reading`: the defaults, then the given levels, then its own.
+    fn effective(
+        &self,
+        own: &RunProps,
+        levels: &[Option<&RunProps>; 3],
+        reading: Reading,
+    ) -> RunProps {
+        let mut effective = RunProps::default();
+        effective.overlay(self.styles.defaults.run.at(reading));
+        for props in levels.iter().flatten() {
+            effective.overlay(props);
         }
-        let mut beneath = Beneath::default();
-        for (at, item) in under.iter().enumerate() {
-            match item {
-                Under::Cell(_, cell) => {
-                    let level = levels[at].as_ref().expect("a cell's table level");
-                    if cell.props.merged {
-                        beneath.whole = beneath.whole.or(Some("merged_cell"));
-                    }
-                    beneath.undecided = beneath
-                        .undecided
-                        .or(cell.props.undecided)
-                        .or(level.undecided);
-                    let layers = &mut beneath.layers;
-                    layers.extend(cell.props.shading.map(Layer::Shading));
-                    layers.extend(level.region_shading.map(Layer::Shading));
-                    layers.extend(level.props.cell.shading.map(Layer::Shading));
-                }
-                Under::Box(info) => {
-                    beneath.whole = beneath.whole.or(info.hidden);
-                    if at == 0 {
-                        beneath.box_colour = info.text_colour;
-                    }
-                    if let Some(fill) = &info.fill {
-                        beneath.layers.push(Layer::Fill(match self.paint(fill) {
-                            Paint::Colours(colours) => Ok(colours),
-                            Paint::Auto | Paint::Bad => Err(()),
-                        }));
-                    }
-                }
-                Under::Host(props) => {
-                    let host_level = match under.get(at + 1) {
-                        Some(Under::Cell(..)) => levels[at + 1].as_ref(),
-                        _ => None,
-                    };
-                    let (host, _) = self.para_props(props, host_level)?;
-                    beneath.undecided = beneath.undecided.or(host.undecided);
-                    beneath.layers.extend(host.shading.map(Layer::Shading));
-                }
-                Under::Nowhere => beneath.whole = beneath.whole.or(Some(UNDECIDED)),
-            }
-        }
-        beneath.level = levels.into_iter().next().flatten();
-        Ok(beneath)
+        effective.overlay(own);
+        effective
     }
 
-    /// Judges a finished paragraph's runs and records its visible text and hidden reason. The
-    /// text of a run left out between two visible stretches leaves `GAP` in their place.
+    /// What `link` and the links around it put beneath a paragraph under `reading`: a cell's
+    /// table level and shading (table style formatting reaches a paragraph only in its own cell),
+    /// a text box's fill and visibility, an inline box's host paragraph and run. A link nested
+    /// in another keeps the outer one's (`keep`), so each is worked out once per reading.
+    fn outward(&self, link: &Link, reading: Reading, keep: bool) -> Result<Rc<Outward>, DocError> {
+        if let Some((_, found)) = link
+            .outward
+            .borrow()
+            .iter()
+            .find(|(seen, _)| *seen == reading)
+        {
+            return Ok(found.clone());
+        }
+        deadline::check()?;
+        let outer = link
+            .outer
+            .as_deref()
+            .map(|outer| self.outward(outer, reading, true))
+            .transpose()?;
+        let mut out = Outward {
+            level: None,
+            layers: Vec::new(),
+            outer,
+            whole: None,
+            undecided: None,
+            box_colour: None,
+            colours: OnceCell::new(),
+        };
+        match &link.under {
+            Under::Cell(shape, cell) => {
+                let level = self.table_level(&shape.borrow(), cell, reading)?;
+                let props = cell.props.at(reading);
+                if props.merged {
+                    out.whole = Some("merged_cell");
+                }
+                out.undecided = props.undecided.or(level.undecided);
+                out.layers.extend(props.shading.map(Layer::Shading));
+                out.layers.extend(level.region_shading.map(Layer::Shading));
+                out.layers
+                    .extend(level.props.cell.shading.map(Layer::Shading));
+                out.level = Some(level);
+            }
+            Under::Box(info) => {
+                out.whole = info.hidden;
+                out.box_colour = info.text_colour;
+                if let Some(fill) = &info.fill {
+                    out.layers.push(Layer::Fill(match self.paint(fill) {
+                        Paint::Colours(colours) => Ok(colours),
+                        Paint::Auto | Paint::Bad => Err(()),
+                    }));
+                }
+            }
+            Under::Host(props, run) => {
+                // The host paragraph sits in what lies beneath it: its cell's level, if any.
+                let level = out.outer.as_ref().and_then(|outer| outer.level.as_ref());
+                let (host, style) = self.para_props(props.at(reading), level, reading)?;
+                out.undecided = host.undecided;
+                out.layers.extend(host.shading.map(Layer::Shading));
+                if let Some(run) = run {
+                    let own = run.at(reading);
+                    let char_style = self
+                        .styles
+                        .resolve(own.style, StyleKind::Character, reading)
+                        .map(|id| self.styles.merged(id, StyleKind::Character, reading))
+                        .transpose()?;
+                    let levels = [
+                        level.map(|level| &level.props.run),
+                        style.as_ref().map(|style| &style.props.run),
+                        char_style.as_ref().map(|style| &style.props.run),
+                    ];
+                    let effective = self.effective(own, &levels, reading);
+                    out.whole = if self.vanished(own, &levels, &effective, reading) {
+                        Some("vanish")
+                    } else {
+                        effective.undecided
+                    };
+                }
+            }
+        }
+        if let Some(outer) = &out.outer {
+            out.whole = out.whole.or(outer.whole);
+            out.undecided = out.undecided.or(outer.undecided);
+        }
+        let out = Rc::new(out);
+        if keep {
+            link.outward.borrow_mut().push((reading, out.clone()));
+        }
+        Ok(out)
+    }
+
+    /// What lies beneath the paragraphs of `under` under `reading`; the paragraphs of one cell
+    /// or text box share it, worked out once.
+    fn beneath(
+        &mut self,
+        under: Option<&Rc<Link>>,
+        reading: Reading,
+    ) -> Result<Option<Rc<Outward>>, DocError> {
+        let Some(link) = under else {
+            return Ok(None);
+        };
+        if let Some((last, seen)) = &self.last_beneath
+            && Rc::ptr_eq(last, link)
+            && let Some((_, found)) = seen.iter().find(|(seen, _)| *seen == reading)
+        {
+            return Ok(Some(found.clone()));
+        }
+        let found = self.outward(link, reading, false)?;
+        match &mut self.last_beneath {
+            Some((last, seen)) if Rc::ptr_eq(last, link) => seen.push((reading, found.clone())),
+            last => *last = Some((link.clone(), vec![(reading, found.clone())])),
+        }
+        Ok(Some(found))
+    }
+
+    /// Judges a finished paragraph's runs under every reading and records its visible text and
+    /// hidden reason. Where text was left out between two visible stretches, or text Word draws
+    /// was left out at either end, `GAP` stands in its place.
     fn judge(&mut self, part: &mut Part, para: Para) -> Result<(), DocError> {
         deadline::check()?;
-        // The paragraphs of one cell or text box share their chain, judged once for all of them.
-        let beneath = match &self.last_beneath {
-            Some((chain, beneath)) if Rc::ptr_eq(chain, &para.under) => beneath.clone(),
-            _ => {
-                let beneath = Rc::new(self.beneath(&para.under)?);
-                self.last_beneath = Some((para.under.clone(), beneath.clone()));
-                beneath
-            }
-        };
-        let level = beneath.level.as_ref();
-        let (para_props, para_style) = self.para_props(&para.props, level)?;
-        let whole = beneath.whole;
-        let undecided = para_props.undecided.or(beneath.undecided);
-        let own: Vec<Layer> = para_props.shading.map(Layer::Shading).into_iter().collect();
+        let mut views = Vec::new();
+        for reading in self.readings() {
+            let beneath = self.beneath(para.under.as_ref(), reading)?;
+            let level = beneath.as_ref().and_then(|beneath| beneath.level.as_ref());
+            let (props, style) = self.para_props(para.props.at(reading), level, reading)?;
+            views.push(View {
+                reading,
+                beneath,
+                props,
+                style,
+            });
+        }
+        let whole = views
+            .iter()
+            .find_map(|view| view.beneath.as_ref().and_then(|beneath| beneath.whole));
 
-        let styles = &self.styles;
         let mut text = String::new();
-        let (mut gap, mut why) = (false, None::<&'static str>);
-        for run in para.runs {
-            if let Some(reason) = whole {
-                why = why.or(Some(reason));
-                continue;
-            }
-            let char_style = styles
-                .resolve(run.props.style.as_deref(), StyleKind::Character)
-                .map(|id| styles.merged(id, StyleKind::Character))
-                .transpose()?;
-            let run_levels = [
-                level.map(|level| &level.props.run),
-                para_style.as_ref().map(|style| &style.props.run),
-                char_style.as_ref().map(|style| &style.props.run),
-            ];
-            let mut effective = styles.defaults.run.clone();
-            for props in run_levels.iter().flatten() {
-                effective.overlay(props);
-            }
-            effective.overlay(&run.props);
-            let hidden = if run.text.is_empty() {
-                None
-            } else {
-                self.hidden_why(
-                    &run.props,
-                    &run_levels,
-                    &effective,
-                    &run.text,
-                    undecided.or(effective.undecided),
-                    (&own, &beneath.layers),
-                    beneath.box_colour.as_ref(),
-                )
-            };
-            match hidden {
-                Some(reason) => {
-                    why = why.or(Some(reason));
-                    gap = true;
+        let mut why = whole.or(para.dropped);
+        let mut gap = Gap::None;
+        if whole.is_none() {
+            for (at, run) in para.runs.into_iter().enumerate() {
+                if at % 256 == 255 {
+                    deadline::check()?;
                 }
-                None => {
-                    if let Some(reason) = run.dropped {
+                let mut hidden = None;
+                if !run.text.is_empty() {
+                    for view in &views {
+                        hidden = self.run_hidden(view, &run)?;
+                        if hidden.is_some() {
+                            break;
+                        }
+                    }
+                }
+                match hidden {
+                    Some(reason) => {
                         why = why.or(Some(reason));
+                        gap = Gap::Text;
                     }
-                    if run.text.is_empty() {
-                        gap = true;
-                        continue;
+                    None => {
+                        why = why.or(run.dropped);
+                        gap = gap.max(run.gap_before);
+                        if run.text.is_empty() {
+                            continue;
+                        }
+                        // Neighbours never join across what was left out, and a stretch never
+                        // starts where text was left out before it.
+                        if gap == Gap::Text || (gap == Gap::Object && !text.is_empty()) {
+                            text.push(GAP);
+                        }
+                        if text.is_empty() {
+                            text = run.text;
+                        } else {
+                            text.push_str(&run.text);
+                        }
+                        gap = run.gap_after;
                     }
-                    // Neighbours never join across what was left out.
-                    if (gap || run.gap_before) && !text.is_empty() {
-                        text.push(GAP);
-                    }
-                    if text.is_empty() {
-                        text = run.text;
-                    } else {
-                        text.push_str(&run.text);
-                    }
-                    gap = run.gap_after;
                 }
+            }
+            if gap.max(para.gap) == Gap::Text && !text.is_empty() {
+                text.push(GAP);
             }
         }
         if let Some(why) = why {
@@ -3615,29 +4398,32 @@ impl Doc<'_> {
         Ok(())
     }
 
-    /// Why a run is hidden, if it is: `vanish`, `tiny`, `low_contrast`, or why its properties
-    /// sit where Word's choice cannot be decided.
-    #[allow(clippy::too_many_arguments)]
-    fn hidden_why(
-        &self,
-        direct: &RunProps,
-        levels: &[Option<&RunProps>; 3],
-        effective: &RunProps,
-        text: &str,
-        undecided: Option<&'static str>,
-        beneath: (&[Layer], &[Layer]),
-        box_colour: Option<&ColourSpec>,
-    ) -> Option<&'static str> {
-        if self.vanished(direct, levels, effective) {
-            return Some("vanish");
+    /// Why a run with text is hidden under one reading of its paragraph, if it is.
+    fn run_hidden(&self, view: &View, run: &Run) -> Result<Option<&'static str>, DocError> {
+        let reading = view.reading;
+        let styles = &self.styles;
+        let own = run.props.at(reading);
+        let char_style = styles
+            .resolve(own.style, StyleKind::Character, reading)
+            .map(|id| styles.merged(id, StyleKind::Character, reading))
+            .transpose()?;
+        let levels = [
+            view.level().map(|level| &level.props.run),
+            view.style.as_ref().map(|style| &style.props.run),
+            char_style.as_ref().map(|style| &style.props.run),
+        ];
+        let effective = self.effective(own, &levels, reading);
+        if self.vanished(own, &levels, &effective, reading) {
+            return Ok(Some("vanish"));
         }
-        if self.tiny(effective, text) {
-            return Some("tiny");
+        if self.tiny(&effective, &run.text) {
+            return Ok(Some("tiny"));
         }
-        if self.low_contrast(effective, direct, beneath, box_colour) {
-            return Some("low_contrast");
+        if let Some(why) = self.low_contrast(&effective, own, view)? {
+            return Ok(Some(why));
         }
-        undecided
+        let beneath = view.beneath.as_ref().and_then(|beneath| beneath.undecided);
+        Ok(view.props.undecided.or(beneath).or(effective.undecided))
     }
 
     /// `w:vanish` is a toggle (ECMA-376 Part 1 §17.7.3): the run's own value wins; otherwise the
@@ -3648,8 +4434,9 @@ impl Doc<'_> {
         direct: &RunProps,
         levels: &[Option<&RunProps>; 3],
         effective: &RunProps,
+        reading: Reading,
     ) -> bool {
-        let defaults = self.styles.defaults.run.vanish;
+        let defaults = self.styles.defaults.run.at(reading).vanish;
         let simple = |toggle: Option<Toggle>| matches!(toggle, Some(Toggle::On | Toggle::Bad));
         if simple(effective.spec_vanish) || simple(effective.web_hidden) {
             return true;
@@ -3708,100 +4495,114 @@ impl Doc<'_> {
         })
     }
 
-    /// Below `min_contrast` against what lies beneath, for any candidate colour and background.
-    /// In a shape, the shape's own text colour counts too wherever the run itself sets none.
+    /// `low_contrast` when a candidate colour falls below `min_contrast` against a background
+    /// that may lie beneath, `undecided` when the backgrounds are too many to list. In a shape,
+    /// the shape's own text colour counts too wherever the run itself sets none.
     fn low_contrast(
         &self,
         effective: &RunProps,
         direct: &RunProps,
-        (own, beneath): (&[Layer], &[Layer]),
-        box_colour: Option<&ColourSpec>,
-    ) -> bool {
+        view: &View,
+    ) -> Result<Option<&'static str>, DocError> {
+        const LOW: Option<&str> = Some("low_contrast");
         let mut colours = match effective.colour.as_ref().map(|spec| self.paint(spec)) {
             None | Some(Paint::Auto) => Vec::new(),
-            Some(Paint::Bad) => return true,
+            Some(Paint::Bad) => return Ok(LOW),
             Some(Paint::Colours(colours)) => colours,
         };
         let own_colour = direct
             .colour
             .as_ref()
             .is_some_and(|spec| !matches!(self.paint(spec), Paint::Auto));
+        let box_colour = view
+            .beneath
+            .as_ref()
+            .and_then(|beneath| beneath.box_colour.as_ref());
         if !own_colour && let Some(spec) = box_colour {
             match self.paint(spec) {
                 Paint::Colours(more) => colours.extend(more),
-                Paint::Bad => return true,
+                Paint::Bad => return Ok(LOW),
                 Paint::Auto => {}
             }
         }
         // Automatic text takes `readable_on` of its background, never low-contrast by itself.
         if colours.is_empty() {
-            return false;
+            return Ok(None);
         }
-        let mut near = Vec::with_capacity(own.len() + 2);
+        let mut near = Vec::with_capacity(3);
         if let Some(highlight) = effective.highlight {
             near.push(Layer::Highlight(highlight));
         }
         if let Some(shading) = effective.shading {
             near.push(Layer::Shading(shading));
         }
-        near.extend(own.iter().cloned());
-        let Ok(backgrounds) = self.background(&near, beneath) else {
-            return true;
+        near.extend(view.props.shading.map(Layer::Shading));
+        let backgrounds = match self.background(&near, view.beneath.as_deref()) {
+            Ok(backgrounds) => backgrounds,
+            Err(Unlisted::Paint) => return Ok(LOW),
+            Err(Unlisted::Many) => return Ok(Some(UNDECIDED)),
+            Err(Unlisted::Stop(error)) => return Err(error),
         };
         let floor = self.limits.min_contrast;
-        colours.iter().any(|&colour| {
+        let low = colours.iter().any(|&colour| {
             backgrounds
                 .iter()
                 .any(|&background| colour::contrast_ratio(colour, background) < floor)
-        })
+        });
+        Ok(low.then_some("low_contrast"))
     }
 
-    /// The colours that may lie beneath a run: the first layer of `near`, then of `far`, that
-    /// shows one, else the page.
-    fn background(&self, near: &[Layer], far: &[Layer]) -> Result<Vec<Rgb>, ()> {
-        let (layer, near, far) = match (near.split_first(), far.split_first()) {
-            (Some((layer, rest)), _) => (layer, rest, far),
-            (None, Some((layer, rest))) => (layer, &[][..], rest),
-            (None, None) => return self.page.clone(),
+    /// The colours that may lie beneath a run: the first of `near`'s layers that shows one, else
+    /// what lies beneath `far` (worked out once per link and reading), else the page.
+    fn background(&self, near: &[Layer], far: Option<&Outward>) -> Result<Vec<Rgb>, Unlisted> {
+        deadline::check().map_err(Unlisted::Stop)?;
+        let Some((layer, rest)) = near.split_first() else {
+            return match far {
+                Some(far) => far
+                    .colours
+                    .get_or_init(|| self.background(&far.layers, far.outer.as_deref()))
+                    .clone(),
+                None => self.page.clone().map_err(|()| Unlisted::Paint),
+            };
         };
+        let beneath = || self.background(rest, far);
         match layer {
-            Layer::Highlight(Highlight::None) => self.background(near, far),
+            Layer::Highlight(Highlight::None) => beneath(),
             Layer::Highlight(Highlight::Rgb(colour)) => Ok(vec![*colour]),
-            Layer::Highlight(Highlight::Bad) => Err(()),
-            Layer::Fill(colours) => colours.clone(),
+            Layer::Highlight(Highlight::Bad) => Err(Unlisted::Paint),
+            Layer::Fill(colours) => colours.clone().map_err(|()| Unlisted::Paint),
             Layer::Shading(shading) => {
                 // An automatic pattern colour is black (Word draws it so); an automatic fill
                 // lets the layer beneath show through.
                 let pattern = || match self.paint(&shading.colour) {
                     Paint::Auto => Ok(vec![Rgb::BLACK]),
                     Paint::Colours(colours) => Ok(colours),
-                    Paint::Bad => Err(()),
+                    Paint::Bad => Err(Unlisted::Paint),
                 };
                 let fill = || match self.paint(&shading.fill) {
-                    Paint::Auto => self.background(near, far),
+                    Paint::Auto => beneath(),
                     Paint::Colours(colours) => Ok(colours),
-                    Paint::Bad => Err(()),
+                    Paint::Bad => Err(Unlisted::Paint),
                 };
+                let mut colours = Vec::new();
                 match shading.pattern {
-                    Pattern::Clear | Pattern::Nil => fill(),
-                    Pattern::Solid => pattern(),
+                    Pattern::Clear | Pattern::Nil => return fill(),
+                    Pattern::Solid => return pattern(),
                     Pattern::Percent(percent) => {
                         let (over, under) = (pattern()?, fill()?);
-                        Ok(over
-                            .iter()
-                            .flat_map(|&over| {
-                                under
-                                    .iter()
-                                    .map(move |&under| colour::mix(over, under, percent))
-                            })
-                            .collect())
+                        for &over in &over {
+                            for &under in &under {
+                                add_candidate(&mut colours, colour::mix(over, under, percent))?;
+                            }
+                        }
                     }
                     Pattern::Other => {
-                        let mut colours = pattern()?;
-                        colours.extend(fill()?);
-                        Ok(colours)
+                        for colour in pattern()?.into_iter().chain(fill()?) {
+                            add_candidate(&mut colours, colour)?;
+                        }
                     }
                 }
+                Ok(colours)
             }
         }
     }
@@ -3881,9 +4682,14 @@ impl Doc<'_> {
         Ok(colours)
     }
 
-    /// The table style level of a cell's paragraph: the table's style (else the default table
-    /// style) with the regions its look turns on for the cell, in Word's order.
-    fn table_level(&self, shape: &TableShape, cell: &CellAt) -> Result<TableLevel, DocError> {
+    /// The table style level of a cell's paragraph under `reading`: the table's style (else the
+    /// default table style) with the regions its look turns on for the cell, in Word's order.
+    fn table_level(
+        &self,
+        shape: &TableShape,
+        cell: &CellAt,
+        reading: Reading,
+    ) -> Result<TableLevel, DocError> {
         let Some(row) = shape.rows.get(cell.row) else {
             return Ok(TableLevel {
                 undecided: Some(UNDECIDED),
@@ -3892,8 +4698,8 @@ impl Doc<'_> {
         };
         let Some(merged) = self
             .styles
-            .resolve(shape.style.as_deref(), StyleKind::Table)
-            .map(|id| self.styles.merged(id, StyleKind::Table))
+            .resolve(shape.style.at(reading), StyleKind::Table, reading)
+            .map(|id| self.styles.merged(id, StyleKind::Table, reading))
             .transpose()?
         else {
             return Ok(TableLevel {
@@ -3901,15 +4707,28 @@ impl Doc<'_> {
                 ..TableLevel::default()
             });
         };
-        let table_look = shape.look.unwrap_or(Look::from_bits(WORD_TABLE_LOOK));
-        let look = row.look.unwrap_or(table_look);
+        let table_look = shape
+            .look
+            .at(reading)
+            .unwrap_or(Look::from_bits(WORD_TABLE_LOOK));
+        let look = row.look.at(reading).unwrap_or(table_look);
+        // A band size that is missing or 0: no banding under one reading, bands of one under the
+        // other.
+        let band = |size: u32| match (size, reading.bands_off) {
+            (0, true) => None,
+            (0, false) => Some(1),
+            (size, _) => Some(size as usize),
+        };
         let (rows, columns) = (shape.rows.len(), row.cells);
         let (last_row, last_column) = (cell.row + 1 == rows, cell.column + 1 == columns);
         let (first_row, first_column) = (cell.row == 0, cell.column == 0);
         let mut regions = vec![Region::WholeTable];
         let header_rows = usize::from(table_look.first_row);
-        if !look.no_row_bands && cell.row >= header_rows {
-            let band = (cell.row - header_rows) / merged.row_band as usize;
+        if !look.no_row_bands
+            && cell.row >= header_rows
+            && let Some(size) = band(merged.row_band)
+        {
+            let band = (cell.row - header_rows) / size;
             regions.push(if band.is_multiple_of(2) {
                 Region::Band1Horz
             } else {
@@ -3917,8 +4736,11 @@ impl Doc<'_> {
             });
         }
         let header_columns = usize::from(table_look.first_column);
-        if !look.no_column_bands && cell.column >= header_columns {
-            let band = (cell.column - header_columns) / merged.column_band as usize;
+        if !look.no_column_bands
+            && cell.column >= header_columns
+            && let Some(size) = band(merged.column_band)
+        {
+            let band = (cell.column - header_columns) / size;
             regions.push(if band.is_multiple_of(2) {
                 Region::Band1Vert
             } else {
@@ -3976,7 +4798,7 @@ impl Doc<'_> {
         for (ordinal, why, para_id) in part.hidden {
             self.warnings.push(ExtractWarning::HiddenContent {
                 at: Locator::DocxParagraph {
-                    part: part.name.to_owned(),
+                    part: part.name.clone(),
                     ordinal,
                     para_id,
                 },
@@ -3993,7 +4815,7 @@ impl Doc<'_> {
                     piece: piece as u32,
                     text: replace_nul(&text[range]),
                     locator: Locator::DocxParagraph {
-                        part: part.name.to_owned(),
+                        part: part.name.clone(),
                         ordinal,
                         para_id: para_id.clone(),
                     },
@@ -4007,16 +4829,6 @@ impl Doc<'_> {
         }
         Ok(())
     }
-}
-
-/// What a chain of containers puts beneath its paragraphs.
-#[derive(Default)]
-struct Beneath {
-    level: Option<TableLevel>,
-    layers: Vec<Layer>,
-    whole: Option<&'static str>,
-    undecided: Option<&'static str>,
-    box_colour: Option<ColourSpec>,
 }
 
 /// The table style level of one cell.

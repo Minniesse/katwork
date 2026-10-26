@@ -177,6 +177,11 @@ jobs:
             cargo fuzz run "$target" "$RUNNER_TEMP/corpus/$target" "corpus/$target" -a -- \
               -max_total_time=60 -timeout=10 -rss_limit_mb=1024
           done
+      # A package the product gains and the fuzz lock lacks is resolved afresh by the build,
+      # which then rewrites the lock: the fuzzed parsers would not be the ones locked.
+      - name: The fuzz build left its lock as committed
+        if: steps.changed.outputs.run == 'true'
+        run: git diff --exit-code fuzz/Cargo.lock
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: failure()
         with:

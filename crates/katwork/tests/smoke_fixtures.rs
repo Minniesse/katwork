@@ -177,3 +177,24 @@ async fn doc_limits_probe() {
         (expected, expected)
     );
 }
+
+#[tokio::test]
+async fn doc_limits_follow_the_config() {
+    let config = katwork::config::Config::from_lookup(|key| match key {
+        "DATABASE_URL" => Some("postgres://localhost/fixture".into()),
+        "KATWORK_SECRET" => Some(uuid::Uuid::now_v7().to_string()),
+        "KATWORK_DOC_MAX_XML_ELEMENTS" => Some("12345".into()),
+        "KATWORK_DOC_MAX_READ_BYTES" => Some("123456789".into()),
+        _ => None,
+    })
+    .unwrap();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy(&config.database_url)
+        .unwrap();
+    let core = katwork::runtime::Core::new(pool, std::sync::Arc::new(config));
+    let limits = core.docs.limits();
+    assert_eq!(
+        (limits.max_xml_elements, limits.max_read_bytes),
+        (12_345, 123_456_789)
+    );
+}

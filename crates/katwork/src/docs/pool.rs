@@ -110,8 +110,8 @@ impl DocPool {
     /// starts nothing, and a `deadline` passed while queued is `Timeout`. Once a worker picks the
     /// job up it is raced against `started + call_timeout` (`CallTimeout`), `deadline`
     /// (`Timeout`) and `cancel` (`Cancelled`), and `run` returns at once on any of them while
-    /// the job stops at its next `deadline::check`. Dropping this future cancels the job too.
-    /// A panic in `job` is `Internal`.
+    /// the job stops at its next `deadline::check`, which also refuses it once it holds more than
+    /// `max_read_bytes`. Dropping this future cancels the job too. A panic in `job` is `Internal`.
     pub async fn run<T: Send + 'static>(
         &self,
         workspace: WorkspaceId,
@@ -167,7 +167,12 @@ impl DocPool {
             let call_deadline = started + shared.limits.call_timeout;
             let job_deadline = caller_deadline.map_or(call_deadline, |at| at.min(call_deadline));
             let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                deadline::scope(job_deadline, Some(job_token), || job(&shared.limits))
+                deadline::scope(
+                    job_deadline,
+                    Some(job_token),
+                    shared.limits.max_read_bytes,
+                    || job(&shared.limits),
+                )
             }))
             .unwrap_or(Err(DocError::Internal));
             shared.started[worker].store(0, Ordering::Relaxed);

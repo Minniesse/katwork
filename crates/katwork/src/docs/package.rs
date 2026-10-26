@@ -27,6 +27,9 @@ const RATIO_EXEMPT_BYTES: u64 = 1 << 20;
 const ENCRYPTION_FLAGS: u16 = 0x0001 | 0x0040 | 0x2000;
 /// The Info-ZIP Unicode Path extra field: a second name for an entry.
 const UNICODE_PATH: u16 = 0x7075;
+/// The longest entry name accepted. Part names are short paths; a reader copies its part's name
+/// into what it returns.
+const MAX_NAME_BYTES: usize = 256;
 /// `to_stored_zip` writes ZIP32 records, so a package never outgrows them.
 const ZIP32_BYTES: u64 = 1 << 31;
 
@@ -128,10 +131,10 @@ struct EndRecord {
 /// Opens an OOXML package: one end record ending exactly at the end of the file, at most
 /// `max_zip_entries` entries (refused before the directory is parsed), no bytes before the
 /// archive, a directory whose headers fill exactly the size the end record gives (no gap, no
-/// header past the counted ones), local headers that agree with the directory, no overlapping
-/// entries, unique ASCII names under ASCII case folding with no `..`, `\` or leading `/`, no
-/// encryption, only stored and deflated entries, and at most `max_unzipped_bytes` actually
-/// inflated.
+/// header past the counted ones), local headers that agree with the directory (their DOS time
+/// aside), no overlapping entries, unique ASCII names of at most 256 bytes under ASCII case
+/// folding with no `..`, `\` or leading `/`, no encryption, only stored and deflated entries,
+/// and at most `max_unzipped_bytes` actually inflated.
 pub fn open_package(bytes: &[u8], limits: &DocLimits) -> Result<Package, DocError> {
     if bytes.len() as u64 > limits.max_input_bytes {
         return Err(DocError::TooLarge("input"));
@@ -148,6 +151,8 @@ pub fn open_package(bytes: &[u8], limits: &DocLimits) -> Result<Package, DocErro
     let config = Config {
         archive_offset: ArchiveOffset::Known(0),
     };
+    // The input with each local header's DOS time made its central header's (`same_times`).
+    let retimed: Vec<u8>;
     let mut archive = ZipArchive::with_config(config, Cursor::new(bytes))
         .map_err(|_| DocError::Malformed("zip"))?;
     // Byte-equal names fold into one entry of the crate's index.
@@ -166,6 +171,8 @@ pub fn open_package(bytes: &[u8], limits: &DocLimits) -> Result<Package, DocErro
     // Where the next central header must start: the headers follow one another from the
     // directory's start, and the last ends where the directory does.
     let mut next = end.directory_offset;
+    // Each entry's local header and central header, for `same_times`.
+    let mut headers = Vec::with_capacity(archive.len());
     for at in 0..archive.len() {
         if at % 1024 == 1023 {
             deadline::check()?;
@@ -191,11 +198,17 @@ pub fn open_package(bytes: &[u8], limits: &DocLimits) -> Result<Package, DocErro
         if unicode_path {
             return Err(DocError::Malformed("zip_name"));
         }
+        headers.push((entry.header_start(), next));
         next = header_end;
         names.push((name, entry.size(), entry.compressed_size()));
     }
     if next != end.directory_end {
         return Err(DocError::Malformed("zip_directory"));
+    }
+    if let Some(copy) = same_times(bytes, &headers) {
+        retimed = copy;
+        archive = ZipArchive::with_config(config, Cursor::new(retimed.as_slice()))
+            .map_err(|_| DocError::Malformed("zip"))?;
     }
     archive
         .validate_header_consistency()
@@ -225,8 +238,9 @@ pub fn open_package(bytes: &[u8], limits: &DocLimits) -> Result<Package, DocErro
 
 /// Finds the one end record, refusing a second one (a decoy in the comment included) from the
 /// central directory's start or the scan window's start (the last 64 KiB and 22 bytes),
-/// whichever is later, and follows a ZIP64 locator when a count, the directory size or its
-/// offset overflows (the markers the `zip` crate follows it on).
+/// whichever is later. A ZIP64 locator right before it is always followed, and the end record's
+/// fields must each be their overflow marker or the ZIP64 value; a marker with no locator is
+/// refused.
 fn end_record(bytes: &[u8]) -> Result<EndRecord, DocError> {
     let malformed = DocError::Malformed("zip_end_record");
     if bytes.len() < END_LEN {
@@ -258,31 +272,53 @@ fn end_record(bytes: &[u8]) -> Result<EndRecord, DocError> {
         directory_size: u64::from(directory_size),
         directory_end: at as u64,
     };
-    if entries == u16::MAX
+    let markers = entries == u16::MAX
         || disk_entries == u16::MAX
         || directory_size == u32::MAX
-        || directory_offset == u32::MAX
-    {
-        // The ZIP64 locator sits right before the end record and points at the ZIP64 record.
-        let locator = at.checked_sub(20).ok_or(malformed)?;
-        if &bytes[locator..locator + 4] != ZIP64_LOCATOR || u32_at(bytes, locator + 4) != 0 {
-            return Err(malformed);
+        || directory_offset == u32::MAX;
+    // The ZIP64 locator sits right before the end record. Some readers follow one found there
+    // whatever the markers say, so the guard does too, and the 32-bit fields must then agree
+    // with the ZIP64 record they stand for.
+    let locator = at
+        .checked_sub(20)
+        .filter(|&locator| &bytes[locator..locator + 4] == ZIP64_LOCATOR);
+    match locator {
+        None if markers => return Err(malformed),
+        None => {
+            if disk != 0 || directory_disk != 0 || disk_entries != entries {
+                return Err(malformed);
+            }
         }
-        let zip64 = usize::try_from(u64_at(bytes, locator + 8)).map_err(|_| malformed)?;
-        if zip64.checked_add(56).is_none_or(|end| end > locator)
-            || &bytes[zip64..zip64 + 4] != ZIP64_END
-            || u32_at(bytes, zip64 + 16) != 0
-            || u32_at(bytes, zip64 + 20) != 0
-            || u64_at(bytes, zip64 + 24) != u64_at(bytes, zip64 + 32)
-        {
-            return Err(malformed);
+        Some(locator) => {
+            // The ZIP64 record, with no extensible data, ends where the locator starts, and the
+            // locator points at it: no reader can find another one.
+            let zip64 = locator.checked_sub(56).ok_or(malformed)?;
+            if u32_at(bytes, locator + 4) != 0
+                || u64_at(bytes, locator + 8) != zip64 as u64
+                || &bytes[zip64..zip64 + 4] != ZIP64_END
+                || u64_at(bytes, zip64 + 4) != 44
+                || u32_at(bytes, zip64 + 16) != 0
+                || u32_at(bytes, zip64 + 20) != 0
+                || u64_at(bytes, zip64 + 24) != u64_at(bytes, zip64 + 32)
+            {
+                return Err(malformed);
+            }
+            record.entries = u64_at(bytes, zip64 + 32);
+            record.directory_size = u64_at(bytes, zip64 + 40);
+            record.directory_offset = u64_at(bytes, zip64 + 48);
+            record.directory_end = zip64 as u64;
+            let agrees = |field: u64, marker: u64, value: u64| field == marker || field == value;
+            let (short, long) = (u64::from(u16::MAX), u64::from(u32::MAX));
+            if !agrees(u64::from(entries), short, record.entries)
+                || !agrees(u64::from(disk_entries), short, record.entries)
+                || !agrees(u64::from(directory_size), long, record.directory_size)
+                || !agrees(u64::from(directory_offset), long, record.directory_offset)
+                || !agrees(u64::from(disk), short, 0)
+                || !agrees(u64::from(directory_disk), short, 0)
+            {
+                return Err(malformed);
+            }
         }
-        record.entries = u64_at(bytes, zip64 + 32);
-        record.directory_size = u64_at(bytes, zip64 + 40);
-        record.directory_offset = u64_at(bytes, zip64 + 48);
-        record.directory_end = zip64 as u64;
-    } else if disk != 0 || directory_disk != 0 || disk_entries != entries {
-        return Err(malformed);
     }
     if record.directory_offset > record.directory_end {
         return Err(malformed);
@@ -296,10 +332,37 @@ fn end_record(bytes: &[u8]) -> Result<EndRecord, DocError> {
     Ok(record)
 }
 
-/// OPC part names are ASCII; the guard also refuses what a path could escape or alias with.
+/// A copy of `bytes` whose local headers carry their central headers' DOS time and date, when any
+/// differs, or `None`. The time is no part of the content and writers do not keep the two equal,
+/// so the crate's consistency check compares every other field. A local header out of place is
+/// left for that check to refuse.
+fn same_times(bytes: &[u8], headers: &[(u64, u64)]) -> Option<Vec<u8>> {
+    // At most `max_zip_entries` headers, each read once: the walk before it checks the deadline.
+    let mut copy: Option<Vec<u8>> = None;
+    for &(local, central) in headers {
+        let (Ok(local), Ok(central)) = (usize::try_from(local), usize::try_from(central)) else {
+            continue;
+        };
+        let (Some(time), Some(written)) = (
+            bytes.get(central + 12..central + 16),
+            bytes.get(local..local + 14),
+        ) else {
+            continue;
+        };
+        if &written[..4] != LOCAL || &written[10..14] == time {
+            continue;
+        }
+        copy.get_or_insert_with(|| bytes.to_vec())[local + 10..local + 14].copy_from_slice(time);
+    }
+    copy
+}
+
+/// OPC part names are ASCII; the guard also refuses what a path could escape or alias with, and a
+/// name longer than `MAX_NAME_BYTES`.
 fn entry_name(raw: &[u8]) -> Result<String, DocError> {
     let name = std::str::from_utf8(raw).map_err(|_| DocError::Malformed("zip_name"))?;
     if name.is_empty()
+        || name.len() > MAX_NAME_BYTES
         || !name.bytes().all(|byte| (0x20..0x7F).contains(&byte))
         || name.starts_with('/')
         || name.contains('\\')

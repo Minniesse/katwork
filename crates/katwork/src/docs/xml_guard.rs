@@ -10,6 +10,10 @@ use quick_xml::{
 
 use super::{DocError, DocLimits, deadline};
 
+/// Attributes one element may carry, namespace declarations included. Word writes a few dozen at
+/// most (the most on a part's root); more is refused before any reader walks them.
+pub const MAX_XML_ATTRIBUTES: usize = 256;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct XmlStats {
     pub elements: u64,
@@ -130,7 +134,7 @@ impl XmlStats {
 }
 
 /// Checks an element opened at `depth` (0 for the root): the depth cap, a single root, bound
-/// prefixes and well-formed attribute values.
+/// prefixes, at most `MAX_XML_ATTRIBUTES` attributes and well-formed attribute values.
 fn element(
     reader: &NsReader<&[u8]>,
     start: &BytesStart,
@@ -150,7 +154,10 @@ fn element(
     if let (ResolveResult::Unknown(_), _) = reader.resolver().resolve_element(start.name()) {
         return Err(DocError::Malformed("xml_namespace"));
     }
-    for attribute in start.attributes() {
+    for (at, attribute) in start.attributes().enumerate() {
+        if at == MAX_XML_ATTRIBUTES {
+            return Err(DocError::TooComplex("xml_attributes"));
+        }
         let attribute = attribute.map_err(|_| DocError::Malformed("xml_attribute"))?;
         if let (ResolveResult::Unknown(_), _) = reader.resolver().resolve_attribute(attribute.key) {
             return Err(DocError::Malformed("xml_namespace"));

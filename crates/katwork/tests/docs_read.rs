@@ -377,7 +377,7 @@ fn docx_main_part_comes_from_rels() {
     assert_eq!(text(&extracted), "from main");
     assert!(matches!(
         &extracted.blocks[0].locator,
-        Locator::DocxParagraph { part, .. } if part == "word/main.xml"
+        Locator::DocxParagraph { part, .. } if &**part == "word/main.xml"
     ));
 }
 
@@ -399,7 +399,7 @@ fn docx_tracked_insertion_in_deletion_out_instr_text_out() {
 
 #[test]
 fn docx_field_instruction_text_is_excluded() {
-    let body = r#"<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:t>HYPERLINK "x"</w:t></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>shown</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r><w:r><w:t> after</w:t></w:r></w:p>"#;
+    let body = r#"<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText>HYPERLINK "x"</w:instrText><w:t>notshown</w:t></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>shown</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r><w:r><w:t> after</w:t></w:r></w:p>"#;
     assert_eq!(text(&read_body(body)), "shown after");
 }
 
@@ -409,7 +409,8 @@ fn docx_hidden_text_excluded_and_warned() {
         "",
         &[run("", "seen "), run("<w:vanish/>", "secret")].concat(),
     ));
-    assert_eq!(text(&extracted), "seen ");
+    // Hidden text at the paragraph's end leaves a gap too.
+    assert_eq!(text(&extracted), "seen \u{FFFC}");
     assert_eq!(hidden(&extracted), [(1, "vanish")]);
 }
 
@@ -803,7 +804,14 @@ fn docx_banded_rows_and_corner_cells_follow_words_order() {
             "Corner",
             &[region("firstRow", "000000"), region("nwCell", "FFFFFF")].concat(),
         ),
-        table_style("Bands", &region("band1Horz", "000000")),
+        table_style(
+            "Bands",
+            &[
+                r#"<w:tblPr><w:tblStyleRowBandSize w:val="1"/></w:tblPr>"#,
+                &region("band1Horz", "000000"),
+            ]
+            .concat(),
+        ),
     ]
     .concat();
     let pair = |props: &str, first: &str, second: &str| {
@@ -1050,6 +1058,8 @@ fn docx_altchunk_and_ole_are_ignored_and_warned() {
             .entry("word/embeddings/oleObject1.bin", b"oledata"),
     );
     assert_eq!(text(&extracted), "body");
+    // Excluded, not hidden: no warning for the object's text.
+    assert_eq!(hidden(&extracted), []);
     let embedded: Vec<_> = extracted
         .warnings
         .iter()
@@ -1070,7 +1080,7 @@ fn docx_non_w_namespace_prefix_is_read() {
         r#"<?xml version="1.0" encoding="UTF-8"?><ns0:document xmlns:ns0="{W}"><ns0:body><ns0:p><ns0:r><ns0:rPr><ns0:vanish/></ns0:rPr><ns0:t>gone</ns0:t></ns0:r><ns0:r><ns0:t>prefixed</ns0:t></ns0:r></ns0:p></ns0:body></ns0:document>"#
     );
     let extracted = read(&Docx::from_document(&document));
-    assert_eq!(text(&extracted), "prefixed");
+    assert_eq!(text(&extracted), "\u{FFFC}prefixed");
     assert_eq!(hidden(&extracted), [(1, "vanish")]);
 }
 
@@ -1108,7 +1118,7 @@ fn docx_endnotes_are_read_and_macros_are_warned() {
         .blocks
         .iter()
         .map(|block| match &block.locator {
-            Locator::DocxParagraph { part, .. } => (part.as_str(), block.text.as_str()),
+            Locator::DocxParagraph { part, .. } => (&**part, block.text.as_str()),
             other => panic!("{other:?}"),
         })
         .collect();
@@ -1253,6 +1263,28 @@ fn docx_highlight_palette_is_words() {
         let extracted = read_body(&body);
         assert_eq!(text(&extracted), "readable", "{name}");
         assert_eq!(hidden(&extracted), [(1, "low_contrast")], "{name}");
+        // With a floor just above 1, only text of exactly the highlight's colour is hidden: the
+        // value is Word's to the last bit.
+        let exact = DocLimits {
+            min_contrast: 1.000_1,
+            ..limits()
+        };
+        let extracted = read_with(&Docx::new(&body), &exact).unwrap();
+        assert_eq!(hidden(&extracted), [(1, "low_contrast")], "{name} exactly");
+        let nudged = format!(
+            "{:02X}{}",
+            u8::from_str_radix(&hex[..2], 16).unwrap() ^ 8,
+            &hex[2..]
+        );
+        let near = paragraphs(&[(
+            &format!(r#"<w:color w:val="{nudged}"/><w:highlight w:val="{name}"/>"#),
+            "near",
+        )]);
+        assert_eq!(
+            text(&read_with(&Docx::new(&near), &exact).unwrap()),
+            "near",
+            "{name}"
+        );
     }
 }
 
@@ -1320,7 +1352,7 @@ fn docx_uncertain_choices_leave_what_they_set_undecided() {
     ]
     .concat();
     let extracted = read_body(&body);
-    assert_eq!(text(&extracted), "after\nplain");
+    assert_eq!(text(&extracted), "\u{FFFC}after\nplain");
     assert_eq!(
         hidden(&extracted),
         [
@@ -1436,7 +1468,7 @@ fn docx_based_on_band_sizes_and_field_characters_in_dropped_markup_are_undecided
 
     let field = r#"<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><x:wrap xmlns:x="urn:example:unknown"><w:fldChar w:fldCharType="separate"/></x:wrap></w:r><w:r><w:t>stillcode</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r><w:r><w:t>after</w:t></w:r></w:p>"#;
     let extracted = read_body(field);
-    assert_eq!(text(&extracted), "after");
+    assert_eq!(text(&extracted), "\u{FFFC}after");
     assert_eq!(hidden(&extracted), [(1, "unknown_namespace")]);
 }
 
@@ -1507,6 +1539,18 @@ fn docx_theme_reads_only_its_scheme() {
         &format!("{decoy_scheme}</a:themeElements>"),
     );
     let renamed = theme(&[("lt1", r#"<a:light1><a:srgbClr val="000000"/></a:light1>"#)]);
+    let foreign = real.replace(
+        "<a:clrScheme name=\"Office\">",
+        r#"<a:clrScheme name="Office"><x:slot xmlns:x="urn:example:unknown"/>"#,
+    );
+    let written_twice = real.replace(
+        "</a:clrScheme>",
+        r#"<a:lt1><a:srgbClr val="000000"/></a:lt1></a:clrScheme>"#,
+    );
+    let two_colours = theme(&[(
+        "lt1",
+        r#"<a:lt1><a:srgbClr val="FFFFFF"/><a:srgbClr val="000000"/></a:lt1>"#,
+    )]);
     let parse = |xml: &str| ThemeColours::parse(xml.as_bytes(), &limits(), &mut budget()).unwrap();
     assert_eq!(parse(&real).slot(SchemeSlot::Lt1), Some(Rgb::WHITE));
     // A decoy inside an element Word drops is not on the scheme's path.
@@ -1520,6 +1564,15 @@ fn docx_theme_reads_only_its_scheme() {
     // A scheme outside the path is not the theme's; a mapping name is not a slot name.
     assert_eq!(parse(&outside).slot(SchemeSlot::Lt1), Some(Rgb::WHITE));
     assert_eq!(parse(&renamed).slot(SchemeSlot::Lt1), None);
+    // An element of another namespace in the scheme leaves every slot unknown; a slot written
+    // twice, or holding two colours, is unknown.
+    assert_eq!(parse(&foreign).slot(SchemeSlot::Accent1), None);
+    assert_eq!(parse(&written_twice).slot(SchemeSlot::Lt1), None);
+    assert_eq!(
+        parse(&written_twice).slot(SchemeSlot::Accent1),
+        parse(&real).slot(SchemeSlot::Accent1)
+    );
+    assert_eq!(parse(&two_colours).slot(SchemeSlot::Lt1), None);
 
     // Read through a document: the decoy's black lt1 would make this run visible.
     let background1 = r#"<w:color w:val="000000" w:themeColor="background1"/>"#;
@@ -1577,7 +1630,7 @@ fn docx_left_out_runs_leave_a_gap_between_their_neighbours() {
             "",
             &[run("", "Do "), run("<w:vanish/>", "NOT "), run(WHITE, "x"), run("", "pay")].concat(),
         ),
-        // Nothing to join at the ends.
+        // Text Word draws left out at either end: a figure there may have lost digits.
         para(
             "",
             &[run("<w:webHidden/>", "lead"), run("", "Introduction"), run("<w:webHidden/>", "\t5")]
@@ -1604,7 +1657,7 @@ fn docx_left_out_runs_leave_a_gap_between_their_neighbours() {
             format!("Budget: 1{gap}00 baht"),
             format!("Paid 9{gap}99 baht"),
             format!("Do {gap}pay"),
-            "Introduction".into(),
+            format!("{gap}Introduction{gap}"),
             format!("1{gap}00"),
             format!("1{gap}250"),
         ]
@@ -1630,7 +1683,13 @@ fn docx_run_characters_are_what_word_draws() {
         r#"<w:p><w:r><w:t>docu</w:t><w:softHyphen/><w:t>ment</w:t></w:r></w:p>"#,
         r#"<w:p><w:r><w:t xml:space="preserve">Balance </w:t><w:sym w:font="Symbol" w:char="F02D"/><w:t>500</w:t></w:r></w:p>"#,
         r#"<w:p><w:r><w:t>A</w:t><w:sym w:font="Wingdings" w:char="F0FC"/><w:t>B</w:t></w:r></w:p>"#,
-        r#"<w:p><w:r><w:t xml:space="preserve">ok </w:t><mc:AlternateContent xmlns:w16se="http://schemas.microsoft.com/office/word/2015/wordml/symex"><mc:Choice Requires="w16se"><w16se:symEx w16se:font="Segoe UI Emoji" w16se:char="1F44D"/></mc:Choice><mc:Fallback><w:t>?</w:t></mc:Fallback></mc:AlternateContent></w:r></w:p>"#,
+        // Word's symbol extension follows the `w:sym` rule: the Symbol font's characters are
+        // read, any other font's glyph leaves a gap.
+        r#"<w:p><w:r><w:t xml:space="preserve">ok </w:t><mc:AlternateContent xmlns:w16se="http://schemas.microsoft.com/office/word/2015/wordml/symex"><mc:Choice Requires="w16se"><w16se:symEx w16se:font="Segoe UI Emoji" w16se:char="1F44D"/></mc:Choice><mc:Fallback><w:t>?</w:t></mc:Fallback></mc:AlternateContent><w:t xml:space="preserve"> done</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>Total 1</w:t><mc:AlternateContent xmlns:w16se="http://schemas.microsoft.com/office/word/2015/wordml/symex"><mc:Choice Requires="w16se"><w16se:symEx w16se:font="Wingdings" w16se:char="0032"/></mc:Choice><mc:Fallback/></mc:AlternateContent><w:t>00</w:t></w:r></w:p>"#,
+        r#"<w:p><w:r><w:t>Total 1</w:t><mc:AlternateContent xmlns:w16se="http://schemas.microsoft.com/office/word/2015/wordml/symex"><mc:Choice Requires="w16se"><w16se:symEx w16se:font="Symbol" w16se:char="0032"/></mc:Choice><mc:Fallback/></mc:AlternateContent><w:t>00</w:t></w:r></w:p>"#,
+        // The Symbol font check: Wingdings' F02D is no minus sign.
+        r#"<w:p><w:r><w:t xml:space="preserve">Balance </w:t><w:sym w:font="Wingdings" w:char="F02D"/><w:t>500</w:t></w:r></w:p>"#,
     ]
     .concat();
     let extracted = read_body(&body);
@@ -1647,7 +1706,10 @@ fn docx_run_characters_are_what_word_draws() {
             "document",
             "Balance \u{2212}500",
             "A\u{FFFC}B",
-            "ok \u{1F44D}",
+            "ok \u{FFFC} done",
+            "Total 1\u{FFFC}00",
+            "Total 1200",
+            "Balance \u{FFFC}500",
         ]
     );
     assert!(hidden(&extracted).is_empty());
@@ -1973,7 +2035,8 @@ fn docx_markup_word_would_not_read_fails_closed() {
         r#"<w:p><w:notAnElement><w:r><w:t>unknownw</w:t></w:r></w:notAnElement></w:p>"#.into(),
         // A paragraph there.
         r#"<w:notAnElement><w:p><w:r><w:t>unknownpara</w:t></w:r></w:p></w:notAnElement>"#.into(),
-        // A property written twice, and a second w:rPr.
+        // A property written twice is read both ways: the first value hides it. A second w:rPr
+        // is undecided.
         para("", &run(r#"<w:vanish/><w:vanish w:val="0"/>"#, "twovanish")),
         r#"<w:p><w:r><w:rPr/><w:rPr><w:b/></w:rPr><w:t>secondrpr</w:t></w:r></w:p>"#.into(),
         r#"<w:p><w:pPr/><w:pPr/><w:r><w:t>secondppr</w:t></w:r></w:p>"#.into(),
@@ -1983,14 +2046,14 @@ fn docx_markup_word_would_not_read_fails_closed() {
     ]
     .concat();
     let extracted = read_body(&body);
-    assert_eq!(text(&extracted), "choice\nkept\nplain");
+    assert_eq!(text(&extracted), "\u{FFFC}choice\n\u{FFFC}kept\nplain");
     assert_eq!(
         hidden(&extracted),
         [
             (1, "unknown_namespace"),
             (2, "undecided"),
             (3, "undecided"),
-            (4, "undecided"),
+            (4, "vanish"),
             (5, "undecided"),
             (6, "undecided"),
             (7, "undecided")
@@ -2040,7 +2103,7 @@ fn docx_hidden_content_names_its_part() {
             ExtractWarning::HiddenContent {
                 at: Locator::DocxParagraph { part, ordinal, .. },
                 why,
-            } => Some((part.clone(), *ordinal, *why)),
+            } => Some((part.to_string(), *ordinal, *why)),
             _ => None,
         })
         .collect();
@@ -2051,6 +2114,1500 @@ fn docx_hidden_content_names_its_part() {
             ("word/header1.xml".to_owned(), 1, "vanish")
         ]
     );
+}
+
+/// A style id defined twice, or a property written twice in one place: Word is seen to take the
+/// last definition whole and the standard keeps the first's id, so each reading is judged and
+/// the text is hidden only when one hides it. Real documents do both.
+#[test]
+fn docx_duplicate_styles_and_properties_are_read_both_ways() {
+    let heading = |colour: &str, size: &str| {
+        format!(
+            r#"<w:style w:type="paragraph" w:styleId="Heading1"><w:rPr><w:color w:val="{colour}"/><w:sz w:val="{size}"/></w:rPr></w:style>"#
+        )
+    };
+    let normal = r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:rPr><w:sz w:val="22"/></w:rPr></w:style>"#;
+    let table_normal = r#"<w:style w:type="table" w:default="1" w:styleId="TableNormal"/>"#;
+    let styled =
+        |id: &str, marker: &str| para(&format!(r#"<w:pStyle w:val="{id}"/>"#), &run("", marker));
+    type Case = (String, String, &'static str, Vec<(u32, &'static str)>);
+    let cases: Vec<Case> = vec![
+        // Two visible definitions: the heading stays.
+        (
+            [heading("2E74B5", "32"), heading("2E5090", "36")].concat(),
+            styled("Heading1", "heading"),
+            "heading",
+            vec![],
+        ),
+        // Normal and TableNormal written twice, the same both times.
+        (
+            [normal, normal, table_normal, table_normal].concat(),
+            [
+                para("", &run("", "body")),
+                table("", &[vec![cell("", &para("", &run("", "incell")))]]),
+            ]
+            .concat(),
+            "body\nincell",
+            vec![],
+        ),
+        // One definition hides, whichever comes first.
+        (
+            [
+                heading("2E74B5", "32"),
+                r#"<w:style w:type="paragraph" w:styleId="Heading1"><w:rPr><w:vanish/></w:rPr></w:style>"#.into(),
+            ]
+            .concat(),
+            styled("Heading1", "lastvanish"),
+            "",
+            vec![(1, "vanish")],
+        ),
+        (
+            [
+                r#"<w:style w:type="paragraph" w:styleId="Heading1"><w:rPr><w:vanish/></w:rPr></w:style>"#.into(),
+                heading("2E74B5", "32"),
+            ]
+            .concat(),
+            styled("Heading1", "firstvanish"),
+            "",
+            vec![(1, "vanish")],
+        ),
+        // A paragraph style that hides, then a table style with its id.
+        (
+            concat!(
+                r#"<w:style w:type="paragraph" w:styleId="X"><w:rPr><w:vanish/></w:rPr></w:style>"#,
+                r#"<w:style w:type="table" w:styleId="X"/>"#
+            )
+            .into(),
+            styled("X", "crosskinds"),
+            "",
+            vec![(1, "vanish")],
+        ),
+        // Two default paragraph styles, one hiding.
+        (
+            concat!(
+                r#"<w:style w:type="paragraph" w:default="1" w:styleId="A"><w:rPr><w:vanish/></w:rPr></w:style>"#,
+                r#"<w:style w:type="paragraph" w:default="1" w:styleId="B"/>"#
+            )
+            .into(),
+            para("", &run("", "twodefaults")),
+            "",
+            vec![(1, "vanish")],
+        ),
+        // A size written twice in a style, Word's own (Mac Word 14 writes it): both visible.
+        (
+            r#"<w:style w:type="paragraph" w:styleId="Title"><w:rPr><w:szCs w:val="52"/><w:szCs w:val="36"/></w:rPr></w:style>"#.into(),
+            para(r#"<w:pStyle w:val="Title"/>"#, &run("<w:cs/>", "title")),
+            "title",
+            vec![],
+        ),
+        // A base written twice, the first hiding.
+        (
+            concat!(
+                r#"<w:style w:type="paragraph" w:styleId="Hide"><w:rPr><w:vanish/></w:rPr></w:style>"#,
+                r#"<w:style w:type="paragraph" w:styleId="Show"/>"#,
+                r#"<w:style w:type="paragraph" w:styleId="Two"><w:basedOn w:val="Hide"/><w:basedOn w:val="Show"/></w:style>"#
+            )
+            .into(),
+            styled("Two", "twobases"),
+            "",
+            vec![(1, "vanish")],
+        ),
+    ];
+    for (styles, body, shown, warned) in cases {
+        let extracted = read(&Docx::new(&body).styles(&styles));
+        assert_eq!(text(&extracted), shown, "{styles}");
+        assert_eq!(hidden(&extracted), warned, "{styles}");
+    }
+
+    // Properties written twice in one place: the same value twice is one; two visible values
+    // are visible; a hiding value hides.
+    let body = [
+        para("", &run(r#"<w:szCs w:val="24"/><w:szCs w:val="24"/>"#, "samesize")),
+        para("", &run(r#"<w:sz w:val="24"/><w:sz w:val="28"/>"#, "twosizes")),
+        para("", &run(r#"<w:sz w:val="24"/><w:sz w:val="2"/>"#, "onetiny")),
+        para("", &run(r#"<w:color w:val="000000"/><w:color w:val="FFFFFF"/>"#, "onewhite")),
+        para("", &run(r#"<w:vanish w:val="0"/><w:vanish/>"#, "vanishlast")),
+        para(
+            r#"<w:shd w:val="clear" w:color="auto" w:fill="000000"/><w:shd w:val="clear" w:color="auto" w:fill="FFFFFF"/>"#,
+            &run(BLACK, "twoshadings"),
+        ),
+        table(
+            "",
+            &[vec![cell(
+                r#"<w:shd w:val="clear" w:color="auto" w:fill="FFFFFF"/><w:shd w:val="clear" w:color="auto" w:fill="000000"/>"#,
+                &para("", &run(BLACK, "celltwice")),
+            )]],
+        ),
+    ]
+    .concat();
+    let extracted = read_body(&body);
+    assert_eq!(text(&extracted), "samesize\ntwosizes");
+    assert_eq!(
+        hidden(&extracted),
+        [
+            (3, "tiny"),
+            (4, "low_contrast"),
+            (5, "vanish"),
+            (6, "low_contrast"),
+            (7, "low_contrast")
+        ]
+    );
+
+    // A table's style and look written twice, in its properties and in a row's exceptions.
+    let styles = [
+        table_style("Plain", ""),
+        table_style("Dark", &region("wholeTable", "000000")),
+        table_style("Header", &region("firstRow", "000000")),
+    ]
+    .concat();
+    let body = [
+        table(
+            r#"<w:tblStyle w:val="Dark"/><w:tblStyle w:val="Plain"/>"#,
+            &[vec![cell("", &para("", &run(BLACK, "twostyles")))]],
+        ),
+        table(
+            r#"<w:tblStyle w:val="Header"/><w:tblLook w:firstRow="0"/><w:tblLook w:firstRow="1"/>"#,
+            &[vec![cell("", &para("", &run(BLACK, "twolooks")))]],
+        ),
+        format!(
+            r#"<w:tbl><w:tblPr><w:tblStyle w:val="Header"/><w:tblLook w:firstRow="0"/></w:tblPr><w:tr><w:tblPrEx><w:tblLook w:firstRow="1"/><w:tblLook w:firstRow="0"/></w:tblPrEx>{}</w:tr></w:tbl>"#,
+            cell("", &para("", &run(BLACK, "rowlooks")))
+        ),
+    ]
+    .concat();
+    let extracted = read(&Docx::new(&body).styles(&styles));
+    assert_eq!(text(&extracted), "");
+    assert_eq!(
+        hidden(&extracted),
+        [
+            (1, "low_contrast"),
+            (2, "low_contrast"),
+            (3, "low_contrast")
+        ]
+    );
+
+    // A container written twice is still undecided: two w:rPr in w:rPrDefault, two w:pPr in
+    // w:pPrDefault.
+    for defaults in [
+        r#"<w:docDefaults><w:rPrDefault><w:rPr><w:vanish/></w:rPr><w:rPr><w:vanish w:val="0"/></w:rPr></w:rPrDefault></w:docDefaults>"#,
+        r#"<w:docDefaults><w:pPrDefault><w:pPr><w:shd w:val="clear" w:color="auto" w:fill="FFFFFF"/></w:pPr><w:pPr><w:shd w:val="clear" w:color="auto" w:fill="000000"/></w:pPr></w:pPrDefault></w:docDefaults>"#,
+    ] {
+        let extracted = read(&Docx::new(&para("", &run("", "defaults"))).styles(defaults));
+        assert_eq!(text(&extracted), "", "{defaults}");
+        assert_eq!(hidden(&extracted), [(1, "undecided")], "{defaults}");
+    }
+}
+
+/// A table style band size that is missing or 0 is read both ways (no banding, and bands of
+/// one row or column), and the text is hidden when either hides it.
+#[test]
+fn docx_band_sizes_missing_or_zero_are_read_both_ways() {
+    let banded = |size: &str| {
+        table_style(
+            "Bands",
+            &[
+                format!("<w:tblPr>{size}</w:tblPr>"),
+                region("band1Horz", "000000"),
+                region("band1Vert", "000000"),
+            ]
+            .concat(),
+        )
+    };
+    let rows = [
+        vec![cell("", &para("", &run(WHITE, "white")))],
+        vec![cell("", &para("", &run(BLACK, "black")))],
+    ];
+    let row_table = table(
+        r#"<w:tblStyle w:val="Bands"/><w:tblLook w:firstRow="0" w:firstColumn="0" w:noVBand="1"/>"#,
+        &rows,
+    );
+    let column_table = table(
+        r#"<w:tblStyle w:val="Bands"/><w:tblLook w:firstRow="0" w:firstColumn="0" w:noHBand="1"/>"#,
+        &[vec![
+            cell("", &para("", &run(WHITE, "white"))),
+            cell("", &para("", &run(BLACK, "black"))),
+        ]],
+    );
+    for (sizes, shown, warned) in [
+        // Bands of one: white on the first band's black, black on the second band's white.
+        (
+            r#"<w:tblStyleRowBandSize w:val="1"/><w:tblStyleColBandSize w:val="1"/>"#,
+            "white\nblack\nwhite\nblack",
+            vec![],
+        ),
+        // Missing, or 0: with no banding the first band's white text lies on the page.
+        (
+            "",
+            "black\nblack",
+            vec![(1, "low_contrast"), (3, "low_contrast")],
+        ),
+        (
+            r#"<w:tblStyleRowBandSize w:val="0"/><w:tblStyleColBandSize w:val="0"/>"#,
+            "black\nblack",
+            vec![(1, "low_contrast"), (3, "low_contrast")],
+        ),
+    ] {
+        let extracted = read(
+            &Docx::new(&[row_table.clone(), column_table.clone()].concat()).styles(&banded(sizes)),
+        );
+        assert_eq!(text(&extracted), shown, "{sizes}");
+        assert_eq!(hidden(&extracted), warned, "{sizes}");
+    }
+    // A band size written twice is read both ways as well.
+    let extracted = read(&Docx::new(&row_table).styles(&banded(
+        r#"<w:tblStyleRowBandSize w:val="1"/><w:tblStyleRowBandSize w:val="2"/>"#,
+    )));
+    assert_eq!(text(&extracted), "white");
+    assert_eq!(hidden(&extracted), [(2, "low_contrast")]);
+}
+
+/// Word lays out no object anchored in hidden text, inline or floating: a text box whose drawing
+/// sits in a hidden run is hidden with it.
+#[test]
+fn docx_text_boxes_in_hidden_runs_are_hidden() {
+    let white_fill = r#"<a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill>"#;
+    // A `w:drawing` text box, and a VML one in `w:pict`.
+    let drawing = |frame: &str, marker: &str| {
+        let boxed = shape_box(frame, "", white_fill, &para("", &run("", marker)));
+        boxed["<w:r>".len()..boxed.len() - "</w:r>".len()].to_owned()
+    };
+    let pict = |style: &str, marker: &str| {
+        format!(
+            r#"<w:pict><v:shape style="{style}" fillcolor="white"><v:textbox><w:txbxContent>{}</w:txbxContent></v:textbox></v:shape></w:pict>"#,
+            para("", &run("", marker))
+        )
+    };
+    let in_run =
+        |run_props: &str, object: String| format!("<w:r><w:rPr>{run_props}</w:rPr>{object}</w:r>");
+    let styles = concat!(
+        r#"<w:style w:type="character" w:styleId="Gone"><w:rPr><w:vanish/></w:rPr></w:style>"#,
+        r#"<w:style w:type="paragraph" w:styleId="GonePara"><w:rPr><w:vanish/></w:rPr></w:style>"#
+    );
+    // As Word writes a text box: a `wps` choice and a VML fallback.
+    let word_shape = |marker: &str| {
+        format!(
+            r#"<mc:AlternateContent><mc:Choice Requires="wps">{}</mc:Choice><mc:Fallback>{}</mc:Fallback></mc:AlternateContent>"#,
+            drawing("anchor", marker),
+            pict("position:absolute", marker)
+        )
+    };
+    let body = [
+        format!(
+            "<w:p>{}</w:p>",
+            in_run("<w:vanish/>", drawing("inline", "inlinehidden"))
+        ),
+        format!(
+            "<w:p>{}</w:p>",
+            in_run(
+                r#"<w:rStyle w:val="Gone"/>"#,
+                drawing("inline", "stylehidden")
+            )
+        ),
+        format!(
+            r#"<w:p><w:pPr><w:pStyle w:val="GonePara"/></w:pPr>{}</w:p>"#,
+            in_run("", drawing("inline", "parastylehidden"))
+        ),
+        format!(
+            "<w:p>{}</w:p>",
+            in_run("<w:vanish/>", drawing("anchor", "anchorhidden"))
+        ),
+        format!(
+            "<w:p>{}</w:p>",
+            in_run("<w:vanish/>", pict("position:absolute", "vmlfloating"))
+        ),
+        format!(
+            "<w:p>{}</w:p>",
+            in_run("<w:vanish/>", pict("", "vmlinline"))
+        ),
+        format!(
+            "<w:p>{}</w:p>",
+            in_run("<w:vanish/>", word_shape("wordshape"))
+        ),
+        // Controls: a visible host, a vanish turned off, and a host run too small to read (the
+        // drawing's size is its own).
+        format!(
+            "<w:p>{}</w:p>",
+            in_run("", drawing("inline", "visiblehost"))
+        ),
+        format!(
+            "<w:p>{}</w:p>",
+            in_run(r#"<w:vanish w:val="0"/>"#, drawing("inline", "vanishoff"))
+        ),
+        format!(
+            "<w:p>{}</w:p>",
+            in_run(r#"<w:sz w:val="2"/>"#, drawing("inline", "tinyhost"))
+        ),
+    ]
+    .concat();
+    let extracted = read(&Docx::new(&body).styles(styles));
+    assert_eq!(text(&extracted), "visiblehost\nvanishoff\ntinyhost");
+    let warned: Vec<&str> = hidden(&extracted).into_iter().map(|(_, why)| why).collect();
+    assert_eq!(warned, ["vanish"; 7]);
+
+    // A run's properties after its content are refused, as a paragraph's are.
+    for body in [
+        format!(
+            r#"<w:p><w:r>{}<w:rPr><w:vanish/></w:rPr></w:r></w:p>"#,
+            drawing("inline", "late")
+        ),
+        r#"<w:p><w:r><w:t>late</w:t><w:rPr><w:vanish/></w:rPr></w:r></w:p>"#.into(),
+    ] {
+        assert_eq!(
+            docs::extract(MediaKind::Docx, &Docx::new(&body).build(), &limits()),
+            Err(DocError::Malformed("docx_structure"))
+        );
+    }
+}
+
+/// A field's type is the first word of its instruction, read past leading white space. A type
+/// that cannot be read (none, too long, or written by a nested field) leaves the result
+/// undecided; types Word computes, never shows or draws from their code are hidden.
+#[test]
+fn docx_field_types_are_read_past_white_space() {
+    let spaces = " ".repeat(70);
+    let one_space_runs = format!(
+        r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r>{}<w:r><w:instrText>PAGE</w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>9</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>"#,
+        r#"<w:r><w:instrText xml:space="preserve"> </w:instrText></w:r>"#.repeat(70)
+    );
+    let nested_type = format!(
+        r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r>{}<w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>9</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>"#,
+        field(r#" QUOTE "PAGE" "#, "PAGE")
+    );
+    // The type's word begun, then finished by a nested field's result: `PA` + `GE`.
+    let finished_by_nested = format!(
+        r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText>PA</w:instrText></w:r>{}<w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>9</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>"#,
+        field(r#" QUOTE "GE" "#, "GE")
+    );
+    let rows: Vec<(String, Option<&str>)> = vec![
+        (field(&format!("{spaces}PAGE "), "9"), Some("field_result")),
+        (
+            field(&format!("{spaces}SET x 1 "), "9"),
+            Some("field_result"),
+        ),
+        (
+            field(&format!("\t\t\n{spaces}PAGE"), "9"),
+            Some("field_result"),
+        ),
+        (
+            field(&format!("{}PAGE", " ".repeat(60)), "9"),
+            Some("field_result"),
+        ),
+        (
+            field(&format!("{}PAGE", " ".repeat(61)), "9"),
+            Some("field_result"),
+        ),
+        (one_space_runs, Some("field_result")),
+        (
+            format!(r#"<w:fldSimple w:instr="{spaces}PAGE"><w:r><w:t>9</w:t></w:r></w:fldSimple>"#),
+            Some("field_result"),
+        ),
+        (nested_type, Some("undecided")),
+        (finished_by_nested, Some("undecided")),
+        (field("", "9"), Some("undecided")),
+        (field(&"X".repeat(65), "9"), Some("undecided")),
+        (field(r#"\* MERGEFORMAT"#, "9"), Some("undecided")),
+        (field(" REF budget ", "9"), None),
+        (field(" FOO ", "9"), None),
+        (field(&format!("{spaces}hyperlink \"x\""), "9"), None),
+    ];
+    for (body, why) in rows {
+        let extracted = read_body(&format!("<w:p>{body}</w:p>"));
+        match why {
+            Some(why) => {
+                assert_eq!(text(&extracted), "", "{body}");
+                assert_eq!(hidden(&extracted), [(1, why)], "{body}");
+            }
+            None => assert_eq!(text(&extracted), "9", "{body}"),
+        }
+    }
+    // Every type Word never shows, computes, or draws from its code, in either field form.
+    for kind in [
+        "ASK",
+        "SET",
+        "TC",
+        "XE",
+        "TA",
+        "RD",
+        "PRIVATE",
+        "PAGE",
+        "NUMPAGES",
+        "SECTIONPAGES",
+        "SECTION",
+        "PAGEREF",
+        "STYLEREF",
+        "DATE",
+        "TIME",
+        "AUTONUM",
+        "AUTONUMLGL",
+        "AUTONUMOUT",
+        "LISTNUM",
+        "EQ",
+        "MACROBUTTON",
+        "GOTOBUTTON",
+        "SYMBOL",
+        "FORMDROPDOWN",
+    ] {
+        for body in [
+            field(&format!(" {kind} x "), "9"),
+            format!(r#"<w:fldSimple w:instr=" {kind} x "><w:r><w:t>9</w:t></w:r></w:fldSimple>"#),
+        ] {
+            let extracted = read_body(&format!("<w:p>{body}</w:p>"));
+            assert_eq!(text(&extracted), "", "{kind}");
+            assert_eq!(hidden(&extracted), [(1, "field_result")], "{kind}");
+        }
+    }
+}
+
+/// A field stored with no result, where Word draws one, leaves a gap as a dropped run does: its
+/// neighbours never join into a figure. A field Word never shows draws nothing there.
+#[test]
+fn docx_fields_with_no_result_leave_a_gap() {
+    let bare = |instruction: &str| {
+        format!(
+            r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve">{instruction}</w:instrText></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>"#
+        )
+    };
+    let around = |field: &str| {
+        format!(
+            "<w:p>{}{field}{}</w:p>",
+            run("", "Budget: 1"),
+            run("", "00 baht")
+        )
+    };
+    let body = [
+        around(&bare(" PAGE ")),
+        around(r#"<w:fldSimple w:instr=" PAGE "/>"#),
+        around(&bare(" PAGEREF x ")),
+        around(&bare(" TITLE ")),
+        around(&bare(" DATE ")),
+        around(&bare(" REF x ")),
+        around(
+            &bare(" PAGE ").replace(
+                r#"<w:r><w:fldChar w:fldCharType="end"/></w:r>"#,
+                r#"<w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t></w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>"#,
+            ),
+        ),
+        // Never shown: nothing is drawn there.
+        around(&bare(r#" SET x "1" "#)),
+        around(&bare(r#" XE "budget" "#)),
+    ]
+    .concat();
+    let gap = "Budget: 1\u{FFFC}00 baht";
+    assert_eq!(
+        read_body(&body)
+            .blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>(),
+        [
+            gap,
+            gap,
+            gap,
+            gap,
+            gap,
+            gap,
+            gap,
+            "Budget: 100 baht",
+            "Budget: 100 baht"
+        ]
+    );
+    // In a footer, every field is recomputed on every page.
+    let footer = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><w:ftr {NAMESPACES}><w:p>{}{}{}</w:p></w:ftr>"#,
+        run("", "Total 1"),
+        bare(" REF x "),
+        run("", "0 pages")
+    );
+    let extracted = read(&Docx::new(&para("", &run("", "main"))).related(
+        "footer",
+        "footer1.xml",
+        footer.as_bytes(),
+    ));
+    assert_eq!(text(&extracted), "main\nTotal 1\u{FFFC}0 pages");
+}
+
+/// `w15:dataBinding` binds a control as `w:dataBinding` does: Word refills it from the custom
+/// XML part, so its cached text is hidden. Properties after the control's content are refused.
+#[test]
+fn docx_word_2013_data_bindings_hide_cached_text() {
+    let w15 = "http://schemas.microsoft.com/office/word/2012/wordml";
+    let binding = format!(
+        r#"<w15:dataBinding xmlns:w15="{w15}" w:xpath="/r[1]/x[1]" w:storeItemID="{{11111111-1111-1111-1111-111111111111}}"/>"#
+    );
+    let body = [
+        format!(
+            r#"<w:p><w:r><w:t xml:space="preserve">lead </w:t></w:r><w:sdt><w:sdtPr>{binding}</w:sdtPr><w:sdtContent><w:r><w:t>cached</w:t></w:r></w:sdtContent></w:sdt></w:p>"#
+        ),
+        format!(
+            r#"<w:sdt><w:sdtPr>{binding}</w:sdtPr><w:sdtContent><w:p><w:r><w:t>cachedblock</w:t></w:r></w:p></w:sdtContent></w:sdt>"#
+        ),
+        format!(
+            r#"<w:p><w:sdt><w:sdtPr><mc:AlternateContent xmlns:w15="{w15}"><mc:Choice Requires="w15">{binding}</mc:Choice></mc:AlternateContent></w:sdtPr><w:sdtContent><w:r><w:t>cachedchoice</w:t></w:r></w:sdtContent></w:sdt></w:p>"#
+        ),
+    ]
+    .concat();
+    let extracted = read_body(&body);
+    assert_eq!(text(&extracted), "lead \u{FFFC}");
+    assert_eq!(
+        hidden(&extracted),
+        [
+            (1, "data_binding"),
+            (2, "data_binding"),
+            (3, "data_binding")
+        ]
+    );
+    for binding in [
+        binding.clone(),
+        r#"<w:dataBinding w:xpath="/r[1]" w:storeItemID="{11111111-1111-1111-1111-111111111111}"/>"#.into(),
+    ] {
+        let late = format!(
+            r#"<w:p><w:sdt><w:sdtContent><w:r><w:t>late</w:t></w:r></w:sdtContent><w:sdtPr>{binding}</w:sdtPr></w:sdt></w:p>"#
+        );
+        assert_eq!(
+            docs::extract(MediaKind::Docx, &Docx::new(&late).build(), &limits()),
+            Err(DocError::Malformed("docx_structure"))
+        );
+    }
+}
+
+/// An inline equation, or any element the reader does not read that holds text, stands where
+/// Word draws it: a gap, and an `unknown_namespace` warning.
+#[test]
+fn docx_equations_and_unread_inline_content_leave_a_gap() {
+    let math = r#"xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math""#;
+    let body = [
+        format!(
+            r#"<w:p>{}<m:oMath {math}><m:r><m:t>2</m:t></m:r></m:oMath>{}</w:p>"#,
+            run("", "Budget: 1"),
+            run("", "00 baht")
+        ),
+        format!(
+            r#"<w:p>{}<m:oMath {math}><m:r><w:rPr><w:rFonts w:ascii="Cambria Math"/></w:rPr><m:t>2</m:t></m:r></m:oMath>{}</w:p>"#,
+            run("", "Total 1"),
+            run("", "00")
+        ),
+        format!(r#"<w:p><m:oMathPara {math}><m:oMath><m:r><m:t>x=1</m:t></m:r></m:oMath></m:oMathPara></w:p>"#),
+        format!(
+            r#"<w:p>{}<w:hyperlink><m:oMath {math}><m:r><m:t>7</m:t></m:r></m:oMath></w:hyperlink>{}</w:p>"#,
+            run("", "rate "),
+            run("", "%")
+        ),
+        // An empty element of an unknown namespace holds nothing Word draws.
+        format!(
+            r#"<w:p>{}<x:mark xmlns:x="urn:example:unknown"/>{}</w:p>"#,
+            run("", "Budget: 1"),
+            run("", "00 baht")
+        ),
+        // Markup inside text, and character data directly in mc:AlternateContent.
+        r#"<w:p><w:r><w:t>1<w:b>2</w:b>00</w:t></w:r></w:p>"#.into(),
+        r#"<w:p><w:r><w:t>A<mc:AlternateContent>secret</mc:AlternateContent>B</w:t></w:r></w:p>"#.into(),
+    ]
+    .concat();
+    let extracted = read_body(&body);
+    assert_eq!(
+        extracted
+            .blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "Budget: 1\u{FFFC}00 baht",
+            "Total 1\u{FFFC}00",
+            "rate \u{FFFC}%",
+            "Budget: 100 baht",
+            "1\u{FFFC}00",
+            "A\u{FFFC}B"
+        ]
+    );
+    assert_eq!(
+        hidden(&extracted),
+        [
+            (1, "unknown_namespace"),
+            (2, "unknown_namespace"),
+            (3, "unknown_namespace"),
+            (4, "unknown_namespace"),
+            (6, "undecided"),
+            (7, "unknown_namespace")
+        ]
+    );
+}
+
+/// The accepted view has no row deleted in a conflict (`w14:conflictDel`, which Word treats as a
+/// tracked deletion), and no cell a tracked change merged into the one above.
+#[test]
+fn docx_conflict_deletions_and_tracked_merges_are_not_shown() {
+    let row = |props: &str, cell_props: &str, marker: &str| {
+        format!(
+            "<w:tr>{props}{}</w:tr>",
+            cell(cell_props, &para("", &run("", marker)))
+        )
+    };
+    let body = format!(
+        r#"<w:tbl><w:tblPr/>{}{}{}{}{}{}</w:tbl>"#,
+        row("", "", "top"),
+        row(
+            r#"<w:trPr><w14:conflictDel w:id="9" w:author="a" w:date="2026-01-01T00:00:00Z"/></w:trPr>"#,
+            "",
+            "conflictdeleted"
+        ),
+        row(
+            "",
+            r#"<w:cellMerge w:id="1" w:author="a" w:vMerge="cont"/>"#,
+            "mergedaway"
+        ),
+        row(
+            "",
+            r#"<w:cellMerge w:id="2" w:author="a" w:vMerge="rest"/>"#,
+            "restarted"
+        ),
+        row("", "<w:hMerge/>", "hmerged"),
+        row("", r#"<w:vMerge w:val="restart"/>"#, "vrestart"),
+    );
+    let extracted = read_body(&body);
+    assert_eq!(text(&extracted), "top\nrestarted\nvrestart");
+    assert_eq!(hidden(&extracted), [(3, "merged_cell"), (5, "merged_cell")]);
+}
+
+/// A `w:shd` with no pattern is drawn as its fill, as for `clear` (generators write it so).
+#[test]
+fn docx_shading_with_no_pattern_shows_its_fill() {
+    let body = [
+        para(r#"<w:shd w:fill="E8EEF5"/>"#, &run(BLACK, "blackonlight")),
+        para(r#"<w:shd w:fill="E8EEF5"/>"#, &run(WHITE, "whiteonlight")),
+        table(
+            "",
+            &[vec![cell(
+                r#"<w:shd w:fill="1F3864"/>"#,
+                &para("", &run(WHITE, "whiteondark")),
+            )]],
+        ),
+    ]
+    .concat();
+    let extracted = read_body(&body);
+    assert_eq!(text(&extracted), "blackonlight\nwhiteondark");
+    assert_eq!(hidden(&extracted), [(2, "low_contrast")]);
+}
+
+/// Shape markup Word would not lay out as the reader reads it: properties after the text box
+/// was read are refused; a shape outside its frame is undecided. Extensions Word does not draw
+/// from (`a:extLst`) are passed over.
+#[test]
+fn docx_late_and_misplaced_shape_markup_fails_closed() {
+    let white_fill = r#"<a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill>"#;
+    let late_frame = |late: &str| {
+        format!(
+            "<w:p>{}</w:p>",
+            shape_box("anchor", "", white_fill, &para("", &run("", "late")))
+                .replace("</a:graphic>", &format!("</a:graphic>{late}"))
+        )
+    };
+    for late in [
+        r#"<wp:docPr id="1" name="Box" hidden="1"/>"#,
+        r#"<wp:extent cx="1" cy="1"/>"#,
+        r#"<wp:positionH relativeFrom="page"><wp:posOffset>40000000</wp:posOffset></wp:positionH>"#,
+        r#"<wp:simplePos x="0" y="0"/>"#,
+    ] {
+        assert_eq!(
+            docs::extract(
+                MediaKind::Docx,
+                &Docx::new(&late_frame(late)).build(),
+                &limits()
+            ),
+            Err(DocError::Malformed("docx_structure")),
+            "{late}"
+        );
+    }
+    let wsp = |marker: &str| {
+        format!(
+            r#"<wps:wsp><wps:spPr>{white_fill}</wps:spPr><wps:txbx><w:txbxContent>{}</w:txbxContent></wps:txbx></wps:wsp>"#,
+            para("", &run("", marker))
+        )
+    };
+    let body = [
+        format!("<w:p><w:r><w:drawing>{}</w:drawing></w:r></w:p>", wsp("noframe")),
+        format!("<w:p><w:r>{}</w:r></w:p>", wsp("inrun")),
+        format!("<w:p>{}</w:p>", wsp("inpara")),
+        format!(
+            r#"<w:p><w:r><v:shape fillcolor="white"><v:textbox><w:txbxContent>{}</w:txbxContent></v:textbox></v:shape></w:r></w:p>"#,
+            para("", &run("", "vmlnopict"))
+        ),
+        // Word keeps a fill it does not draw in an extension: the box is white.
+        format!(
+            "<w:p>{}</w:p>",
+            shape_box(
+                "anchor",
+                "",
+                &format!(
+                    r#"{white_fill}<a:extLst><a:ext uri="{{909E8E84-426E-40DD-AFC4-6F175D3DCCD1}}"><a14:hiddenFill xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main"><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a14:hiddenFill></a:ext></a:extLst>"#
+                ),
+                &para("", &run("", "extension"))
+            )
+        ),
+    ]
+    .concat();
+    let extracted = read_body(&body);
+    assert_eq!(text(&extracted), "extension");
+    // Each box's paragraph comes after the paragraph holding it.
+    assert_eq!(
+        hidden(&extracted),
+        [
+            (2, "undecided"),
+            (4, "undecided"),
+            (6, "undecided"),
+            (8, "undecided")
+        ]
+    );
+}
+
+/// A followed relationship's mode is `Internal` (or none) or `External`; any other is refused,
+/// and a Strict relationship named from a transitional package is unsupported.
+#[test]
+fn docx_relationship_modes_and_strict_types() {
+    let white_normal = styles(
+        r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:rPr><w:color w:val="FFFFFF"/></w:rPr></w:style>"#,
+    );
+    let with_mode = |mode: &str| {
+        let docx = Docx::new(&para("", &run("", "whitebystyle"))).related(
+            "styles",
+            "styles.xml",
+            white_normal.as_bytes(),
+        );
+        let entries: Vec<(String, Vec<u8>)> = docx
+            .entries()
+            .into_iter()
+            .map(|(name, bytes)| {
+                if name == "word/_rels/document.xml.rels" {
+                    let xml = String::from_utf8(bytes).unwrap().replace(
+                        r#"Target="styles.xml""#,
+                        &format!(r#"Target="styles.xml"{mode}"#),
+                    );
+                    (name, xml.into_bytes())
+                } else {
+                    (name, bytes)
+                }
+            })
+            .collect();
+        zip(
+            &entries
+                .iter()
+                .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+                .collect::<Vec<_>>(),
+            true,
+        )
+    };
+    for (mode, expected) in [
+        ("", Ok("")),
+        (r#" TargetMode="Internal""#, Ok("")),
+        (r#" TargetMode="External""#, Ok("whitebystyle")),
+        (
+            r#" TargetMode="internal""#,
+            Err(DocError::Malformed("docx_rels")),
+        ),
+        (
+            r#" TargetMode="Bogus""#,
+            Err(DocError::Malformed("docx_rels")),
+        ),
+    ] {
+        let read = docs::extract(MediaKind::Docx, &with_mode(mode), &limits())
+            .map(|extracted| text(&extracted));
+        assert_eq!(read.as_deref().map_err(|error| *error), expected, "{mode}");
+    }
+    let strict = Docx::new(&para("", &run("", "x"))).related(
+        "http://purl.oclc.org/ooxml/officeDocument/relationships/styles",
+        "styles.xml",
+        white_normal.as_bytes(),
+    );
+    assert_eq!(
+        docs::extract(MediaKind::Docx, &strict.build(), &limits()),
+        Err(DocError::Unsupported("strict_ooxml"))
+    );
+}
+
+/// A right-to-left override (`w:bdo`) makes Word draw its text in reverse order: hidden, with a
+/// gap. A left-to-right one is read.
+#[test]
+fn docx_bidi_overrides_are_hidden() {
+    let body = [
+        format!(
+            r#"<w:p>{}<w:bdo w:val="rtl">{}</w:bdo>{}</w:p>"#,
+            run("", "Budget "),
+            run("", "123"),
+            run("", " baht")
+        ),
+        format!(
+            r#"<w:p><w:bdo w:val="ltr">{}</w:bdo></w:p>"#,
+            run("", "ltr")
+        ),
+    ]
+    .concat();
+    let extracted = read_body(&body);
+    assert_eq!(text(&extracted), "Budget \u{FFFC} baht\nltr");
+    assert_eq!(hidden(&extracted), [(1, "reversed")]);
+}
+
+/// What may lie beneath a run is listed once per colour, and past 64 colours it is undecided:
+/// nested shadings of two candidate colours each would double the list at every level.
+#[test]
+fn docx_shading_candidates_are_deduplicated_and_capped() {
+    let nested = |shading: &str, depth: usize, props: &str| {
+        let open = format!("<w:tbl><w:tr><w:tc><w:tcPr>{shading}</w:tcPr>").repeat(depth);
+        format!(
+            "{open}{}{}",
+            para("", &run(props, "x")),
+            "</w:tc></w:tr></w:tbl>".repeat(depth)
+        )
+    };
+    let two_candidates =
+        r#"<w:shd w:val="pct50" w:color="123456" w:themeColor="accent1" w:fill="auto"/>"#;
+    let started = Instant::now();
+    let extracted = read_body(&nested(two_candidates, 40, r#"<w:color w:val="ABCDEF"/>"#));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(hidden(&extracted), [(1, "undecided")]);
+    // Stripes over stripes add the same black at every level: two colours, however deep.
+    let stripes = r#"<w:shd w:val="horzStripe" w:color="000000" w:fill="auto"/>"#;
+    let extracted = read_body(&nested(stripes, 70, WHITE));
+    assert_eq!(hidden(&extracted), [(1, "low_contrast")]);
+}
+
+/// One row per fail-closed rule: removing the rule changes what the row reads.
+#[test]
+fn docx_each_fail_closed_rule_is_pinned() {
+    let unknown =
+        |inner: &str| format!(r#"<x:wrap xmlns:x="urn:example:unknown">{inner}</x:wrap>"#);
+    let white_fill = r#"<a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill>"#;
+    let anchored = |frame_props: &str, sp_pr: &str, marker: &str| {
+        format!(
+            "<w:p>{}</w:p>",
+            shape_box("anchor", frame_props, sp_pr, &para("", &run("", marker)))
+        )
+    };
+    let inline = |sp_pr: &str, marker: &str| {
+        format!(
+            "<w:p>{}</w:p>",
+            shape_box("inline", "", sp_pr, &para("", &run("", marker)))
+        )
+    };
+    let vml = |attributes: &str, inner: &str, marker: &str| {
+        format!(
+            r#"<w:p><w:r><w:pict><v:shape {attributes}>{inner}<v:textbox><w:txbxContent>{}</w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>"#,
+            para("", &run("", marker))
+        )
+    };
+    let beside = |object: &str| format!("<w:p>{}{object}{}</w:p>", run("", "1"), run("", "00"));
+    let fields = |inner: &str| format!("<w:p>{inner}</w:p>");
+    let begin = r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r>"#;
+    let instr = |text: &str| {
+        format!(r#"<w:r><w:instrText xml:space="preserve">{text}</w:instrText></w:r>"#)
+    };
+    let separate = r#"<w:r><w:fldChar w:fldCharType="separate"/></w:r>"#;
+    let end = r#"<w:r><w:fldChar w:fldCharType="end"/></w:r>"#;
+    let result = |text: &str| format!("<w:r><w:t>{text}</w:t></w:r>");
+    let styled_table = |style: &str, look: &str, rows: &[Vec<String>]| {
+        table(&format!(r#"<w:tblStyle w:val="{style}"/>{look}"#), rows)
+    };
+    let black_shading = r#"<w:shd w:val="clear" w:color="auto" w:fill="000000"/>"#;
+
+    type Row = (&'static str, Docx, &'static str, Vec<(u32, &'static str)>);
+    let rows: Vec<Row> = vec![
+        // Shapes.
+        (
+            "VML display:none",
+            Docx::new(&vml(r#"style="position:absolute;display:none" fillcolor="white""#, "", "x")),
+            "",
+            vec![(2, "hidden_shape")],
+        ),
+        (
+            "a hidden wps:cNvPr",
+            Docx::new(&anchored(
+                "",
+                white_fill,
+                "x",
+            ).replace("<wps:spPr>", r#"<wps:cNvPr id="2" name="s" hidden="1"/><wps:spPr>"#)),
+            "",
+            vec![(2, "hidden_shape")],
+        ),
+        (
+            "an unparseable docPr hidden",
+            Docx::new(&anchored(r#"<wp:docPr id="1" name="b" hidden="maybe"/>"#, white_fill, "x")),
+            "",
+            vec![(2, "undecided")],
+        ),
+        (
+            "simplePos off the page",
+            Docx::new(&anchored(
+                r#"<wp:simplePos x="40000000" y="0"/>"#,
+                white_fill,
+                "x",
+            ).replace("<wp:anchor>", r#"<wp:anchor simplePos="1">"#)),
+            "",
+            vec![(2, "off_page")],
+        ),
+        (
+            "off the page on the negative side",
+            Docx::new(&anchored(
+                r#"<wp:positionV relativeFrom="page"><wp:posOffset>-40000000</wp:posOffset></wp:positionV><wp:extent cx="914400" cy="914400"/>"#,
+                white_fill,
+                "x",
+            )),
+            "",
+            vec![(2, "off_page")],
+        ),
+        (
+            "an offset that does not parse",
+            Docx::new(&anchored(
+                r#"<wp:positionH relativeFrom="page"><wp:posOffset>far</wp:posOffset></wp:positionH>"#,
+                white_fill,
+                "x",
+            )),
+            "",
+            vec![(2, "undecided")],
+        ),
+        (
+            "an inline shape is never off the page",
+            Docx::new(&inline(white_fill, "x").replace(
+                "<wp:inline>",
+                r#"<wp:inline><wp:positionH relativeFrom="page"><wp:posOffset>40000000</wp:posOffset></wp:positionH>"#,
+            )),
+            "x",
+            vec![],
+        ),
+        ("a pattern fill", Docx::new(&inline("<a:pattFill/>", "x")), "", vec![(2, "unknown_paint")]),
+        ("a picture fill", Docx::new(&inline("<a:blipFill/>", "x")), "", vec![(2, "unknown_paint")]),
+        ("a group fill", Docx::new(&inline("<a:grpFill/>", "x")), "", vec![(2, "unknown_paint")]),
+        (
+            "two fills, the last none",
+            Docx::new(&inline(&format!("{white_fill}<a:noFill/>"), "x")),
+            "",
+            vec![(2, "unknown_paint")],
+        ),
+        (
+            "two colours in one fill",
+            Docx::new(&inline(
+                r#"<a:solidFill><a:srgbClr val="000000"/><a:srgbClr val="FFFFFF"/></a:solidFill>"#,
+                "x",
+            )),
+            "",
+            vec![(2, "unknown_paint")],
+        ),
+        (
+            "VML opacity",
+            Docx::new(&vml(r#"fillcolor="white""#, r#"<v:fill opacity="0.5"/>"#, "x")),
+            "",
+            vec![(2, "unknown_paint")],
+        ),
+        (
+            "VML filled off, floating",
+            Docx::new(&vml(r#"style="position:absolute" filled="f""#, "", "x")),
+            "",
+            vec![(2, "unknown_paint")],
+        ),
+        // VML's own booleans: an inline box filled `f` shows the paragraph it sits in, one
+        // filled `t` its colour.
+        (
+            "VML filled f, inline",
+            Docx::new(&vml(r#"filled="f""#, "", "x")),
+            "x",
+            vec![],
+        ),
+        (
+            "VML filled t",
+            Docx::new(
+                &vml(r#"filled="t" fillcolor="black""#, "", "x")
+                    .replace("<w:rPr></w:rPr>", &format!("<w:rPr>{BLACK}</w:rPr>")),
+            ),
+            "",
+            vec![(2, "low_contrast")],
+        ),
+        (
+            "style fill 0 is no fill",
+            Docx::new(&inline("", "x").replace(
+                "</wps:spPr>",
+                r#"</wps:spPr><wps:style><a:fillRef idx="0"/></wps:style>"#,
+            )),
+            "x",
+            vec![],
+        ),
+        (
+            "another style fill is the theme's, unread",
+            Docx::new(&inline("", "x").replace(
+                "</wps:spPr>",
+                r#"</wps:spPr><wps:style><a:fillRef idx="1"/></wps:style>"#,
+            )),
+            "",
+            vec![(2, "unknown_paint")],
+        ),
+        (
+            "two font colours",
+            Docx::new(&inline(white_fill, "x").replace(
+                "</wps:spPr>",
+                r#"</wps:spPr><wps:style><a:fontRef idx="minor"><a:srgbClr val="000000"/></a:fontRef><a:fontRef idx="minor"/></wps:style>"#,
+            )),
+            "",
+            vec![(2, "unknown_paint")],
+        ),
+        (
+            "a text colour transform",
+            Docx::new(&inline(white_fill, "x").replace(
+                "</wps:spPr>",
+                r#"</wps:spPr><wps:style><a:fontRef idx="minor"><a:srgbClr val="000000"><a:lumMod val="10000"/></a:srgbClr></a:fontRef></wps:style>"#,
+            )),
+            "",
+            vec![(2, "unknown_paint")],
+        ),
+        (
+            "text in no shape",
+            Docx::new(&format!(
+                "<w:p><w:r><w:pict><w:txbxContent>{}</w:txbxContent></w:pict></w:r></w:p>",
+                para("", &run("", "x"))
+            )),
+            "",
+            vec![(2, "unknown_paint")],
+        ),
+        (
+            "text in a shape's extensions",
+            Docx::new(&inline(
+                &format!(
+                    r#"{white_fill}<a:extLst><a:ext uri="{{00000000-0000-0000-0000-000000000000}}">{}</a:ext></a:extLst>"#,
+                    unknown("note")
+                ),
+                "x",
+            )),
+            "x",
+            vec![],
+        ),
+        (
+            "a shape property in undecided markup",
+            Docx::new(&inline(&unknown(white_fill), "x")),
+            "",
+            vec![(2, "unknown_namespace")],
+        ),
+        (
+            "a fill after the text box",
+            Docx::new(&vml(r#"fillcolor="white""#, "", "x").replace(
+                "</v:textbox>",
+                r#"</v:textbox><v:fill color="black"/>"#,
+            )),
+            "error",
+            vec![],
+        ),
+        (
+            "shape properties after the text box",
+            Docx::new(&inline(white_fill, "x").replace("</wps:wsp>", "<wps:spPr/></wps:wsp>")),
+            "error",
+            vec![],
+        ),
+        (
+            "a shape style after the text box",
+            Docx::new(&inline(white_fill, "x").replace("</wps:wsp>", "<wps:style/></wps:wsp>")),
+            "error",
+            vec![],
+        ),
+        // A text box in a paragraph outside any cell of its table.
+        (
+            "a box whose host is in no cell",
+            Docx::new(&format!(
+                "<w:tbl><w:tr>{}</w:tr></w:tbl>",
+                inline(white_fill, "x")
+            )),
+            "",
+            vec![(2, "undecided")],
+        ),
+        // The host paragraph's cell gives it its table style's paragraph shading.
+        (
+            "an inline box's host takes its cell's table level",
+            Docx::new(&styled_table(
+                "Shaded",
+                "",
+                &[vec![cell(
+                    "",
+                    &format!(
+                        "<w:p>{}</w:p>",
+                        shape_box("inline", "", "", &para("", &run(BLACK, "x")))
+                    ),
+                )]],
+            ))
+            .styles(&table_style(
+                "Shaded",
+                &format!("<w:pPr>{black_shading}</w:pPr>"),
+            )),
+            "",
+            vec![(2, "low_contrast")],
+        ),
+        // Gaps.
+        ("a note mark", Docx::new(&beside(r#"<w:r><w:footnoteReference w:id="1"/></w:r>"#)), "1\u{FFFC}00", vec![]),
+        ("a page number", Docx::new(&beside("<w:r><w:pgNum/></w:r>")), "1\u{FFFC}00", vec![]),
+        ("ruby text", Docx::new(&beside("<w:r><w:ruby/></w:r>")), "1\u{FFFC}00", vec![]),
+        (
+            "an embedded object",
+            Docx::new(&beside("<w:r><w:object/></w:r>")),
+            "1\u{FFFC}00",
+            vec![],
+        ),
+        (
+            "a picture after a run's text",
+            Docx::new(&format!(
+                "<w:p><w:r><w:t>1</w:t><w:drawing/></w:r>{}</w:p>",
+                run("", "250")
+            )),
+            "1\u{FFFC}250",
+            vec![],
+        ),
+        (
+            "a run holding only dropped text",
+            Docx::new(&beside(&format!("<w:r>{}</w:r>", unknown("<w:t>2</w:t>")))),
+            "1\u{FFFC}00",
+            vec![(1, "unknown_namespace")],
+        ),
+        (
+            "a Symbol font control character",
+            Docx::new(&beside(
+                r#"<w:r><mc:AlternateContent xmlns:w16se="http://schemas.microsoft.com/office/word/2015/wordml/symex"><mc:Choice Requires="w16se"><w16se:symEx w16se:font="Symbol" w16se:char="0007"/></mc:Choice></mc:AlternateContent></w:r>"#,
+            )),
+            "1\u{FFFC}00",
+            vec![],
+        ),
+        // Fields.
+        (
+            "a field end in dropped markup",
+            Docx::new(&fields(&format!(
+                "{begin}{}{separate}{}<w:r>{}</w:r>{}{end}",
+                instr(" REF x "),
+                result("r"),
+                unknown(r#"<w:fldChar w:fldCharType="end"/>"#),
+                result("after")
+            ))),
+            "r\u{FFFC}",
+            vec![(1, "unknown_namespace")],
+        ),
+        (
+            "an unknown field character",
+            Docx::new(&fields(&format!(
+                r#"{begin}{}<w:r><w:fldChar w:fldCharType="bogus"/></w:r>{separate}{}{end}"#,
+                instr(" REF x "),
+                result("r")
+            ))),
+            "",
+            vec![(1, "unknown_namespace")],
+        ),
+        (
+            "a second separate",
+            Docx::new(&fields(&format!(
+                "{begin}{}{separate}{}{separate}{}{end}",
+                instr(" REF x "),
+                result("a"),
+                result("b")
+            ))),
+            "a\u{FFFC}",
+            vec![(1, "unknown_namespace")],
+        ),
+        (
+            "hidden instruction text",
+            Docx::new(&fields(&format!(
+                "{begin}<w:r>{}</w:r>{separate}{}{end}",
+                unknown(r#"<w:instrText> REF x </w:instrText>"#),
+                result("r")
+            ))),
+            "",
+            vec![(1, "unknown_namespace")],
+        ),
+        (
+            "markup inside an instruction",
+            Docx::new(&fields(&format!(
+                "{begin}<w:r><w:instrText> REF<w:b/> x </w:instrText></w:r>{separate}{}{end}",
+                result("r")
+            ))),
+            "",
+            vec![(1, "unknown_namespace")],
+        ),
+        // Settings.
+        (
+            "updateFields where Word may not read it",
+            Docx::new(&fields(&format!("{begin}{}{separate}{}{end}", instr(" REF x "), result("r"))))
+                .settings(&unknown(r#"<w:updateFields w:val="0"/>"#)),
+            "",
+            vec![(1, "field_result")],
+        ),
+        (
+            "updateFields written twice, on then off",
+            Docx::new(&fields(&format!("{begin}{}{separate}{}{end}", instr(" REF x "), result("r"))))
+                .settings(r#"<w:updateFields/><w:updateFields w:val="0"/>"#),
+            "",
+            vec![(1, "field_result")],
+        ),
+        (
+            "updateFields written off twice",
+            Docx::new(&fields(&format!("{begin}{}{separate}{}{end}", instr(" REF x "), result("r"))))
+                .settings(r#"<w:updateFields w:val="0"/><w:updateFields w:val="0"/>"#),
+            "r",
+            vec![],
+        ),
+        (
+            "displayBackgroundShape where Word may not read it",
+            Docx::from_document(&document_with(
+                r#"<w:background w:color="000000"/>"#,
+                &para("", &run(WHITE, "x")),
+            ))
+            .settings(&unknown("<w:displayBackgroundShape/>")),
+            "",
+            vec![(1, "low_contrast")],
+        ),
+        (
+            "displayBackgroundShape written twice, off then on",
+            Docx::from_document(&document_with(
+                r#"<w:background w:color="000000"/>"#,
+                &para("", &run(WHITE, "x")),
+            ))
+            .settings(r#"<w:displayBackgroundShape w:val="0"/><w:displayBackgroundShape/>"#),
+            "",
+            vec![(1, "low_contrast")],
+        ),
+        (
+            "a second page colour",
+            Docx::from_document(&document_with(
+                r#"<w:background w:color="000000"/><w:background w:color="FFFFFF"/>"#,
+                &para("", &run(BLACK, "x")),
+            ))
+            .settings("<w:displayBackgroundShape/>"),
+            "",
+            vec![(1, "low_contrast")],
+        ),
+        (
+            "a scheme mapping written twice, two ways",
+            Docx::new(&para(
+                "",
+                &run(r#"<w:color w:val="FFFFFF" w:themeColor="background1"/>"#, "x"),
+            ))
+            .theme(&theme(&[]))
+            .settings(r#"<w:clrSchemeMapping w:bg1="light1"/><w:clrSchemeMapping w:bg1="dark1"/>"#),
+            "",
+            vec![(1, "low_contrast")],
+        ),
+        (
+            "a picture at a paragraph's end",
+            Docx::new(&format!("<w:p>{}<w:r><w:drawing/></w:r></w:p>", run("", "x"))),
+            "x",
+            vec![],
+        ),
+        // Styles and tables.
+        (
+            "two rPrDefault",
+            Docx::new(&para("", &run("", "x"))).styles(
+                r#"<w:docDefaults><w:rPrDefault/><w:rPrDefault><w:rPr/></w:rPrDefault></w:docDefaults>"#,
+            ),
+            "",
+            vec![(1, "undecided")],
+        ),
+        (
+            "a style's rPr written twice",
+            Docx::new(&para(r#"<w:pStyle w:val="S"/>"#, &run("", "x")))
+                .styles(r#"<w:style w:type="paragraph" w:styleId="S"><w:rPr/><w:rPr/></w:style>"#),
+            "",
+            vec![(1, "undecided")],
+        ),
+        (
+            "a region's tcPr written twice",
+            Docx::new(&styled_table("T", "", &[vec![cell("", &para("", &run("", "x")))]]))
+                .styles(&table_style(
+                    "T",
+                    r#"<w:tblStylePr w:type="wholeTable"><w:tcPr/><w:tcPr/></w:tblStylePr>"#,
+                )),
+            "",
+            vec![(1, "undecided")],
+        ),
+        (
+            "a region written twice",
+            Docx::new(&styled_table("T", "", &[vec![cell("", &para("", &run("", "x")))]]))
+                .styles(&table_style(
+                    "T",
+                    &[region("wholeTable", "FFFFFF"), region("wholeTable", "000000")].concat(),
+                )),
+            "",
+            vec![(1, "undecided")],
+        ),
+        (
+            "a second tblPr",
+            Docx::new(&table("", &[vec![cell("", &para("", &run("", "x")))]]).replace(
+                "</w:tblPr>",
+                "</w:tblPr><w:tblPr/>",
+            )),
+            "",
+            vec![(1, "undecided")],
+        ),
+        (
+            "a second trPr",
+            Docx::new(&table("", &[vec![cell("", &para("", &run("", "x")))]]).replace(
+                "<w:tr>",
+                "<w:tr><w:trPr/><w:trPr/>",
+            )),
+            "",
+            vec![(1, "undecided")],
+        ),
+        (
+            "a second tcPr",
+            Docx::new(&table("", &[vec![cell("", &para("", &run("", "x")))]]).replace(
+                "</w:tcPr>",
+                "</w:tcPr><w:tcPr/>",
+            )),
+            "",
+            vec![(1, "undecided")],
+        ),
+        (
+            "a vMerge that does not parse",
+            Docx::new(&table("", &[vec![cell(r#"<w:vMerge w:val="bogus"/>"#, &para("", &run("", "x")))]])),
+            "",
+            vec![(1, "undecided")],
+        ),
+        (
+            "a table outside a block's place",
+            Docx::new(&format!(
+                "<w:p>{}</w:p>",
+                table("", &[vec![cell("", &para("", &run("", "x")))]])
+            )),
+            "",
+            vec![(2, "undecided")],
+        ),
+        (
+            "a row outside a table's place",
+            Docx::new(&format!(
+                "<w:tbl><w:tblPr/><w:notAnElement><w:tr>{}</w:tr></w:notAnElement></w:tbl>",
+                cell("", &para("", &run("", "x")))
+            )),
+            "",
+            vec![(1, "undecided")],
+        ),
+        (
+            "a cell outside a row's place",
+            Docx::new(&format!(
+                "<w:tbl><w:tblPr/><w:tr><w:notAnElement>{}</w:notAnElement></w:tr></w:tbl>",
+                cell("", &para("", &run("", "x")))
+            )),
+            "",
+            vec![(1, "undecided")],
+        ),
+        (
+            "a cell's properties after a nested table",
+            Docx::new(&format!(
+                "<w:tbl><w:tblPr/><w:tr><w:tc>{}<w:tcPr/></w:tc></w:tr></w:tbl>",
+                table("", &[vec![cell("", &para("", &run("", "x")))]])
+            )),
+            "error",
+            vec![],
+        ),
+        (
+            "a deleted cell moves the cells after it",
+            Docx::new(&styled_table(
+                "Columns",
+                r#"<w:tblLook w:firstRow="0" w:firstColumn="0" w:noHBand="1"/>"#,
+                &[vec![
+                    cell("", &para("", &run("", "a"))),
+                    cell(r#"<w:cellDel w:id="1" w:author="a"/>"#, &para("", &run("", "b"))),
+                    cell("", &para("", &run(BLACK, "c"))),
+                ]],
+            ))
+            .styles(&table_style(
+                "Columns",
+                &[
+                    r#"<w:tblPr><w:tblStyleColBandSize w:val="1"/></w:tblPr>"#,
+                    &region("band1Vert", "000000"),
+                ]
+                .concat(),
+            )),
+            "a\nc",
+            vec![],
+        ),
+        // Markup compatibility.
+        (
+            "a choice requiring markup compatibility itself",
+            Docx::new(r#"<w:p><mc:AlternateContent><mc:Choice Requires="mc"><w:r><w:t>x</w:t></w:r></mc:Choice></mc:AlternateContent></w:p>"#),
+            "x",
+            vec![],
+        ),
+        (
+            "alternate content directly in alternate content",
+            Docx::new(r#"<w:p><mc:AlternateContent><mc:AlternateContent><mc:Choice Requires="w14"><w:r><w:t>x</w:t></w:r></mc:Choice></mc:AlternateContent></mc:AlternateContent></w:p>"#),
+            "",
+            vec![(1, "unknown_namespace")],
+        ),
+        (
+            "a choice outside alternate content",
+            Docx::new(r#"<w:p><mc:Choice Requires="w14"><w:r><w:t>x</w:t></w:r></mc:Choice></w:p>"#),
+            "",
+            vec![(1, "unknown_namespace")],
+        ),
+        (
+            "another markup compatibility element",
+            Docx::new(r#"<w:p><mc:Other><w:r><w:t>x</w:t></w:r></mc:Other></w:p>"#),
+            "",
+            vec![(1, "unknown_namespace")],
+        ),
+        // Parts.
+        (
+            "a styles part related but missing",
+            Docx::new(&para("", &run("", "x"))).related_missing("styles", "styles.xml"),
+            "error",
+            vec![],
+        ),
+        (
+            "a second body",
+            Docx::from_document(&document(&para("", &run("", "x"))).replace(
+                "</w:body>",
+                "</w:body><w:body/>",
+            )),
+            "error",
+            vec![],
+        ),
+    ];
+    for (case, docx, shown, warned) in rows {
+        match docs::extract(MediaKind::Docx, &docx.build(), &limits()) {
+            Ok(extracted) => {
+                assert_ne!(shown, "error", "{case}: read");
+                assert_eq!(text(&extracted), shown, "{case}");
+                assert_eq!(hidden(&extracted), warned, "{case}");
+            }
+            Err(error) => assert_eq!(shown, "error", "{case}: {error:?}"),
+        }
+    }
+
+    // A header related twice is read once.
+    let header = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><w:hdr {NAMESPACES}>{}</w:hdr>"#,
+        para("", &run("", "header"))
+    );
+    let twice = Docx::new("")
+        .related("header", "header1.xml", header.as_bytes())
+        .related_missing("header", "header1.xml");
+    assert_eq!(text(&read(&twice)), "header");
+}
+
+/// Every namespace the reader understands is one Word writes: a choice requiring it is read.
+#[test]
+fn docx_every_understood_namespace_is_read() {
+    for uri in [
+        "http://schemas.microsoft.com/office/word/2010/wordml",
+        "http://schemas.microsoft.com/office/word/2012/wordml",
+        "http://schemas.microsoft.com/office/word/2015/wordml/symex",
+        "http://schemas.microsoft.com/office/word/2016/wordml/cid",
+        "http://schemas.microsoft.com/office/word/2018/wordml",
+        "http://schemas.microsoft.com/office/word/2018/wordml/cex",
+        "http://schemas.microsoft.com/office/word/2020/wordml/sdtdatahash",
+        "http://schemas.microsoft.com/office/word/2023/wordml/word16du",
+        "http://schemas.microsoft.com/office/word/2024/wordml/sdtformatlock",
+        "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+        "http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing",
+        "http://schemas.microsoft.com/office/word/2010/wordprocessingShape",
+        "http://schemas.microsoft.com/office/word/2010/wordprocessingGroup",
+        "http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas",
+        "http://schemas.openxmlformats.org/drawingml/2006/main",
+        "http://schemas.openxmlformats.org/drawingml/2006/picture",
+        "urn:schemas-microsoft-com:vml",
+        "urn:schemas-microsoft-com:office:office",
+        "urn:schemas-microsoft-com:office:word",
+    ] {
+        let body = format!(
+            r#"<w:p><mc:AlternateContent xmlns:z="{uri}"><mc:Choice Requires="z"><w:r><w:t>choice</w:t></w:r></mc:Choice><mc:Fallback><w:r><w:t>fallback</w:t></w:r></mc:Fallback></mc:AlternateContent></w:p>"#
+        );
+        assert_eq!(text(&read_body(&body)), "choice", "{uri}");
+    }
 }
 
 fn read_with(docx: &Docx, limits: &DocLimits) -> Result<Extracted, DocError> {
@@ -2267,6 +3824,7 @@ fn docx_style_ids_and_kinds_that_do_not_agree_are_undecided() {
         r#"<w:style w:type="paragraph" w:styleId="Q"><w:rPr><w:b/></w:rPr></w:style>"#,
         r#"<w:style w:type="paragraph" w:styleId="Cross"><w:basedOn w:val="C"/></w:style>"#,
         r#"<w:style w:type="paragraph" w:styleId="Same"><w:basedOn w:val="Q"/></w:style>"#,
+        // The same definition twice is one style.
         r#"<w:style w:type="paragraph" w:styleId="Twice"/>"#,
         r#"<w:style w:type="paragraph" w:styleId="Twice"/>"#,
     );
@@ -2277,8 +3835,8 @@ fn docx_style_ids_and_kinds_that_do_not_agree_are_undecided() {
     ]
     .concat();
     let extracted = read(&Docx::new(&body).styles(styles));
-    assert_eq!(text(&extracted), "samekind");
-    assert_eq!(hidden(&extracted), [(1, "undecided"), (3, "undecided")]);
+    assert_eq!(text(&extracted), "samekind\ntwice");
+    assert_eq!(hidden(&extracted), [(1, "undecided")]);
 }
 
 #[test]
@@ -2559,6 +4117,27 @@ fn xml_elements_are_one_budget_for_the_package() {
         ),
         Err(DocError::TooComplex("xml_elements"))
     );
+    // Elements with content draw on the budget as empty ones do.
+    let open_flood = |elements: usize| "<w:p></w:p>".repeat(elements);
+    assert!(read_with(&Docx::new(&open_flood(900)), &small).is_ok());
+    assert_eq!(
+        read_with(&Docx::new(&open_flood(1_000)), &small),
+        Err(DocError::TooComplex("xml_elements"))
+    );
+    // The theme draws on the package's budget too.
+    let themed = theme(&[]).replace(
+        "</a:themeElements>",
+        &format!(
+            "<a:fontScheme name=\"x\">{}</a:fontScheme></a:themeElements>",
+            "<a:b/>".repeat(600)
+        ),
+    );
+    assert!(read_with(&Docx::new("").theme(&themed), &small).is_ok());
+    assert_eq!(
+        read_with(&Docx::new(&flood(600)).theme(&themed), &small),
+        Err(DocError::TooComplex("xml_elements"))
+    );
+    assert_eq!(DocLimits::default().max_xml_elements, 2_000_000);
 }
 
 #[test]
@@ -2596,6 +4175,66 @@ fn runs_styles_and_relationships_are_capped() {
     assert_eq!(
         read_with(&headers(2_001), &limits()),
         Err(DocError::TooComplex("relationships"))
+    );
+    // Style ids the styles part defines are at most 256 bytes; a longer one named in the body
+    // names no style.
+    let id = |len: usize| "s".repeat(len);
+    for (styles, expected) in [
+        (format!(r#"<w:style w:styleId="{}"/>"#, id(256)), Ok(())),
+        (
+            format!(r#"<w:style w:styleId="{}"/>"#, id(257)),
+            Err(DocError::TooComplex("style_id")),
+        ),
+        (
+            format!(
+                r#"<w:style w:styleId="s"><w:basedOn w:val="{}"/></w:style>"#,
+                id(257)
+            ),
+            Err(DocError::TooComplex("style_id")),
+        ),
+    ] {
+        assert_eq!(
+            read_with(&Docx::new("").styles(&styles), &limits()).map(drop),
+            expected
+        );
+    }
+    let long_reference = format!(r#"<w:rStyle w:val="{}"/>"#, id(4_000));
+    assert_eq!(
+        text(&read(
+            &Docx::new(&para("", &run(&long_reference, "named"))).styles("")
+        )),
+        "named"
+    );
+    // A field opened in a simple field counts toward the field depth, as fldChar fields do.
+    let shallow = DocLimits {
+        max_xml_depth: 16,
+        ..limits()
+    };
+    let begins = r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r>"#.repeat(16);
+    assert_eq!(
+        read_with(
+            &Docx::new(&format!(
+                r#"<w:p>{begins}<w:fldSimple w:instr=" PAGE "/></w:p>"#
+            )),
+            &shallow
+        ),
+        Err(DocError::TooComplex("field_depth"))
+    );
+    // A table's queued paragraphs are capped at what they could still show or warn of.
+    let few = DocLimits {
+        max_blocks: 10,
+        ..limits()
+    };
+    let hidden_rows = table(
+        "",
+        &[vec![cell(
+            "",
+            &para("", &run("<w:vanish/>", "x")).repeat(21),
+        )]],
+    );
+    assert_eq!(
+        read_with(&Docx::new(&hidden_rows), &few),
+        Err(DocError::TooComplex("blocks"))
     );
     // Relationships the reader never follows are not kept, however many.
     let hyperlinks = (0..5_000).fold(Docx::new(""), |docx, _| {
@@ -2655,6 +4294,16 @@ fn xml_guard_table() {
     assert_eq!(
         xml_guard::scan(flood.as_bytes(), &limits(), None, &mut budget()),
         Err(DocError::TooComplex("xml_namespaces"))
+    );
+    // Attributes, namespace declarations among them, are capped per element.
+    let attributes = |n: usize| {
+        let list: String = (0..n).map(|at| format!(" a{at}=''")).collect();
+        format!("<a xmlns:p='urn:p'{list}/>")
+    };
+    assert!(xml_guard::scan(attributes(255).as_bytes(), &limits(), None, &mut budget()).is_ok());
+    assert_eq!(
+        xml_guard::scan(attributes(256).as_bytes(), &limits(), None, &mut budget()),
+        Err(DocError::TooComplex("xml_attributes"))
     );
     let stats = xml_guard::scan(
         b"\xEF\xBB\xBF<x:r xmlns:x='u'><x:c/><c/><x:d><x:c/></x:d></x:r>",
@@ -2863,7 +4512,7 @@ fn zip_strictness_table() {
     );
     set_u32(&mut commented, commented_end + 12, directory_len + 5);
     assert!(open_package(&commented, &limits()).is_ok());
-    // Only the directory size carries the ZIP64 marker; the ZIP64 record claims 100,000 entries.
+    // The count is neither its marker nor the ZIP64 record's 100,000.
     let mut size_marker = zip64_record(100_000, 0, 0, 0);
     size_marker.extend_from_slice(&[end_record(1, 0xFFFF_FFFF, 0, 0)].concat());
     let corrupt = package_with(&[RawEntry {
@@ -2974,9 +4623,9 @@ fn zip_strictness_table() {
         ),
         ("a second disk", disk, DocError::Malformed("zip_end_record")),
         (
-            "the ZIP64 marker in the directory size only",
+            "a count that is neither its marker nor the ZIP64 count",
             size_marker,
-            DocError::TooComplex("zip_entries"),
+            DocError::Malformed("zip_end_record"),
         ),
         (
             "a corrupt deflate stream",
@@ -3005,6 +4654,122 @@ fn zip_strictness_table() {
             .part("WORD/document.xml"),
         Some(&b"<a>streamed</a>"[..])
     );
+}
+
+/// `zip` with `tail` as its last central header's comment, the directory size grown to match.
+fn with_last_comment(zip: &[u8], tail: &[u8]) -> Vec<u8> {
+    let mut out = zip.to_vec();
+    let header = *central_headers(&out).last().unwrap();
+    let name = usize::from(u16::from_le_bytes([out[header + 28], out[header + 29]]));
+    let extra = usize::from(u16::from_le_bytes([out[header + 30], out[header + 31]]));
+    let at = header + 46 + name + extra;
+    out.splice(at..at, tail.iter().copied());
+    set_u16(&mut out, header + 32, tail.len() as u16);
+    let end = out.len() - 22;
+    let size = u32::from_le_bytes(out[end + 12..end + 16].try_into().unwrap());
+    set_u32(&mut out, end + 12, size + tail.len() as u32);
+    out
+}
+
+#[test]
+fn zip64_locators_are_followed_wherever_they_stand() {
+    let honest = zip(&[("a.xml", b"<a/>"), ("b.xml", b"<b/>")], true);
+    let end = honest.len() - 22;
+    let field = |at: usize| u32::from_le_bytes(honest[end + at..end + at + 4].try_into().unwrap());
+    let (size, offset) = (field(12), field(16));
+    // ZIP64 records naming the honest directory, then end records with the given 32-bit fields.
+    let zip64 = |entries: u16, size32: u32, offset32: u32| {
+        let mut out = honest[..end].to_vec();
+        out.extend_from_slice(&zip64_record(
+            2,
+            u64::from(size),
+            u64::from(offset),
+            end as u64,
+        ));
+        out.extend_from_slice(&end_record(entries, size32, offset32, 0));
+        out
+    };
+    // Each 32-bit field is its marker or the ZIP64 value: the size alone carries the marker.
+    let size_only = zip64(2, 0xFFFF_FFFF, offset);
+    assert_eq!(
+        open_package(&size_only, &limits())
+            .unwrap()
+            .names()
+            .collect::<Vec<_>>(),
+        ["a.xml", "b.xml"]
+    );
+    // A locator hidden in the last entry's comment, with no marker anywhere: Python's zipfile
+    // and libarchive follow it to another directory, so the guard follows it too.
+    let record_at = honest.len() - 22;
+    let hidden_locator = with_last_comment(
+        &honest,
+        &zip64_record(1, 46 + 5, u64::from(offset), record_at as u64),
+    );
+    // Markers set, and the locator names a record that is not the one right before it.
+    let mut displaced = zip64(0xFFFF, 0xFFFF_FFFF, 0xFFFF_FFFF);
+    let record = displaced.len() - 22 - 20 - 56;
+    let copy = displaced[record..record + 56].to_vec();
+    displaced.splice(record + 56..record + 56, copy);
+    // The count carries the marker; the 32-bit size and offset name another directory.
+    let other_size = zip64(0xFFFF, size - 46 - 5, offset);
+    let mut long_record = zip64(0xFFFF, 0xFFFF_FFFF, 0xFFFF_FFFF);
+    let record = long_record.len() - 22 - 20 - 56;
+    set_u32(&mut long_record, record + 4, 100);
+    let mut far_disk = zip64(0xFFFF, 0xFFFF_FFFF, 0xFFFF_FFFF);
+    let locator = far_disk.len() - 22 - 20;
+    set_u32(&mut far_disk, locator + 4, 1);
+    // A marker with no locator before the end record names no ZIP64 record.
+    let mut marker_alone = honest.clone();
+    set_u32(&mut marker_alone, end + 12, 0xFFFF_FFFF);
+    let mut disk_counts = zip64(0xFFFF, 0xFFFF_FFFF, 0xFFFF_FFFF);
+    let record = disk_counts.len() - 22 - 20 - 56;
+    set_u32(&mut disk_counts, record + 24, 1);
+    for (case, bytes) in [
+        ("a locator in an entry comment", hidden_locator),
+        ("a locator naming an earlier record", displaced),
+        ("32-bit fields naming another directory", other_size),
+        ("a ZIP64 record with extensible data", long_record),
+        ("the ZIP64 record on another disk", far_disk),
+        ("entries on this disk not the total", disk_counts),
+        ("a size marker with no locator", marker_alone),
+    ] {
+        assert_eq!(
+            open_package(&bytes, &limits()).unwrap_err(),
+            DocError::Malformed("zip_end_record"),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn local_header_times_need_not_match_and_names_are_bounded() {
+    let honest = zip(&[("a.xml", b"<a/>"), ("b.xml", b"<b/>")], true);
+    // Writers set the local header's DOS time apart from the central one's; it is no content.
+    let mut retimed = honest.clone();
+    let local = local_header(&retimed, central_headers(&honest)[1]);
+    set_u16(&mut retimed, local + 10, 0x1234);
+    set_u16(&mut retimed, local + 12, 0x5678);
+    let package = open_package(&retimed, &limits()).unwrap();
+    assert_eq!(package.part("b.xml"), Some(&b"<b/>"[..]));
+    // Every other field still has to agree.
+    let mut recrc = honest.clone();
+    let crc = u32::from_le_bytes(recrc[local + 14..local + 18].try_into().unwrap());
+    set_u32(&mut recrc, local + 14, crc ^ 1);
+    assert_eq!(
+        open_package(&recrc, &limits()).unwrap_err(),
+        DocError::Malformed("zip_header_mismatch")
+    );
+    for (len, accepted) in [(256, true), (257, false)] {
+        let name = format!("{}.xml", "n".repeat(len - 4));
+        let bytes = zip(&[(name.as_str(), b"<a/>")], false);
+        match open_package(&bytes, &limits()) {
+            Ok(_) => assert!(accepted, "{len}"),
+            Err(error) => {
+                assert!(!accepted, "{len}");
+                assert_eq!(error, DocError::Malformed("zip_name"));
+            }
+        }
+    }
 }
 
 #[test]
@@ -3221,11 +4986,16 @@ fn guard_loops_stop_at_the_job_deadline() {
     let bytes = package_with(&entries);
     assert!(open_package(&bytes, &limits()).is_ok());
     let before = package::inflated_entries();
-    let result = deadline::scope(Instant::now() + Duration::from_secs(3600), None, || {
-        // The end record's search window takes 64 checks; then the entries are read.
-        deadline::expire_after_checks(200);
-        open_package(&bytes, &limits())
-    });
+    let result = deadline::scope(
+        Instant::now() + Duration::from_secs(3600),
+        None,
+        u64::MAX,
+        || {
+            // The end record's search window takes 64 checks; then the entries are read.
+            deadline::expire_after_checks(200);
+            open_package(&bytes, &limits())
+        },
+    );
     assert_eq!(result.unwrap_err(), DocError::Timeout);
     let inflated = package::inflated_entries() - before;
     assert!((1..2_000).contains(&inflated), "{inflated}");
@@ -3245,10 +5015,15 @@ fn stored(docx: &Docx) -> Vec<u8> {
 
 /// `f` inside a job scope whose deadline passes at check number `checks + 1`.
 fn after_checks<T>(checks: u32, f: impl FnOnce() -> Result<T, DocError>) -> Result<T, DocError> {
-    deadline::scope(Instant::now() + Duration::from_secs(3600), None, || {
-        deadline::expire_after_checks(checks);
-        f()
-    })
+    deadline::scope(
+        Instant::now() + Duration::from_secs(3600),
+        None,
+        u64::MAX,
+        || {
+            deadline::expire_after_checks(checks);
+            f()
+        },
+    )
 }
 
 /// Every reader loop checks the deadline. Each row's input makes one loop's checks far more than
@@ -3284,6 +5059,41 @@ fn reader_loops_stop_at_the_job_deadline() {
         "<w:r/>".repeat(200_000)
     )));
     let visible = stored(&Docx::new(&para("", &run("", "x")).repeat(20_000)));
+    // One paragraph of 60,000 runs: the walk makes about 740 checks, the judge's run loop 234.
+    let many_runs = stored(&Docx::new(&format!(
+        "<w:p>{}</w:p>",
+        "<w:r><w:t>x</w:t></w:r>".repeat(60_000)
+    )));
+    // A paragraph 80 tables deep: what each enclosing cell puts beneath it is worked out once,
+    // with a check per cell.
+    let deep = Docx::new(&format!(
+        "{}{}{}",
+        "<w:tbl><w:tr><w:tc>".repeat(80),
+        para("", &run("", "x")),
+        "</w:tc></w:tr></w:tbl>".repeat(80)
+    ))
+    .build();
+    // 30,000 runs each in a character style of its own: one merge, with a check, per style.
+    let styled_runs = stored(
+        &Docx::new(&format!(
+            "<w:p>{}</w:p>",
+            (0..30_000)
+                .map(|at| format!(
+                    r#"<w:r><w:rPr><w:rStyle w:val="c{at}"/></w:rPr><w:t>x</w:t></w:r>"#
+                ))
+                .collect::<String>()
+        ))
+        .styles(
+            &(0..30_000)
+                .map(|at| format!(r#"<w:style w:type="character" w:styleId="c{at}"/>"#))
+                .collect::<String>(),
+        ),
+    );
+    // Coloured runs: the colours beneath each are worked out, with a check, per run.
+    let coloured_runs = stored(&Docx::new(&format!(
+        "<w:p>{}</w:p>",
+        r#"<w:r><w:rPr><w:color w:val="000000"/></w:rPr><w:t>x</w:t></w:r>"#.repeat(30_000)
+    )));
     let themed = theme(&[]).replace(
         "</a:themeElements>",
         &format!(
@@ -3348,6 +5158,26 @@ fn reader_loops_stop_at_the_job_deadline() {
             Box::new(|| docs::extract(MediaKind::Docx, &visible, &limits()).map(drop)),
         ),
         (
+            "the judge's runs",
+            850,
+            Box::new(|| docs::extract(MediaKind::Docx, &many_runs, &limits()).map(drop)),
+        ),
+        (
+            "the links beneath a paragraph",
+            40,
+            Box::new(|| docs::extract(MediaKind::Docx, &deep, &limits()).map(drop)),
+        ),
+        (
+            "the style merges",
+            5_000,
+            Box::new(|| docs::extract(MediaKind::Docx, &styled_runs, &limits()).map(drop)),
+        ),
+        (
+            "the colours beneath each run",
+            10_000,
+            Box::new(|| docs::extract(MediaKind::Docx, &coloured_runs, &limits()).map(drop)),
+        ),
+        (
             "the theme's scheme walk",
             300,
             Box::new(|| ThemeColours::parse(themed.as_bytes(), &limits(), &mut budget()).map(drop)),
@@ -3372,14 +5202,14 @@ fn reader_loops_stop_at_the_job_deadline() {
 fn deadline_scope_does_not_leak_into_the_next_job() {
     assert_eq!(deadline::check(), Ok(()));
     let panicked = std::panic::catch_unwind(|| {
-        deadline::scope(Instant::now(), None, || {
+        deadline::scope(Instant::now(), None, u64::MAX, || {
             assert_eq!(deadline::check(), Err(DocError::Timeout));
             panic!("job failed");
         })
     });
     assert!(panicked.is_err());
     assert_eq!(deadline::check(), Ok(()));
-    let early: Result<(), DocError> = deadline::scope(Instant::now(), None, || {
+    let early: Result<(), DocError> = deadline::scope(Instant::now(), None, u64::MAX, || {
         deadline::check()?;
         unreachable!("the deadline has passed")
     });
@@ -3390,6 +5220,7 @@ fn deadline_scope_does_not_leak_into_the_next_job() {
     let cancelled = deadline::scope(
         Instant::now() + Duration::from_secs(60),
         Some(cancel),
+        u64::MAX,
         deadline::check,
     );
     assert_eq!(cancelled, Err(DocError::Cancelled));

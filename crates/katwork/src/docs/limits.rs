@@ -13,6 +13,9 @@ pub struct DocLimits {
     /// The elements of every XML part of one package, together: `xml_guard::scan` refuses the
     /// package before any reader builds a model past it.
     pub max_xml_elements: u64,
+    /// The bytes one read may hold at once on its pool thread (`heap::ReadHeap` counts them);
+    /// past it the read is `TooComplex("memory")` at its next `deadline::check`.
+    pub max_read_bytes: u64,
     /// Non-empty XLSX cells.
     pub max_cells: u32,
     pub max_shared_strings: u32,
@@ -57,6 +60,7 @@ impl Default for DocLimits {
             max_zip_entries: 2_000,
             max_xml_depth: 256,
             max_xml_elements: 2_000_000,
+            max_read_bytes: 1_073_741_824,
             max_cells: 250_000,
             max_shared_strings: 1_000_000,
             max_pages: 500,

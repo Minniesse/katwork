@@ -1,6 +1,7 @@
 //! Document readers. Files are hostile input parsed in the server process, so every read runs
-//! on `DocPool`'s dedicated threads, under `DocLimits` and the job deadline (`deadline::check`).
-use std::{borrow::Cow, ops::Range};
+//! on `DocPool`'s dedicated threads, under `DocLimits`, the job deadline and its memory budget
+//! (`deadline::check`).
+use std::{borrow::Cow, ops::Range, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
@@ -8,6 +9,7 @@ use unicode_segmentation::UnicodeSegmentation;
 pub mod colour;
 pub mod deadline;
 mod docx;
+pub mod heap;
 pub mod limits;
 pub mod package;
 pub mod pool;
@@ -143,10 +145,10 @@ pub enum Locator {
     PdfPage {
         page: u32,
     },
-    /// `part` is the package part's name (`word/document.xml`); `ordinal` counts every `w:p` of
-    /// that part in document order, from 1.
+    /// `part` is the package part's name (`word/document.xml`), shared by every locator of the
+    /// part; `ordinal` counts every `w:p` of that part in document order, from 1.
     DocxParagraph {
-        part: String,
+        part: Arc<str>,
         ordinal: u32,
         para_id: Option<String>,
     },

@@ -57,6 +57,7 @@ impl Core {
 fn doc_limits(config: &Config) -> DocLimits {
     let limits = DocLimits {
         max_xml_elements: config.doc_max_xml_elements,
+        max_read_bytes: config.doc_max_read_bytes,
         ..DocLimits::default()
     };
     // The smoke stack wedges the pool on purpose and needs the watchdog to fire in seconds.

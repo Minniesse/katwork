@@ -20,6 +20,10 @@ use katwork_server::{
     config::{Config, redact_database_secrets},
 };
 
+/// Counts each document read's bytes, so a read past `max_read_bytes` is refused.
+#[global_allocator]
+static ALLOCATOR: katwork::docs::heap::ReadHeap = katwork::docs::heap::ReadHeap;
+
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::registry()
@@ -384,6 +388,11 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_server_counts_what_document_reads_hold() {
+        assert!(katwork::docs::heap::installed());
+    }
+
     #[tokio::test]
     async fn healthcheck_accepts_only_a_complete_success_status() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
