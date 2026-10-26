@@ -212,8 +212,9 @@ fn offset(index: usize) -> u32 {
 /// 1. U+FEFF, U+200B, U+200C, U+200D, U+2060 and U+00AD are removed, and so is every other
 ///    `Default_Ignorable_Code_Point`, U+FFF9–U+FFFB and every control that is neither
 ///    `White_Space` nor an information separator (U+001C–U+001F), so a match key sees through
-///    them. The scanners still read the controls and the Hangul fillers in the input: beside a
-///    digit they are no part of a figure (see [`crate::find_numbers`]).
+///    them. The scanners still read the controls and the Hangul fillers in the input: inside a
+///    figure or right before it they make the run one `Code`, and after it they are not read
+///    (see [`crate::find_numbers`]).
 /// 2. NFC, chunk by chunk at code points of canonical combining class 0 with `NFC_QC=Yes`.
 /// 3. Compatibility forms other than SARA AM: `Zs` and the information separators U+001C–U+001F
 ///    (which Python counts as white space) to U+0020, full-width ASCII to ASCII, the ligatures

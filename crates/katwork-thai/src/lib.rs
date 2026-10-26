@@ -11,15 +11,15 @@
 //! Every reading carries its span in code points of the text it came from, its confidence and
 //! flags saying how it was written. The crate depends on nothing in KatWork.
 //!
-//! **The clean-context rule** (a founder decision): a figure or a date reads with confidence 0.8
-//! or more only when it matches a pattern the reader knows exactly and no signal of a range, a
-//! list, a fraction, a period or a sign stands near it. Joining and opening signals (ถึง, จนถึง,
-//! ตั้งแต่, จาก, ระหว่าง, และ, หรือ, `to`, `until`, `between`, `and`, `or`, a dash, slash, arrow
-//! or comma) count next to the reading, with one space and a filler word such as วันที่ between;
-//! sign and period signals (ติดลบ, ลบ, `minus`; ไตรมาส, ปีงบ, งวด, ครึ่ง, เดือนแรก, `Q2`, `H1`)
-//! count within 15 code points of it. Near one, a reading is capped at 0.6 and the readings the
-//! signal suggests go in `alts`, so a check against it is inconclusive, never a pass. The
-//! signals are one table in the crate. A run the reader cannot read at all is one `Code`.
+//! **The clean-clause rule** (a founder decision): a figure or a date reads with confidence 0.8
+//! or more only when it matches a pattern the reader knows exactly and its clause holds no other
+//! figure or date and no signal word of a range, a list, a fraction, a period or a sign (ถึง,
+//! จาก, และ, หรือ, ติดลบ, เป็นลบ, ไตรมาส, งวด, สะสม, `to`, `since`, `and`, `negative`, `YTD`, a
+//! dash, an arrow, a slash or a comma, and the rest of the crate's one table). A clause runs
+//! between line breaks and sentence punctuation (`;`, `!`, `?`, ฯ, a colon or a full stop before
+//! a space, as the table's module states exactly). Otherwise a reading is capped at 0.6 and its
+//! other readings go in `alts`, so a check against it is inconclusive, never a pass. A run the
+//! reader cannot read at all is one `Code`.
 mod context;
 mod dates;
 mod digits;

@@ -1005,7 +1005,8 @@ fn ranges_are_one_low_confidence_reading() {
     assert_eq!(only(&figure).conf, 0.6);
     assert_eq!(quantities(&figure), vec![format!("5 {LAN}")]);
     let growth = format!("{PI} 2567 -25%");
-    assert!(only(&growth).conf >= 0.8);
+    // No range, but a figure beside the year in its clause: 0.6 (fix round 3).
+    assert_eq!(only(&growth).conf, 0.6);
     // ถึง also means "reached": a figure with an amount word after it ends no range, though the
     // ถึง still keeps the year below 0.8.
     let reached = format!("{YOTKHAI}{PI} 2567 {THUENG} 2570 {LAN}{BAHT}");
@@ -1367,13 +1368,18 @@ fn period_words_near_a_year_keep_it_below_0_8() {
             "{text:?}: {found:?}"
         );
     }
+    // Fix round 3: every signal caps every reading of its clause, a sign word a date too, and a
+    // period word a day.
+    for text in [
+        format!("ผลปร\u{0E30}กอบก\u{0E32}รต\u{0E34}ดลบ\u{0E43}น{PI} 2568"),
+        format!("{SONG_RAI}{KHA_CHAI}{QUARTER} 4 {PHAYNAI}{WAN}{THI} 31 ต.ค. 2568"),
+    ] {
+        assert_eq!(only(&text).conf, 0.6, "{text:?}");
+    }
     for (text, conf) in [
-        // A sign word is no signal for a date; a Latin period word inside a word is none.
-        (
-            format!("ผลปร\u{0E30}กอบก\u{0E32}รต\u{0E34}ดลบ\u{0E43}น{PI} 2568"),
-            0.9,
-        ),
-        (format!("FAQ2 {PI} 2568"), 0.9),
+        // A Latin signal inside a word is none (`to` in tonight, `sun` in sundry).
+        (format!("tonight {PI} 2568"), 0.9),
+        (format!("sundry {PI} 2568"), 0.9),
         // ต้น, กลาง, ปลาย and สิ้น are parts of a year only before ปี or เดือน: ต้นทุน is cost.
         (
             format!("\u{0E15}\u{0E49}\u{0E19}\u{0E17}\u{0E38}\u{0E19}{PI} 2568"),
@@ -1383,10 +1389,6 @@ fn period_words_near_a_year_keep_it_below_0_8() {
         ("Q2 FY2026".to_owned(), 0.85),
         (format!("{FISCAL} 2569"), 0.85),
         (format!("{PI} 2568"), 0.9),
-        (
-            format!("{SONG_RAI}{KHA_CHAI}{QUARTER} 4 {PHAYNAI}{WAN}{THI} 31 ต.ค. 2568"),
-            0.9,
-        ),
     ] {
         assert_eq!(only(&text).conf, conf, "{text:?}");
     }
@@ -1470,7 +1472,11 @@ fn controls_keep_date_numbers_apart() {
     );
     let year = format!("{PI} 2567\u{001F}1,250 {LAN}{BAHT}");
     assert_eq!(only(&year).value, self::year(2024));
-    assert_eq!(only(&year).conf, 0.9);
+    // One clause holds the year and the amount, so the year reads at 0.6 (fix round 3); a record
+    // separator ends the clause.
+    assert_eq!(only(&year).conf, 0.6);
+    let record = format!("{PI} 2567\u{001E}1,250 {LAN}{BAHT}");
+    assert_eq!(only(&record).conf, 0.9);
     let budget = format!("{FISCAL} 2569\u{001F}1,250 {LAN}{BAHT}");
     assert_eq!(only(&budget).value, fiscal_year(2026));
     // A control right before a date number keeps it from being read too.
@@ -1528,9 +1534,10 @@ fn round_one_rule_branches_each_have_a_case() {
     // `to` inside a word is no connector, so the bare year before it lists nothing.
     let tonight = dates("FY2024 tonight FY2026");
     assert_eq!(tonight.len(), 2, "{tonight:?}");
-    assert!(tonight.iter().all(|found| found.conf >= 0.8));
+    assert!(tonight.iter().all(|found| found.conf == 0.6));
     let total = only("FY2026 2025 total");
-    assert_eq!((total.conf, total.alts.len()), (0.85, 0), "{total:?}");
+    // The bare 2025 is a figure of its clause, so FY2026 reads at 0.6, alone (fix round 3).
+    assert_eq!((total.conf, total.alts.len()), (0.6, 0), "{total:?}");
     // A range's left month after its end month is in the year before.
     one_low_reading("ต.ค.-ก.ย. 2568", month(2024, 10), &[month(2025, 9)]);
     // Two digits continue a range only 1 to 20 years on; four digits within 100 years.

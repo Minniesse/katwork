@@ -278,15 +278,46 @@ pub(crate) fn foreign_separator(c: char) -> bool {
     if crate::normalize::is_thai_mark(c) || c == '\'' || c == '`' {
         return true;
     }
-    !(c.is_whitespace()
-        || c.is_alphanumeric()
-        || c.is_ascii()
-        || is_thai(c)
-        || matches!(
-            c,
-            '\u{2014}' | '\u{2015}' | '\u{2E3A}' | '\u{2E3B}' | '\u{FE58}' | '\u{301C}'
-        )
-        || matches!(c, '\u{2190}'..='\u{21FF}'))
+    !(c.is_whitespace() || c.is_alphanumeric() || c.is_ascii() || is_thai(c) || dash_or_arrow(c))
+}
+
+/// A dash or an arrow, which joins the two ends of a range (`10―15`, `1,000 ⇒ 1,250`): the dash
+/// punctuation `normalize_th` leaves (it folds the hyphens and minus signs to `-`), the tilde and
+/// wave dashes, the arrow blocks, and the triangles drawn as arrows. One rule for the lexer,
+/// where it splits two figures, and for the signal table.
+pub(crate) fn dash_or_arrow(c: char) -> bool {
+    matches!(
+        c,
+        '-' | '~'
+            | '\u{058A}'
+            | '\u{05BE}'
+            | '\u{1400}'
+            | '\u{1806}'
+            | '\u{2010}'..='\u{2015}'
+            | '\u{2E17}'
+            | '\u{2E1A}'
+            | '\u{2E3A}'
+            | '\u{2E3B}'
+            | '\u{2E40}'
+            | '\u{2E5D}'
+            | '\u{301C}'
+            | '\u{3030}'
+            | '\u{30A0}'
+            | '\u{FE31}'
+            | '\u{FE32}'
+            | '\u{FE58}'
+            | '\u{FE63}'
+            | '\u{FF0D}'
+            | '\u{FF5E}'
+            | '\u{10EAD}'
+            | '\u{2190}'..='\u{21FF}'
+            | '\u{25B6}'
+            | '\u{25BA}'
+            | '\u{2794}'..='\u{27BF}'
+            | '\u{27F0}'..='\u{27FF}'
+            | '\u{2900}'..='\u{297F}'
+            | '\u{2B00}'..='\u{2BFF}'
+    )
 }
 
 /// A glyph the text layer could not name: U+FFFD, U+FFFC or a private-use code point. A figure it
@@ -370,5 +401,5 @@ mod tests {
     }
 
     /// The fingerprint of the rules as written in fix round 2.
-    const RULES: u64 = 0x3528_1c7a_d769_9a80;
+    const RULES: u64 = 0xcdd7_3bfb_5990_53cf;
 }

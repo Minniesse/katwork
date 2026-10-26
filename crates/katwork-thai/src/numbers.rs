@@ -3,8 +3,9 @@
 use std::ops::Range;
 
 use rust_decimal::Decimal;
+use unicode_normalization::char::canonical_combining_class;
 
-use crate::context::{CONF_CAP, CONF_OTHER, Context, Target};
+use crate::context::{CONF_CAP, CONF_OTHER, Context};
 use crate::dates::{self, DateValue, Hit, Scan};
 use crate::digits::{Script, script};
 use crate::found::{
@@ -529,15 +530,15 @@ pub fn parse_number_words(text: &str) -> Option<Decimal> {
 /// it, it holds two dots, or it is one of three or more digit groups joined by `-`; otherwise
 /// `Quantity`.
 ///
-/// Confidence follows the clean-context rule ([`crate::find_dates`] keeps it too): a quantity
-/// reads at 1.0 only when it matches a pattern the reader knows exactly and no signal of a
-/// range, a list, a fraction or a sign stands near it (ถึง, จนถึง, ตั้งแต่, จาก, ระหว่าง, และ,
-/// หรือ, ติดลบ, ลบ, `to`, `until`, `and`, `or`, a dash, slash, arrow or comma joining it to another
-/// figure or date, and the rest of the crate's one list). Joining and opening signals count next
-/// to the reading (one space, and a filler such as วันที่, between); sign signals within 15 code
-/// points before it. Otherwise its confidence is at most 0.6 and the readings the signal
-/// suggests go in `alts`: the negative after a sign, the scale and unit of the other end of a
-/// range. Patterns the reader does not know exactly read at most 0.6 too: a bare ลบ (0.5), a
+/// Confidence follows the clean-clause rule ([`crate::find_dates`] keeps it too): a quantity
+/// reads at 1.0 only when it matches a pattern the reader knows exactly and its clause holds no
+/// other figure or date and no signal word of the crate's one table (see the crate
+/// documentation). Numbering that opens the clause (`1.`, `(2)`), the amount in words that
+/// restates the figure, and a signal inside the reading's own span count for nothing. Otherwise
+/// its confidence is at most 0.6 and its other readings go in `alts`: the negative beside a
+/// sign word or alone in parentheses, the scale and unit of the figure a range or list signal
+/// joins it to, and the parts of a compound amount the grammar does not name (`1 ล้าน 250,000
+/// บาท`). Patterns the reader does not know exactly read at most 0.6 too: a bare ลบ (0.5), a
 /// percent or currency symbol inside accounting parentheses unless the figure is the whole text
 /// (`(5%)` in prose may restate a rise; the positive reading is in `alts`), two currencies on
 /// one figure (`USD 100 บาท`), and a power word followed by one digit word, which everyday Thai
@@ -565,7 +566,7 @@ pub fn find_numbers(text: &str, ctx: &Ctx) -> Result<Vec<Found<Number>>, TooLong
         .collect())
 }
 
-/// Every number and date of the text, each capped by the signals near it: what both scanners
+/// Every number and date of the text, each capped by the rest of its clause: what both scanners
 /// return.
 pub(crate) fn read(view: &View, anchor: chrono::NaiveDate) -> (Vec<Item>, Scan) {
     let mut dates = dates::scan(view, anchor);
@@ -581,77 +582,244 @@ pub(crate) fn read(view: &View, anchor: chrono::NaiveDate) -> (Vec<Item>, Scan) 
     (items, dates)
 }
 
-/// Applies the clean-context rule: a quantity or a date with a signal near it reads at most
-/// [`CONF_CAP`], with the readings the signal suggests in `alts`.
+/// Applies the clean-clause rule: a quantity or a date whose clause holds another figure or date,
+/// or a signal outside its own span, reads at most [`CONF_CAP`], with its other readings in
+/// `alts`: the negative beside a sign, the scale and unit of the figure next to a bare one, and
+/// the dates next to a date. A date capped by a signal alone carries no other reading.
 fn clean_context(view: &View, items: &mut [Item], hits: &mut [Hit], months: &[Range<usize>]) {
     let t = &view.chars;
-    let readings: Vec<Range<usize>> = items
+    // No punctuation inside a reading ends a clause: the dots of ต.ค., 1.5 or 13.30 น.
+    let mut covered = vec![false; t.len()];
+    for range in items
         .iter()
-        .map(|item| item.extent.clone())
-        .chain(hits.iter().map(|hit| hit.range.clone()))
-        .chain(months.iter().cloned())
-        .collect();
-    let own: Vec<Range<usize>> = items
-        .iter()
-        .filter(|item| item.number.role == NumberRole::Quantity)
-        .map(|item| item.range.clone())
-        .chain(hits.iter().map(|hit| hit.range.clone()))
-        .collect();
-    let context = Context::new(t, &readings, &own);
-    let mut by_start = vec![None; t.len() + 1];
-    let mut by_end = vec![None; t.len() + 1];
-    for (index, item) in items.iter().enumerate() {
-        if let Some(slot) = by_start.get_mut(item.extent.start) {
-            *slot = Some(index);
-        }
-        if let Some(slot) = by_end.get_mut(item.extent.end) {
-            *slot = Some(index);
+        .map(|item| &item.range)
+        .chain(hits.iter().map(|hit| &hit.range))
+        .chain(months)
+    {
+        if let Some(slots) = covered.get_mut(range.clone()) {
+            slots.fill(true);
         }
     }
+    let line_breaks: Vec<bool> = (0..t.len())
+        .map(|at| {
+            t[at] == ' '
+                && view
+                    .written(&(at..at + 1))
+                    .chars()
+                    .any(crate::context::line_break)
+        })
+        .collect();
+    let context = Context::new(t, &covered, &line_breaks);
+    let mut spans: Vec<Range<usize>> = hits.iter().map(|hit| hit.range.clone()).collect();
+    spans.sort_by_key(|span| span.start);
+    let in_hit = |at: usize| {
+        let index = spans.partition_point(|span| span.start <= at);
+        index > 0 && spans[index - 1].contains(&at)
+    };
+    // The readings of each clause: the numbers outside a date (a list marker that opens its
+    // clause is numbering, not a figure), the dates, and the month names outside a date.
+    let mut figures = vec![0usize; context.clauses()];
+    let mut dates = vec![0usize; context.clauses()];
+    let mut date_starts = vec![false; t.len() + 1];
+    for range in hits.iter().map(|hit| &hit.range).chain(months) {
+        if let Some(slot) = date_starts.get_mut(range.start) {
+            *slot = true;
+        }
+    }
+    let counted: Vec<bool> = items
+        .iter()
+        .map(|item| {
+            let clause_start = context.clause_start(context.clause_of(item.range.start));
+            !in_hit(item.range.start) && !list_marker(t, item, clause_start, &date_starts)
+        })
+        .collect();
+    for (item, counted) in items.iter().zip(&counted) {
+        if *counted {
+            figures[context.clause_of(item.range.start)] += 1;
+        }
+    }
+    for hit in hits.iter() {
+        dates[context.clause_of(hit.range.start)] += 1;
+    }
+    for month in months.iter().filter(|month| !in_hit(month.start)) {
+        dates[context.clause_of(month.start)] += 1;
+    }
+    // Words in the amount-in-words parentheses that equal the figure before them restate it: the
+    // two are one reading for each other.
+    let mut restates = vec![None; items.len()];
+    for index in 1..items.len() {
+        let (figure, words) = (&items[index - 1], &items[index]);
+        if words.flags.contains(Flags::AMOUNT_IN_WORDS)
+            && figure.number.role == NumberRole::Quantity
+            && counted[index - 1]
+            && counted[index]
+            && figure.number.checked_effective() == words.number.checked_effective()
+        {
+            restates[index] = Some(index - 1);
+            restates[index - 1] = Some(index);
+        }
+    }
+    let quantity: Vec<bool> = items
+        .iter()
+        .zip(&counted)
+        .map(|(item, counted)| *counted && item.number.role == NumberRole::Quantity)
+        .collect();
     let numbers: Vec<Number> = items.iter().map(|item| item.number.clone()).collect();
-    for item in items
-        .iter_mut()
-        .filter(|item| item.number.role == NumberRole::Quantity)
-    {
-        let near = context.near(&item.extent, Target::Figure);
-        if !near.capped {
+    let extents: Vec<Range<usize>> = items.iter().map(|item| item.extent.clone()).collect();
+    let clauses: Vec<usize> = items
+        .iter()
+        .map(|item| context.clause_of(item.range.start))
+        .collect();
+    for index in 0..items.len() {
+        if items[index].number.role != NumberRole::Quantity {
             continue;
         }
-        item.conf = item.conf.min(CONF_CAP);
-        let mut alts = Vec::new();
-        if near.sign {
-            alts.push(opposite(&item.number));
+        let clause = clauses[index];
+        let partner = restates[index].filter(|other| clauses[*other] == clause);
+        // Any other figure or date in the clause caps it (the founder's rule).
+        let others = figures[clause] + dates[clause]
+            - usize::from(counted[index])
+            - usize::from(partner.is_some());
+        let signals = context.signals(&items[index].extent);
+        let item = &items[index];
+        let paren = item.number.role == NumberRole::Quantity
+            && !item.flags.contains(Flags::PAREN_NEGATIVE)
+            && !item.flags.contains(Flags::AMOUNT_IN_WORDS)
+            && counted[index]
+            && enclosed(t, &item.extent);
+        if others == 0 && !signals.any && !paren {
+            continue;
         }
-        let partners = near
-            .partners_before
-            .iter()
-            .filter_map(|at| by_end.get(*at).copied().flatten())
-            .chain(
-                near.partners_after
-                    .iter()
-                    .filter_map(|at| by_start.get(*at).copied().flatten()),
-            );
-        for partner in partners {
-            if let Some(carried) = carried(&item.number, &numbers[partner]) {
+        let mut alts = Vec::new();
+        if signals.sign || paren {
+            alts.push(opposite(&numbers[index]));
+        }
+        // The figures a range or list signal joins it to lend a bare figure their scale and unit
+        // (`10-15 ล้านบาท`; not to a list marker, which counts nothing).
+        let lend = counted[index];
+        let before = (0..index)
+            .rev()
+            .take_while(|other| clauses[*other] == clause)
+            .find(|other| quantity[*other] && Some(*other) != partner);
+        let after = (index + 1..items.len())
+            .take_while(|other| clauses[*other] == clause)
+            .find(|other| quantity[*other] && Some(*other) != partner);
+        for other in before.into_iter().chain(after).filter(|_| lend) {
+            let (left, right) = if other < index {
+                (&extents[other], &extents[index])
+            } else {
+                (&extents[index], &extents[other])
+            };
+            if !context.joined(left.end, right.start) {
+                continue;
+            }
+            if let Some(carried) = carried(&numbers[index], &numbers[other]) {
                 alts.push(carried);
             }
         }
+        let item = &mut items[index];
+        item.conf = item.conf.min(CONF_CAP);
         for alt in alts {
             if alt != item.number && !item.alts.iter().any(|(other, _)| *other == alt) {
                 item.alts.push((alt, CONF_OTHER));
             }
         }
     }
-    for hit in hits.iter_mut() {
-        let target = if matches!(hit.value, DateValue::Day { .. }) {
-            Target::Day
-        } else {
-            Target::Period
-        };
-        if context.near(&hit.range, target).capped {
-            hit.conf = hit.conf.min(CONF_CAP);
+    let values: Vec<DateValue> = hits.iter().map(|hit| hit.value).collect();
+    let hit_clauses: Vec<usize> = hits
+        .iter()
+        .map(|hit| context.clause_of(hit.range.start))
+        .collect();
+    for index in 0..hits.len() {
+        let clause = hit_clauses[index];
+        let own = crate::context::with_weekday(t, &hits[index].range);
+        if figures[clause] + dates[clause] <= 1 && !context.signals(&own).any {
+            continue;
+        }
+        let hit = &mut hits[index];
+        hit.conf = hit.conf.min(CONF_CAP);
+        // The dates next to it in its clause are its other readings.
+        let before = (0..index).rev().find(|other| hit_clauses[*other] == clause);
+        let after = (index + 1..values.len()).find(|other| hit_clauses[*other] == clause);
+        for other in before.into_iter().chain(after) {
+            let value = &values[other];
+            if *value != hit.value && !hit.alts.iter().any(|(alt, _)| alt == value) {
+                hit.alts.push((*value, CONF_OTHER));
+            }
         }
     }
+}
+
+/// A list marker that opens its clause (`1.`, `2)`, `(3)`): numbering, not a figure of the
+/// clause. A day before a month name or a date is none (`15. October 2025`).
+fn list_marker(t: &[char], item: &Item, clause_start: usize, date_starts: &[bool]) -> bool {
+    let number = &item.number;
+    let small = number.value > Decimal::ZERO && number.value < Decimal::from(100);
+    if number.role != NumberRole::Quantity
+        || number.unit.is_some()
+        || number.scale.0 != 0
+        || number.decimals != 0
+        || !small
+    {
+        return false;
+    }
+    let Range { start, end } = item.range;
+    let open = start > 0 && t[start - 1] == '(';
+    let lead = if open { start - 1 } else { start };
+    let opens_clause = t[clause_start..lead]
+        .iter()
+        .all(|c| c.is_whitespace() || matches!(c, '-' | '\u{2022}' | '*'));
+    let closes = match t.get(end) {
+        Some(')') => true,
+        Some('.') => !open && t.get(end + 1).is_none_or(|c| c.is_whitespace()),
+        _ => false,
+    };
+    let next = if t.get(end + 1) == Some(&' ') {
+        end + 2
+    } else {
+        end + 1
+    };
+    opens_clause && closes && !date_starts.get(next).copied().unwrap_or(false)
+}
+
+/// The reading over `extent` stands alone in parentheses, one space allowed inside each
+/// (`( 1,250 )`, `(1,250 ล้านบาท)`): an accounting negative the reader did not take as one.
+fn enclosed(t: &[char], extent: &Range<usize>) -> bool {
+    let open = extent.start.checked_sub(1).and_then(|before| {
+        if t[before] == ' ' {
+            before.checked_sub(1)
+        } else {
+            Some(before)
+        }
+    });
+    let close = if t.get(extent.end) == Some(&' ') {
+        extent.end + 1
+    } else {
+        extent.end
+    };
+    open.is_some_and(|open| t[open] == '(') && t.get(close) == Some(&')')
+}
+
+/// The parts of a compound amount, each read alone with the amount's unit: the other reading of
+/// an amount the grammar does not name.
+fn parts(groups: &[Group], negative: bool, number: &Number) -> Vec<Number> {
+    groups
+        .iter()
+        .filter_map(|part| {
+            let (value, scale, decimals) = mixed(part.value, negative, part.scale, part.place)?;
+            Some(Number {
+                value,
+                scale: Scale(scale),
+                form: if part.words {
+                    Form::Mixed
+                } else {
+                    Form::Digits
+                },
+                decimals,
+                ..number.clone()
+            })
+        })
+        .collect()
 }
 
 /// `number` with the scale and unit of the figure it is joined to, when it has none of its own:
@@ -1332,7 +1500,9 @@ impl<'a> Scanner<'a> {
         let mut tail = end;
         // A second, different currency after one before the figure (`USD 100 บาท`).
         let mut other_unit = None;
+        // A date's number takes no unit: `Q2 2025 THB 500` leaves the THB to the 500.
         if reads_on
+            && !self.in_date(&(token.start..token.end))
             && let Some((after, word_end)) = self.unit_after(self.space(end), unit.is_some())
         {
             self.take_unit(self.space(end)..word_end);
@@ -1460,6 +1630,16 @@ impl<'a> Scanner<'a> {
                 conf = conf.min(CONF_CAP);
                 alts.push((opposite(&number), other));
             }
+            // A compound amount the grammar does not name (`1 ล้าน 250,000 บาท`, `3 ล้าน 9 แสน`)
+            // reads at 0.6 at most, each part read alone beside it.
+            if groups.len() > 1 {
+                conf = conf.min(CONF_CAP);
+                alts.extend(
+                    parts(&groups, negative, &number)
+                        .into_iter()
+                        .map(|part| (part, other)),
+                );
+            }
             if let Some(other_unit) = other_unit {
                 conf = conf.min(CONF_CAP);
                 let mut written_after = number.clone();
@@ -1505,8 +1685,9 @@ impl<'a> Scanner<'a> {
         let role = self.role_without_value(token);
         let (mut start, mut end) = (token.start, token.end);
         // Letters the lexer put at its head that a figure before took (as its scale) stay that
-        // figure's.
-        while start < end && self.taken[start] {
+        // figure's. A date part is inside its date's span, which the date took: it stays whole
+        // (`1-10-2568`).
+        while role != NumberRole::DatePart && start < end && self.taken[start] {
             start += 1;
         }
         if role == NumberRole::Code {
@@ -1570,7 +1751,7 @@ impl<'a> Scanner<'a> {
             let at = self.space(after);
             let (next, used) = match tokens.get(i + 1 + more).filter(|token| token.start == at) {
                 Some(token) => {
-                    let TokenKind::Figure { int, frac, grouped } = &token.kind else {
+                    let TokenKind::Figure { int, frac, .. } = &token.kind else {
                         return Ok(more);
                     };
                     if self.in_date(&(token.start..token.end))
@@ -1583,25 +1764,25 @@ impl<'a> Scanner<'a> {
                     };
                     let decimals = i64::try_from(frac.len()).unwrap_or(i64::MAX);
                     match self.group(token.end, figure, decimals) {
-                        // A figure with no scale word of its own joins only when it is written
-                        // as an amount, with thousands separators or a currency after it
-                        // (`1 ล้าน 250,000 บาท`); a small bare one counts something else.
-                        GroupRead::None if *grouped || self.currency_after(token.end) => (
-                            Group {
-                                end: token.end,
-                                value: figure,
-                                place: -decimals,
-                                scale: 0,
-                                words: true,
-                                terms: if thai {
-                                    vec![Term::Figure(figure, decimals)]
-                                } else {
-                                    Vec::new()
+                        // A figure with no scale word of its own joins only a Thai amount, and
+                        // only with a currency or a unit word right after it (`1 ล้าน 250,000
+                        // บาท`); never an English scale (`10 million 1,000 employees` is two).
+                        GroupRead::None
+                            if thai && self.unit_word(self.space(token.end)).is_some() =>
+                        {
+                            (
+                                Group {
+                                    end: token.end,
+                                    value: figure,
+                                    place: -decimals,
+                                    scale: 0,
+                                    words: true,
+                                    terms: vec![Term::Figure(figure, decimals)],
+                                    digit_last: false,
                                 },
-                                digit_last: false,
-                            },
-                            1,
-                        ),
+                                1,
+                            )
+                        }
                         GroupRead::None => return Ok(more),
                         GroupRead::Unreadable(end) => return Err((end, more + 1)),
                         GroupRead::Read(group) => (group, 1),
@@ -2036,14 +2217,6 @@ impl<'a> Scanner<'a> {
         self.unit_word(self.space(end)).is_some()
     }
 
-    /// A currency word or symbol after the figure that ends at `end`, one space allowed.
-    fn currency_after(&self, end: usize) -> bool {
-        matches!(
-            self.unit_word(self.space(end)),
-            Some((Unit::Currency(_), _))
-        )
-    }
-
     /// A Latin abbreviation of a scale at `at`, one space after a figure, with no letter after
     /// it: `mil`, `mln`, `bln`, `bil`, `mm` or `MB`, or `M`, `B`, `K` or `T` in capitals. Where
     /// it ends.
@@ -2141,10 +2314,16 @@ impl<'a> Scanner<'a> {
         start
     }
 
-    /// Where the run of non-Thai letters that no figure took ends, going on from `at`.
+    /// Where the run of non-Thai letters that no figure took ends, going on from `at`; a combining
+    /// mark after a letter is part of the run (`12O\u{0332}5`, a nukta after U+0915).
     fn letters_after(&self, at: usize) -> usize {
         let mut end = at;
-        while self.taken.get(end) == Some(&false) && self.get(end).is_some_and(code_letter) {
+        let mark = |c: char| canonical_combining_class(c) != 0 && !is_thai(c);
+        while self.taken.get(end) == Some(&false)
+            && self
+                .get(end)
+                .is_some_and(|c| code_letter(c) || (end > at && mark(c)))
+        {
             end += 1;
         }
         crate::found::work(end - at + 1);
@@ -2240,7 +2419,7 @@ impl<'a> Scanner<'a> {
         if words.is_empty() {
             return;
         }
-        let (words, end, fits) = self.spaced_parts(words, end);
+        let (words, end, fits, parts) = self.spaced_parts(words, end);
         let after = self.space(end);
         let (unit, close) = match self.unit_after(after, false) {
             Some((unit, word_end)) => (Some(unit), self.space(word_end)),
@@ -2257,7 +2436,9 @@ impl<'a> Scanner<'a> {
             unit,
             value: restates,
         };
+        let pushed = self.items.len();
         self.word_number(start, &words, end, Some(restated));
+        self.cap_parts(pushed, &parts);
     }
 
     /// The longest run of number words from `at` that no figure, date or percent word took.
@@ -2282,15 +2463,15 @@ impl<'a> Scanner<'a> {
     /// the words, where the last run ends, and whether each run writes only places below the one
     /// before it and the grammar reads them as their sum. When one does not, the whole span is
     /// one code.
-    fn spaced_parts(&self, mut words: Vec<Word>, mut end: usize) -> (Vec<Word>, usize, bool) {
+    fn spaced_parts(&self, mut words: Vec<Word>, mut end: usize) -> SpacedParts {
         if !words
             .iter()
             .any(|word| matches!(word, Word::Power(_) | Word::Lan))
         {
-            return (words, end, true);
+            return (words, end, true, Vec::new());
         }
         let Ok((value, place)) = numeral(&terms(&words)) else {
-            return (words, end, true);
+            return (words, end, true, Vec::new());
         };
         let mut groups = vec![Group {
             end,
@@ -2310,15 +2491,41 @@ impl<'a> Scanner<'a> {
                         Term::Figure(..) => None,
                     }));
                     if !fits(&groups, &next) {
-                        return (words, end, false);
+                        return (words, end, false, Vec::new());
                     }
                     groups.push(next);
                 }
-                GroupRead::Unreadable(next_end) => return (words, next_end, false),
+                GroupRead::Unreadable(next_end) => return (words, next_end, false, Vec::new()),
                 GroupRead::None => break,
             }
         }
-        (words, end, true)
+        let parts = groups.iter().map(|group| group.value).collect();
+        (words, end, true, parts)
+    }
+
+    /// The number words read from `pushed` on were joined from `parts` across spaces: an amount
+    /// the grammar does not name, at 0.6 at most, each part read alone beside it.
+    fn cap_parts(&mut self, pushed: usize, parts: &[Decimal]) {
+        if parts.len() < 2 {
+            return;
+        }
+        for item in &mut self.items[pushed..] {
+            if item.number.role != NumberRole::Quantity {
+                continue;
+            }
+            item.conf = item.conf.min(CONF_CAP);
+            for value in parts {
+                let mut value = *value;
+                value.set_sign_negative(item.number.value.is_sign_negative());
+                let part = Number {
+                    value,
+                    scale: Scale(0),
+                    decimals: 0,
+                    ..item.number.clone()
+                };
+                item.alts.push((part, CONF_OTHER));
+            }
+        }
     }
 
     /// Number words with a power word or ล้าน over `at..end`, then one space and a figure with a
@@ -2389,11 +2596,23 @@ impl<'a> Scanner<'a> {
                     decimals: u32::try_from(-figure_place).unwrap_or(0),
                     role: NumberRole::Quantity,
                 };
-                let (conf, alts) = if sign == Some(Sign::Ambiguous) {
+                let (conf, mut alts) = if sign == Some(Sign::Ambiguous) {
                     (conf.min(0.5), vec![(opposite(&number), 0.5)])
                 } else {
                     (conf, Vec::new())
                 };
+                // Words and a figure joined (`หนึ่งล้าน 2 แสน`): an amount the grammar does not
+                // name, at 0.6 at most, each part read alone beside it.
+                let conf = conf.min(CONF_CAP);
+                for mut part in [value, figure_value] {
+                    part.set_sign_negative(number.value.is_sign_negative());
+                    let part = Number {
+                        value: part,
+                        decimals: 0,
+                        ..number.clone()
+                    };
+                    alts.push((part, CONF_OTHER));
+                }
                 self.push_item(
                     start..range_end,
                     start..extent_end,
@@ -2567,16 +2786,22 @@ impl<'a> Scanner<'a> {
                 at += 1;
                 continue;
             }
-            let (words, end, fits) = self.spaced_parts(words, end);
+            let (words, end, fits, parts) = self.spaced_parts(words, end);
             if !fits {
                 self.push_fixed(at..end, NumberRole::Code, Flags::WORDS);
             } else if !self.join_figure(at, &words, end) {
+                let pushed = self.items.len();
                 self.word_number(at, &words, end, None);
+                self.cap_parts(pushed, &parts);
             }
             at = end;
         }
     }
 }
+
+/// Number words joined across spaces: all the words, where they end, whether the grammar reads
+/// them as the sum of their parts, and the parts' values when there are several.
+type SpacedParts = (Vec<Word>, usize, bool, Vec<Decimal>);
 
 /// What the parentheses of the amount-in-words pattern hold besides the words: the unit written
 /// in them and the value of the figure before them.

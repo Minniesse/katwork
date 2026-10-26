@@ -294,7 +294,7 @@ pub(crate) struct Hit {
     pub(crate) value: DateValue,
     pub(crate) conf: f32,
     flags: Flags,
-    alts: Vec<(DateValue, f32)>,
+    pub(crate) alts: Vec<(DateValue, f32)>,
     /// The year that ends a marked year or a fiscal year, which a bare year may continue as a
     /// range.
     year: Option<YearToken>,
@@ -348,11 +348,11 @@ pub(crate) struct Scan {
 /// date that is year first or whose day is above 12; 0.6 for other numeric dates and every
 /// two-digit year; 0.85 for fiscal years and quarters; 0.5 for academic years, the ร.ศ. and
 /// จ.ศ. eras, ranges, lists and a quarter of a year that is not fiscal; at most 0.7 for a BE
-/// year before 2484 (`PRE_1941`); at most 0.6 under the clean-context rule (see the crate
-/// documentation): a signal of a range, a list or a fraction near any date, or of a part of a
-/// year (ไตรมาส, ปีงบ, งวด, ครึ่ง, เดือนแรก, ต้นปี, `Q2`, `H1`, `half`) near a year, month or
-/// period, and a month whose name follows a day the reader could not read (`໑໕ ต.ค. 2568`,
-/// `15x ต.ค.`, `สิบห้า ต.ค.`). The lowest rule that applies wins.
+/// year before 2484 (`PRE_1941`); at most 0.6 under the clean-clause rule (see the crate
+/// documentation): another figure or date, or a signal word, in the date's clause (the weekday
+/// written with the date is part of it), with the dates beside it in `alts`; and a month whose
+/// name follows a day the reader could not read (`໑໕ ต.ค. 2568`, `15x ต.ค.`, `สิบห้า ต.ค.`). The
+/// lowest rule that applies wins.
 ///
 /// The text is read through [`crate::normalize_th`], and Latin era markers are matched in the
 /// original capitals. Spans are code points of `text`; a text longer than
@@ -779,7 +779,9 @@ impl Scanner<'_> {
             None => {
                 let year = self.year(at, &[4])?;
                 // A bare four digits before an amount word are the amount: ไตรมาส 2 2568 ล้านบาท.
-                if crate::numbers::amount_word_at(self.t, self.space(year.end)) {
+                // A currency written before the next figure is that figure's (`Q2 2025 THB 500`).
+                let after = self.space(year.end);
+                if crate::numbers::amount_word_at(self.t, after) && !self.currency_prefix(after) {
                     return None;
                 }
                 (None, year, PeriodKind::Unknown)
@@ -806,10 +808,26 @@ impl Scanner<'_> {
             .map(|(_, _, quarters_end)| quarters_end)
     }
 
+    /// A currency word or symbol at `at` written before a figure, one space allowed: `THB 500`,
+    /// `$500`.
+    fn currency_prefix(&self, at: usize) -> bool {
+        ["thb", "usd", "us$", "$", "\u{0E3F}"]
+            .iter()
+            .find(|word| has_at(self.t, at, word))
+            .is_some_and(|word| {
+                self.get(self.space(at + char_len(word)))
+                    .is_some_and(is_digit)
+            })
+    }
+
     fn quarter_number(&self, at: usize) -> Option<u32> {
         let c = self.get(at)?;
         let quarter = c.to_digit(10).filter(|q| (1..=4).contains(q))?;
-        (!self.get(at + 1).is_some_and(is_digit)).then_some(quarter)
+        // Not the head of a longer figure: `ไตรมาส 1 ถึง 3,500 ล้านบาท` ends at the 1.
+        let continues = self.get(at + 1).is_some_and(is_digit)
+            || (matches!(self.get(at + 1), Some(',' | '.'))
+                && self.get(at + 2).is_some_and(is_digit));
+        (!continues).then_some(quarter)
     }
 
     /// `ปีงบประมาณ`, `ปีงบ` or `FY`, an optional era marker, and a year.
