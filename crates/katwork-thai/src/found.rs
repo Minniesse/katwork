@@ -162,6 +162,23 @@ impl View {
             .is_some_and(|deleted| deleted.iter().copied().any(breaks_figure))
     }
 
+    /// A control or a Hangul filler that step 1 deleted lies under the normalized code point
+    /// `at` or in the gap before it (not an information separator, which step 3 made a space).
+    pub(crate) fn deleted_mark(&self, at: usize) -> bool {
+        let gap = self.normalized.gap_before(at);
+        let source = self.source(&(at..at + 1));
+        let start = usize::try_from(gap.start.min(source.start)).unwrap_or(usize::MAX);
+        let end = usize::try_from(source.end.max(gap.end)).unwrap_or(usize::MAX);
+        work(1);
+        self.original
+            .get(start..end.min(self.original.len()))
+            .is_some_and(|input| {
+                input
+                    .iter()
+                    .any(|c| breaks_figure(*c) && crate::normalize::is_invisible(*c))
+            })
+    }
+
     fn slice(&self, range: &Range<u32>) -> String {
         let start = usize::try_from(range.start).unwrap_or(usize::MAX);
         let end = usize::try_from(range.end).unwrap_or(usize::MAX);

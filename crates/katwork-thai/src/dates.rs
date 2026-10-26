@@ -349,8 +349,10 @@ pub(crate) struct Scan {
 /// two-digit year; 0.85 for fiscal years and quarters; 0.5 for academic years, the ร.ศ. and
 /// จ.ศ. eras, ranges, lists and a quarter of a year that is not fiscal; at most 0.7 for a BE
 /// year before 2484 (`PRE_1941`); at most 0.6 under the clean-clause rule (see the crate
-/// documentation): another figure or date, or a signal word, in the date's clause (the weekday
-/// written with the date is part of it), with the dates beside it in `alts`; and a month whose
+/// documentation): a second date, a second figure, a code or a signal word in the date's clause
+/// (one figure may share it, and the weekday written with the date is part of it), with the
+/// dates beside it in `alts`; a day written with a stop after it (`15. October 2025`); and a
+/// month whose
 /// name follows a day the reader could not read (`໑໕ ต.ค. 2568`, `15x ต.ค.`, `สิบห้า ต.ค.`). The
 /// lowest rule that applies wins.
 ///
@@ -981,7 +983,13 @@ impl Scanner<'_> {
         {
             return Some(end);
         }
-        if matches!(self.get(end), Some('/' | '.' | '-')) {
+        // `15. October 2025`, `15, October 2025`: a day with a stop after it, as some forms write
+        // it, or a numbered line before a date; read as the day, below 0.8.
+        let stopped = digits <= 2
+            && matches!(self.get(end), Some('.' | ','))
+            && self.get(end + 1) == Some(' ')
+            && self.month_at(end + 2).is_some();
+        if matches!(self.get(end), Some('/' | '.' | '-')) && !stopped {
             return self.numeric(at);
         }
         if digits > 2 {
@@ -997,8 +1005,12 @@ impl Scanner<'_> {
         {
             return None;
         }
-        let ordinal = self.ordinal_suffix(day, end);
-        let mut month_at = self.space(ordinal.unwrap_or(end));
+        let ordinal = self.ordinal_suffix(day, end).filter(|_| !stopped);
+        let mut month_at = if stopped {
+            end + 2
+        } else {
+            self.space(ordinal.unwrap_or(end))
+        };
         if ordinal.is_some() && has_at(self.t, month_at, "of") && self.latin_end(month_at + 2) {
             month_at = self.space(month_at + 2);
         }
@@ -1024,7 +1036,12 @@ impl Scanner<'_> {
         if let Some(reading) = self.read(year, era, CONF_MARKED, |ce, era| {
             NaiveDate::from_ymd_opt(ce, month, day).map(|date| DateValue::Day { date, era })
         }) {
-            self.push(at..year.end, reading);
+            let conf = if stopped {
+                reading.conf.min(CONF_CAP)
+            } else {
+                reading.conf
+            };
+            self.push(at..year.end, Reading { conf, ..reading });
         }
         Some(year.end)
     }

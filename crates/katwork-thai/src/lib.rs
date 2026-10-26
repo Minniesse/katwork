@@ -12,8 +12,9 @@
 //! flags saying how it was written. The crate depends on nothing in KatWork.
 //!
 //! **The clean-clause rule** (a founder decision): a figure or a date reads with confidence 0.8
-//! or more only when it matches a pattern the reader knows exactly and its clause holds no other
-//! figure or date and no signal word of a range, a list, a fraction, a period or a sign (ถึง,
+//! or more only when it matches a pattern the reader knows exactly and its clause holds no second
+//! figure, no second date (one figure and one date, an amount with its year, may share it) and
+//! no signal word of a range, a list, a fraction, a period or a sign (ถึง,
 //! จาก, และ, หรือ, ติดลบ, เป็นลบ, ไตรมาส, งวด, สะสม, `to`, `since`, `and`, `negative`, `YTD`, a
 //! dash, an arrow, a slash or a comma, and the rest of the crate's one table). A clause runs
 //! between line breaks and sentence punctuation (`;`, `!`, `?`, ฯ, a colon or a full stop before

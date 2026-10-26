@@ -532,8 +532,8 @@ pub fn parse_number_words(text: &str) -> Option<Decimal> {
 ///
 /// Confidence follows the clean-clause rule ([`crate::find_dates`] keeps it too): a quantity
 /// reads at 1.0 only when it matches a pattern the reader knows exactly and its clause holds no
-/// other figure or date and no signal word of the crate's one table (see the crate
-/// documentation). Numbering that opens the clause (`1.`, `(2)`), the amount in words that
+/// other figure, no second date and no signal word of the crate's one table (see the crate
+/// documentation): one figure and one date may share a clean clause. Numbering that opens the clause (`1.`, `(2)`), the amount in words that
 /// restates the figure, and a signal inside the reading's own span count for nothing. Otherwise
 /// its confidence is at most 0.6 and its other readings go in `alts`: the negative beside a
 /// sign word or alone in parentheses, the scale and unit of the figure a range or list signal
@@ -582,8 +582,9 @@ pub(crate) fn read(view: &View, anchor: chrono::NaiveDate) -> (Vec<Item>, Scan) 
     (items, dates)
 }
 
-/// Applies the clean-clause rule: a quantity or a date whose clause holds another figure or date,
-/// or a signal outside its own span, reads at most [`CONF_CAP`], with its other readings in
+/// Applies the clean-clause rule: a quantity or a date whose clause holds a second figure or a
+/// second date (one of each may share it), a code beside a date, or a signal outside its own
+/// span, reads at most [`CONF_CAP`], with its other readings in
 /// `alts`: the negative beside a sign, the scale and unit of the figure next to a bare one, and
 /// the dates next to a date. A date capped by a signal alone carries no other reading.
 fn clean_context(view: &View, items: &mut [Item], hits: &mut [Hit], months: &[Range<usize>]) {
@@ -609,7 +610,12 @@ fn clean_context(view: &View, items: &mut [Item], hits: &mut [Hit], months: &[Ra
                     .any(crate::context::line_break)
         })
         .collect();
-    let context = Context::new(t, &covered, &line_breaks);
+    // A control or a Hangul filler step 1 deleted outside every reading may have been a dash
+    // (U+0096 is an en dash read with the wrong code page): a signal.
+    let deleted: Vec<bool> = (0..t.len())
+        .map(|at| !covered[at] && view.deleted_mark(at))
+        .collect();
+    let context = Context::new(t, &covered, &line_breaks, &deleted);
     let mut spans: Vec<Range<usize>> = hits.iter().map(|hit| hit.range.clone()).collect();
     spans.sort_by_key(|span| span.start);
     let in_hit = |at: usize| {
@@ -659,6 +665,19 @@ fn clean_context(view: &View, items: &mut [Item], hits: &mut [Hit], months: &[Ra
             restates[index - 1] = Some(index);
         }
     }
+    // The figures of each clause, a figure and the words that restate it counted once, and the
+    // codes among them: a run the reader cannot read leaves no clause clean for a date.
+    let mut distinct = figures.clone();
+    let mut codes = vec![0usize; context.clauses()];
+    for (index, item) in items.iter().enumerate() {
+        let clause = context.clause_of(item.range.start);
+        if restates[index] == Some(index.wrapping_sub(1)) {
+            distinct[clause] -= 1;
+        }
+        if counted[index] && item.number.role == NumberRole::Code {
+            codes[clause] += 1;
+        }
+    }
     let quantity: Vec<bool> = items
         .iter()
         .zip(&counted)
@@ -676,10 +695,9 @@ fn clean_context(view: &View, items: &mut [Item], hits: &mut [Hit], months: &[Ra
         }
         let clause = clauses[index];
         let partner = restates[index].filter(|other| clauses[*other] == clause);
-        // Any other figure or date in the clause caps it (the founder's rule).
-        let others = figures[clause] + dates[clause]
-            - usize::from(counted[index])
-            - usize::from(partner.is_some());
+        // The founder's answer: one figure and one date may share a clean clause (an amount with
+        // its year); a second figure, a second date or any signal word caps them.
+        let clean = distinct[clause] - usize::from(counted[index]) == 0 && dates[clause] <= 1;
         let signals = context.signals(&items[index].extent);
         let item = &items[index];
         let paren = item.number.role == NumberRole::Quantity
@@ -687,7 +705,7 @@ fn clean_context(view: &View, items: &mut [Item], hits: &mut [Hit], months: &[Ra
             && !item.flags.contains(Flags::AMOUNT_IN_WORDS)
             && counted[index]
             && enclosed(t, &item.extent);
-        if others == 0 && !signals.any && !paren {
+        if clean && !signals.any && !paren {
             continue;
         }
         let mut alts = Vec::new();
@@ -733,7 +751,8 @@ fn clean_context(view: &View, items: &mut [Item], hits: &mut [Hit], months: &[Ra
     for index in 0..hits.len() {
         let clause = hit_clauses[index];
         let own = crate::context::with_weekday(t, &hits[index].range);
-        if figures[clause] + dates[clause] <= 1 && !context.signals(&own).any {
+        let clean = dates[clause] <= 1 && distinct[clause] <= 1 && codes[clause] == 0;
+        if clean && !context.signals(&own).any {
             continue;
         }
         let hit = &mut hits[index];

@@ -1,7 +1,10 @@
 //! The clean-clause rule (a founder decision): a figure or a date reads with confidence 0.8 or
-//! more only when its clause holds no other figure or date and no signal word from [`SIGNALS`].
-//! Otherwise its confidence is capped at [`CONF_CAP`] and its other readings go in `alts`, so a
-//! check against it is inconclusive, never a pass. A run the reader cannot read at all stays one
+//! more only when its clause holds no second figure, no second date and no signal word from
+//! [`SIGNALS`]. One figure and one date may share a clean clause, an amount with its year (the
+//! founder's answer in round 3b); a code beside a date, a run the reader cannot read, leaves the
+//! clause unclean, and so does a control that step 1 deleted outside every reading. Otherwise the
+//! confidence is capped at [`CONF_CAP`] and the other readings go in `alts`, so a check against
+//! the reading is inconclusive, never a pass. A run the reader cannot read at all stays one
 //! `Code`.
 //!
 //! A clause runs from one boundary to the next, or to the start or the end of the text. The
@@ -23,7 +26,7 @@
 
 use std::ops::Range;
 
-use crate::found::{dash_or_arrow, has_at, has_before, is_latin_letter, is_numeral};
+use crate::found::{dash_or_arrow, has_at, has_before, is_latin_letter, is_numeral, unknown_glyph};
 
 /// The highest confidence of a reading in a clause that is not clean: below 0.8, so it is never
 /// passed.
@@ -53,8 +56,8 @@ pub(crate) enum Kind {
 pub(crate) enum Pattern {
     /// These code points, as `normalize_th` writes them.
     Text(&'static str),
-    /// One code point of a class.
-    Class(fn(char) -> bool),
+    /// One code point of a class, with its name.
+    Class(&'static str, fn(char) -> bool),
 }
 
 /// One signal. Latin text counts only as a whole word (no Latin letter or digit on either side);
@@ -72,18 +75,21 @@ const fn text(text: &'static str, kind: Kind) -> Signal {
     }
 }
 
-const fn class(class: fn(char) -> bool, kind: Kind) -> Signal {
+const fn class(name: &'static str, class: fn(char) -> bool, kind: Kind) -> Signal {
     Signal {
-        pattern: Pattern::Class(class),
+        pattern: Pattern::Class(name, class),
         kind,
     }
 }
+
+/// The class of dashes and arrows, whose own rules (`dash_counts`) say where one counts.
+const DASHES: &str = "dash_or_arrow";
 
 /// Every signal the reader knows. A change to the list is a change here and nowhere else, and
 /// `signal_table_is_frozen` names it. ระหว่าง and `between` have no row: on their own they mean
 /// "during" or "among" (the founder's answer in round 2b), and with a connector in their clause
 /// the connector caps.
-pub(crate) const SIGNALS: [Signal; 122] = [
+pub(crate) const SIGNALS: [Signal; 123] = [
     // Ranges, closed or open.
     text("\u{0E16}\u{0E36}\u{0E07}", Kind::Range), // ถึง
     text("\u{0E08}\u{0E19}\u{0E16}\u{0E36}\u{0E07}", Kind::Range), // จนถึง
@@ -131,7 +137,8 @@ pub(crate) const SIGNALS: [Signal; 122] = [
     text("up to and including", Kind::Range),
     text("onward", Kind::Range),
     text("onwards", Kind::Range),
-    class(dash_or_arrow, Kind::Range), // a dash or an arrow
+    class(DASHES, dash_or_arrow, Kind::Range),
+    class("unknown_glyph", unknown_glyph, Kind::Range), // a glyph the text layer could not name
     text("->", Kind::Range),
     text("=>", Kind::Range),
     // Lists.
@@ -545,8 +552,9 @@ pub(crate) struct Context {
 
 impl Context {
     /// `covered` marks the code points inside a reading, where punctuation ends no clause;
-    /// `line_break` the spaces that stand for a line break of the input.
-    pub(crate) fn new(t: &[char], covered: &[bool], line_break: &[bool]) -> Self {
+    /// `line_break` the spaces that stand for a line break of the input; `deleted` the code
+    /// points where step 1 deleted a control or a Hangul filler, each a signal.
+    pub(crate) fn new(t: &[char], covered: &[bool], line_break: &[bool], deleted: &[bool]) -> Self {
         let mut clause = Vec::with_capacity(t.len());
         let mut starts = vec![0];
         for at in 0..t.len() {
@@ -565,6 +573,14 @@ impl Context {
             if covered[at] {
                 continue;
             }
+            if deleted[at] {
+                let occurrence = Occurrence {
+                    start: at,
+                    end: at + 1,
+                };
+                found.push(occurrence);
+                joins.push(occurrence);
+            }
             for signal in &SIGNALS {
                 let (end, kind) = match signal.pattern {
                     Pattern::Text(text) => {
@@ -577,12 +593,17 @@ impl Context {
                         }
                         (end, signal.kind)
                     }
-                    Pattern::Class(class) => {
+                    Pattern::Class(name, class) => {
                         if !class(*c) {
                             continue;
                         }
-                        let Some(kind) = dash_counts(t, at, starts[clause[at]]) else {
-                            continue;
+                        let kind = if name == DASHES {
+                            let Some(kind) = dash_counts(t, at, starts[clause[at]]) else {
+                                continue;
+                            };
+                            kind
+                        } else {
+                            signal.kind
                         };
                         (at + 1, kind)
                     }
@@ -668,7 +689,8 @@ mod tests {
     fn example(signal: &Signal) -> String {
         match signal.pattern {
             Pattern::Text(text) => text.to_owned(),
-            Pattern::Class(..) => "\u{21D2}".to_owned(),
+            Pattern::Class(DASHES, _) => "\u{21D2}".to_owned(),
+            Pattern::Class(..) => "\u{FFFD}".to_owned(),
         }
     }
 
@@ -747,7 +769,7 @@ mod tests {
     /// fingerprinted: deleting or changing a row changes it, and the test names the table.
     #[test]
     fn signal_table_is_frozen() {
-        const TABLE: u64 = 0x56c6_ced5_a14e_f8f3;
+        const TABLE: u64 = 0xb93f_34be_966c_4082;
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         let mut eat = |byte: u8| {
             hash ^= u64::from(byte);
@@ -756,7 +778,7 @@ mod tests {
         for signal in SIGNALS {
             let name = match signal.pattern {
                 Pattern::Text(text) => text,
-                Pattern::Class(_) => "dash_or_arrow",
+                Pattern::Class(name, _) => name,
             };
             name.bytes().for_each(&mut eat);
             eat(signal.kind as u8);
@@ -764,6 +786,10 @@ mod tests {
         }
         for c in (0..=0x10_FFFF).filter_map(char::from_u32) {
             if dash_or_arrow(c) {
+                (c as u32).to_le_bytes().into_iter().for_each(&mut eat);
+            }
+            if unknown_glyph(c) {
+                eat(0xfe);
                 (c as u32).to_le_bytes().into_iter().for_each(&mut eat);
             }
         }

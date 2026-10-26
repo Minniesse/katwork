@@ -1005,8 +1005,8 @@ fn ranges_are_one_low_confidence_reading() {
     assert_eq!(only(&figure).conf, 0.6);
     assert_eq!(quantities(&figure), vec![format!("5 {LAN}")]);
     let growth = format!("{PI} 2567 -25%");
-    // No range, but a figure beside the year in its clause: 0.6 (fix round 3).
-    assert_eq!(only(&growth).conf, 0.6);
+    // No range: a year and one figure share a clean clause (round 3b).
+    assert_eq!(only(&growth).conf, 0.9);
     // ถึง also means "reached": a figure with an amount word after it ends no range, though the
     // ถึง still keeps the year below 0.8.
     let reached = format!("{YOTKHAI}{PI} 2567 {THUENG} 2570 {LAN}{BAHT}");
@@ -1472,9 +1472,9 @@ fn controls_keep_date_numbers_apart() {
     );
     let year = format!("{PI} 2567\u{001F}1,250 {LAN}{BAHT}");
     assert_eq!(only(&year).value, self::year(2024));
-    // One clause holds the year and the amount, so the year reads at 0.6 (fix round 3); a record
-    // separator ends the clause.
-    assert_eq!(only(&year).conf, 0.6);
+    // One clause holds the year and one amount, which may share it (the founder's answer, round
+    // 3b); a record separator ends the clause.
+    assert_eq!(only(&year).conf, 0.9);
     let record = format!("{PI} 2567\u{001E}1,250 {LAN}{BAHT}");
     assert_eq!(only(&record).conf, 0.9);
     let budget = format!("{FISCAL} 2569\u{001F}1,250 {LAN}{BAHT}");
@@ -1536,8 +1536,8 @@ fn round_one_rule_branches_each_have_a_case() {
     assert_eq!(tonight.len(), 2, "{tonight:?}");
     assert!(tonight.iter().all(|found| found.conf == 0.6));
     let total = only("FY2026 2025 total");
-    // The bare 2025 is a figure of its clause, so FY2026 reads at 0.6, alone (fix round 3).
-    assert_eq!((total.conf, total.alts.len()), (0.6, 0), "{total:?}");
+    // FY2026 and the bare 2025, one date and one figure, share a clean clause (round 3b).
+    assert_eq!((total.conf, total.alts.len()), (0.85, 0), "{total:?}");
     // A range's left month after its end month is in the year before.
     one_low_reading("ต.ค.-ก.ย. 2568", month(2024, 10), &[month(2025, 9)]);
     // Two digits continue a range only 1 to 20 years on; four digits within 100 years.

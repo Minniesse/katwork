@@ -1510,11 +1510,10 @@ fn controls_inside_a_figure_make_a_code_and_separators_keep_figures_apart() {
         assert_eq!(found.value.role, NumberRole::Code, "{text:?}");
         assert_eq!(span(&text, &found), code, "{text:?}");
     }
-    // A field separator keeps the year and the amount apart in one clause, so both read below
-    // 0.8 (fix round 3); a record separator is a line break and ends the clause.
+    // A field separator keeps the year and the amount apart in one clause, which one date and one
+    // figure may share (round 3b); a record separator is a line break and ends the clause.
     let year = format!("{PI} 2567\u{001F}1,250 {LAN}{BAHT}");
-    assert_eq!(effective(&year), vec![dec("1250000000")]);
-    assert!(confident(&year).is_empty());
+    assert_eq!(confident(&year), vec![dec("1250000000")]);
     let record = format!("{PI} 2567\u{001E}1,250 {LAN}{BAHT}");
     assert_eq!(confident(&record), vec![dec("1250000000")]);
     assert_eq!(values("1,250\u{001F}300"), vec![dec("1250"), dec("300")]);
@@ -2289,10 +2288,10 @@ fn minutes_with_one_reading_to_a_line_keep_it_confident() {
     );
 }
 
-/// Fix round 3: the demo's own notes under the clean-clause rule. Each paragraph that holds a
-/// year and an amount, two dates, or a signal word reads below 0.8, so only the Thai trap's lone
-/// amount stays confident, and no date does. Task 13's acceptance test expects the notes'
-/// figures and due dates passed: the PR body asks the founder about it.
+/// Fix round 3 and the founder's answer (round 3b): the demo's own notes under the clean-clause
+/// rule. A paragraph with one amount and its fiscal year keeps both confident; one with two
+/// dates, three figures or a signal word (ไตรมาส) reads below 0.8, as does the English trap,
+/// which holds `and`.
 #[test]
 fn the_demo_notes_read_under_the_clause_rule() {
     let sure: Vec<String> = numbers(NOTES)
@@ -2300,10 +2299,84 @@ fn the_demo_notes_read_under_the_clause_rule() {
         .filter(|found| found.value.role == NumberRole::Quantity && found.conf >= 0.8)
         .map(|found| found.raw.clone())
         .collect();
-    assert_eq!(sure, [format!("9,999 {LAN}")]);
-    let dates = find_dates(NOTES, &ctx()).unwrap();
-    assert_eq!(dates.len(), 7, "{dates:?}");
-    assert!(dates.iter().all(|found| found.conf == 0.6), "{dates:?}");
+    assert_eq!(
+        sure,
+        [
+            format!("1,250 {LAN}"),
+            format!("1,020 {LAN}"),
+            format!("410 {LAN}"),
+            format!("9,999 {LAN}"),
+        ]
+    );
+    let fiscal = "ป\u{0E35}งบปร\u{0E30}ม\u{0E32}ณ";
+    let dates: Vec<(String, f32)> = find_dates(NOTES, &ctx())
+        .unwrap()
+        .iter()
+        .map(|found| (found.raw.clone(), found.conf))
+        .collect();
+    assert_eq!(
+        dates,
+        [
+            ("1 ต.ค. 2568".to_owned(), 0.6),
+            (format!("{fiscal} 2568"), 0.85),
+            (format!("{fiscal} 2568"), 0.85),
+            (format!("{fiscal} 2569"), 0.85),
+            (format!("{fiscal} 2569"), 0.6),
+            ("15 ต.ค. 2568".to_owned(), 0.6),
+            ("31 ต.ค. 2568".to_owned(), 0.6),
+        ]
+    );
+}
+
+/// The founder's answer (round 3b): one figure and one date may share a clean clause (an amount
+/// with its year) and both stay confident; a second figure, a second date, a code, or a signal
+/// word still caps them.
+#[test]
+fn one_figure_and_one_date_may_share_a_clean_clause() {
+    for (text, date) in [
+        (format!("{RAYDAI}{PI} 2567 1,250 {LAN}{BAHT}"), 0.9),
+        (format!("{BUDGET} FY2026 3,450 {LAN}{BAHT}"), 0.85),
+        (format!("{RAYDAI} 1,250 {LAN}{BAHT} {PI} 2567"), 0.9),
+    ] {
+        assert_eq!(only_date(&text).conf, date, "{text:?}");
+        let found = quantities(&text);
+        assert_eq!(found.len(), 1, "{text:?}");
+        assert_eq!(found[0].conf, 1.0, "{text:?}");
+    }
+    for text in [
+        // Two figures.
+        format!("{RAYDAI}{PI} 2567 1,250 {LAN}{BAHT} {KAMRAI} 270 {LAN}{BAHT}"),
+        // Two dates.
+        format!("{RAYDAI}{PI} 2566 {PI} 2567 1,250 {LAN}{BAHT}"),
+        // One figure, one date and a signal word.
+        format!("{RAYDAI}ส\u{0E30}สม{PI} 2568 3,450 {LAN}{BAHT}"),
+        format!("{RAYDAI}{PI} 2567 {TID_LOP}{THI}{ROI_LA} 5"),
+        // A code beside a date: a run the reader cannot read.
+        "FY2025Q1 revenue".to_owned(),
+        // A control step 1 deleted, or a glyph the text layer could not name, between a year
+        // and a figure.
+        format!("{PI} 2567 \u{0096} 2569"),
+        format!("{PI} 2567 \u{FFFD} 2569"),
+    ] {
+        let found = quantities(&text);
+        let dates = find_dates(&text, &ctx()).unwrap();
+        assert!(!dates.is_empty(), "{text:?}");
+        assert!(
+            found.iter().all(|found| found.conf < 0.8)
+                && dates.iter().all(|found| found.conf < 0.8),
+            "{text:?}: {found:?} {dates:?}"
+        );
+    }
+    // The amount in words that restates its figure is that figure: the year beside them stays.
+    let words = format!(
+        "ค\u{0E48}\u{0E32}\u{0E43}ช\u{0E49}จ\u{0E48}\u{0E32}ย{PI} 2568 1,200 {BAHT} ({NUENG}{PHAN}{SONG}{ROI}{BAHT}{THUAN})"
+    );
+    assert_eq!(only_date(&words).conf, 0.9);
+    assert!(quantities(&words).iter().all(|found| found.conf == 1.0));
+    // A day written with a stop after it (`15. October 2025`) is read, below 0.8.
+    let day = only_date("15. October 2025");
+    assert_eq!(day.conf, 0.6);
+    assert!(quantities("15. October 2025").is_empty());
 }
 
 /// Fix round 2: every signal the founder named, placed where it counts, keeps the reading near
@@ -2760,9 +2833,13 @@ fn clause_boundaries_part_figures_and_nothing_else_does() {
             numbers(&text)
         );
     }
-    // A full stop inside a reading is no boundary: one date, one time, one clause.
+    // A full stop inside a reading is no boundary: a date and its time share one clean clause
+    // (round 3b).
     let minutes = "ว\u{0E31}นท\u{0E35}\u{0E48} 1 ต.ค. 2568 \u{0E40}วล\u{0E32} 13.30 น.";
-    assert_eq!(find_dates(minutes, &ctx()).unwrap()[0].conf, 0.6);
+    assert_eq!(find_dates(minutes, &ctx()).unwrap()[0].conf, 0.9);
+    // A meeting number beside the date and its time makes two figures.
+    let numbered = "คร\u{0E31}\u{0E49}งท\u{0E35}\u{0E48} 5 ว\u{0E31}นท\u{0E35}\u{0E48} 1 ต.ค. 2568 \u{0E40}วล\u{0E32} 13.30 น.";
+    assert_eq!(find_dates(numbered, &ctx()).unwrap()[0].conf, 0.6);
 }
 
 /// Fix round 3: numbering that opens its clause (`1.`, `2)`, `(3)`), a bullet dash before a
