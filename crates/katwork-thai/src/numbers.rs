@@ -5,7 +5,7 @@ use std::ops::Range;
 use rust_decimal::Decimal;
 use unicode_normalization::char::canonical_combining_class;
 
-use crate::context::{CONF_CAP, CONF_OTHER, Context};
+use crate::context::{CONF_CAP, CONF_OTHER, Context, Kind, Marks};
 use crate::dates::{self, DateValue, Hit, Scan};
 use crate::digits::{Script, script};
 use crate::found::{
@@ -530,11 +530,12 @@ pub fn parse_number_words(text: &str) -> Option<Decimal> {
 /// it, it holds two dots, or it is one of three or more digit groups joined by `-`; otherwise
 /// `Quantity`.
 ///
-/// Confidence follows the clean-clause rule ([`crate::find_dates`] keeps it too): a quantity
-/// reads at 1.0 only when it matches a pattern the reader knows exactly and its clause holds no
-/// other figure, no second date and no signal word of the crate's one table (see the crate
-/// documentation): one figure and one date may share a clean clause. Numbering that opens the clause (`1.`, `(2)`), the amount in words that
-/// restates the figure, and a signal inside the reading's own span count for nothing. Otherwise
+/// Confidence follows the clean-paragraph rule ([`crate::find_dates`] keeps it too): a quantity
+/// reads at 1.0 only when it matches a pattern the reader knows exactly and the whole `text`
+/// holds no other figure, no second date and no signal word of the crate's one table (see the
+/// crate documentation): one figure and one date may share a clean text, and no line break or
+/// punctuation splits it. Numbering that opens a line (`1.`, `(2)`), the amount in words that
+/// restates the figure, and a signal inside a reading count for nothing. Otherwise
 /// its confidence is at most 0.6 and its other readings go in `alts`: the negative beside a
 /// sign word or alone in parentheses, the scale and unit of the figure a range or list signal
 /// joins it to, and the parts of a compound amount the grammar does not name (`1 ล้าน 250,000
@@ -566,7 +567,7 @@ pub fn find_numbers(text: &str, ctx: &Ctx) -> Result<Vec<Found<Number>>, TooLong
         .collect())
 }
 
-/// Every number and date of the text, each capped by the rest of its clause: what both scanners
+/// Every number and date of the text, each capped by the rest of the text: what both scanners
 /// return.
 pub(crate) fn read(view: &View, anchor: chrono::NaiveDate) -> (Vec<Item>, Scan) {
     let mut dates = dates::scan(view, anchor);
@@ -582,74 +583,32 @@ pub(crate) fn read(view: &View, anchor: chrono::NaiveDate) -> (Vec<Item>, Scan) 
     (items, dates)
 }
 
-/// Applies the clean-clause rule: a quantity or a date whose clause holds a second figure or a
-/// second date (one of each may share it), a code beside a date, or a signal outside its own
-/// span, reads at most [`CONF_CAP`], with its other readings in
+/// Applies the clean-paragraph rule to the whole text: a quantity or a date reads at most
+/// [`CONF_CAP`] when the text holds a second figure or a second date (one of each may share it),
+/// a code beside a date, or a signal outside the reading's own span, with its other readings in
 /// `alts`: the negative beside a sign, the scale and unit of the figure next to a bare one, and
 /// the dates next to a date. A date capped by a signal alone carries no other reading.
 fn clean_context(view: &View, items: &mut [Item], hits: &mut [Hit], months: &[Range<usize>]) {
     let t = &view.chars;
-    // No punctuation inside a reading ends a clause: the dots of ต.ค., 1.5 or 13.30 น.
-    let mut covered = vec![false; t.len()];
-    for range in items
-        .iter()
-        .map(|item| &item.range)
-        .chain(hits.iter().map(|hit| &hit.range))
-        .chain(months)
-    {
-        if let Some(slots) = covered.get_mut(range.clone()) {
-            slots.fill(true);
-        }
-    }
-    let line_breaks: Vec<bool> = (0..t.len())
-        .map(|at| {
-            t[at] == ' '
-                && view
-                    .written(&(at..at + 1))
-                    .chars()
-                    .any(crate::context::line_break)
-        })
-        .collect();
-    // A control or a Hangul filler step 1 deleted outside every reading may have been a dash
-    // (U+0096 is an en dash read with the wrong code page): a signal.
-    let deleted: Vec<bool> = (0..t.len())
-        .map(|at| !covered[at] && view.deleted_mark(at))
-        .collect();
-    let context = Context::new(t, &covered, &line_breaks, &deleted);
+    let marks = marks(view, items, hits, months);
+    let context = Context::new(t, &marks);
     let mut spans: Vec<Range<usize>> = hits.iter().map(|hit| hit.range.clone()).collect();
     spans.sort_by_key(|span| span.start);
     let in_hit = |at: usize| {
         let index = spans.partition_point(|span| span.start <= at);
         index > 0 && spans[index - 1].contains(&at)
     };
-    // The readings of each clause: the numbers outside a date (a list marker that opens its
-    // clause is numbering, not a figure), the dates, and the month names outside a date.
-    let mut figures = vec![0usize; context.clauses()];
-    let mut dates = vec![0usize; context.clauses()];
-    let mut date_starts = vec![false; t.len() + 1];
-    for range in hits.iter().map(|hit| &hit.range).chain(months) {
-        if let Some(slot) = date_starts.get_mut(range.start) {
-            *slot = true;
-        }
-    }
+    // The readings of the text: the numbers outside a date (a list marker that opens its line is
+    // numbering, not a figure), the dates, and the month names outside a date.
     let counted: Vec<bool> = items
         .iter()
         .map(|item| {
-            let clause_start = context.clause_start(context.clause_of(item.range.start));
-            !in_hit(item.range.start) && !list_marker(t, item, clause_start, &date_starts)
+            let line_start = marks.line_start[item.range.start];
+            !in_hit(item.range.start) && !list_marker(t, item, line_start, &marks.date_start)
         })
         .collect();
-    for (item, counted) in items.iter().zip(&counted) {
-        if *counted {
-            figures[context.clause_of(item.range.start)] += 1;
-        }
-    }
-    for hit in hits.iter() {
-        dates[context.clause_of(hit.range.start)] += 1;
-    }
-    for month in months.iter().filter(|month| !in_hit(month.start)) {
-        dates[context.clause_of(month.start)] += 1;
-    }
+    let figures = counted.iter().filter(|counted| **counted).count();
+    let dates = hits.len() + months.iter().filter(|month| !in_hit(month.start)).count();
     // Words in the amount-in-words parentheses that equal the figure before them restate it: the
     // two are one reading for each other.
     let mut restates = vec![None; items.len()];
@@ -665,19 +624,17 @@ fn clean_context(view: &View, items: &mut [Item], hits: &mut [Hit], months: &[Ra
             restates[index - 1] = Some(index);
         }
     }
-    // The figures of each clause, a figure and the words that restate it counted once, and the
-    // codes among them: a run the reader cannot read leaves no clause clean for a date.
-    let mut distinct = figures.clone();
-    let mut codes = vec![0usize; context.clauses()];
-    for (index, item) in items.iter().enumerate() {
-        let clause = context.clause_of(item.range.start);
-        if restates[index] == Some(index.wrapping_sub(1)) {
-            distinct[clause] -= 1;
-        }
-        if counted[index] && item.number.role == NumberRole::Code {
-            codes[clause] += 1;
-        }
-    }
+    // The figures of the text, a figure and the words that restate it counted once, and the
+    // codes among them: a run the reader cannot read leaves no text clean for a date.
+    let pairs = (1..items.len())
+        .filter(|index| restates[*index] == Some(index - 1))
+        .count();
+    let distinct = figures.saturating_sub(pairs);
+    let codes = items
+        .iter()
+        .zip(&counted)
+        .filter(|(item, counted)| **counted && item.number.role == NumberRole::Code)
+        .count();
     let quantity: Vec<bool> = items
         .iter()
         .zip(&counted)
@@ -685,19 +642,14 @@ fn clean_context(view: &View, items: &mut [Item], hits: &mut [Hit], months: &[Ra
         .collect();
     let numbers: Vec<Number> = items.iter().map(|item| item.number.clone()).collect();
     let extents: Vec<Range<usize>> = items.iter().map(|item| item.extent.clone()).collect();
-    let clauses: Vec<usize> = items
-        .iter()
-        .map(|item| context.clause_of(item.range.start))
-        .collect();
     for index in 0..items.len() {
         if items[index].number.role != NumberRole::Quantity {
             continue;
         }
-        let clause = clauses[index];
-        let partner = restates[index].filter(|other| clauses[*other] == clause);
-        // The founder's answer: one figure and one date may share a clean clause (an amount with
+        let partner = restates[index];
+        // The founder's answers: one figure and one date may share a clean text (an amount with
         // its year); a second figure, a second date or any signal word caps them.
-        let clean = distinct[clause] - usize::from(counted[index]) == 0 && dates[clause] <= 1;
+        let clean = distinct <= usize::from(counted[index]) && dates <= 1;
         let signals = context.signals(&items[index].extent);
         let item = &items[index];
         let paren = item.number.role == NumberRole::Quantity
@@ -717,11 +669,9 @@ fn clean_context(view: &View, items: &mut [Item], hits: &mut [Hit], months: &[Ra
         let lend = counted[index];
         let before = (0..index)
             .rev()
-            .take_while(|other| clauses[*other] == clause)
             .find(|other| quantity[*other] && Some(*other) != partner);
-        let after = (index + 1..items.len())
-            .take_while(|other| clauses[*other] == clause)
-            .find(|other| quantity[*other] && Some(*other) != partner);
+        let after =
+            (index + 1..items.len()).find(|other| quantity[*other] && Some(*other) != partner);
         for other in before.into_iter().chain(after).filter(|_| lend) {
             let (left, right) = if other < index {
                 (&extents[other], &extents[index])
@@ -744,22 +694,16 @@ fn clean_context(view: &View, items: &mut [Item], hits: &mut [Hit], months: &[Ra
         }
     }
     let values: Vec<DateValue> = hits.iter().map(|hit| hit.value).collect();
-    let hit_clauses: Vec<usize> = hits
-        .iter()
-        .map(|hit| context.clause_of(hit.range.start))
-        .collect();
-    for index in 0..hits.len() {
-        let clause = hit_clauses[index];
-        let own = crate::context::with_weekday(t, &hits[index].range);
-        let clean = dates[clause] <= 1 && distinct[clause] <= 1 && codes[clause] == 0;
+    for (index, hit) in hits.iter_mut().enumerate() {
+        let own = crate::context::with_weekday(t, &hit.range);
+        let clean = dates <= 1 && distinct <= 1 && codes == 0;
         if clean && !context.signals(&own).any {
             continue;
         }
-        let hit = &mut hits[index];
         hit.conf = hit.conf.min(CONF_CAP);
-        // The dates next to it in its clause are its other readings.
-        let before = (0..index).rev().find(|other| hit_clauses[*other] == clause);
-        let after = (index + 1..values.len()).find(|other| hit_clauses[*other] == clause);
+        // The dates next to it are its other readings.
+        let before = index.checked_sub(1);
+        let after = (index + 1 < values.len()).then_some(index + 1);
         for other in before.into_iter().chain(after) {
             let value = &values[other];
             if *value != hit.value && !hit.alts.iter().any(|(alt, _)| alt == value) {
@@ -769,9 +713,81 @@ fn clean_context(view: &View, items: &mut [Item], hits: &mut [Hit], months: &[Ra
     }
 }
 
-/// A list marker that opens its clause (`1.`, `2)`, `(3)`): numbering, not a figure of the
-/// clause. A day before a month name or a date is none (`15. October 2025`).
-fn list_marker(t: &[char], item: &Item, clause_start: usize, date_starts: &[bool]) -> bool {
+/// Where each signal of the text stands: inside a reading (or the weekday written with a date),
+/// where a date starts, where a reading and its unit words end, where each line starts, and the
+/// signals no table row writes.
+fn marks(view: &View, items: &[Item], hits: &[Hit], months: &[Range<usize>]) -> Marks {
+    let t = &view.chars;
+    let mut covered = vec![false; t.len()];
+    let weekdays: Vec<Range<usize>> = hits
+        .iter()
+        .map(|hit| crate::context::with_weekday(t, &hit.range))
+        .collect();
+    for range in items
+        .iter()
+        .map(|item| &item.range)
+        .chain(&weekdays)
+        .chain(months)
+    {
+        if let Some(slots) = covered.get_mut(range.clone()) {
+            slots.fill(true);
+        }
+    }
+    let mut date_start = vec![false; t.len() + 1];
+    let mut reading_end = vec![false; t.len() + 1];
+    for range in hits.iter().map(|hit| &hit.range).chain(months) {
+        if let Some(slot) = date_start.get_mut(range.start) {
+            *slot = true;
+        }
+    }
+    for range in items
+        .iter()
+        .map(|item| &item.extent)
+        .chain(hits.iter().map(|hit| &hit.range))
+        .chain(months)
+    {
+        if let Some(slot) = reading_end.get_mut(range.end) {
+            *slot = true;
+        }
+    }
+    let mut line_start = Vec::with_capacity(t.len());
+    let mut start = 0;
+    for at in 0..t.len() {
+        line_start.push(start);
+        if view.line_break(at) {
+            start = at + 1;
+        }
+    }
+    // A control or a Hangul filler step 1 deleted outside every reading may have been a dash
+    // (U+0096 is an en dash read with the wrong code page): a signal.
+    let mut marked: Vec<Option<Kind>> = (0..t.len())
+        .map(|at| (!covered[at] && view.deleted_mark(at)).then_some(Kind::Range))
+        .collect();
+    // Latin letters glued to the end of a date (`FY2025YTD`, `FY2025E`, `2568YTD`): a period code
+    // the reader cannot read, so the date may be part of the year.
+    for hit in hits.iter() {
+        let end = hit.range.end;
+        if end == 0 || !is_numeral(t[end - 1]) {
+            continue;
+        }
+        for at in (end..t.len()).take_while(|at| is_latin_letter(t[*at])) {
+            if !covered[at] {
+                marked[at] = Some(Kind::Period);
+            }
+        }
+    }
+    Marks {
+        covered,
+        date_start,
+        reading_end,
+        line_start,
+        marked,
+    }
+}
+
+/// A list marker that opens its line (`1.`, `2)`, `(3)`): numbering, not a figure of the text.
+/// A day before a month name or a date is none (`15. October 2025`).
+fn list_marker(t: &[char], item: &Item, line_start: usize, date_starts: &[bool]) -> bool {
     let number = &item.number;
     let small = number.value > Decimal::ZERO && number.value < Decimal::from(100);
     if number.role != NumberRole::Quantity
@@ -785,7 +801,7 @@ fn list_marker(t: &[char], item: &Item, clause_start: usize, date_starts: &[bool
     let Range { start, end } = item.range;
     let open = start > 0 && t[start - 1] == '(';
     let lead = if open { start - 1 } else { start };
-    let opens_clause = t[clause_start..lead]
+    let opens_line = t[line_start.min(lead)..lead]
         .iter()
         .all(|c| c.is_whitespace() || matches!(c, '-' | '\u{2022}' | '*'));
     let closes = match t.get(end) {
@@ -798,7 +814,7 @@ fn list_marker(t: &[char], item: &Item, clause_start: usize, date_starts: &[bool
     } else {
         end + 1
     };
-    opens_clause && closes && !date_starts.get(next).copied().unwrap_or(false)
+    opens_line && closes && !date_starts.get(next).copied().unwrap_or(false)
 }
 
 /// The reading over `extent` stands alone in parentheses, one space allowed inside each
@@ -2210,7 +2226,8 @@ impl<'a> Scanner<'a> {
     /// A unit word or symbol at `at`, after a figure that already `has_unit` or not. A currency
     /// word or symbol between two figures is the first figure's (`100 USD 3,500 บาท`), unless the
     /// second has no unit of its own and the first already has one (`USD 100 THB 3,500`), or it
-    /// is a symbol written against the second (`5 $10`): then it is the second figure's.
+    /// is a symbol written against the second (`5 $10`), or it opens the next line (`ราคา 100` and
+    /// `USD 3,500` on two lines): then it is the second figure's.
     fn unit_after(&self, at: usize, has_unit: bool) -> Option<(Unit, usize)> {
         let (unit, end) = self.unit_word(at)?;
         let symbol = matches!(self.get(at), Some('$' | '\u{0E3F}'));
@@ -2218,6 +2235,9 @@ impl<'a> Scanner<'a> {
         let next = self.space(end);
         if !currency || !self.get(next).is_some_and(is_digit) {
             return Some((unit, end));
+        }
+        if at > 0 && self.view.line_break(at - 1) {
+            return None;
         }
         if symbol && next == end && self.before(at) == Some(' ') {
             return None;

@@ -348,10 +348,11 @@ pub(crate) struct Scan {
 /// date that is year first or whose day is above 12; 0.6 for other numeric dates and every
 /// two-digit year; 0.85 for fiscal years and quarters; 0.5 for academic years, the ร.ศ. and
 /// จ.ศ. eras, ranges, lists and a quarter of a year that is not fiscal; at most 0.7 for a BE
-/// year before 2484 (`PRE_1941`); at most 0.6 under the clean-clause rule (see the crate
-/// documentation): a second date, a second figure, a code or a signal word in the date's clause
-/// (one figure may share it, and the weekday written with the date is part of it), with the
-/// dates beside it in `alts`; a day written with a stop after it (`15. October 2025`); and a
+/// year before 2484 (`PRE_1941`); at most 0.6 under the clean-paragraph rule (see the crate
+/// documentation): a second date, a second figure, a code or a signal word anywhere in `text`
+/// (one figure may share it, and the weekday written with the date is part of it), or Latin
+/// letters glued to the date's end (`FY2025YTD`), with the dates beside it in `alts`; a day
+/// written with a stop after it (`15. October 2025`); and a
 /// month whose
 /// name follows a day the reader could not read (`໑໕ ต.ค. 2568`, `15x ต.ค.`, `สิบห้า ต.ค.`). The
 /// lowest rule that applies wins.

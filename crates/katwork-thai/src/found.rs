@@ -140,6 +140,26 @@ impl View {
             .collect()
     }
 
+    /// A space that was a line break in the input (Python's `str.splitlines` set): where a line
+    /// starts, for numbering and bullets, and where a currency starts the next line's figure.
+    pub(crate) fn line_break(&self, at: usize) -> bool {
+        self.chars.get(at) == Some(&' ')
+            && self.written(&(at..at + 1)).chars().any(|c| {
+                matches!(
+                    c,
+                    '\n' | '\u{000B}'
+                        | '\u{000C}'
+                        | '\r'
+                        | '\u{001C}'
+                        | '\u{001D}'
+                        | '\u{001E}'
+                        | '\u{0085}'
+                        | '\u{2028}'
+                        | '\u{2029}'
+                )
+            })
+    }
+
     /// A space that was a figure, punctuation, thin or hair space or a narrow no-break space in
     /// the input: one that can sit between the digit groups of one figure.
     pub(crate) fn group_space(&self, at: usize) -> bool {

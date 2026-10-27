@@ -11,16 +11,16 @@
 //! Every reading carries its span in code points of the text it came from, its confidence and
 //! flags saying how it was written. The crate depends on nothing in KatWork.
 //!
-//! **The clean-clause rule** (a founder decision): a figure or a date reads with confidence 0.8
-//! or more only when it matches a pattern the reader knows exactly and its clause holds no second
-//! figure, no second date (one figure and one date, an amount with its year, may share it) and
-//! no signal word of a range, a list, a fraction, a period or a sign (ถึง,
-//! จาก, และ, หรือ, ติดลบ, เป็นลบ, ไตรมาส, งวด, สะสม, `to`, `since`, `and`, `negative`, `YTD`, a
-//! dash, an arrow, a slash or a comma, and the rest of the crate's one table). A clause runs
-//! between line breaks and sentence punctuation (`;`, `!`, `?`, ฯ, a colon or a full stop before
-//! a space, as the table's module states exactly). Otherwise a reading is capped at 0.6 and its
-//! other readings go in `alts`, so a check against it is inconclusive, never a pass. A run the
-//! reader cannot read at all is one `Code`.
+//! **The clean-paragraph rule** (a founder decision): a figure or a date reads with confidence
+//! 0.8 or more only when it matches a pattern the reader knows exactly and the whole text the
+//! scanner is given (a block: a paragraph or a cell) holds no second figure, no second date (one
+//! figure and one date, an amount with its year, may share it) and no signal word of a range, a
+//! list, a fraction, a period or a sign (ถึง, จาก, และ, หรือ, ติดลบ, เป็นลบ, ไตรมาส, งวด, สะสม,
+//! รายเดือน, ปีก่อน, `to`, `since`, `and`, `negative`, `YTD`, `monthly`, `after` before a date, a
+//! dash, an arrow, a slash, a comma, a `+` after a figure, and the rest of the crate's one
+//! table). Nothing splits the text: no line break, colon, full stop, ฯ or other punctuation.
+//! Otherwise a reading is capped at 0.6 and its other readings go in `alts`, so a check against
+//! it is inconclusive, never a pass. A run the reader cannot read at all is one `Code`.
 mod context;
 mod dates;
 mod digits;

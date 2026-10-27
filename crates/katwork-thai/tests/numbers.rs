@@ -730,6 +730,17 @@ fn scanners_never_panic_and_keep_spans_valid() {
         "\u{0E15}\u{0E49}\u{0E19}",
         "Jan",
         "q2",
+        // Fix round 4: line breaks, the amount in words on the next line, and the new signals.
+        "\n",
+        "\r\n",
+        "\n(",
+        "\u{2028}",
+        "+",
+        "ytd",
+        "after",
+        "monthly",
+        "\u{0E01}\u{0E48}\u{0E2D}\u{0E19}",
+        "\u{0E15}\u{0E48}\u{0E2D}\u{0E40}\u{0E14}\u{0E37}\u{0E2D}\u{0E19}",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -1510,8 +1521,8 @@ fn controls_inside_a_figure_make_a_code_and_separators_keep_figures_apart() {
         assert_eq!(found.value.role, NumberRole::Code, "{text:?}");
         assert_eq!(span(&text, &found), code, "{text:?}");
     }
-    // A field separator keeps the year and the amount apart in one clause, which one date and one
-    // figure may share (round 3b); a record separator is a line break and ends the clause.
+    // A field separator or a record separator keeps the year and the amount apart in one text,
+    // which one date and one figure may share (round 3b); nothing splits the text (round 4).
     let year = format!("{PI} 2567\u{001F}1,250 {LAN}{BAHT}");
     assert_eq!(confident(&year), vec![dec("1250000000")]);
     let record = format!("{PI} 2567\u{001E}1,250 {LAN}{BAHT}");
@@ -1647,7 +1658,7 @@ fn digit_groups_with_letters_between_them_are_one_code() {
         assert_eq!(found.value.role, NumberRole::Code, "{text:?}");
         assert_eq!(span(&text, &found), code, "{text:?}");
     }
-    // The code is a figure of the clause, so the price beside it reads below 0.8 (fix round 3).
+    // The code is a figure of the text, so the price beside it reads below 0.8 (fix round 3).
     let model = format!("ร\u{0E38}\u{0E48}น A1B2 {RAKHA} 5 {LAN}{BAHT}");
     assert_eq!(effective(&model), vec![dec("5000000")]);
     assert!(confident(&model).is_empty());
@@ -2145,11 +2156,24 @@ fn a_sign_word_near_a_figure_makes_it_ambiguous() {
     let found = only(&attached);
     assert_eq!(found.value.value, dec("-6.1"));
     assert_eq!(found.conf, 1.0);
-    // A sign word inside a figure's span is that figure's alone; in another clause it counts for
-    // nothing (fix round 3).
+    // A sign word inside a figure's span is that figure's alone: the figure on the next line is
+    // capped by the second figure of the text, with no negative beside it (fix round 4).
     let two = format!("{KAMRAI}{TID_LOP} 5%\n{RAYDAI} 10%");
-    assert_eq!(confident(&two), vec![dec("-5"), dec("10")]);
-    // Anywhere in the clause, however far, a sign word counts (fix round 3: no window).
+    let found = quantities(&two);
+    assert_eq!(
+        found
+            .iter()
+            .map(|found| found.value.value)
+            .collect::<Vec<_>>(),
+        [dec("-5"), dec("10")]
+    );
+    assert!(
+        found
+            .iter()
+            .all(|found| found.conf == 0.6 && found.alts.is_empty()),
+        "{found:?}"
+    );
+    // Anywhere in the text, however far, a sign word counts (fix round 3: no window).
     for gap in [14, 15, 60] {
         let text = format!("{TID_LOP}{} 5 {LAN}{BAHT}", "ก".repeat(gap));
         let found = only(&text);
@@ -2200,14 +2224,24 @@ fn ranges_and_lists_of_figures_are_not_read_with_confidence() {
             numbers(&text)
         );
     }
-    // Two figures in one clause cap both, joined or not: the founder's accepted cost of the
-    // clean-clause rule (fix round 3). In two clauses each is plain.
-    let facts = format!("{RAYDAI} 1,250 {LAN}{BAHT} {LAE}{KAMRAI} 270 {LAN}{BAHT}");
-    let found = quantities(&facts);
-    assert_eq!(found.len(), 2);
-    assert!(found.iter().all(|found| found.conf == 0.6), "{found:?}");
-    let lines = format!("{RAYDAI} 1,250 {LAN}{BAHT}\n{KAMRAI} 270 {LAN}{BAHT}");
-    assert_eq!(confident(&lines), vec![dec("1250000000"), dec("270000000")]);
+    // Two figures in one text cap both, joined or not, on one line or two: the founder's accepted
+    // cost of the clean-paragraph rule (fix round 4). In two texts each is plain.
+    for text in [
+        format!("{RAYDAI} 1,250 {LAN}{BAHT} {LAE}{KAMRAI} 270 {LAN}{BAHT}"),
+        format!("{RAYDAI} 1,250 {LAN}{BAHT}\n{KAMRAI} 270 {LAN}{BAHT}"),
+    ] {
+        let found = quantities(&text);
+        assert_eq!(found.len(), 2, "{text:?}");
+        assert!(found.iter().all(|found| found.conf == 0.6), "{found:?}");
+    }
+    assert_eq!(
+        confident(&format!("{RAYDAI} 1,250 {LAN}{BAHT}")),
+        vec![dec("1250000000")]
+    );
+    assert_eq!(
+        confident(&format!("{KAMRAI} 270 {LAN}{BAHT}")),
+        vec![dec("270000000")]
+    );
     // Ends whose own scales or units differ lend each other nothing: a percent is no part of an
     // amount in millions (mutant C-AGREES).
     for text in [
@@ -2245,12 +2279,24 @@ const NOTES: &str = "บ\u{0E31}นท\u{0E36}กก\u{0E32}รปร\u{0E30}ช
 /// approved budget, a forecast written as a range, and a due date.
 const MINUTES: &str = "ว\u{0E31}นปร\u{0E30}ช\u{0E38}ม 1 ต.ค. 2568\nร\u{0E32}ย\u{0E44}ด\u{0E49}รวม 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท\nค\u{0E48}\u{0E32}\u{0E43}ช\u{0E49}จ\u{0E48}\u{0E32}ยรวม 980 ล\u{0E49}\u{0E32}นบ\u{0E32}ท\nก\u{0E33}\u{0E44}รส\u{0E38}ทธ\u{0E34} 270 ล\u{0E49}\u{0E32}นบ\u{0E32}ท\nอ\u{0E31}ตร\u{0E32}ก\u{0E33}\u{0E44}ร ร\u{0E49}อยล\u{0E30} 21.6\nงบลงท\u{0E38}นท\u{0E35}\u{0E48}อน\u{0E38}ม\u{0E31}ต\u{0E34} 410 ล\u{0E49}\u{0E32}นบ\u{0E32}ท\nค\u{0E32}ดว\u{0E48}\u{0E32}ร\u{0E32}ย\u{0E44}ด\u{0E49}จ\u{0E30}\u{0E40}ต\u{0E34}บ\u{0E42}ตร\u{0E49}อยล\u{0E30} 5-7\nก\u{0E33}หนดส\u{0E48}งร\u{0E32}ยง\u{0E32}น 15 ต.ค. 2568";
 
-/// Fix round 3 (the opposite failure): minutes written one reading to a line keep every plain
-/// figure and date at its plan value; only the forecast range drops below 0.8, with its other
-/// reading.
+/// Fix round 4 (the founder's paragraph unit): minutes written one reading to a line and given as
+/// one block cap every reading, the founder's accepted cost; given one line to a block (the cells
+/// of a table, or paragraphs a reader split on blank lines), each plain figure and date keeps its
+/// plan value, and only the forecast range drops below 0.8, with its other reading.
 #[test]
-fn minutes_with_one_reading_to_a_line_keep_it_confident() {
-    let found = numbers(MINUTES);
+fn minutes_cap_as_one_block_and_keep_each_line_given_alone() {
+    let block = numbers(MINUTES);
+    assert!(
+        block
+            .iter()
+            .filter(|found| found.value.role == NumberRole::Quantity)
+            .all(|found| found.conf == 0.6),
+        "{block:?}"
+    );
+    let block_dates = find_dates(MINUTES, &ctx()).unwrap();
+    assert_eq!(block_dates.len(), 2);
+    assert!(block_dates.iter().all(|found| found.conf == 0.6));
+    let found: Vec<Found<Number>> = MINUTES.lines().flat_map(numbers).collect();
     let sure: Vec<(String, Decimal)> = found
         .iter()
         .filter(|found| found.value.role == NumberRole::Quantity && found.conf >= 0.8)
@@ -2278,26 +2324,34 @@ fn minutes_with_one_reading_to_a_line_keep_it_confident() {
         ["5", "7"]
     );
     assert_eq!(range[1].alts[0].0.unit, Some(Unit::Percent));
-    let dates = find_dates(MINUTES, &ctx()).unwrap();
+    let dates: Vec<(String, f32)> = MINUTES
+        .lines()
+        .flat_map(|line| find_dates(line, &ctx()).unwrap())
+        .map(|found| (found.raw, found.conf))
+        .collect();
     assert_eq!(
-        dates
-            .iter()
-            .map(|found| (found.raw.as_str(), found.conf))
-            .collect::<Vec<_>>(),
-        [("1 ต.ค. 2568", 0.9), ("15 ต.ค. 2568", 0.9)]
+        dates,
+        [
+            ("1 ต.ค. 2568".to_owned(), 0.9),
+            ("15 ต.ค. 2568".to_owned(), 0.9)
+        ]
     );
 }
 
-/// Fix round 3 and the founder's answer (round 3b): the demo's own notes under the clean-clause
-/// rule. A paragraph with one amount and its fiscal year keeps both confident; one with two
-/// dates, three figures or a signal word (ไตรมาส) reads below 0.8, as does the English trap,
-/// which holds `and`.
+/// Fix rounds 3 and 4 and the founder's answer (round 3b): the demo's own notes, each paragraph a
+/// block as the plan's text reader splits them on blank lines. A paragraph with one amount and
+/// its fiscal year keeps both confident; one with two dates, three figures or a signal word
+/// (ไตรมาส) reads below 0.8, as does the English trap, which holds `and`. The whole notes given as
+/// one text are one unit: every reading in them is capped.
 #[test]
-fn the_demo_notes_read_under_the_clause_rule() {
-    let sure: Vec<String> = numbers(NOTES)
+fn the_demo_notes_read_paragraph_by_paragraph() {
+    let paragraphs: Vec<&str> = NOTES.split("\n\n").collect();
+    assert_eq!(paragraphs.len(), 9);
+    let sure: Vec<String> = paragraphs
         .iter()
+        .flat_map(|paragraph| numbers(paragraph))
         .filter(|found| found.value.role == NumberRole::Quantity && found.conf >= 0.8)
-        .map(|found| found.raw.clone())
+        .map(|found| found.raw)
         .collect();
     assert_eq!(
         sure,
@@ -2309,10 +2363,10 @@ fn the_demo_notes_read_under_the_clause_rule() {
         ]
     );
     let fiscal = "ป\u{0E35}งบปร\u{0E30}ม\u{0E32}ณ";
-    let dates: Vec<(String, f32)> = find_dates(NOTES, &ctx())
-        .unwrap()
+    let dates: Vec<(String, f32)> = paragraphs
         .iter()
-        .map(|found| (found.raw.clone(), found.conf))
+        .flat_map(|paragraph| find_dates(paragraph, &ctx()).unwrap())
+        .map(|found| (found.raw, found.conf))
         .collect();
     assert_eq!(
         dates,
@@ -2326,17 +2380,31 @@ fn the_demo_notes_read_under_the_clause_rule() {
             ("31 ต.ค. 2568".to_owned(), 0.6),
         ]
     );
+    let whole = numbers(NOTES);
+    assert!(
+        whole
+            .iter()
+            .filter(|found| found.value.role == NumberRole::Quantity)
+            .all(|found| found.conf == 0.6),
+        "{whole:?}"
+    );
+    let whole_dates = find_dates(NOTES, &ctx()).unwrap();
+    assert_eq!(whole_dates.len(), 7);
+    assert!(whole_dates.iter().all(|found| found.conf == 0.6));
 }
 
-/// The founder's answer (round 3b): one figure and one date may share a clean clause (an amount
-/// with its year) and both stay confident; a second figure, a second date, a code, or a signal
-/// word still caps them.
+/// The founder's answers (rounds 3b and 4): one figure and one date may share a clean paragraph
+/// (an amount with its year), on one line or two, and both stay confident; a second figure, a
+/// second date, a code, or a signal word anywhere in the paragraph still caps them. The plan's
+/// single-figure examples keep their values.
 #[test]
-fn one_figure_and_one_date_may_share_a_clean_clause() {
+fn one_figure_and_one_date_may_share_a_clean_paragraph() {
     for (text, date) in [
         (format!("{RAYDAI}{PI} 2567 1,250 {LAN}{BAHT}"), 0.9),
         (format!("{BUDGET} FY2026 3,450 {LAN}{BAHT}"), 0.85),
         (format!("{RAYDAI} 1,250 {LAN}{BAHT} {PI} 2567"), 0.9),
+        (format!("{RAYDAI}{PI} 2567\n1,250 {LAN}{BAHT}"), 0.9),
+        (format!("{BUDGET} FY2026:\n3,450 {LAN}{BAHT}"), 0.85),
     ] {
         assert_eq!(only_date(&text).conf, date, "{text:?}");
         let found = quantities(&text);
@@ -2344,13 +2412,17 @@ fn one_figure_and_one_date_may_share_a_clean_clause() {
         assert_eq!(found[0].conf, 1.0, "{text:?}");
     }
     for text in [
-        // Two figures.
+        // Two figures, on one line or two.
         format!("{RAYDAI}{PI} 2567 1,250 {LAN}{BAHT} {KAMRAI} 270 {LAN}{BAHT}"),
+        format!("{RAYDAI}{PI} 2567 1,250 {LAN}{BAHT}\n{KAMRAI} 270 {LAN}{BAHT}"),
         // Two dates.
         format!("{RAYDAI}{PI} 2566 {PI} 2567 1,250 {LAN}{BAHT}"),
-        // One figure, one date and a signal word.
+        format!("{RAYDAI}{PI} 2566\n{PI} 2567 1,250 {LAN}{BAHT}"),
+        // One figure, one date and a signal word, on the same line or another.
         format!("{RAYDAI}ส\u{0E30}สม{PI} 2568 3,450 {LAN}{BAHT}"),
+        format!("{RAYDAI}ส\u{0E30}สม\n{PI} 2568 3,450 {LAN}{BAHT}"),
         format!("{RAYDAI}{PI} 2567 {TID_LOP}{THI}{ROI_LA} 5"),
+        format!("{RAYDAI}{PI} 2567 {TID_LOP}:\n{ROI_LA} 5"),
         // A code beside a date: a run the reader cannot read.
         "FY2025Q1 revenue".to_owned(),
         // A control step 1 deleted, or a glyph the text layer could not name, between a year
@@ -2377,6 +2449,20 @@ fn one_figure_and_one_date_may_share_a_clean_clause() {
     let day = only_date("15. October 2025");
     assert_eq!(day.conf, 0.6);
     assert!(quantities("15. October 2025").is_empty());
+    // The plan's single-figure examples (Task 1) keep their values.
+    assert_eq!(
+        confident(
+            "ร\u{0E32}ย\u{0E44}ด\u{0E49}รวม \u{0E51},\u{0E52}\u{0E55}\u{0E50} ล\u{0E49}\u{0E32}นบ\u{0E32}ท"
+        ),
+        vec![dec("1250000000")]
+    );
+    for (text, conf) in [
+        (format!("{PI} 2567"), 0.9),
+        ("1 ต\u{0E38}ล\u{0E32}คม 2568".to_owned(), 0.9),
+        (format!("{FISCAL} 2569"), 0.85),
+    ] {
+        assert_eq!(only_date(&text).conf, conf, "{text:?}");
+    }
 }
 
 /// Fix round 2: every signal the founder named, placed where it counts, keeps the reading near
@@ -2457,9 +2543,9 @@ const KORN: &str = "ก\u{0E48}อน"; // ก่อน
 const BORISAT: &str = "บร\u{0E34}ษ\u{0E31}ท"; // บริษัท
 
 /// The founder's answer (round 2b): ระหว่าง and `between` cap a reading only when a range or
-/// list connector follows it before the next clause; alone they mean "during" or "among", and
-/// the reading stays plain. Under the clean-clause rule (fix round 3) the connector itself caps
-/// every reading of its clause, and a line break ends the clause.
+/// list connector follows it; alone they mean "during" or "among", and the reading stays plain.
+/// Under the clean-paragraph rule (fix round 4) the connector itself caps every reading of its
+/// text, on the same line or the next.
 #[test]
 fn between_caps_a_reading_only_with_a_connector_after_it() {
     let capped = |text: &str| {
@@ -2474,19 +2560,15 @@ fn between_caps_a_reading_only_with_a_connector_after_it() {
         "between 2024 and 2025".to_owned(),
         format!("{RAYDAI}{RAWANG} 1,250 {LAN}{BAHT} {KAP}{PI}{KORN}"),
         "between 1,250 and the target".to_owned(),
+        format!("{RAWANG}{PI} 2568\n{RAYDAI}{LAE}{KAMRAI}{BORISAT}"),
     ] {
         assert!(capped(&text), "{text:?}: {:?}", numbers(&text));
     }
-    // Alone, or with the connector in the next clause, they cap nothing.
-    for text in [
-        format!("{RAWANG}{PI} 2568"),
-        format!("{RAWANG}{PI} 2568\n{RAYDAI}{LAE}{KAMRAI}{BORISAT}"),
-    ] {
-        assert_eq!(only_date(&text).conf, 0.9, "{text:?}");
-    }
+    // Alone they cap nothing.
+    assert_eq!(only_date(&format!("{RAWANG}{PI} 2568")).conf, 0.9);
     assert_eq!(confident("during 2568"), vec![dec("2568")]);
     assert_eq!(confident(&format!("between 3 {BORISAT}")), vec![dec("3")]);
-    // A connector anywhere in the clause caps, with or without a reading after it (fix round 3).
+    // A connector anywhere in the text caps, with or without a reading after it (fix round 3).
     assert!(confident(&format!("{RAYDAI} 1,250 {LAN}{BAHT} {KAP}{PI}{KORN}")).is_empty());
 }
 
@@ -2500,7 +2582,7 @@ fn only_date(text: &str) -> Found<katwork_thai::DateValue> {
 /// rate words, qualifiers and open ends; signs written as เป็นลบ, `negative` or after the figure;
 /// dashes, arrows and controls between figures; part-year words; lists of years with spaces;
 /// mixed numbers; fraction words; period codes glued to a year; compounds) reads every quantity
-/// and every date below 0.8, under the clean-clause rule.
+/// and every date below 0.8, under the clean-paragraph rule.
 const ROUND_TWO_PROBES: [&str; 235] = [
     "ต\u{0E31}\u{0E49}ง\u{0E41}ต\u{0E48}ว\u{0E31}นจ\u{0E31}นทร\u{0E4C}ท\u{0E35}\u{0E48} 1 ต\u{0E38}ล\u{0E32}คม 2568 ถ\u{0E36}งว\u{0E31}นศ\u{0E38}กร\u{0E4C}ท\u{0E35}\u{0E48} 5 ต\u{0E38}ล\u{0E32}คม 2568",
     "ร\u{0E30}หว\u{0E48}\u{0E32}งว\u{0E31}นจ\u{0E31}นทร\u{0E4C}ท\u{0E35}\u{0E48} 6 ถ\u{0E36}งว\u{0E31}นศ\u{0E38}กร\u{0E4C}ท\u{0E35}\u{0E48} 10 ต\u{0E38}ล\u{0E32}คม 2568",
@@ -2762,13 +2844,11 @@ fn every_probe_of_the_round_two_review_reads_below_0_8() {
     }
 }
 
-/// Fix round 3: a clause ends at a line break (Python's set), at `;`, `!`, `?`, ฯ, the danda and
-/// their full-width forms, at a colon before a space, and at a full stop before a space after a
-/// Latin word, `%` or a bracket; so two figures there read alone, each confident. Punctuation
-/// inside a reading, a full stop after a digit, a Thai letter, an initial or an abbreviation, and
-/// a colon between digits end nothing.
+/// Fix round 4 (the founder's paragraph unit): the unit is the whole text a scanner is given.
+/// No line break, sentence punctuation, colon, full stop or ฯ splits it, so two figures in one
+/// text cap each other wherever they stand, and the same two figures in two texts read apart.
 #[test]
-fn clause_boundaries_part_figures_and_nothing_else_does() {
+fn nothing_splits_a_paragraph() {
     let pair = |gap: &str| {
         format!(
             "ยอดข\u{0E32}ย 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท{gap}ก\u{0E33}\u{0E44}ร 270 ล\u{0E49}\u{0E32}นบ\u{0E32}ท"
@@ -2777,6 +2857,8 @@ fn clause_boundaries_part_figures_and_nothing_else_does() {
     for gap in [
         "\n",
         "\r",
+        "\r\n",
+        "\n\n",
         "\u{000B}",
         "\u{000C}",
         "\u{001C}",
@@ -2789,62 +2871,71 @@ fn clause_boundaries_part_figures_and_nothing_else_does() {
         "! ",
         "? ",
         "\u{0E2F} ",
+        "\u{0E5A} ",
         "\u{0964} ",
         "\u{FF1B} ",
         "\u{FF01} ",
         "\u{FF1F} ",
         ": ",
         "\u{FF1A} ",
+        ". ",
+        " \u{001F} ",
+        " / ",
     ] {
-        assert_eq!(
-            confident(&pair(gap)),
-            vec![dec("1250000000"), dec("270000000")],
-            "{gap:?}"
+        let found = quantities(&pair(gap));
+        assert_eq!(found.len(), 2, "{gap:?}: {found:?}");
+        assert!(
+            found.iter().all(|found| found.conf == 0.6),
+            "{gap:?}: {found:?}"
         );
     }
     for text in [
         "Revenue 1,250 million. Profit 270 million.",
         "Growth 5%. Profit 270 million.",
-        "Revenue (FY2025). Profit 270 million.",
+        "Revenue 1,250. Profit 270.",
+        "ABC Co. revenue 1,250 million, profit 270 million",
+        "Revenue 1,250 million at ABC Co. 270 million at XYZ Ltd.",
+        // A line break inside a reading (a figure and its scale on two lines) is that reading's.
+        "\u{0E22}\u{0E2D}\u{0E14}\u{0E02}\u{0E32}\u{0E22} 1,250\n\u{0E25}\u{0E49}\u{0E32}\u{0E19}\u{0E1A}\u{0E32}\u{0E17} \u{0E01}\u{0E33}\u{0E44}\u{0E23} 270 \u{0E25}\u{0E49}\u{0E32}\u{0E19}\u{0E1A}\u{0E32}\u{0E17}",
+        "U.S. revenue 1,250 million and profit 270 million",
+        "Revenue 1,250 million in the U.S. 270 million in Europe",
+        // Month names with no year are dates of the text too.
+        "\u{0E22}\u{0E2D}\u{0E14}\u{0E02}\u{0E32}\u{0E22} \u{0E15}.\u{0E04}. \u{0E1E}.\u{0E22}. \u{0E23}\u{0E27}\u{0E21} 1,250 \u{0E25}\u{0E49}\u{0E32}\u{0E19}\u{0E1A}\u{0E32}\u{0E17}",
+        "ratio 2:1",
+        "ratio 2 : 1",
     ] {
-        assert!(
-            quantities(text).iter().all(|found| found.conf == 1.0),
-            "{text:?}"
-        );
+        assert!(confident(text).is_empty(), "{text:?}: {:?}", numbers(text));
     }
-    for text in [
-        pair(". "),
-        pair(" \u{001F} "),
-        pair(" / "),
-        "Revenue 1,250. Profit 270.".to_owned(),
-        "ABC Co. revenue 1,250 million, profit 270 million".to_owned(),
-        "Revenue 1,250 million at ABC Co. 270 million at XYZ Ltd.".to_owned(),
-        // A line break inside a reading (a figure and its scale on two lines) ends nothing.
-        "\u{0E22}\u{0E2D}\u{0E14}\u{0E02}\u{0E32}\u{0E22} 1,250\n\u{0E25}\u{0E49}\u{0E32}\u{0E19}\u{0E1A}\u{0E32}\u{0E17} \u{0E01}\u{0E33}\u{0E44}\u{0E23} 270 \u{0E25}\u{0E49}\u{0E32}\u{0E19}\u{0E1A}\u{0E32}\u{0E17}".to_owned(),
-        "U.S. revenue 1,250 million and profit 270 million".to_owned(),
-        "Revenue 1,250 million in the U.S. 270 million in Europe".to_owned(),
-        // Month names with no year are dates of the clause too.
-        "\u{0E22}\u{0E2D}\u{0E14}\u{0E02}\u{0E32}\u{0E22} \u{0E15}.\u{0E04}. \u{0E1E}.\u{0E22}. \u{0E23}\u{0E27}\u{0E21} 1,250 \u{0E25}\u{0E49}\u{0E32}\u{0E19}\u{0E1A}\u{0E32}\u{0E17}".to_owned(),
-        "ratio 2:1".to_owned(),
+    // Each figure given alone, as the next block, reads plain.
+    for (text, value) in [
+        (
+            "ยอดข\u{0E32}ย 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+            "1250000000",
+        ),
+        (
+            "ก\u{0E33}\u{0E44}ร 270 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+            "270000000",
+        ),
+        ("Profit 270 million.", "270000000"),
     ] {
-        assert!(
-            confident(&text).is_empty(),
-            "{text:?}: {:?}",
-            numbers(&text)
-        );
+        assert_eq!(confident(text), vec![dec(value)], "{text:?}");
     }
-    // A full stop inside a reading is no boundary: a date and its time share one clean clause
-    // (round 3b).
+    // One date and one figure share a clean text whatever stands between them: a date and its
+    // time (a full stop inside a reading), a fiscal year and its amount after a full stop.
     let minutes = "ว\u{0E31}นท\u{0E35}\u{0E48} 1 ต.ค. 2568 \u{0E40}วล\u{0E32} 13.30 น.";
     assert_eq!(find_dates(minutes, &ctx()).unwrap()[0].conf, 0.9);
+    let fiscal = "Revenue (FY2025). Profit 270 million.";
+    assert_eq!(confident(fiscal), vec![dec("270000000")]);
+    assert_eq!(only_date(fiscal).conf, 0.85);
     // A meeting number beside the date and its time makes two figures.
     let numbered = "คร\u{0E31}\u{0E49}งท\u{0E35}\u{0E48} 5 ว\u{0E31}นท\u{0E35}\u{0E48} 1 ต.ค. 2568 \u{0E40}วล\u{0E32} 13.30 น.";
     assert_eq!(find_dates(numbered, &ctx()).unwrap()[0].conf, 0.6);
 }
 
-/// Fix round 3: numbering that opens its clause (`1.`, `2)`, `(3)`), a bullet dash before a
-/// word, and the weekday written with its date are part of the layout or of the date: the plain
-/// reading beside them keeps its value. A day before a month name is no list marker.
+/// Fix rounds 3 and 4: numbering that opens its line (`1.`, `2)`, `(3)`), a bullet dash before a
+/// word or a date, and the weekday written with its date are part of the layout or of the date:
+/// the plain reading beside them keeps its value, and the weekday caps no amount beside its date.
+/// A day before a month name is no list marker.
 #[test]
 fn numbering_bullets_and_weekdays_cap_nothing() {
     for text in [
@@ -2854,6 +2945,8 @@ fn numbering_bullets_and_weekdays_cap_nothing() {
         "- ร\u{0E32}ย\u{0E44}ด\u{0E49}รวม 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
         "\u{2022} ร\u{0E32}ย\u{0E44}ด\u{0E49}รวม 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
         "year-on-year growth 1,250 million",
+        // Numbering that opens the second line of a text.
+        "ร\u{0E32}ย\u{0E44}ด\u{0E49}รวม\n1. 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
     ] {
         assert!(
             quantities(text)
@@ -2872,8 +2965,22 @@ fn numbering_bullets_and_weekdays_cap_nothing() {
         "1 ต\u{0E38}ล\u{0E32}คม 2568 (ว\u{0E31}นพ\u{0E38}ธ)",
         "1 ต\u{0E38}ล\u{0E32}คม 2568 (พ\u{0E38}ธ)",
         "1 October 2025 (Wednesday)",
+        "Wed. 1 October 2025",
+        "Sat. 4 Oct 2025",
+        // A dash that opens a line before a date is a bullet, not a minus.
+        "- 1 ต.ค. 2568 ส\u{0E48}งร\u{0E32}ยง\u{0E32}น",
+        "\u{0E41}ผนง\u{0E32}น\n- 15 ต.ค. 2568",
     ] {
         assert_eq!(only_date(text).conf, 0.9, "{text:?}");
+    }
+    // The weekday is part of its date, so the one amount beside them keeps its value (round 4).
+    for text in [
+        "ปร\u{0E30}ช\u{0E38}มว\u{0E31}นพ\u{0E38}ธท\u{0E35}\u{0E48} 1 ต\u{0E38}ล\u{0E32}คม 2568 อน\u{0E38}ม\u{0E31}ต\u{0E34}งบปร\u{0E30}ม\u{0E32}ณ 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+        "ปร\u{0E30}ช\u{0E38}มว\u{0E31}นศ\u{0E38}กร\u{0E4C}ท\u{0E35}\u{0E48} 3 ต\u{0E38}ล\u{0E32}คม 2568 อน\u{0E38}ม\u{0E31}ต\u{0E34}งบปร\u{0E30}ม\u{0E32}ณ 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+        "Monday 6 October 2025 budget 1,250 million",
+    ] {
+        assert_eq!(only_date(text).conf, 0.9, "{text:?}");
+        assert_eq!(confident(text), vec![dec("1250000000")], "{text:?}");
     }
     // A weekday that is not the date's caps it, as any period word does.
     assert_eq!(only_date("ท\u{0E38}กว\u{0E31}นจ\u{0E31}นทร\u{0E4C} ปร\u{0E30}ช\u{0E38}ม 1 ต\u{0E38}ล\u{0E32}คม 2568").conf, 0.6);
@@ -2969,7 +3076,7 @@ fn compounds_join_only_thai_amounts_and_read_below_0_8() {
             values.iter().map(|value| dec(value)).collect::<Vec<_>>(),
             "{text:?}"
         );
-        // Two figures, one clause, and no range or list signal between them: no lent scale.
+        // Two figures, one text, and no range or list signal between them: no lent scale.
         assert!(
             found
                 .iter()
@@ -3085,8 +3192,8 @@ fn usd_or_thb(text: &str) -> Option<Unit> {
     }))
 }
 
-/// Fix round 3: a capped date carries the dates next to it in its clause as its other
-/// readings; a date capped by a signal alone carries none.
+/// Fix round 3: a capped date carries the dates next to it in its text as its other readings;
+/// a date capped by a signal alone carries none.
 #[test]
 fn a_capped_date_carries_its_neighbours() {
     let found = find_dates("1 ต.ค. 2568 \u{21D2} 31 ธ.ค. 2568", &ctx()).unwrap();
@@ -3096,4 +3203,617 @@ fn a_capped_date_carries_its_neighbours() {
     assert_eq!(found[1].alts[0].0, found[0].value);
     let alone = only_date("FY2026 Q2 revenue");
     assert_eq!((alone.conf, alone.alts.len()), (0.6, 0));
+}
+
+/// Fix round 4: every probe of the final review's confirmed findings (a line break, a colon, a
+/// full stop or ฯ between a signal and its reading; a unit word or a weekday before a wrapped
+/// figure or date; the next line's currency; period-basis and earlier-period words; open ranges
+/// and date comparators; a `+` after a figure; letters glued to a year) reads every quantity and
+/// every date below 0.8 under the clean-paragraph rule.
+const FINAL_REVIEW_PROBES: [&str; 179] = [
+    "ท\u{0E35}\u{0E48}ปร\u{0E30}ช\u{0E38}มอน\u{0E38}ม\u{0E31}ต\u{0E34}งบปร\u{0E30}ม\u{0E32}ณ 10 ถ\u{0E36}ง\n15 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ยอดข\u{0E32}ย 10 -\n15 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ร\u{0E32}ค\u{0E32}ห\u{0E38}\u{0E49}นอย\u{0E39}\u{0E48}\u{0E43}นช\u{0E48}วง 10 -\n15 บ\u{0E32}ท",
+    "ยอดข\u{0E32}ย 10\nถ\u{0E36}ง 15 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ยอดข\u{0E32}ย 10 ถ\u{0E36}ง\u{000C}15 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ยอดข\u{0E32}ย 10 ถ\u{0E36}ง\u{2028}15 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "The company expects growth of 5 to\n7 percent in FY2026",
+    "The company expects growth of 5%\nto 7% in FY2026",
+    "บร\u{0E34}ษ\u{0E31}ทค\u{0E32}ดว\u{0E48}\u{0E32}ร\u{0E32}ย\u{0E44}ด\u{0E49}ป\u{0E35} 2569 จ\u{0E30}\u{0E40}ต\u{0E34}บ\u{0E42}ตร\u{0E49}อยล\u{0E30} 5 -\n7",
+    "อ\u{0E31}ตร\u{0E32}\u{0E40}ง\u{0E34}น\u{0E40}ฟ\u{0E49}อท\u{0E31}\u{0E48}ว\u{0E44}ปต\u{0E34}ดลบ\nท\u{0E35}\u{0E48}ร\u{0E49}อยล\u{0E30} 0.3",
+    "อ\u{0E31}ตร\u{0E32}\u{0E40}ง\u{0E34}น\u{0E40}ฟ\u{0E49}อท\u{0E31}\u{0E48}ว\u{0E44}ปต\u{0E34}ดลบท\u{0E35}\u{0E48}\nร\u{0E49}อยล\u{0E30} 0.3",
+    "ก\u{0E33}\u{0E44}รส\u{0E38}ทธ\u{0E34}\u{0E40}ป\u{0E47}นลบ\n5 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "Inflation was negative\n0.3% in October",
+    "ร\u{0E32}ย\u{0E44}ด\u{0E49} 6 \u{0E40}ด\u{0E37}อน\u{0E41}รก\nป\u{0E35} 2568 จ\u{0E33}นวน 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ร\u{0E32}ย\u{0E44}ด\u{0E49}คร\u{0E36}\u{0E48}งป\u{0E35}\u{0E41}รกของ\nป\u{0E35} 2568 จ\u{0E33}นวน 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ผลก\u{0E32}รด\u{0E33}\u{0E40}น\u{0E34}นง\u{0E32}น 9 \u{0E40}ด\u{0E37}อน\nป\u{0E35} 2568 ร\u{0E32}ย\u{0E44}ด\u{0E49} 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ป\u{0E35} 2568 ผลตอบ\u{0E41}ทนร\u{0E49}อยล\u{0E30}\n5 ต\u{0E34}ดลบ",
+    "ผลตอบ\u{0E41}ทนร\u{0E49}อยล\u{0E30}\n5 ต\u{0E34}ดลบ",
+    "อ\u{0E31}ตร\u{0E32}\u{0E40}ง\u{0E34}น\u{0E40}ฟ\u{0E49}อร\u{0E49}อยล\u{0E30}\n0.3 (ต\u{0E34}ดลบ)",
+    "อ\u{0E31}ตร\u{0E32}ดอก\u{0E40}บ\u{0E35}\u{0E49}ยร\u{0E49}อยล\u{0E30}\n5 ต\u{0E31}\u{0E49}ง\u{0E41}ต\u{0E48}ป\u{0E35}หน\u{0E49}\u{0E32}\u{0E40}ป\u{0E47}นต\u{0E49}น\u{0E44}ป",
+    "ร\u{0E32}ค\u{0E32} USD\n5 million or more",
+    "ปร\u{0E30}ช\u{0E38}ม 1 ต.ค. 2568 ว\u{0E31}นพ\u{0E38}ธท\u{0E35}\u{0E48}\n8 ต\u{0E38}ล\u{0E32}คม 2568 \u{0E40}ป\u{0E47}นต\u{0E49}น\u{0E44}ป",
+    "ปร\u{0E30}ช\u{0E38}มว\u{0E31}นพ\u{0E38}ธท\u{0E35}\u{0E48}\n1 ต\u{0E38}ล\u{0E32}คม 2568 \u{0E40}ป\u{0E47}นต\u{0E49}น\u{0E44}ป",
+    "Wednesday\n1 October 2025 onwards",
+    "ว\u{0E31}นพ\u{0E38}ธท\u{0E35}\u{0E48}\n1 ต\u{0E38}ล\u{0E32}คม 2568 ร\u{0E32}ค\u{0E32} 1,250 บ\u{0E32}ท ต\u{0E34}ดลบ",
+    "จ\u{0E32}ก 2 ป\u{0E35} ร\u{0E49}อยล\u{0E30}\n5",
+    "ผลตอบ\u{0E41}ทนต\u{0E34}ดลบของกองท\u{0E38}น\u{0E2F} 5%",
+    "ผลก\u{0E32}รด\u{0E33}\u{0E40}น\u{0E34}นง\u{0E32}น 9 \u{0E40}ด\u{0E37}อนของบร\u{0E34}ษ\u{0E31}ท\u{0E2F} ป\u{0E35} 2568 ม\u{0E35}ร\u{0E32}ย\u{0E44}ด\u{0E49} 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "\u{0E43}น\u{0E44}ตรม\u{0E32}ส 3 บร\u{0E34}ษ\u{0E31}ท\u{0E2F} ม\u{0E35}ร\u{0E32}ย\u{0E44}ด\u{0E49}รวม 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ยอดข\u{0E32}ยส\u{0E30}สมของบร\u{0E34}ษ\u{0E31}ท\u{0E2F} ป\u{0E35} 2568 จ\u{0E33}นวน 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "\u{0E44}ตรม\u{0E32}สท\u{0E35}\u{0E48} 3 ของบร\u{0E34}ษ\u{0E31}ท\u{0E2F} ป\u{0E35} 2568 ร\u{0E32}ย\u{0E44}ด\u{0E49} 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ยอดข\u{0E32}ย 10 ล\u{0E49}\u{0E32}นบ\u{0E32}ท\u{0E43}นกร\u{0E38}ง\u{0E40}ทพ\u{0E2F} \u{0E41}ล\u{0E30} 15 ล\u{0E49}\u{0E32}นบ\u{0E32}ท\u{0E43}นต\u{0E48}\u{0E32}งจ\u{0E31}งหว\u{0E31}ด",
+    "ส\u{0E33}หร\u{0E31}บงวด 9 \u{0E40}ด\u{0E37}อนส\u{0E34}\u{0E49}นส\u{0E38}ดว\u{0E31}นท\u{0E35}\u{0E48} 30 ก\u{0E31}นย\u{0E32}ยน 2568 บร\u{0E34}ษ\u{0E31}ท\u{0E2F} ม\u{0E35}ร\u{0E32}ย\u{0E44}ด\u{0E49}รวม 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ผลก\u{0E32}รด\u{0E33}\u{0E40}น\u{0E34}นง\u{0E32}น 9 \u{0E40}ด\u{0E37}อน\u{0E41}รกของบร\u{0E34}ษ\u{0E31}ท\u{0E2F} \u{0E43}นป\u{0E35} 2568 ม\u{0E35}ร\u{0E32}ย\u{0E44}ด\u{0E49}รวม 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ผลปร\u{0E30}กอบก\u{0E32}ร\u{0E44}ตรม\u{0E32}ส 3 ของบร\u{0E34}ษ\u{0E31}ท\u{0E2F} \u{0E43}นป\u{0E35} 2568 ม\u{0E35}ก\u{0E33}\u{0E44}รส\u{0E38}ทธ\u{0E34} 270 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ยอดข\u{0E32}ยส\u{0E30}สมของกล\u{0E38}\u{0E48}มบร\u{0E34}ษ\u{0E31}ท\u{0E2F} \u{0E43}นป\u{0E35} 2568 อย\u{0E39}\u{0E48}ท\u{0E35}\u{0E48} 3,750 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ร\u{0E32}ค\u{0E32} 10 ล\u{0E49}\u{0E32}นบ\u{0E32}ท ส\u{0E33}หร\u{0E31}บ\u{0E42}ครงก\u{0E32}ร\u{0E2F} ถ\u{0E36}ง 15 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "อ\u{0E31}ตร\u{0E32}ก\u{0E32}ร\u{0E40}ต\u{0E34}บ\u{0E42}ต (ต\u{0E34}ดลบ): 5%",
+    "\u{0E44}ตรม\u{0E32}ส 3: ป\u{0E35} 2568 ร\u{0E32}ย\u{0E44}ด\u{0E49} 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ร\u{0E32}ย\u{0E44}ด\u{0E49}ส\u{0E30}สมถ\u{0E36}งส\u{0E34}\u{0E49}น\u{0E40}ด\u{0E37}อน: ป\u{0E35} 2568 จ\u{0E33}นวน 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ยอดข\u{0E32}ยส\u{0E30}สม: ป\u{0E35} 2568 จ\u{0E33}นวน 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ต\u{0E31}\u{0E49}ง\u{0E41}ต\u{0E48}ว\u{0E31}นท\u{0E35}\u{0E48}: 1 ต\u{0E38}ล\u{0E32}คม 2568 ถ\u{0E36}งว\u{0E31}นท\u{0E35}\u{0E48}: 31 ธ\u{0E31}นว\u{0E32}คม 2568",
+    "From: 1 October 2025 To: 31 December 2025",
+    "From: 1 October 2025\nTo: 31 December 2025",
+    "ถ\u{0E36}งว\u{0E31}นท\u{0E35}\u{0E48}: 31 ธ\u{0E31}นว\u{0E32}คม 2568",
+    "YTD: revenue 3,450 million in FY2025",
+    "9M: FY2025 revenue 3,450 million",
+    "อ\u{0E31}ตร\u{0E32}ส\u{0E48}วน 2 : 1",
+    "อ\u{0E31}ตร\u{0E32}ส\u{0E48}วนหน\u{0E35}\u{0E49}ส\u{0E34}นต\u{0E48}อท\u{0E38}น 1.5 : 1",
+    "มต\u{0E34}ท\u{0E35}\u{0E48}ปร\u{0E30}ช\u{0E38}ม 7 : 2 \u{0E40}ส\u{0E35}ยง",
+    "YTD: 3,450",
+    "Revenue YTD: 3,450 million",
+    "ส\u{0E30}สม: 3,450 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "คร\u{0E36}\u{0E48}งป\u{0E35}\u{0E41}รก: ร\u{0E32}ย\u{0E44}ด\u{0E49} 5 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "Q3: 5 million",
+    "9M: 3,450",
+    "from 1 October 2025: revenue 5 million",
+    "net profit (negative): 5.2 million",
+    "ก\u{0E33}\u{0E44}รส\u{0E38}ทธ\u{0E34} (ต\u{0E34}ดลบ): 5.2 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "อ\u{0E31}ตร\u{0E32}ก\u{0E32}ร\u{0E40}ต\u{0E34}บ\u{0E42}ต (ต\u{0E34}ดลบ): ร\u{0E49}อยล\u{0E30} 5",
+    "Growth (minus): 5%",
+    "Change (minus): 5%",
+    "ร\u{0E32}ย\u{0E44}ด\u{0E49} 10 ล\u{0E49}\u{0E32}นบ\u{0E32}ท ถ\u{0E36}ง\n15 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ร\u{0E32}ย\u{0E44}ด\u{0E49} 10 ล\u{0E49}\u{0E32}นบ\u{0E32}ท\nถ\u{0E36}ง 15 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ร\u{0E32}ย\u{0E44}ด\u{0E49} 10-\n15 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "revenue between USD 10 million and\nUSD 15 million",
+    "revenue between USD 10 million and a maximum of\nUSD 15 million",
+    "revenue between USD 10 million and about\n15 million",
+    "ร\u{0E32}ค\u{0E32} 10 ถ\u{0E36}งปร\u{0E30}ม\u{0E32}ณ\n15 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ยอดข\u{0E32}ย\u{0E40}ด\u{0E37}อนต\u{0E38}ล\u{0E32}คม 2568 พฤศจ\u{0E34}ก\u{0E32}ยน 2568 \u{0E41}ล\u{0E30}\nธ\u{0E31}นว\u{0E32}คม 2568 รวม 3,750 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "คร\u{0E36}\u{0E48}งป\u{0E35}\u{0E41}รก\nป\u{0E35} 2568 ร\u{0E32}ย\u{0E44}ด\u{0E49} 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "งบปร\u{0E30}ม\u{0E32}ณ 3/\n4 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "งวด 6 \u{0E40}ด\u{0E37}อน\u{0E41}รก: ป\u{0E35} 2568 ร\u{0E32}ย\u{0E44}ด\u{0E49} 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ร\u{0E32}ย\u{0E44}ด\u{0E49} (ต\u{0E34}ดลบ): ร\u{0E49}อยล\u{0E30} 5",
+    "ร\u{0E32}ย\u{0E44}ด\u{0E49} 9 \u{0E40}ด\u{0E37}อน\nป\u{0E35} 2568 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "อ\u{0E31}ตร\u{0E32}\u{0E40}ง\u{0E34}น\u{0E40}ฟ\u{0E49}อ\u{0E40}ด\u{0E37}อนต\u{0E38}ล\u{0E32}คม 2568 \u{0E40}ป\u{0E47}นลบ\nร\u{0E49}อยล\u{0E30} 0.76",
+    "ว\u{0E31}นท\u{0E35}\u{0E48} 1 ธ\u{0E31}นว\u{0E32}คม 2568 \u{0E40}วล\u{0E32} 09.00 น.\nถ\u{0E36}งว\u{0E31}นท\u{0E35}\u{0E48} 5 ธ\u{0E31}นว\u{0E32}คม 2568",
+    "ร\u{0E32}ค\u{0E32} หน\u{0E36}\u{0E48}งล\u{0E49}\u{0E32}น\n250,000 บ\u{0E32}ท",
+    "ร\u{0E32}ย\u{0E44}ด\u{0E49} 10\n-15 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "Revenue THB 10 mn. - THB 15 mn.",
+    "Revenue THB 10 mn. to THB 15 mn.",
+    "Revenue USD 1.2 bn. - 1.5 bn.",
+    "weight 2 kg. - 3 kg.",
+    "term 5 yrs. - 10 yrs.",
+    "duration 10 hrs. to 15 hrs.",
+    "ร\u{0E32}ค\u{0E32} 100\nUSD 3,500",
+    "Employees 1,250\nUSD 3.5 million revenue",
+    "จ\u{0E33}นวนผ\u{0E39}\u{0E49}\u{0E40}ข\u{0E49}\u{0E32}ร\u{0E48}วม 100\nTHB 3,500 ค\u{0E48}\u{0E32}ลงท\u{0E30}\u{0E40}บ\u{0E35}ยน",
+    "ค\u{0E48}\u{0E32}\u{0E40}ช\u{0E48}\u{0E32}ร\u{0E32}ย\u{0E40}ด\u{0E37}อน ป\u{0E35} 2568 50,000 บ\u{0E32}ท",
+    "ค\u{0E48}\u{0E32}\u{0E40}ช\u{0E48}\u{0E32}\u{0E40}ด\u{0E37}อนล\u{0E30} 50,000 บ\u{0E32}ท ป\u{0E35} 2568",
+    "ยอดข\u{0E32}ย\u{0E40}ฉล\u{0E35}\u{0E48}ยต\u{0E48}อ\u{0E40}ด\u{0E37}อนป\u{0E35} 2568 100 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ร\u{0E32}ย\u{0E44}ด\u{0E49}ต\u{0E48}อว\u{0E31}นป\u{0E35} 2568 5 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ยอดข\u{0E32}ยท\u{0E38}ก\u{0E40}ด\u{0E37}อน ป\u{0E35} 2568 100 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "Monthly revenue in FY2025 was 100 million",
+    "Quarterly revenue FY2025 1,250 million",
+    "Semi-annual revenue FY2025 1,250 million",
+    "Weekly sales FY2025 25 million",
+    "Daily revenue in FY2025 was 5 million",
+    "The six-month figure for FY2025 is 1,250 million",
+    "Revenue for the nine-month period ended 30 September 2025 was 3,450 million",
+    "ร\u{0E32}ย\u{0E44}ด\u{0E49}ป\u{0E35} 2568 ส\u{0E39}งกว\u{0E48}\u{0E32}ป\u{0E35}ก\u{0E48}อนซ\u{0E36}\u{0E48}งอย\u{0E39}\u{0E48}ท\u{0E35}\u{0E48} 1,100 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ป\u{0E35} 2568 ร\u{0E32}ย\u{0E44}ด\u{0E49}ลดลง\u{0E40}หล\u{0E37}อ 1,100 ล\u{0E49}\u{0E32}นบ\u{0E32}ท ต\u{0E48}\u{0E33}กว\u{0E48}\u{0E32}ป\u{0E35}ท\u{0E35}\u{0E48}ผ\u{0E48}\u{0E32}นม\u{0E32}",
+    "Revenue in FY2025 exceeded the prior year's 1,100 million",
+    "Rent FY2025 THB 50,000 per month",
+    "Rent FY2025 50,000 baht a month",
+    "Rent FY2025 50,000 baht each month",
+    "Rent FY2025 50,000 baht every month",
+    "Rent FY2025 50,000 baht (monthly)",
+    "ค\u{0E48}\u{0E32}\u{0E40}ช\u{0E48}\u{0E32} 50,000 บ\u{0E32}ทต\u{0E48}อ\u{0E40}ด\u{0E37}อน ป\u{0E35} 2568",
+    "nine-month period of FY2025 revenue 1,250",
+    "six-month period FY2025 revenue 1,250",
+    "semi-annual FY2025 revenue 1,250",
+    "quarterly revenue FY2025 1,250",
+    "the second week of October 2025 sales 1,250",
+    "ยอดข\u{0E32}ย\u{0E40}ด\u{0E37}อนล\u{0E30} 100 ล\u{0E49}\u{0E32}นบ\u{0E32}ท ป\u{0E35} 2568",
+    "ยอดข\u{0E32}ยร\u{0E32}ย\u{0E40}ด\u{0E37}อน\u{0E40}ฉล\u{0E35}\u{0E48}ย ป\u{0E35} 2568 100 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "monthly revenue FY2025 1,250",
+    "weekly revenue FY2025 1,250",
+    "fortnightly revenue FY2025 1,250",
+    "revenue a month FY2025 1,250",
+    "ค\u{0E48}\u{0E32}\u{0E40}ช\u{0E48}\u{0E32} 5,000 บ\u{0E32}ทต\u{0E48}อ\u{0E40}ด\u{0E37}อน ป\u{0E35} 2568",
+    "Quarterly dividend FY2025 0.75 baht",
+    "Monthly rent for FY2025 50,000 baht",
+    "Daily sales in FY2025 1.2 million baht",
+    "ยอดข\u{0E32}ยร\u{0E32}ยว\u{0E31}นป\u{0E35} 2568 1.2 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ค\u{0E48}\u{0E32}\u{0E40}ช\u{0E48}\u{0E32}ป\u{0E35} 2568 50,000 บ\u{0E32}ทต\u{0E48}อ\u{0E40}ด\u{0E37}อน",
+    "ค\u{0E48}\u{0E32}\u{0E43}ช\u{0E49}จ\u{0E48}\u{0E32}ยต\u{0E48}อว\u{0E31}น ป\u{0E35} 2568 3,000 บ\u{0E32}ท",
+    "revenue per month FY2025 3,450",
+    "ป\u{0E35} 2560 \u{0E40}ป\u{0E47}นต\u{0E49}นม\u{0E32} บร\u{0E34}ษ\u{0E31}ทม\u{0E35}ก\u{0E33}\u{0E44}รส\u{0E38}ทธ\u{0E34} 270 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ก\u{0E48}อนว\u{0E31}นท\u{0E35}\u{0E48} 1 ต\u{0E38}ล\u{0E32}คม 2568 ร\u{0E32}ค\u{0E32} 1,250 บ\u{0E32}ท",
+    "ภ\u{0E32}ยหล\u{0E31}งว\u{0E31}นท\u{0E35}\u{0E48} 1 ต\u{0E38}ล\u{0E32}คม 2568 ร\u{0E32}ค\u{0E32} 1,250 บ\u{0E32}ท",
+    "หล\u{0E31}งป\u{0E35} 2567 ร\u{0E32}ย\u{0E44}ด\u{0E49} 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ก\u{0E48}อนป\u{0E35} 2567 ร\u{0E32}ย\u{0E44}ด\u{0E49} 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "After 1 October 2025 the price is 1,250 baht",
+    "Before 1 October 2025 the price was 1,250 baht",
+    "ก\u{0E48}อนว\u{0E31}นท\u{0E35}\u{0E48} 1 ต\u{0E38}ล\u{0E32}คม 2568",
+    "after 1 October 2025",
+    "ภ\u{0E32}ยหล\u{0E31}งว\u{0E31}นท\u{0E35}\u{0E48} 1 ต.ค. 2568",
+    "หล\u{0E31}งว\u{0E31}นท\u{0E35}\u{0E48} 1 ต.ค. 2568 ยอดข\u{0E32}ย 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "before 1 October 2025 revenue 1,250",
+    "after FY2024 revenue 1,250",
+    "ร\u{0E32}ค\u{0E32}\u{0E40}ร\u{0E34}\u{0E48}มต\u{0E49}น 1,250 บ\u{0E32}ท",
+    "ก\u{0E48}อนว\u{0E31}นท\u{0E35}\u{0E48} 15 ต.ค. 2568",
+    "ภ\u{0E32}ยหล\u{0E31}งป\u{0E35} 2568",
+    "beyond FY2025",
+    "พน\u{0E31}กง\u{0E32}น 1,000+ คน",
+    "THB 1,250+",
+    "500+ employees",
+    "We have 500+ employees",
+    "ม\u{0E35}พน\u{0E31}กง\u{0E32}น 500+ คน",
+    "Revenue of 100+ million baht",
+    "$5+ billion",
+    "10+ years of experience",
+    "100+ countries",
+    "100 million+",
+    "1,250 million+",
+    "$5 billion+",
+    "100 ล\u{0E49}\u{0E32}นบ\u{0E32}ท+",
+    "FY2025YTD revenue 1,250",
+    "FY2025TTM revenue 1,250",
+    "FY2025LTM revenue 1,250",
+    "FY2025E revenue 1,250",
+    "FY2025F revenue 1,250",
+    "ป\u{0E35}งบปร\u{0E30}ม\u{0E32}ณ 2568YTD ร\u{0E32}ย\u{0E44}ด\u{0E49} 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "1 October 2025YTD revenue 1,250",
+    "October 2025YTD revenue 1,250",
+    "B.E. 2568E revenue 1,250",
+    "FY2025x revenue 1,250",
+    "\u{0E40}ง\u{0E34}น\u{0E40}ด\u{0E37}อน 15,000 ถ\u{0E36}ง\n20,000 บ\u{0E32}ท",
+    "\u{0E40}ง\u{0E34}น\u{0E40}ด\u{0E37}อน 15,000\nถ\u{0E36}ง 20,000 บ\u{0E32}ท",
+    "\u{0E40}ง\u{0E34}น\u{0E40}ด\u{0E37}อน 15,000 -\n20,000 บ\u{0E32}ท",
+    "ยอดข\u{0E32}ย 5 ล\u{0E49}\u{0E32}นบ\u{0E32}ท \u{0E41}ล\u{0E30}\n7 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "revenue of 5 million to\n7 million",
+    "net profit was negative\n5.2 million",
+    "net profit was negative\r\n5.2 million",
+    "net profit was negative\u{2028}5.2 million",
+    "ยอดข\u{0E32}ยส\u{0E30}สม\nป\u{0E35} 2568 3,450 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ร\u{0E32}ย\u{0E44}ด\u{0E49} 9 \u{0E40}ด\u{0E37}อน\nป\u{0E35} 2568 3,450 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "the first nine months of\nFY2025",
+];
+
+#[test]
+fn every_probe_of_the_final_review_reads_below_0_8() {
+    for text in FINAL_REVIEW_PROBES {
+        let found = numbers(text);
+        let dates = find_dates(text, &ctx()).unwrap();
+        assert!(
+            !found.is_empty() || !dates.is_empty(),
+            "{text:?} reads nothing"
+        );
+        assert!(
+            found
+                .iter()
+                .filter(|found| found.value.role == NumberRole::Quantity)
+                .all(|found| found.conf < 0.8),
+            "{text:?}: {found:?}"
+        );
+        assert!(
+            dates.iter().all(|found| found.conf < 0.8),
+            "{text:?}: {dates:?}"
+        );
+    }
+}
+
+/// Fix round 4: each word this round adds, with a probe where it is the only signal and a control
+/// without it: the probe reads every quantity and date below 0.8 and the control reads them
+/// confident. A word listed here, not taken from the table, so dropping a row turns this red.
+/// ก่อน, หลัง and the Latin comparators count only before a date or a figure, and `+` only after a
+/// reading, so the ordinary texts after them stay plain.
+const NEW_WORDS: [(&str, &str, &str); 54] = [
+    (
+        "\u{0E40}ป\u{0E47}นต\u{0E49}นม\u{0E32}",
+        "ป\u{0E35} 2560 \u{0E40}ป\u{0E47}นต\u{0E49}นม\u{0E32} ก\u{0E33}\u{0E44}ร 270 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+        "ป\u{0E35} 2560 ก\u{0E33}\u{0E44}ร 270 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    ),
+    (
+        "\u{0E40}ร\u{0E34}\u{0E48}มต\u{0E49}น",
+        "ร\u{0E32}ค\u{0E32}\u{0E40}ร\u{0E34}\u{0E48}มต\u{0E49}น 1,250 บ\u{0E32}ท",
+        "ร\u{0E32}ค\u{0E32} 1,250 บ\u{0E32}ท",
+    ),
+    (
+        "\u{0E40}ร\u{0E34}\u{0E48}มท\u{0E35}\u{0E48}",
+        "ร\u{0E32}ค\u{0E32}\u{0E40}ร\u{0E34}\u{0E48}มท\u{0E35}\u{0E48} 1,250 บ\u{0E32}ท",
+        "ร\u{0E32}ค\u{0E32} 1,250 บ\u{0E32}ท",
+    ),
+    (
+        "ก\u{0E48}อน",
+        "ก\u{0E48}อนว\u{0E31}นท\u{0E35}\u{0E48} 1 ต\u{0E38}ล\u{0E32}คม 2568 ร\u{0E32}ค\u{0E32} 1,250 บ\u{0E32}ท",
+        "ว\u{0E31}นท\u{0E35}\u{0E48} 1 ต\u{0E38}ล\u{0E32}คม 2568 ร\u{0E32}ค\u{0E32} 1,250 บ\u{0E32}ท",
+    ),
+    (
+        "หล\u{0E31}ง",
+        "หล\u{0E31}งป\u{0E35} 2567 ร\u{0E32}ย\u{0E44}ด\u{0E49} 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+        "ป\u{0E35} 2567 ร\u{0E32}ย\u{0E44}ด\u{0E49} 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    ),
+    (
+        "ภ\u{0E32}ยหล\u{0E31}ง",
+        "ภ\u{0E32}ยหล\u{0E31}งว\u{0E31}นท\u{0E35}\u{0E48} 1 ต\u{0E38}ล\u{0E32}คม 2568 ร\u{0E32}ค\u{0E32} 1,250 บ\u{0E32}ท",
+        "ว\u{0E31}นท\u{0E35}\u{0E48} 1 ต\u{0E38}ล\u{0E32}คม 2568 ร\u{0E32}ค\u{0E32} 1,250 บ\u{0E32}ท",
+    ),
+    (
+        "after",
+        "after FY2024 revenue 1,250",
+        "FY2024 revenue 1,250",
+    ),
+    (
+        "before",
+        "before 1 October 2025 revenue 1,250",
+        "1 October 2025 revenue 1,250",
+    ),
+    (
+        "beyond",
+        "beyond FY2025 revenue 1,250",
+        "FY2025 revenue 1,250",
+    ),
+    (
+        "following",
+        "following 1 October 2025 revenue 1,250",
+        "1 October 2025 revenue 1,250",
+    ),
+    (
+        "later than",
+        "later than 1 October 2025 revenue 1,250",
+        "1 October 2025 revenue 1,250",
+    ),
+    (
+        "earlier than",
+        "earlier than 1 October 2025 revenue 1,250",
+        "1 October 2025 revenue 1,250",
+    ),
+    ("+", "500+ employees", "500 employees"),
+    (
+        "ต\u{0E48}อ\u{0E40}ด\u{0E37}อน",
+        "ยอดข\u{0E32}ย\u{0E40}ฉล\u{0E35}\u{0E48}ยต\u{0E48}อ\u{0E40}ด\u{0E37}อนป\u{0E35} 2568 100 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+        "ยอดข\u{0E32}ย\u{0E40}ฉล\u{0E35}\u{0E48}ยป\u{0E35} 2568 100 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    ),
+    (
+        "ร\u{0E32}ย\u{0E40}ด\u{0E37}อน",
+        "ค\u{0E48}\u{0E32}\u{0E40}ช\u{0E48}\u{0E32}ร\u{0E32}ย\u{0E40}ด\u{0E37}อน ป\u{0E35} 2568 50,000 บ\u{0E32}ท",
+        "ค\u{0E48}\u{0E32}\u{0E40}ช\u{0E48}\u{0E32} ป\u{0E35} 2568 50,000 บ\u{0E32}ท",
+    ),
+    (
+        "\u{0E40}ด\u{0E37}อนล\u{0E30}",
+        "ค\u{0E48}\u{0E32}\u{0E40}ช\u{0E48}\u{0E32}\u{0E40}ด\u{0E37}อนล\u{0E30} 50,000 บ\u{0E32}ท ป\u{0E35} 2568",
+        "ค\u{0E48}\u{0E32}\u{0E40}ช\u{0E48}\u{0E32} 50,000 บ\u{0E32}ท ป\u{0E35} 2568",
+    ),
+    (
+        "ท\u{0E38}ก\u{0E40}ด\u{0E37}อน",
+        "ยอดข\u{0E32}ยท\u{0E38}ก\u{0E40}ด\u{0E37}อน ป\u{0E35} 2568 100 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+        "ยอดข\u{0E32}ย ป\u{0E35} 2568 100 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    ),
+    (
+        "ต\u{0E48}อว\u{0E31}น",
+        "ร\u{0E32}ย\u{0E44}ด\u{0E49}ต\u{0E48}อว\u{0E31}นป\u{0E35} 2568 5 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+        "ร\u{0E32}ย\u{0E44}ด\u{0E49}ป\u{0E35} 2568 5 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    ),
+    (
+        "ร\u{0E32}ยว\u{0E31}น",
+        "ยอดข\u{0E32}ยร\u{0E32}ยว\u{0E31}นป\u{0E35} 2568 1.2 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+        "ยอดข\u{0E32}ยป\u{0E35} 2568 1.2 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    ),
+    (
+        "ว\u{0E31}นล\u{0E30}",
+        "ยอดข\u{0E32}ยว\u{0E31}นล\u{0E30} 5 ล\u{0E49}\u{0E32}นบ\u{0E32}ท ป\u{0E35} 2568",
+        "ยอดข\u{0E32}ย 5 ล\u{0E49}\u{0E32}นบ\u{0E32}ท ป\u{0E35} 2568",
+    ),
+    (
+        "ป\u{0E35}ก\u{0E48}อน",
+        "ร\u{0E32}ย\u{0E44}ด\u{0E49}ป\u{0E35} 2568 ส\u{0E39}งกว\u{0E48}\u{0E32}ป\u{0E35}ก\u{0E48}อนซ\u{0E36}\u{0E48}งอย\u{0E39}\u{0E48}ท\u{0E35}\u{0E48} 1,100 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+        "ร\u{0E32}ย\u{0E44}ด\u{0E49}ป\u{0E35} 2568 ซ\u{0E36}\u{0E48}งอย\u{0E39}\u{0E48}ท\u{0E35}\u{0E48} 1,100 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    ),
+    (
+        "ป\u{0E35}ท\u{0E35}\u{0E48}\u{0E41}ล\u{0E49}ว",
+        "ป\u{0E35} 2568 ร\u{0E32}ย\u{0E44}ด\u{0E49}ส\u{0E39}งกว\u{0E48}\u{0E32}ป\u{0E35}ท\u{0E35}\u{0E48}\u{0E41}ล\u{0E49}วซ\u{0E36}\u{0E48}งอย\u{0E39}\u{0E48}ท\u{0E35}\u{0E48} 1,100 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+        "ป\u{0E35} 2568 ร\u{0E32}ย\u{0E44}ด\u{0E49}ซ\u{0E36}\u{0E48}งอย\u{0E39}\u{0E48}ท\u{0E35}\u{0E48} 1,100 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    ),
+    (
+        "ป\u{0E35}ท\u{0E35}\u{0E48}ผ\u{0E48}\u{0E32}นม\u{0E32}",
+        "ป\u{0E35} 2568 ร\u{0E32}ย\u{0E44}ด\u{0E49}ลดลง\u{0E40}หล\u{0E37}อ 1,100 ล\u{0E49}\u{0E32}นบ\u{0E32}ท ต\u{0E48}\u{0E33}กว\u{0E48}\u{0E32}ป\u{0E35}ท\u{0E35}\u{0E48}ผ\u{0E48}\u{0E32}นม\u{0E32}",
+        "ป\u{0E35} 2568 ร\u{0E32}ย\u{0E44}ด\u{0E49}ลดลง\u{0E40}หล\u{0E37}อ 1,100 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    ),
+    (
+        "quarterly",
+        "Quarterly revenue FY2025 1,250 million",
+        "Revenue FY2025 1,250 million",
+    ),
+    (
+        "per quarter",
+        "revenue per quarter FY2025 3,450",
+        "revenue FY2025 3,450",
+    ),
+    (
+        "semi-annual",
+        "Semi-annual revenue FY2025 1,250 million",
+        "Revenue FY2025 1,250 million",
+    ),
+    (
+        "semiannual",
+        "Semiannual revenue FY2025 1,250 million",
+        "Revenue FY2025 1,250 million",
+    ),
+    (
+        "month",
+        "The six-month figure for FY2025 is 1,250 million",
+        "The figure for FY2025 is 1,250 million",
+    ),
+    (
+        "per month",
+        "revenue per month FY2025 3,450",
+        "revenue FY2025 3,450",
+    ),
+    (
+        "a month",
+        "Rent FY2025 50,000 baht a month",
+        "Rent FY2025 50,000 baht",
+    ),
+    (
+        "monthly",
+        "Monthly revenue in FY2025 was 100 million",
+        "Revenue in FY2025 was 100 million",
+    ),
+    (
+        "week",
+        "the second week of October 2025 sales 1,250",
+        "October 2025 sales 1,250",
+    ),
+    (
+        "per week",
+        "revenue per week FY2025 1,250",
+        "revenue FY2025 1,250",
+    ),
+    (
+        "weeks",
+        "two weeks of October 2025 sales 1,250",
+        "October 2025 sales 1,250",
+    ),
+    (
+        "weekly",
+        "Weekly sales FY2025 25 million",
+        "Sales FY2025 25 million",
+    ),
+    (
+        "fortnight",
+        "a fortnight of October 2025 sales 1,250",
+        "October 2025 sales 1,250",
+    ),
+    (
+        "fortnightly",
+        "fortnightly revenue FY2025 1,250",
+        "revenue FY2025 1,250",
+    ),
+    (
+        "daily",
+        "Daily revenue in FY2025 was 5 million",
+        "Revenue in FY2025 was 5 million",
+    ),
+    (
+        "per day",
+        "revenue per day FY2025 1,250",
+        "revenue FY2025 1,250",
+    ),
+    (
+        "ต\u{0E48}อช\u{0E31}\u{0E48}ว\u{0E42}มง",
+        "ค\u{0E48}\u{0E32}\u{0E41}รงต\u{0E48}อช\u{0E31}\u{0E48}ว\u{0E42}มง ป\u{0E35} 2568 500 บ\u{0E32}ท",
+        "ค\u{0E48}\u{0E32}\u{0E41}รง ป\u{0E35} 2568 500 บ\u{0E32}ท",
+    ),
+    (
+        "bimonthly",
+        "bimonthly revenue FY2025 1,250",
+        "revenue FY2025 1,250",
+    ),
+    (
+        "biannual",
+        "biannual revenue FY2025 1,250",
+        "revenue FY2025 1,250",
+    ),
+    (
+        "hourly",
+        "hourly wage FY2025 500 baht",
+        "wage FY2025 500 baht",
+    ),
+    (
+        "annualized",
+        "annualized revenue FY2025 1,250",
+        "revenue FY2025 1,250",
+    ),
+    (
+        "annualised",
+        "annualised revenue FY2025 1,250",
+        "revenue FY2025 1,250",
+    ),
+    (
+        "run-rate",
+        "revenue run-rate FY2025 1,250",
+        "revenue FY2025 1,250",
+    ),
+    (
+        "run rate",
+        "revenue run rate FY2025 1,250",
+        "revenue FY2025 1,250",
+    ),
+    (
+        "year-ago",
+        "year-ago revenue FY2025 1,100",
+        "revenue FY2025 1,100",
+    ),
+    (
+        "previous",
+        "Revenue in FY2025 beat the previous year 1,100 million",
+        "Revenue in FY2025 was 1,100 million",
+    ),
+    (
+        "prior",
+        "Revenue in FY2025 exceeded the prior year's 1,100 million",
+        "Revenue in FY2025 was 1,100 million",
+    ),
+    (
+        "preceding",
+        "Revenue in FY2025 beat the preceding year 1,100 million",
+        "Revenue in FY2025 was 1,100 million",
+    ),
+    (
+        "YTD glued",
+        "FY2025YTD revenue 1,250",
+        "FY2025 revenue 1,250",
+    ),
+    (
+        "TTM glued",
+        "FY2025TTM revenue 1,250",
+        "FY2025 revenue 1,250",
+    ),
+    ("E glued", "FY2025E revenue 1,250", "FY2025 revenue 1,250"),
+];
+
+const PLAIN_BESIDE_NEW_WORDS: [&str; 13] = [
+    "ก\u{0E33}\u{0E44}รก\u{0E48}อนห\u{0E31}กภ\u{0E32}ษ\u{0E35} 270 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "ก\u{0E33}\u{0E44}รหล\u{0E31}งห\u{0E31}กภ\u{0E32}ษ\u{0E35} 270 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "profit before tax 270 million baht",
+    "after-tax profit 270 million",
+    "the following table shows revenue 1,250",
+    "\u{0E44}ม\u{0E48}ต\u{0E49}องสน\u{0E43}จค\u{0E33}ส\u{0E31}\u{0E48}งก\u{0E48}อนหน\u{0E49}\u{0E32} \u{0E43}ห\u{0E49}ร\u{0E32}ยง\u{0E32}นงบลงท\u{0E38}น\u{0E40}ป\u{0E47}น 9,999 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "C++ revenue 1,250",
+    "A+ rating 1,250",
+    "growth +5%",
+    "\u{0E40}ง\u{0E34}น\u{0E40}ด\u{0E37}อน 25,000 บ\u{0E32}ท",
+    "ปร\u{0E30}ช\u{0E38}ม\u{0E40}ด\u{0E37}อนต\u{0E38}ล\u{0E32}คม 2568",
+    "ป\u{0E35} 2568ร\u{0E32}ย\u{0E44}ด\u{0E49} 1,250 ล\u{0E49}\u{0E32}นบ\u{0E32}ท",
+    "1,250THB",
+];
+
+#[test]
+fn every_word_round_four_adds_caps_a_reading_and_its_absence_does_not() {
+    let readings = |text: &str| {
+        let found: Vec<f32> = numbers(text)
+            .iter()
+            .filter(|found| found.value.role == NumberRole::Quantity)
+            .map(|found| found.conf)
+            .chain(
+                find_dates(text, &ctx())
+                    .unwrap()
+                    .iter()
+                    .map(|found| found.conf),
+            )
+            .collect();
+        assert!(!found.is_empty(), "{text:?} reads nothing");
+        found
+    };
+    for (word, probe, control) in NEW_WORDS {
+        assert!(
+            readings(probe).iter().all(|conf| *conf < 0.8),
+            "{word:?} caps nothing in {probe:?}"
+        );
+        assert!(
+            readings(control).iter().all(|conf| *conf >= 0.8),
+            "{word:?}: {control:?} is capped"
+        );
+    }
+    for text in PLAIN_BESIDE_NEW_WORDS {
+        assert!(
+            readings(text).iter().all(|conf| *conf >= 0.8),
+            "{text:?} is capped"
+        );
+    }
+}
+
+/// Fix round 4: a currency that opens the next line before a figure is that figure's, never the
+/// figure's that ends the line before (`ราคา 100` and `USD 3,500` on two lines); with no figure
+/// after it, it stays the figure's before it.
+#[test]
+fn a_currency_that_opens_the_next_line_is_its_figures() {
+    let usd = Some(Unit::Currency("USD"));
+    let thb = Some(Unit::Currency("THB"));
+    for (text, units) in [
+        (format!("{RAKHA} 100\nUSD 3,500"), vec![None, usd.clone()]),
+        (format!("{RAKHA} 100\r\nUSD 3,500"), vec![None, usd.clone()]),
+        (
+            "Employees 1,250\nUSD 3.5 million revenue".to_owned(),
+            vec![None, usd.clone()],
+        ),
+        (
+            "จ\u{0E33}นวนผ\u{0E39}\u{0E49}\u{0E40}ข\u{0E49}\u{0E32}ร\u{0E48}วม 100\nTHB 3,500"
+                .to_owned(),
+            vec![None, thb.clone()],
+        ),
+        (format!("{RAKHA} 100\n$ 3,500"), vec![None, usd.clone()]),
+        (
+            format!("{RAKHA} 100\n\u{0E3F} 3,500"),
+            vec![None, thb.clone()],
+        ),
+        // On one line, a currency between two figures is still the first one's.
+        (
+            format!("{RAKHA} 100 USD 3,500 {BAHT}"),
+            vec![usd.clone(), thb.clone()],
+        ),
+        (
+            "1,250 THB\n35 USD".to_owned(),
+            vec![thb.clone(), usd.clone()],
+        ),
+        (format!("{RAKHA} 100\nUSD"), vec![usd.clone()]),
+    ] {
+        let found = quantities(&text);
+        assert_eq!(
+            found
+                .iter()
+                .map(|found| found.value.unit.clone())
+                .collect::<Vec<_>>(),
+            units,
+            "{text:?}: {found:?}"
+        );
+    }
+}
+
+/// Fix round 4 (a round 3b regression): the amount in words on the line after its figure, the
+/// usual layout of a voucher or a cheque, restates it, so both read 1.0 and nothing panics (this
+/// test runs in the debug build, where an overflow would panic); with another figure in the
+/// text, all three are capped.
+#[test]
+fn amount_in_words_on_the_next_line_restates_its_figure() {
+    let words = format!("({NUENG}{PHAN}{SONG}{ROI}{BAHT}{THUAN})");
+    let lead = "ค\u{0E48}\u{0E32}\u{0E43}ช\u{0E49}จ\u{0E48}\u{0E32}ย";
+    for gap in ["\n", "\r\n", "\u{2028}", "\n\n", "\n  "] {
+        let text = format!("{lead} 1,200 {BAHT}{gap}{words}");
+        let found = quantities(&text);
+        assert_eq!(found.len(), 2, "{gap:?}: {found:?}");
+        assert!(
+            found
+                .iter()
+                .all(|found| found.value.effective() == dec("1200") && found.conf == 1.0),
+            "{gap:?}: {found:?}"
+        );
+        assert!(found[1].flags.contains(Flags::AMOUNT_IN_WORDS), "{gap:?}");
+        assert!(find_dates(&text, &ctx()).unwrap().is_empty());
+    }
+    let million =
+        format!("จ\u{0E33}นวน\u{0E40}ง\u{0E34}น 10,000,000 {BAHT}\n({SIP}{LAN}{BAHT}{THUAN})");
+    assert!(quantities(&million).iter().all(|found| found.conf == 1.0));
+    for tail in [
+        format!(" ค\u{0E48}\u{0E32}ธรรม\u{0E40}น\u{0E35}ยม 500 {BAHT}"),
+        format!(" ภ\u{0E32}ย\u{0E43}น 30 {WAN}"),
+    ] {
+        let text = format!("{lead} 1,200 {BAHT}\n{words}{tail}");
+        let found = quantities(&text);
+        assert_eq!(found.len(), 3, "{text:?}: {found:?}");
+        assert!(found.iter().all(|found| found.conf == 0.6), "{found:?}");
+    }
 }

@@ -1005,7 +1005,7 @@ fn ranges_are_one_low_confidence_reading() {
     assert_eq!(only(&figure).conf, 0.6);
     assert_eq!(quantities(&figure), vec![format!("5 {LAN}")]);
     let growth = format!("{PI} 2567 -25%");
-    // No range: a year and one figure share a clean clause (round 3b).
+    // No range: a year and one figure share a clean text (round 3b).
     assert_eq!(only(&growth).conf, 0.9);
     // ถึง also means "reached": a figure with an amount word after it ends no range, though the
     // ถึง still keeps the year below 0.8.
@@ -1368,8 +1368,8 @@ fn period_words_near_a_year_keep_it_below_0_8() {
             "{text:?}: {found:?}"
         );
     }
-    // Fix round 3: every signal caps every reading of its clause, a sign word a date too, and a
-    // period word a day.
+    // Fix rounds 3 and 4: every signal caps every reading of its text, a sign word a date too,
+    // and a period word a day.
     for text in [
         format!("ผลปร\u{0E30}กอบก\u{0E32}รต\u{0E34}ดลบ\u{0E43}น{PI} 2568"),
         format!("{SONG_RAI}{KHA_CHAI}{QUARTER} 4 {PHAYNAI}{WAN}{THI} 31 ต.ค. 2568"),
@@ -1472,8 +1472,8 @@ fn controls_keep_date_numbers_apart() {
     );
     let year = format!("{PI} 2567\u{001F}1,250 {LAN}{BAHT}");
     assert_eq!(only(&year).value, self::year(2024));
-    // One clause holds the year and one amount, which may share it (the founder's answer, round
-    // 3b); a record separator ends the clause.
+    // One text holds the year and one amount, which may share it (the founder's answer, round
+    // 3b); a record separator splits nothing (round 4).
     assert_eq!(only(&year).conf, 0.9);
     let record = format!("{PI} 2567\u{001E}1,250 {LAN}{BAHT}");
     assert_eq!(only(&record).conf, 0.9);
@@ -1536,7 +1536,7 @@ fn round_one_rule_branches_each_have_a_case() {
     assert_eq!(tonight.len(), 2, "{tonight:?}");
     assert!(tonight.iter().all(|found| found.conf == 0.6));
     let total = only("FY2026 2025 total");
-    // FY2026 and the bare 2025, one date and one figure, share a clean clause (round 3b).
+    // FY2026 and the bare 2025, one date and one figure, share a clean text (round 3b).
     assert_eq!((total.conf, total.alts.len()), (0.85, 0), "{total:?}");
     // A range's left month after its end month is in the year before.
     one_low_reading("ต.ค.-ก.ย. 2568", month(2024, 10), &[month(2025, 9)]);

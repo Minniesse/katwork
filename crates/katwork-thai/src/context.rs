@@ -1,51 +1,43 @@
-//! The clean-clause rule (a founder decision): a figure or a date reads with confidence 0.8 or
-//! more only when its clause holds no second figure, no second date and no signal word from
-//! [`SIGNALS`]. One figure and one date may share a clean clause, an amount with its year (the
-//! founder's answer in round 3b); a code beside a date, a run the reader cannot read, leaves the
-//! clause unclean, and so does a control that step 1 deleted outside every reading. Otherwise the
-//! confidence is capped at [`CONF_CAP`] and the other readings go in `alts`, so a check against
-//! the reading is inconclusive, never a pass. A run the reader cannot read at all stays one
-//! `Code`.
+//! The clean-paragraph rule (a founder decision, fix round 4): a figure or a date reads with
+//! confidence 0.8 or more only when the whole text the scanner is given (a block: a paragraph or
+//! a cell) holds no signal word from [`SIGNALS`] and at most one figure and one date (an amount
+//! with its year, the founder's answer in round 3b). A code beside a date, a run the reader cannot
+//! read, leaves the text unclean, and so does a control that step 1 deleted outside every
+//! reading. Otherwise the confidence is capped at [`CONF_CAP`] and the other readings go in
+//! `alts`, so a check against the reading is inconclusive, never a pass. A run the reader cannot
+//! read at all stays one `Code`.
 //!
-//! A clause runs from one boundary to the next, or to the start or the end of the text. The
-//! boundaries, outside every reading (so not the dots of `ต.ค.` or `1.5`, nor the colon of
-//! `13:30`):
-//! - a line break of the input, as Python's `str.splitlines` has them: U+000A to U+000D, U+001C
-//!   to U+001E, U+0085, U+2028 and U+2029 (`normalize_th` makes each a space);
-//! - `;`, `!`, `?`, `ฯ`, `।`, and the full-width `；`, `！` and `？`;
-//! - `:` or `：` with white space or the end of the text after it, so not the colon of `2:1`;
-//! - `.` or `．` with white space or the end of the text after it, after `%`, a closing bracket,
-//!   a quotation mark, or a Latin word of two letters or more that is no abbreviation in
-//!   [`ABBREVIATIONS`]. Never after a digit (`15. October`, `1. รายได้`), a Thai letter (`ลบ.ม.`,
-//!   a Thai abbreviation) or a single letter (`B.E.`, `e.g.`).
+//! Nothing splits the text: no line break, colon, full stop, ฯ or other punctuation ends the unit.
+//! A caller that wants two readings judged apart gives the scanner two texts.
 //!
-//! [`SIGNALS`] is the one list of signals, matched anywhere in the clause, Latin ones as whole
-//! words. A signal inside a reading's own span (the ไตรมาส of `ไตรมาส 2 ปีงบประมาณ 2569`, the ติดลบ
-//! of `ติดลบ 5%`, the weekday written with its date) belongs to that reading's pattern and does
-//! not cap it.
+//! [`SIGNALS`] is the one list of signals, matched anywhere in the text, Latin ones as whole
+//! words. A signal inside a reading (the comma of `1,250`, the ไตรมาส of `ไตรมาส 2 ปีงบประมาณ
+//! 2569`, the ติดลบ of `ติดลบ 5%`, the weekday written with its date) belongs to that reading's
+//! pattern and caps nothing.
 
 use std::ops::Range;
 
 use crate::found::{dash_or_arrow, has_at, has_before, is_latin_letter, is_numeral, unknown_glyph};
 
-/// The highest confidence of a reading in a clause that is not clean: below 0.8, so it is never
+/// The highest confidence of a reading in a text that is not clean: below 0.8, so it is never
 /// passed.
 pub(crate) const CONF_CAP: f32 = 0.6;
 
 /// The confidence of each other reading beside a capped one.
 pub(crate) const CONF_OTHER: f32 = 0.4;
 
-/// What a signal says about the readings in its clause.
+/// What a signal says about the readings in its text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
-    /// A reading may be one end of a range, open or closed (ถึง, `-`, `since`, เป็นต้นไป).
+    /// A reading may be one end of a range, open or closed (ถึง, `-`, `since`, เป็นต้นไป, `after`
+    /// before a date, `+` after a figure).
     Range,
     /// A reading may be one item of a list (และ, `,`, `or`).
     List,
     /// A reading may be one term of a fraction or a ratio (`/`, ส่วน).
     Fraction,
-    /// A reading may name part of a year, a month or a week, or a figure be for one (ไตรมาส,
-    /// งวด, สะสม, `9M`, `YTD`, a weekday).
+    /// A reading may name part of a year, a month or a week, or a figure be for one or for
+    /// another year (ไตรมาส, งวด, สะสม, รายเดือน, ปีก่อน, `9M`, `YTD`, `monthly`, a weekday).
     Period,
     /// A figure may be negative (ติดลบ, เป็นลบ, `negative`): its negative is another reading.
     Sign,
@@ -61,7 +53,7 @@ pub(crate) enum Pattern {
 }
 
 /// One signal. Latin text counts only as a whole word (no Latin letter or digit on either side);
-/// a few Thai entries count only where [`counts`] says.
+/// a few entries count only where [`counts`] says.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Signal {
     pub(crate) pattern: Pattern,
@@ -85,11 +77,12 @@ const fn class(name: &'static str, class: fn(char) -> bool, kind: Kind) -> Signa
 /// The class of dashes and arrows, whose own rules (`dash_counts`) say where one counts.
 const DASHES: &str = "dash_or_arrow";
 
-/// Every signal the reader knows. A change to the list is a change here and nowhere else, and
-/// `signal_table_is_frozen` names it. ระหว่าง and `between` have no row: on their own they mean
-/// "during" or "among" (the founder's answer in round 2b), and with a connector in their clause
-/// the connector caps.
-pub(crate) const SIGNALS: [Signal; 123] = [
+/// Every signal the reader knows, and `signal_table_is_frozen` names it. ระหว่าง and `between`
+/// have no row: on their own they mean "during" or "among" (the founder's answer in round 2b),
+/// and with a connector in their text the connector caps. dates.rs keeps its own connector
+/// lists for joining two dates into one range reading (follow-up 18); capping uses this table
+/// alone.
+pub(crate) const SIGNALS: [Signal; 169] = [
     // Ranges, closed or open.
     text("\u{0E16}\u{0E36}\u{0E07}", Kind::Range), // ถึง
     text("\u{0E08}\u{0E19}\u{0E16}\u{0E36}\u{0E07}", Kind::Range), // จนถึง
@@ -120,9 +113,23 @@ pub(crate) const SIGNALS: [Signal; 123] = [
         Kind::Range,
     ), // เป็นต้นไป
     text(
+        "\u{0E40}\u{0E1B}\u{0E47}\u{0E19}\u{0E15}\u{0E49}\u{0E19}\u{0E21}\u{0E32}",
+        Kind::Range,
+    ), // เป็นต้นมา
+    text(
         "\u{0E02}\u{0E36}\u{0E49}\u{0E19}\u{0E44}\u{0E1B}",
         Kind::Range,
     ), // ขึ้นไป
+    text(
+        "\u{0E40}\u{0E23}\u{0E34}\u{0E48}\u{0E21}\u{0E15}\u{0E49}\u{0E19}",
+        Kind::Range,
+    ), // เริ่มต้น
+    text(
+        "\u{0E40}\u{0E23}\u{0E34}\u{0E48}\u{0E21}\u{0E17}\u{0E35}\u{0E48}",
+        Kind::Range,
+    ), // เริ่มที่
+    text(BEFORE, Kind::Range),
+    text(AFTER, Kind::Range),
     text("from", Kind::Range),
     text("since", Kind::Range),
     text("starting", Kind::Range),
@@ -137,10 +144,17 @@ pub(crate) const SIGNALS: [Signal; 123] = [
     text("up to and including", Kind::Range),
     text("onward", Kind::Range),
     text("onwards", Kind::Range),
+    text("after", Kind::Range),
+    text("before", Kind::Range),
+    text("beyond", Kind::Range),
+    text("following", Kind::Range),
+    text("later than", Kind::Range),
+    text("earlier than", Kind::Range),
     class(DASHES, dash_or_arrow, Kind::Range),
     class("unknown_glyph", unknown_glyph, Kind::Range), // a glyph the text layer could not name
     text("->", Kind::Range),
     text("=>", Kind::Range),
+    text(PLUS, Kind::Range),
     // Lists.
     text("\u{0E41}\u{0E25}\u{0E30}", Kind::List), // และ
     text("\u{0E2B}\u{0E23}\u{0E37}\u{0E2D}", Kind::List), // หรือ
@@ -158,7 +172,7 @@ pub(crate) const SIGNALS: [Signal; 123] = [
     text("thirds", Kind::Fraction),
     text("fourths", Kind::Fraction),
     text("quarters", Kind::Fraction),
-    // Parts of a year, a month or a week, and figures for one.
+    // Parts of a year, a month or a week, figures for one, and figures for another year.
     text("\u{0E07}\u{0E27}\u{0E14}", Kind::Period), // งวด
     text("\u{0E04}\u{0E23}\u{0E36}\u{0E48}\u{0E07}", Kind::Period), // ครึ่ง
     text(
@@ -175,17 +189,58 @@ pub(crate) const SIGNALS: [Signal; 123] = [
     ), // เดือนสุดท้าย
     text(MONTH, Kind::Period),
     text(
+        "\u{0E15}\u{0E48}\u{0E2D}\u{0E40}\u{0E14}\u{0E37}\u{0E2D}\u{0E19}",
+        Kind::Period,
+    ), // ต่อเดือน
+    text(
+        "\u{0E23}\u{0E32}\u{0E22}\u{0E40}\u{0E14}\u{0E37}\u{0E2D}\u{0E19}",
+        Kind::Period,
+    ), // รายเดือน
+    text(
+        "\u{0E40}\u{0E14}\u{0E37}\u{0E2D}\u{0E19}\u{0E25}\u{0E30}",
+        Kind::Period,
+    ), // เดือนละ
+    text(
+        "\u{0E17}\u{0E38}\u{0E01}\u{0E40}\u{0E14}\u{0E37}\u{0E2D}\u{0E19}",
+        Kind::Period,
+    ), // ทุกเดือน
+    text(
+        "\u{0E15}\u{0E48}\u{0E2D}\u{0E27}\u{0E31}\u{0E19}",
+        Kind::Period,
+    ), // ต่อวัน
+    text(
+        "\u{0E23}\u{0E32}\u{0E22}\u{0E27}\u{0E31}\u{0E19}",
+        Kind::Period,
+    ), // รายวัน
+    text("\u{0E27}\u{0E31}\u{0E19}\u{0E25}\u{0E30}", Kind::Period), // วันละ
+    text(
+        "\u{0E15}\u{0E48}\u{0E2D}\u{0E0A}\u{0E31}\u{0E48}\u{0E27}\u{0E42}\u{0E21}\u{0E07}",
+        Kind::Period,
+    ), // ต่อชั่วโมง
+    text(
         "\u{0E44}\u{0E15}\u{0E23}\u{0E21}\u{0E32}\u{0E2A}",
         Kind::Period,
     ), // ไตรมาส
-    text("\u{0E1B}\u{0E35}\u{0E07}\u{0E1A}", Kind::Period), // ปีงบ
+    text("\u{0E1B}\u{0E35}\u{0E07}\u{0E1A}", Kind::Period),         // ปีงบ
+    text(
+        "\u{0E1B}\u{0E35}\u{0E01}\u{0E48}\u{0E2D}\u{0E19}",
+        Kind::Period,
+    ), // ปีก่อน
+    text(
+        "\u{0E1B}\u{0E35}\u{0E17}\u{0E35}\u{0E48}\u{0E41}\u{0E25}\u{0E49}\u{0E27}",
+        Kind::Period,
+    ), // ปีที่แล้ว
+    text(
+        "\u{0E1B}\u{0E35}\u{0E17}\u{0E35}\u{0E48}\u{0E1C}\u{0E48}\u{0E32}\u{0E19}\u{0E21}\u{0E32}",
+        Kind::Period,
+    ), // ปีที่ผ่านมา
     text(
         "\u{0E2A}\u{0E31}\u{0E1B}\u{0E14}\u{0E32}\u{0E2B}\u{0E4C}",
         Kind::Period,
     ), // สัปดาห์
     text("\u{0E1B}\u{0E31}\u{0E01}\u{0E29}\u{0E4C}", Kind::Period), // ปักษ์
-    text("\u{0E2A}\u{0E30}\u{0E2A}\u{0E21}", Kind::Period), // สะสม
-    text("\u{0E41}\u{0E23}\u{0E01}", Kind::Period),         // แรก
+    text("\u{0E2A}\u{0E30}\u{0E2A}\u{0E21}", Kind::Period),         // สะสม
+    text("\u{0E41}\u{0E23}\u{0E01}", Kind::Period),                 // แรก
     text(
         "\u{0E2A}\u{0E38}\u{0E14}\u{0E17}\u{0E49}\u{0E32}\u{0E22}",
         Kind::Period,
@@ -239,8 +294,27 @@ pub(crate) const SIGNALS: [Signal; 123] = [
     text("9m", Kind::Period),
     text("12m", Kind::Period),
     text("quarter", Kind::Period),
+    text("quarterly", Kind::Period),
     text("half", Kind::Period),
+    text("semi-annual", Kind::Period),
+    text("semiannual", Kind::Period),
+    text("month", Kind::Period),
     text("months", Kind::Period),
+    text("monthly", Kind::Period),
+    text("week", Kind::Period),
+    text("weeks", Kind::Period),
+    text("weekly", Kind::Period),
+    text("fortnight", Kind::Period),
+    text("fortnightly", Kind::Period),
+    text("bimonthly", Kind::Period),
+    text("biannual", Kind::Period),
+    text("daily", Kind::Period),
+    text("per day", Kind::Period),
+    text("hourly", Kind::Period),
+    text("annualized", Kind::Period),
+    text("annualised", Kind::Period),
+    text("run-rate", Kind::Period),
+    text("run rate", Kind::Period),
     text("ytd", Kind::Period),
     text("mtd", Kind::Period),
     text("qtd", Kind::Period),
@@ -253,6 +327,10 @@ pub(crate) const SIGNALS: [Signal; 123] = [
     text("late", Kind::Period),
     text("first", Kind::Period),
     text("last", Kind::Period),
+    text("previous", Kind::Period),
+    text("prior", Kind::Period),
+    text("preceding", Kind::Period),
+    text("year-ago", Kind::Period),
     text("end of", Kind::Period),
     text("beginning of", Kind::Period),
     text("start of", Kind::Period),
@@ -293,6 +371,31 @@ const PI: &str = "\u{0E1B}\u{0E35}"; // ปี
 const MONTH: &str = "\u{0E40}\u{0E14}\u{0E37}\u{0E2D}\u{0E19}"; // เดือน
 const PART: &str = "\u{0E2A}\u{0E48}\u{0E27}\u{0E19}"; // ส่วน
 const LOP: &str = "\u{0E25}\u{0E1A}"; // ลบ
+/// ก่อน (before) and หลัง (after, so ภายหลัง too): signals only before a date or a figure, so
+/// กำไรก่อนหักภาษี (profit before tax) and ก่อนหน้านี้ are none.
+const BEFORE: &str = "\u{0E01}\u{0E48}\u{0E2D}\u{0E19}"; // ก่อน
+const AFTER: &str = "\u{0E2B}\u{0E25}\u{0E31}\u{0E07}"; // หลัง
+/// `+` right after a reading or its unit words: an open end (`500+`, `100 million+`).
+const PLUS: &str = "+";
+
+/// Latin words that make a date or a figure the edge of an open range only right before one
+/// (`after 1 October 2025`, `beyond FY2025`), so `profit before tax` and `the following table`
+/// stay plain.
+const DATED: [&str; 6] = [
+    "after",
+    "before",
+    "beyond",
+    "following",
+    "later than",
+    "earlier than",
+];
+
+/// A filler word that may stand between ก่อน, หลัง or `after` and the date: วันที่, วัน, เดือน.
+const FILLERS: [&str; 3] = [
+    "\u{0E27}\u{0E31}\u{0E19}\u{0E17}\u{0E35}\u{0E48}", // วันที่
+    "\u{0E27}\u{0E31}\u{0E19}",                         // วัน
+    MONTH,
+];
 
 /// Ordinary words that hold ลบ with no sign in it: one letter, then ลบ.
 const ORDINARY_LOP: [&str; 7] = [
@@ -303,14 +406,6 @@ const ORDINARY_LOP: [&str; 7] = [
     "\u{0E1E}\u{0E25}\u{0E1A}",                 // พลบ
     "\u{0E02}\u{0E25}\u{0E1A}",                 // ขลบ
     "\u{0E1C}\u{0E25}\u{0E1A}\u{0E27}\u{0E01}", // ผลบวก
-];
-
-/// Latin words whose `.` ends no clause, as `normalize_th` writes them.
-pub(crate) const ABBREVIATIONS: [&str; 46] = [
-    "al", "approx", "apr", "aug", "bhd", "cf", "co", "corp", "dec", "dept", "dr", "est", "etc",
-    "feb", "fig", "figs", "fri", "govt", "inc", "jan", "jul", "jun", "ltd", "mar", "mon", "mr",
-    "mrs", "ms", "no", "nos", "nov", "oct", "pp", "plc", "pte", "ref", "sat", "sep", "sept", "st",
-    "sun", "thu", "tue", "vol", "vs", "wed",
 ];
 
 /// Thai weekday names and the English ones, full and short: written with a date, part of it.
@@ -343,59 +438,25 @@ const WEEKDAYS_EN: [&str; 14] = [
     "sun",
 ];
 
-/// A line break as Python's `str.splitlines` has it.
-pub(crate) fn line_break(c: char) -> bool {
-    matches!(
-        c,
-        '\n' | '\u{000B}'
-            | '\u{000C}'
-            | '\r'
-            | '\u{001C}'
-            | '\u{001D}'
-            | '\u{001E}'
-            | '\u{0085}'
-            | '\u{2028}'
-            | '\u{2029}'
-    )
-}
-
-/// Punctuation that ends a clause wherever it stands outside a reading.
-fn stop(c: char) -> bool {
-    matches!(
-        c,
-        ';' | '!' | '?' | '\u{0E2F}' | '\u{0964}' | '\u{FF1B}' | '\u{FF01}' | '\u{FF1F}'
-    )
-}
-
-/// The code point at `at` ends its clause (not counting line breaks, which only the input shows).
-fn ends_clause(t: &[char], at: usize) -> bool {
-    let c = t[at];
-    let free_after = t.get(at + 1).is_none_or(|next| next.is_whitespace());
-    match c {
-        _ if stop(c) => true,
-        ':' | '\u{FF1A}' => free_after,
-        '.' | '\u{FF0E}' if free_after => {
-            let Some(before) = at.checked_sub(1).map(|prev| t[prev]) else {
-                return false;
-            };
-            if is_latin_letter(before) {
-                let start = (0..at)
-                    .rev()
-                    .take_while(|i| is_latin_letter(t[*i]))
-                    .last()
-                    .unwrap_or(at);
-                let word: String = t[start..at].iter().collect();
-                let initial = start > 0 && t[start - 1] == '.';
-                at - start >= 2 && !initial && !ABBREVIATIONS.contains(&word.as_str())
-            } else {
-                matches!(
-                    before,
-                    '%' | ')' | ']' | '}' | '"' | '\'' | '\u{201D}' | '\u{2019}'
-                )
-            }
-        }
-        _ => false,
-    }
+/// What the scanners found at each code point of the text: where a signal stands decides
+/// whether it counts.
+pub(crate) struct Marks {
+    /// Inside a reading, or the weekday written with a date: a signal there is part of the
+    /// reading's pattern (the comma of `1,250`, the ถึง of a range read whole, วันพุธ in
+    /// `วันพุธที่ 1 ตุลาคม 2568`).
+    pub(crate) covered: Vec<bool>,
+    /// A date or a month name starts here (one longer than the text).
+    pub(crate) date_start: Vec<bool>,
+    /// A reading, with the unit words that go with it, ends right before here (one longer than
+    /// the text).
+    pub(crate) reading_end: Vec<bool>,
+    /// Where the line of the input that holds each code point starts: a dash that opens a line
+    /// is a bullet or a minus, not a range.
+    pub(crate) line_start: Vec<usize>,
+    /// A signal no row of the table writes: a control or a Hangul filler step 1 deleted outside
+    /// every reading (U+0096 is an en dash read with the wrong code page), and Latin letters
+    /// glued to the end of a date (`FY2025YTD`, `FY2025E`), a period code the reader cannot read.
+    pub(crate) marked: Vec<Option<Kind>>,
 }
 
 /// A number written right before `start`, one space allowed: a figure or a Thai number word.
@@ -408,14 +469,31 @@ fn number_before(t: &[char], start: usize) -> bool {
     end > 0 && (is_numeral(t[end - 1]) || crate::numbers::number_word_ends_at(t, end))
 }
 
+/// A date, a month name or a figure starts right after `end`: one space allowed, and a filler
+/// word (วันที่, วัน, เดือน) with one space after it.
+fn dated(t: &[char], end: usize, date_start: &[bool]) -> bool {
+    let space = |at: usize| if t.get(at) == Some(&' ') { at + 1 } else { at };
+    let at = space(end);
+    let after_filler = FILLERS
+        .iter()
+        .find(|filler| has_at(t, at, filler))
+        .map_or(at, |filler| space(at + filler.chars().count()));
+    [at, after_filler].into_iter().any(|at| {
+        date_start.get(at).copied().unwrap_or(false) || t.get(at).is_some_and(|c| is_numeral(*c))
+    })
+}
+
 /// A text signal at `start..end` counts where it stands: a Latin one as a whole word; ลบ unless a
 /// `.` (ลบ.ม.) or a Thai combining mark (ชลบุรี) follows it or it lies inside an ordinary word
 /// (สลบ, ผลบวก); ต้น, กลาง, ปลาย and สิ้น before ปี or เดือน; เดือน and ส่วน after a number
-/// (`9 เดือน`, `3 ส่วน 4`).
-fn counts(t: &[char], start: usize, end: usize, text: &str) -> bool {
+/// (`9 เดือน`, `3 ส่วน 4`); ก่อน, หลัง, `after`, `before` and the other [`DATED`] words right
+/// before a date or a figure; `+` right after a reading.
+fn counts(t: &[char], start: usize, end: usize, text: &str, marks: &Marks) -> bool {
     if text.starts_with(|c: char| c.is_ascii_alphanumeric()) {
         let word = |c: Option<&char>| c.is_some_and(|c| is_latin_letter(*c) || c.is_ascii_digit());
-        return !word(start.checked_sub(1).and_then(|prev| t.get(prev))) && !word(t.get(end));
+        if word(start.checked_sub(1).and_then(|prev| t.get(prev))) || word(t.get(end)) {
+            return false;
+        }
     }
     match text {
         LOP => {
@@ -426,14 +504,18 @@ fn counts(t: &[char], start: usize, end: usize, text: &str) -> bool {
         }
         START | MIDDLE | LATE | END => has_at(t, end, PI) || has_at(t, end, MONTH),
         MONTH | PART => number_before(t, start),
+        BEFORE | AFTER => dated(t, end, &marks.date_start),
+        _ if DATED.contains(&text) => dated(t, end, &marks.date_start),
+        PLUS => marks.reading_end[start],
         _ => true,
     }
 }
 
 /// A dash or an arrow at `at` counts: not a hyphen between two letters (`year-on-year`), and not
-/// a bullet that opens its clause before a word (`- รายได้รวม`). Opening its clause before a
-/// figure, it may be a minus (`net profit: - 5.2 million`), so it counts as a sign.
-fn dash_counts(t: &[char], at: usize, clause_start: usize) -> Option<Kind> {
+/// a bullet that opens its line or a label's value before a word or a date (`- รายได้รวม`,
+/// `- 15 ต.ค. 2568`). Opening them before a figure, it may be a minus (`net profit: - 5.2
+/// million`), so it counts as a sign.
+fn dash_counts(t: &[char], at: usize, marks: &Marks) -> Option<Kind> {
     let letter = |c: Option<&char>| c.is_some_and(|c| c.is_alphabetic());
     if t[at] == '-'
         && letter(at.checked_sub(1).and_then(|prev| t.get(prev)))
@@ -441,22 +523,25 @@ fn dash_counts(t: &[char], at: usize, clause_start: usize) -> Option<Kind> {
     {
         return None;
     }
-    if t[clause_start..at].iter().all(|c| c.is_whitespace()) {
+    let opens = t[marks.line_start[at]..at]
+        .iter()
+        .all(|c| c.is_whitespace())
+        || t[..at].iter().rev().find(|c| !c.is_whitespace()) == Some(&':');
+    if opens {
         let next = if t.get(at + 1) == Some(&' ') {
             at + 2
         } else {
             at + 1
         };
-        return t
-            .get(next)
-            .is_some_and(|c| is_numeral(*c))
-            .then_some(Kind::Sign);
+        let figure = t.get(next).is_some_and(|c| is_numeral(*c)) && !marks.date_start[next];
+        return figure.then_some(Kind::Sign);
     }
     Some(Kind::Range)
 }
 
 /// `range` of a date with the weekday written with it (`วันพุธที่ 1 ตุลาคม 2568`, `Monday 6
-/// October 2025`, `1 ตุลาคม 2568 (วันพุธ)`): there the weekday is part of the date.
+/// October 2025`, `Wed. 1 October 2025`, `1 ตุลาคม 2568 (วันพุธ)`): there the weekday is part
+/// of the date.
 pub(crate) fn with_weekday(t: &[char], range: &Range<usize>) -> Range<usize> {
     let back = |at: usize| {
         if at > 0 && t[at - 1] == ' ' {
@@ -483,7 +568,7 @@ pub(crate) fn with_weekday(t: &[char], range: &Range<usize>) -> Range<usize> {
             day_start
         };
     } else {
-        let at = if at > 0 && t[at - 1] == ',' {
+        let at = if at > 0 && matches!(t[at - 1], ',' | '.') {
             at - 1
         } else {
             at
@@ -528,21 +613,17 @@ struct Occurrence {
     end: usize,
 }
 
-/// What the signals of a reading's clause say, outside its own span.
+/// What the signals of a reading's text say, outside its own span.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct Signals {
-    /// Some signal stands in the clause: the reading is capped.
+    /// Some signal stands in the text: the reading is capped.
     pub(crate) any: bool,
-    /// A sign signal stands in the clause: a figure's negative is another reading.
+    /// A sign signal stands in the text: a figure's negative is another reading.
     pub(crate) sign: bool,
 }
 
-/// The clauses of a text and the signals in them.
+/// The signals of a text.
 pub(crate) struct Context {
-    /// The clause of each code point.
-    clause: Vec<usize>,
-    /// Where each clause starts.
-    starts: Vec<usize>,
     /// Every signal that counts, in text order, the sign signals among them, and the range and
     /// list signals.
     found: Vec<Occurrence>,
@@ -551,35 +632,33 @@ pub(crate) struct Context {
 }
 
 impl Context {
-    /// `covered` marks the code points inside a reading, where punctuation ends no clause;
-    /// `line_break` the spaces that stand for a line break of the input; `deleted` the code
-    /// points where step 1 deleted a control or a Hangul filler, each a signal.
-    pub(crate) fn new(t: &[char], covered: &[bool], line_break: &[bool], deleted: &[bool]) -> Self {
-        let mut clause = Vec::with_capacity(t.len());
-        let mut starts = vec![0];
-        for at in 0..t.len() {
-            clause.push(starts.len() - 1);
-            if !covered[at] && (line_break[at] || ends_clause(t, at)) {
-                starts.push(at + 1);
-            }
-        }
+    pub(crate) fn new(t: &[char], marks: &Marks) -> Self {
         let mut found = Vec::new();
         let mut signs = Vec::new();
         let mut joins = Vec::new();
+        let mut push = |occurrence: Occurrence, kind: Kind| {
+            found.push(occurrence);
+            match kind {
+                Kind::Sign => signs.push(occurrence),
+                Kind::Range | Kind::List => joins.push(occurrence),
+                Kind::Fraction | Kind::Period => {}
+            }
+        };
         for (at, c) in t.iter().enumerate() {
             crate::found::work(1);
             // Inside a reading a signal is part of its pattern: the comma of `1,250`, the dash of
             // `2567-2569`, the ถึง of a range read whole.
-            if covered[at] {
+            if marks.covered[at] {
                 continue;
             }
-            if deleted[at] {
-                let occurrence = Occurrence {
-                    start: at,
-                    end: at + 1,
-                };
-                found.push(occurrence);
-                joins.push(occurrence);
+            if let Some(kind) = marks.marked[at] {
+                push(
+                    Occurrence {
+                        start: at,
+                        end: at + 1,
+                    },
+                    kind,
+                );
             }
             for signal in &SIGNALS {
                 let (end, kind) = match signal.pattern {
@@ -588,7 +667,7 @@ impl Context {
                             continue;
                         }
                         let end = at + text.chars().count();
-                        if !counts(t, at, end, text) {
+                        if !counts(t, at, end, text, marks) {
                             continue;
                         }
                         (end, signal.kind)
@@ -598,7 +677,7 @@ impl Context {
                             continue;
                         }
                         let kind = if name == DASHES {
-                            let Some(kind) = dash_counts(t, at, starts[clause[at]]) else {
+                            let Some(kind) = dash_counts(t, at, marks) else {
                                 continue;
                             };
                             kind
@@ -608,40 +687,14 @@ impl Context {
                         (at + 1, kind)
                     }
                 };
-                let occurrence = Occurrence { start: at, end };
-                found.push(occurrence);
-                match kind {
-                    Kind::Sign => signs.push(occurrence),
-                    Kind::Range | Kind::List => joins.push(occurrence),
-                    Kind::Fraction | Kind::Period => {}
-                }
+                push(Occurrence { start: at, end }, kind);
             }
         }
         Context {
-            clause,
-            starts,
             found,
             signs,
             joins,
         }
-    }
-
-    /// How many clauses the text has.
-    pub(crate) fn clauses(&self) -> usize {
-        self.starts.len()
-    }
-
-    /// The clause the code point at `at` lies in.
-    pub(crate) fn clause_of(&self, at: usize) -> usize {
-        self.clause
-            .get(at)
-            .copied()
-            .unwrap_or(self.starts.len() - 1)
-    }
-
-    /// Where clause `clause` starts.
-    pub(crate) fn clause_start(&self, clause: usize) -> usize {
-        self.starts[clause]
     }
 
     /// A range or list signal stands between `from` and `to`: the two readings there may be the
@@ -654,26 +707,18 @@ impl Context {
             .any(|found| found.end <= to)
     }
 
-    /// The signals in the clause of a reading whose own span is `own`, outside it.
+    /// The signals in the text of a reading whose own span is `own`, outside it.
     pub(crate) fn signals(&self, own: &Range<usize>) -> Signals {
-        let clause = self.clause_of(own.start);
-        let from = self.starts[clause];
-        let to = self.starts.get(clause + 1).copied().unwrap_or(usize::MAX);
         let outside = |list: &[Occurrence]| {
-            let lo = list.partition_point(|found| found.start < from);
-            let hi = list.partition_point(|found| found.start < to);
-            let first = list
-                .partition_point(|found| found.start < own.start)
-                .max(lo);
+            let first = list.partition_point(|found| found.start < own.start);
             let last = list
                 .partition_point(|found| found.start < own.end)
-                .min(hi)
                 .max(first);
             let inside = list[first..last]
                 .iter()
                 .filter(|found| found.end <= own.end)
                 .count();
-            hi - lo > inside
+            list.len() > inside
         };
         Signals {
             any: outside(&self.found),
@@ -705,16 +750,18 @@ mod tests {
             .iter()
             .chain(WEEKDAYS_TH.iter())
             .chain(WEEKDAYS_EN.iter())
-            .chain(ABBREVIATIONS.iter())
+            .chain(DATED.iter())
+            .chain(FILLERS.iter())
         {
             assert_eq!(crate::normalize_th(word).text, *word, "{word:?}");
         }
     }
 
-    /// Every entry of the table, in a clause with one figure (or one year, for a period word),
-    /// caps that reading, and the same text with a plain word in its place does not.
+    /// Every entry of the table, in a text with one figure (or one year, for a period word or a
+    /// word that counts only before a date), caps that reading, and the same text with a plain
+    /// word in its place does not.
     #[test]
-    fn every_signal_in_the_table_caps_a_reading_in_its_clause() {
+    fn every_signal_in_the_table_caps_a_reading_in_its_text() {
         let ctx = crate::Ctx {
             anchor: chrono::NaiveDate::from_ymd_opt(2025, 11, 1),
         };
@@ -738,15 +785,20 @@ mod tests {
         };
         for signal in SIGNALS {
             let word = example(&signal);
+            let dated = [BEFORE, AFTER].contains(&word.as_str()) || DATED.contains(&word.as_str());
             // Each entry where its own rule lets it count, kept apart from the reading.
             let probe = if [START, MIDDLE, LATE, END].contains(&word.as_str()) {
                 format!("{word}{year}")
             } else if [MONTH, PART].contains(&word.as_str()) {
                 format!("{three}{word} {plain} {year}")
+            } else if dated {
+                format!("{plain} {word} {year}")
+            } else if word == PLUS {
+                format!("{plain} {figure}{word}")
             } else {
                 format!("{plain} {word} {plain} {figure}")
             };
-            let control = if [MONTH, PART].contains(&word.as_str()) {
+            let control = if [MONTH, PART].contains(&word.as_str()) || dated {
                 format!("{plain} {plain} {year}")
             } else {
                 format!("{plain} {plain} {plain} {figure}")
@@ -766,10 +818,11 @@ mod tests {
     }
 
     /// The table, with each entry's kind and the dash and arrow class over every scalar value,
-    /// fingerprinted: deleting or changing a row changes it, and the test names the table.
+    /// and the weekday names a date takes in, fingerprinted: deleting or changing a row changes
+    /// it, and the test names the table.
     #[test]
     fn signal_table_is_frozen() {
-        const TABLE: u64 = 0xb93f_34be_966c_4082;
+        const TABLE: u64 = 0xd608_e3b6_52d0_d3e4;
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         let mut eat = |byte: u8| {
             hash ^= u64::from(byte);
@@ -784,6 +837,16 @@ mod tests {
             eat(signal.kind as u8);
             eat(0xff);
         }
+        for word in WEEKDAYS_TH
+            .iter()
+            .chain([&THURSDAY_SHORT_TH])
+            .chain(WEEKDAYS_EN.iter())
+            .chain(DATED.iter())
+            .chain(FILLERS.iter())
+        {
+            word.bytes().for_each(&mut eat);
+            eat(0xfd);
+        }
         for c in (0..=0x10_FFFF).filter_map(char::from_u32) {
             if dash_or_arrow(c) {
                 (c as u32).to_le_bytes().into_iter().for_each(&mut eat);
@@ -795,7 +858,7 @@ mod tests {
         }
         assert_eq!(
             hash, TABLE,
-            "the signal table changed: update TABLE and say so in the PR"
+            "the signal table changed (fingerprint {hash:#018x}): update TABLE and say so in the PR"
         );
     }
 }
