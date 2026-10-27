@@ -48,11 +48,11 @@ export const ev = {
     runId: string,
     katId: string,
     replyMessageId: string,
-    opts: { jobId?: string; synthetic?: boolean } = {},
+    opts: { jobId?: string | null; synthetic?: boolean } = {},
   ) =>
     custom('katwork.run_started', {
       runId,
-      jobId: opts.jobId ?? `job-of-${runId}`,
+      jobId: opts.jobId === undefined ? `job-of-${runId}` : opts.jobId,
       katId,
       replyMessageId,
       synthetic: opts.synthetic ?? false,
@@ -100,8 +100,12 @@ export const ev = {
       jobId: opts.jobId ?? null,
       clientMsgId: opts.clientMsgId ?? null,
     }),
-  notice: (messageId: string, code: string, kats: { id: string; name: string }[] = []) =>
-    ev.stored(messageId, code, { author: { kind: 'system' }, meta: { code, kats } }),
+  notice: (
+    messageId: string,
+    code: string,
+    kats: { id: string; name: string }[] = [],
+    jobId: string | null = null,
+  ) => ev.stored(messageId, code, { author: { kind: 'system' }, meta: { code, kats }, jobId }),
   jobStatus: (
     jobId: string,
     status: string | null,

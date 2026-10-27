@@ -20,6 +20,10 @@ use katwork_server::{
     config::{Config, redact_database_secrets},
 };
 
+/// Counts each document read's bytes, so a read past `max_read_bytes` is refused.
+#[global_allocator]
+static ALLOCATOR: katwork::docs::heap::ReadHeap = katwork::docs::heap::ReadHeap;
+
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::registry()
@@ -230,8 +234,13 @@ async fn run() -> Result<(), KatError> {
             }
             let pool = db::connect(&config.database_url).await?;
             let transport = config.transport.clone();
-            let core = Arc::new(Core::new(pool, config));
+            let core = Arc::new(Core::start(pool, config)?);
             core.registry.log_tiers();
+            katwork_server::spawn_doc_watchdog(&core)?;
+            #[cfg(feature = "smoke-fixtures")]
+            if let Some(marker) = std::env::var_os("KATWORK_SMOKE_WEDGE_ONCE") {
+                katwork::docs::pool::smoke::wedge_once(&core.docs, std::path::Path::new(&marker))?;
+            }
             let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
             let mut workers = katwork::jobs::worker::spawn_pool(
                 core.clone(),
@@ -379,6 +388,11 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_server_counts_what_document_reads_hold() {
+        assert!(katwork::docs::heap::installed());
+    }
+
     #[tokio::test]
     async fn healthcheck_accepts_only_a_complete_success_status() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

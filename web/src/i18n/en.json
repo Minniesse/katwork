@@ -188,6 +188,7 @@
   "reason.approval_pending": "This action needs approval. Approving actions is not available yet, so this request has ended.",
   "reason.question_pending": "A Kat asked you a question. Answer it to continue.",
   "reason.interrupted_review_required": "The work stopped partway after it had started changing things. Review what happened before trying again.",
+  "reason.review_before_rerun": "This request has already changed something, such as a saved file. Check what changed before a Kat runs it again.",
   "reason.kat_paused": "That Kat is paused. Ask your admin to resume it, or ask another Kat.",
   "reason.internal_error": "An internal error stopped this job. Please try again.",
   "reason.retries_exhausted": "KatWork tried several times and couldn't finish. Try again later.",

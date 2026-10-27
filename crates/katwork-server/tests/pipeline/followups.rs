@@ -12,6 +12,109 @@ async fn parent_of(pool: &PgPool, job: JobId) -> Option<JobId> {
         .unwrap()
 }
 
+/// Marks the job's tasks the way the ledger does before a non-Read tool call runs.
+async fn changed_something(pool: &PgPool, job: JobId) {
+    sqlx::query("UPDATE tasks SET effects_started_at=clock_timestamp() WHERE job_id=$1")
+        .bind(job)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn notice_codes(pool: &PgPool, job: JobId) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT meta->>'code' FROM messages WHERE job_id=$1 AND author_kind='system' ORDER BY id",
+    )
+    .bind(job)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn needs_input_follow_up_after_write_shows_review_first_notice(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let parent = f.awaiting().await;
+    changed_something(&pool, parent).await;
+    let (_, job) = f.submit("yes").await;
+    assert_eq!(parent_of(&pool, job).await, Some(parent));
+    assert_eq!(notice_codes(&pool, job).await, ["review_before_rerun"]);
+    assert_eq!(
+        f.notices().await,
+        [json!({"code":"review_before_rerun","kats":[]})]
+    );
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn follow_up_after_a_read_only_job_shows_no_review_notice(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let parent = f.awaiting().await;
+    let (_, job) = f.submit("yes").await;
+    assert_eq!(parent_of(&pool, job).await, Some(parent));
+    assert!(notice_codes(&pool, job).await.is_empty());
+    assert!(f.notices().await.is_empty());
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn follow_up_stopped_at_intake_after_write_still_shows_the_review_notice(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let parent = f.awaiting().await;
+    changed_something(&pool, parent).await;
+    sqlx::query("UPDATE kats SET daily_token_budget=0 WHERE id=$1")
+        .bind(f.kats[2].id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (_, job) = f.submit("my answer").await;
+    assert_eq!(parent_of(&pool, job).await, Some(parent));
+    assert_eq!(
+        f.status(job).await,
+        (Some("stopped".into()), Some("quota_exceeded".into()))
+    );
+    assert_eq!(
+        f.notices().await,
+        [
+            json!({"code":"review_before_rerun","kats":[]}),
+            json!({"code":"quota_exceeded","kats":[{"id":f.kats[2].id,"name":f.kats[2].name}]}),
+        ]
+    );
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn retried_follow_up_post_keeps_one_review_notice(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let parent = f.awaiting().await;
+    changed_something(&pool, parent).await;
+    let first = f.post("yes", Some("answer")).await;
+    assert_eq!(first.status(), 201);
+    let first = body(first).await;
+    let retry = f.post("yes", Some("answer")).await;
+    assert_eq!(retry.status(), 200);
+    assert_eq!(body(retry).await, first);
+    assert_eq!(
+        f.notices().await,
+        [json!({"code":"review_before_rerun","kats":[]})]
+    );
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn follow_up_checks_only_its_direct_parent(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let wrote = f.awaiting().await;
+    changed_something(&pool, wrote).await;
+    let (_, asked) = f.submit("which file?").await;
+    sqlx::query("UPDATE jobs SET status='needs_input',reason='question_pending',decided_by='policy',finished_at=clock_timestamp() WHERE id=$1").bind(asked).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE tasks SET state='done' WHERE job_id=$1")
+        .bind(asked)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (_, job) = f.submit("the second one").await;
+    assert_eq!(parent_of(&pool, job).await, Some(asked));
+    assert_eq!(notice_codes(&pool, asked).await, ["review_before_rerun"]);
+    assert!(notice_codes(&pool, job).await.is_empty());
+}
+
 async fn claim_stopped_answer_can_be_resent(pool: PgPool, reason: &str, change: &'static str) {
     let f = Fixture::new(&pool).await;
     let parent = f.awaiting().await;

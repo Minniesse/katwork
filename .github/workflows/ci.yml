@@ -100,6 +100,94 @@ jobs:
       - run: npm run check:contrast
       - run: npm run build
 
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      # The fuzz crate has its own lock file: every package it shares with the product must be at
+      # a version the product's lock holds, so the parsers fuzzed are the ones the server runs.
+      - name: The fuzz lock matches the product's
+        run: |
+          python3 - <<'PY'
+          import sys, tomllib
+
+          def versions(path):
+              found = {}
+              with open(path, "rb") as file:
+                  for package in tomllib.load(file).get("package", []):
+                      found.setdefault(package["name"], set()).add(package["version"])
+              return found
+
+          product, fuzz = versions("Cargo.lock"), versions("fuzz/Cargo.lock")
+          drift = sorted(
+              f"{name} {sorted(fuzz[name] - product[name])}, product {sorted(product[name])}"
+              for name in fuzz.keys() & product.keys()
+              if not fuzz[name] <= product[name]
+          )
+          for line in drift:
+              print("fuzz/Cargo.lock drifted:", line)
+          sys.exit(1 if drift else 0)
+          PY
+      # A workflow skipped by a paths filter would leave this required check pending, so the job
+      # always runs and fuzzes only when the readers, the fuzz crate or the locked versions
+      # changed.
+      - name: Check whether the readers changed
+        id: changed
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif git diff --quiet "$BASE" HEAD -- crates/katwork/src/docs fuzz Cargo.lock; then
+            echo 'SKIP fuzz-smoke: crates/katwork/src/docs, fuzz and Cargo.lock are unchanged.'
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        if: steps.changed.outputs.run == 'true'
+        with:
+          # Keep in step with fuzz/rust-toolchain.toml.
+          toolchain: nightly-2026-10-01
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: steps.changed.outputs.run == 'true'
+        with:
+          path: |
+            ~/.cargo/bin/cargo-fuzz
+            ~/.cargo/registry
+            fuzz/target
+          key: fuzz-${{ runner.os }}-${{ hashFiles('fuzz/Cargo.lock', 'fuzz/rust-toolchain.toml') }}
+      - name: Install cargo-fuzz
+        if: steps.changed.outputs.run == 'true'
+        working-directory: fuzz
+        run: command -v cargo-fuzz || cargo install cargo-fuzz --locked --version 0.13.2
+      - name: Every target has committed seeds
+        if: steps.changed.outputs.run == 'true'
+        run: for target in package docx text; do test -n "$(ls "fuzz/corpus/$target")"; done
+      - name: Fuzz each target for 60 s
+        if: steps.changed.outputs.run == 'true'
+        working-directory: fuzz
+        # New inputs go to a scratch corpus; the committed seeds are read only.
+        run: |
+          for target in package docx text; do
+            mkdir -p "$RUNNER_TEMP/corpus/$target"
+            cargo fuzz run "$target" "$RUNNER_TEMP/corpus/$target" "corpus/$target" -a -- \
+              -max_total_time=60 -timeout=10 -rss_limit_mb=1024
+          done
+      # A package the product gains and the fuzz lock lacks is resolved afresh by the build,
+      # which then rewrites the lock: the fuzzed parsers would not be the ones locked.
+      - name: The fuzz build left its lock as committed
+        if: steps.changed.outputs.run == 'true'
+        run: git diff --exit-code fuzz/Cargo.lock
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 45

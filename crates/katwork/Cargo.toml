@@ -44,7 +44,11 @@ caseless.workspace = true
 unicode-segmentation.workspace = true
 pulldown-cmark.workspace = true
 regex-syntax.workspace = true
+zip.workspace = true
+quick-xml.workspace = true
+crc32fast.workspace = true
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util", "io-util"] }
+flate2.workspace = true

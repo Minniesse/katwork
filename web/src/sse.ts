@@ -109,6 +109,8 @@ export interface JobInfo {
   katId: string | null;
   /** A run of this job has started. */
   started: boolean;
+  /** The code of the job's latest notice that asks for a review of what it changed (Task 8). */
+  review: string | null;
 }
 
 export interface Transcript {
@@ -125,9 +127,13 @@ export interface Transcript {
   jobs: Record<string, JobInfo>;
   /**
    * Each Kat's latest run error code, by Kat id. Runs overlap, so one Kat's error never hides
-   * or clears another's; only a later answered or ready job of the same Kat clears it.
+   * or clears another's; only a later answered or ready job of the same Kat clears it. When
+   * the run's job has a review notice, the code is the notice's: a retry would repeat a write.
+   * A lost lease's close keeps its own code until a review notice of the job comes after it.
    */
   errors: Record<string, string>;
+  /** The job of the run behind each Kat's error, by Kat id: that job's review notice replaces it. */
+  errorJobs: Record<string, string>;
 }
 
 export type StreamStatus = 'live' | 'reconnecting' | 'polling' | 'resync' | 'unauthenticated';
@@ -155,6 +161,11 @@ const REQUIRED: Record<AgUiEvent['type'], readonly string[]> = {
 const SUCCESS = new Set(['answered', 'ready']);
 // Run endings that are outcomes, not errors.
 const NOT_ERRORS = new Set(['cancelled', 'question_pending', 'approval_pending']);
+// Notices that ask the person to review what a job changed before anything runs it again.
+const REVIEWS = new Set(['review_before_rerun', 'interrupted_review_required', 'outcome_unknown']);
+// The run ending after which KatWork may run the same job again (it requeues a task whose
+// lease was lost): it is no stop, so it never takes a review the job already had.
+const RERUNS = new Set(['lease_lost']);
 
 type Fields = Record<string, unknown>;
 
@@ -370,11 +381,42 @@ export function emptyTranscript(): Transcript {
     katStates: {},
     jobs: {},
     errors: {},
+    errorJobs: {},
   };
 }
 
 function emptyJob(): JobInfo {
-  return { status: null, reason: null, holdReason: null, katId: null, started: false };
+  return {
+    status: null,
+    reason: null,
+    holdReason: null,
+    katId: null,
+    started: false,
+    review: null,
+  };
+}
+
+/** The review a stored message gives its job: the code of a System notice that asks for one. */
+function reviewOf(message: ChatMessage): string | null {
+  const code = message.meta?.code;
+  return message.author?.kind === 'system' && code !== undefined && REVIEWS.has(code)
+    ? code
+    : null;
+}
+
+/**
+ * A job's review notice. The job keeps its code, and a Kat whose error came from a run of
+ * that job shows it in place of the run's close code, whichever of the two arrived first.
+ * A notice after a lost lease's close means the reclaim stopped the job, so it replaces that
+ * code too.
+ */
+function noteReview(state: Transcript, jobId: string, code: string): Transcript {
+  const job = own(state.jobs, jobId) ?? emptyJob();
+  let errors = state.errors;
+  for (const [katId, errorJob] of Object.entries(state.errorJobs)) {
+    if (errorJob === jobId) errors = { ...errors, [katId]: code };
+  }
+  return { ...state, jobs: { ...state.jobs, [jobId]: { ...job, review: code } }, errors };
 }
 
 function fromApi(message: ApiMessage): ChatMessage {
@@ -401,14 +443,12 @@ function fromApi(message: ApiMessage): ChatMessage {
  */
 export function mergeMessages(state: Transcript, messages: ApiMessage[]): Transcript {
   return messages.reduce((next, message) => {
-    const withMessage = putMessage(next, {
-      ...fromApi(message),
-      runId: own(next.messages, message.id)?.runId ?? null,
-    });
+    const stored = { ...fromApi(message), runId: own(next.messages, message.id)?.runId ?? null };
+    const withMessage = putMessage(next, stored);
     if (!message.job_id) return withMessage;
     const job = own(withMessage.jobs, message.job_id) ?? emptyJob();
-    const author = parseAuthor(message.author);
-    return {
+    const author = stored.author;
+    const withJob = {
       ...withMessage,
       jobs: {
         ...withMessage.jobs,
@@ -421,17 +461,31 @@ export function mergeMessages(state: Transcript, messages: ApiMessage[]): Transc
         },
       },
     };
+    const review = reviewOf(stored);
+    return review ? noteReview(withJob, message.job_id, review) : withJob;
   }, state);
 }
 
 /**
  * An older page of the thread ("Show earlier messages"). It only adds what the transcript does
- * not hold yet: anything already here, a message or a job's status, came later and is newer.
+ * not hold yet: anything already here, a message, a job's status or its review, came later and
+ * is newer.
  */
 export function mergeEarlier(state: Transcript, messages: ApiMessage[]): Transcript {
   const unseen = messages.filter((message) => !Object.hasOwn(state.messages, message.id));
-  const merged = mergeMessages(state, unseen);
-  return { ...merged, jobs: { ...merged.jobs, ...state.jobs } };
+  // Merged without the error links, so an older review notice replaces no newer one.
+  const merged = mergeMessages({ ...state, errorJobs: {} }, unseen);
+  let next: Transcript = {
+    ...merged,
+    jobs: { ...merged.jobs, ...state.jobs },
+    errorJobs: state.errorJobs,
+  };
+  for (const [jobId, job] of Object.entries(merged.jobs)) {
+    if (job.review !== null && !own(state.jobs, jobId)?.review) {
+      next = noteReview(next, jobId, job.review);
+    }
+  }
+  return next;
 }
 
 /** The Kats with a run that started and has not closed yet: those still replying. */
@@ -588,7 +642,12 @@ function applyCustom(state: Transcript, name: string, value: Fields): Transcript
       };
       const code = stringOrNull(value.code);
       if (code !== null && !NOT_ERRORS.has(code)) {
-        next = { ...next, errors: { ...next.errors, [run.katId]: code } };
+        const review =
+          run.jobId && !RERUNS.has(code) ? (own(next.jobs, run.jobId)?.review ?? null) : null;
+        const errorJobs = { ...next.errorJobs };
+        if (run.jobId) errorJobs[run.katId] = run.jobId;
+        else delete errorJobs[run.katId];
+        next = { ...next, errors: { ...next.errors, [run.katId]: review ?? code }, errorJobs };
       }
       const reply = own(next.messages, run.replyMessageId);
       // Unconfirmed text from a closed run never stays beside the stored transcript.
@@ -602,7 +661,7 @@ function applyCustom(state: Transcript, name: string, value: Fields): Transcript
       const existing = own(state.messages, messageId);
       const author = parseAuthor(value.author) ?? existing?.author ?? null;
       const jobId = stringOrNull(value.jobId);
-      const next = putMessage(state, {
+      const stored: ChatMessage = {
         id: messageId,
         author,
         authorName: stringOrNull(value.authorName) ?? existing?.authorName ?? '',
@@ -616,7 +675,10 @@ function applyCustom(state: Transcript, name: string, value: Fields): Transcript
         clientMsgId: stringOrNull(value.clientMsgId),
         createdAt: stringOrNull(value.createdAt) ?? existing?.createdAt ?? null,
         runId: existing?.runId ?? null,
-      });
+      };
+      const next = putMessage(state, stored);
+      const review = reviewOf(stored);
+      if (jobId && review) return noteReview(next, jobId, review);
       if (!jobId || author?.kind !== 'kat') return next;
       const job = own(next.jobs, jobId) ?? emptyJob();
       return job.katId
@@ -637,8 +699,10 @@ function applyCustom(state: Transcript, name: string, value: Fields): Transcript
       if (job.status === null || !SUCCESS.has(job.status) || !job.katId) return next;
       if (!Object.hasOwn(next.errors, job.katId)) return next;
       const errors = { ...next.errors };
+      const errorJobs = { ...next.errorJobs };
       delete errors[job.katId];
-      return { ...next, errors };
+      delete errorJobs[job.katId];
+      return { ...next, errors, errorJobs };
     }
     case 'katwork.kat_state': {
       const { katId, state: katState } = value;

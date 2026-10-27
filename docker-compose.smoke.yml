@@ -7,6 +7,9 @@ services:
         CARGO_FEATURES: smoke-fixtures
     environment: &smoke-environment
       KATWORK_SMOKE_HOLD_SECS: "20"
+      # The wedged-pool case sets these for its own stack only; empty is off.
+      KATWORK_SMOKE_DOC_CALL_TIMEOUT_MS: ${KATWORK_SMOKE_DOC_CALL_TIMEOUT_MS:-}
+      KATWORK_SMOKE_WEDGE_ONCE: ${KATWORK_SMOKE_WEDGE_ONCE:-}
       KATWORK_DEMO: "1"
       KATWORK_ALLOW_DEMO_ON_HTTPS: ${KATWORK_ALLOW_DEMO_ON_HTTPS:-}
       OPENAI_API_KEY: ""
