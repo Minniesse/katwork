@@ -353,7 +353,7 @@ The alpha computer for each Kat has these parts:
 | **WordCraft** | DOCX; saves DOCX and PDF | Drafting and editing documents. A Kat's edits to an existing document are tracked changes under its AI author name. It renders the labelled preview of each DOCX output. |
 | **GridCraft** | XLSX and CSV | Editing workbooks. Its check runs on every XLSX output before it is saved (below), and it is a reader challenger behind KatWork's package guard; umya-spreadsheet stays the reader until GridCraft wins its challenge. |
 | **PdfCraft** | PDF | Reading, annotating, combining, filling and redacting PDFs; its text extraction is a reader challenger. Its OCR cannot read Thai, so Thai scans go through KatWork's `OcrEngine` (`docs/adr/0008-thai-ocr-engines.md`). |
-| **DeckCraft** | PPTX; saves PPTX and PDF | Slides. KatWork reads PPTX for evidence; in sub-project 2a no PPTX text is a full-quality source, so a claim citing a deck stays unverified (founder decision, 2026-10-25). |
+| **DeckCraft** | PPTX; saves PPTX and PDF | Slides. In sub-project 2a a Kat works in it only on decks Kats made there from blank, and reads any other deck with `read_file` (founder decision, 2026-10-27). KatWork reads PPTX for evidence; in sub-project 2a no PPTX text is a full-quality source, so a claim citing a deck stays unverified (founder decision, 2026-10-25). |
 | **DesignCraft** | its own format; saves PDF | Page layout. |
 | **VectorCraft** | its own format; saves SVG, PDF and PNG | Vector art, diagrams and charts. |
 | **FigCraft** | its own format; saves PDF, PNG and SVG | Interface design. |
