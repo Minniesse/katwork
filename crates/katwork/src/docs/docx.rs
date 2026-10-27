@@ -125,7 +125,17 @@ const LAYOUT_COMPUTED: [&str; 12] = [
     "LISTNUM",
 ];
 /// Fields Word draws from their code or form data rather than from the result the file holds.
-const DRAWN_FROM_CODE: [&str; 5] = ["EQ", "MACROBUTTON", "GOTOBUTTON", "SYMBOL", "FORMDROPDOWN"];
+const DRAWN_FROM_CODE: [&str; 9] = [
+    "EQ",
+    "MACROBUTTON",
+    "GOTOBUTTON",
+    "SYMBOL",
+    "FORMDROPDOWN",
+    "FORMCHECKBOX",
+    "DISPLAYBARCODE",
+    "MERGEBARCODE",
+    "BARCODE",
+];
 /// Why text is hidden when it sits where Word's choice cannot be decided (an unknown namespace,
 /// a markup-compatibility branch Word may take differently).
 const UNKNOWN_NAMESPACE: &str = "unknown_namespace";
@@ -362,7 +372,7 @@ fn relationships(
                 depth += 1;
             }
             Item::End => depth -= 1,
-            Item::Text { .. } => {}
+            Item::Text { .. } | Item::Unread { .. } => {}
             Item::Eof => return Ok(Some(found)),
         }
     }
@@ -388,6 +398,12 @@ enum Item<'i> {
         skipped: bool,
         hidden: bool,
     },
+    /// An element of an unknown namespace, inside no other, ended; it held content or named
+    /// something in an attribute, so Word may draw something where it stood (an equation's
+    /// delimiter, say).
+    Unread {
+        skipped: bool,
+    },
     Eof,
 }
 
@@ -397,6 +413,9 @@ struct Frame {
     skip: bool,
     hide: bool,
     alternate: bool,
+    /// An element of an unknown namespace, and whether it is inside no other.
+    unknown: bool,
+    outermost: bool,
 }
 
 #[derive(Default)]
@@ -417,6 +436,10 @@ struct Walker<'i> {
     alternates: Vec<Alternate>,
     skipped: u32,
     hidden: u32,
+    /// Open elements of unknown namespaces.
+    unknown: u32,
+    /// The outermost open one holds an element, text or a named attribute.
+    unknown_content: bool,
     events: u64,
     /// An `End` owed for an empty element just reported.
     pending_end: bool,
@@ -438,6 +461,8 @@ impl<'i> Walker<'i> {
             alternates: Vec::new(),
             skipped: 0,
             hidden: 0,
+            unknown: 0,
+            unknown_content: false,
             events: 0,
             pending_end: false,
         })
@@ -470,20 +495,22 @@ impl<'i> Walker<'i> {
                     self.close();
                 }
                 Event::Start(start) => {
-                    if let Some(item) = self.open(start, namespace) {
+                    if let Some(item) = self.open(start, namespace)? {
                         return Ok(item);
                     }
                 }
                 Event::Empty(start) => {
-                    if let Some(item) = self.open(start, namespace) {
+                    if let Some(item) = self.open(start, namespace)? {
                         self.pending_end = true;
                         return Ok(item);
                     }
-                    self.close();
+                    if let Some(item) = self.close() {
+                        return Ok(item);
+                    }
                 }
                 Event::End(_) => {
-                    if self.close() {
-                        return Ok(Item::End);
+                    if let Some(item) = self.close() {
+                        return Ok(item);
                     }
                 }
                 Event::Text(text) => return Ok(self.text(text.xml10_content().into_owned())),
@@ -500,7 +527,8 @@ impl<'i> Walker<'i> {
 
     /// Character data; directly in `mc:AlternateContent`, outside its branches, it is markup Word
     /// does not read there.
-    fn text(&self, text: String) -> Item<'i> {
+    fn text(&mut self, text: String) -> Item<'i> {
+        self.unknown_content |= self.unknown > 0 && !text.chars().all(char::is_whitespace);
         Item::Text {
             text,
             skipped: self.skipped > 0,
@@ -517,8 +545,19 @@ impl<'i> Walker<'i> {
     /// Opens a non-compatibility element. One of an unknown namespace hides what is inside it and
     /// is not reported; one directly inside `mc:AlternateContent`, outside its branches, is
     /// markup Word does not read there, and hides what is inside it too.
-    fn open(&mut self, start: BytesStart<'i>, namespace: Option<&'static str>) -> Option<Item<'i>> {
+    fn open(
+        &mut self,
+        start: BytesStart<'i>,
+        namespace: Option<&'static str>,
+    ) -> Result<Option<Item<'i>>, DocError> {
         let reported = namespace.is_some();
+        // Whatever opens inside an element of an unknown namespace is its content.
+        self.unknown_content |= self.unknown > 0;
+        let outermost = !reported && self.unknown == 0;
+        if outermost {
+            self.unknown_content = named_attribute(&start)?;
+        }
+        self.unknown += u32::from(!reported);
         let hide = !reported || self.in_alternate();
         self.hidden += u32::from(hide);
         self.frames.push(Frame {
@@ -526,13 +565,15 @@ impl<'i> Walker<'i> {
             skip: false,
             hide,
             alternate: false,
+            unknown: !reported,
+            outermost,
         });
-        reported.then_some(Item::Start {
+        Ok(reported.then_some(Item::Start {
             start,
             namespace,
             skipped: self.skipped > 0,
             hidden: self.hidden > 0,
-        })
+        }))
     }
 
     /// `mc:AlternateContent` and its branches: the first `mc:Choice` whose `Requires` names only
@@ -547,6 +588,8 @@ impl<'i> Walker<'i> {
             skip: false,
             hide: false,
             alternate: false,
+            unknown: false,
+            outermost: false,
         };
         match (name.as_ref(), in_alternate) {
             ("AlternateContent", _) => {
@@ -617,17 +660,25 @@ impl<'i> Walker<'i> {
         }))
     }
 
-    /// Ends the innermost open element; true when it was reported.
-    fn close(&mut self) -> bool {
-        let Some(frame) = self.frames.pop() else {
-            return false;
-        };
+    /// Ends the innermost open element: `End` when it was reported, `Unread` when it is an
+    /// element of an unknown namespace, inside no other, that held something.
+    fn close(&mut self) -> Option<Item<'i>> {
+        let frame = self.frames.pop()?;
         self.skipped -= u32::from(frame.skip);
         self.hidden -= u32::from(frame.hide);
+        self.unknown -= u32::from(frame.unknown);
         if frame.alternate {
             self.alternates.pop();
         }
-        frame.reported
+        if frame.reported {
+            Some(Item::End)
+        } else if frame.outermost && self.unknown_content {
+            Some(Item::Unread {
+                skipped: self.skipped > 0,
+            })
+        } else {
+            None
+        }
     }
 
     /// The value of `start`'s attribute `local` in `namespace` (`None`: unprefixed), with its
@@ -661,6 +712,18 @@ impl<'i> Walker<'i> {
     fn w(&self, start: &BytesStart, local: &str) -> Result<Option<String>, DocError> {
         self.attr(start, Some(W), local)
     }
+}
+
+/// Whether `start` has an attribute besides namespace declarations.
+fn named_attribute(start: &BytesStart) -> Result<bool, DocError> {
+    for attribute in start.attributes() {
+        let attribute = attribute.map_err(|_| DocError::Malformed("xml_attribute"))?;
+        let key = attribute.key.into_inner();
+        if key != "xmlns" && !key.starts_with("xmlns:") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// A WordprocessingML part's namespaces: WordprocessingML itself and `UNDERSTOOD`.
@@ -1479,7 +1542,7 @@ struct Style {
 }
 
 /// A style with its `w:basedOn` chain folded in, outermost first, as one reading takes it.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 struct Merged {
     props: Props,
     regions: HashMap<Region, Props>,
@@ -1803,7 +1866,7 @@ impl Styles {
                     }
                     _ => {}
                 },
-                Item::Text { .. } => {}
+                Item::Text { .. } | Item::Unread { .. } => {}
                 Item::Eof => {
                     styles.ids = ids;
                     return Ok(styles);
@@ -1945,7 +2008,25 @@ impl Styles {
         if crossed {
             merged.props.undecided(UNDECIDED);
         }
-        let merged = Rc::new(merged);
+        // A chain that reads the same under another reading is held once.
+        let same = [false, true]
+            .into_iter()
+            .flat_map(|styles_first| {
+                [false, true].map(|props_first| Reading {
+                    styles_first,
+                    props_first,
+                    bands_off: false,
+                })
+            })
+            .filter(|other| *other != reading)
+            .find_map(|other| {
+                self.merged
+                    .borrow()
+                    .get(&(kind, id, other))
+                    .filter(|found| ***found == merged)
+                    .cloned()
+            });
+        let merged = same.unwrap_or_else(|| Rc::new(merged));
         self.merged.borrow_mut().insert(key, merged.clone());
         Ok(merged)
     }
@@ -2042,7 +2123,7 @@ impl Settings {
                     depth += 1;
                 }
                 Item::End => depth -= 1,
-                Item::Text { .. } => {}
+                Item::Text { .. } | Item::Unread { .. } => {}
                 Item::Eof => return Ok(settings),
             }
         }
@@ -2320,6 +2401,11 @@ struct ShapeState {
     offset: [Option<i64>; 2],
     extent: [i64; 2],
     vml: bool,
+    /// A frame (`wp:inline`, `wp:anchor`), a group or canvas (whose shapes stand directly in
+    /// it), a WordprocessingML shape (`wps:wsp`, which holds a text box in `wps:txbx`).
+    frame: bool,
+    group: bool,
+    wsp: bool,
     /// The fill a VML shape has when it sets none: its `v:shapetype`'s, else VML's own white;
     /// unknown when it names a shapetype not defined before it.
     vml_default: Option<ShapeFill>,
@@ -2522,9 +2608,14 @@ enum Node {
     RowExceptions,
     Cell,
     CellProps,
-    /// `w:drawing` or `w:pict`: what it draws stands between the run's text.
-    Object,
+    /// `w:drawing` and `w:pict`: what they draw stands between the run's text, and only a frame
+    /// in one or a VML shape in the other is laid out.
+    Drawing,
+    Pict,
     Shape,
+    /// `a:graphic` in a frame, and its `a:graphicData`, where a drawing's shape stands.
+    Graphic,
+    GraphicData,
     ShapeProps,
     ShapeStyle,
     Position(usize),
@@ -2534,6 +2625,8 @@ enum Node {
     Colour(Target),
     /// `a:extLst`: extensions Word does not draw from.
     Extensions,
+    /// `wps:txbx` in a `wps:wsp`, or `v:textbox` in a VML shape: where Word reads a shape's text.
+    ShapeText,
     TextBox,
     Excluded,
     Other,
@@ -2583,13 +2676,14 @@ struct Part {
     containers: Vec<Container>,
     shapes: Vec<ShapeState>,
     fields: Vec<Field>,
+    /// How many fields were open when each open text box or `w:fldSimple` began: a field
+    /// character inside one acts only on the fields above its floor.
+    floors: Vec<usize>,
     /// The fills of the `v:shapetype`s defined so far, by id.
     shapetypes: HashMap<String, Option<ShapeFill>>,
     sdts: Vec<Sdt>,
     /// Why the text of the open content is dropped whole, innermost last.
     dropping: Vec<&'static str>,
-    /// Open `w:drawing` and `w:pict` elements: a shape outside one is out of place.
-    objects: u32,
     /// Open `a:extLst` elements.
     extensions: u32,
     /// Paragraphs of the open tables, judged once the outermost one ends. Boxed, so the queue
@@ -2661,12 +2755,48 @@ impl Part {
         }
     }
 
+    /// Markup inside a run's text: what the run shows around it is undecided.
+    fn undecide_text(&mut self) {
+        if let Some(run) = self.run() {
+            run.drop_text(UNDECIDED);
+        }
+    }
+
+    /// Markup inside an instruction: its field's type is undecided.
+    fn undecide_instruction(&mut self) {
+        if let Some(field) = self.fields.iter_mut().rev().find(|field| field.code) {
+            field.undecided = true;
+        }
+    }
+
     /// Text of a field's instruction, read for the innermost field still in its instruction.
     fn instruction(&mut self, text: &str, hidden: bool) {
-        if let Some(field) = self.fields.iter_mut().rev().find(|field| field.code) {
+        let floor = self.floor();
+        if let Some(field) = self.fields[floor..]
+            .iter_mut()
+            .rev()
+            .find(|field| field.code)
+        {
             field.undecided |= hidden;
             field.kind.feed(text);
         }
+    }
+
+    /// The floor of the innermost open text box or `w:fldSimple`.
+    fn floor(&self) -> usize {
+        self.floors.last().copied().unwrap_or(0)
+    }
+
+    /// A field character that would act on a field begun outside the text box or `w:fldSimple`
+    /// it stands in: the innermost field is undecided instead.
+    fn outside_floor(&mut self) -> bool {
+        if self.fields.len() > self.floor() {
+            return false;
+        }
+        if let Some(field) = self.fields.last_mut() {
+            field.undecided = true;
+        }
+        true
     }
 
     /// A field starts: if the innermost open field is in its instruction and has not finished
@@ -2797,9 +2927,9 @@ impl Doc<'_> {
             shapes: Vec::new(),
             shapetypes: HashMap::new(),
             fields: Vec::new(),
+            floors: Vec::new(),
             sdts: Vec::new(),
             dropping: Vec::new(),
-            objects: 0,
             extensions: 0,
             pending: Vec::new(),
             seen: 0,
@@ -2850,14 +2980,27 @@ impl Doc<'_> {
                                 }
                             }
                         }
-                        // Text of an element the reader does not read, in a paragraph: an
-                        // equation, say, which Word draws where it stands. A shape's
-                        // extensions are not drawn.
-                        _ if hidden
-                            && part.extensions == 0
-                            && !text.chars().all(char::is_whitespace) =>
-                        {
+                        // Text of an element the reader does not read is reported with it
+                        // (`Item::Unread`).
+                        _ => {}
+                    }
+                }
+                Item::Unread { skipped } => {
+                    if skipped || part.excluded > 0 {
+                        continue;
+                    }
+                    let parent = nodes.last().copied();
+                    match parent {
+                        Some(Node::Text) => part.undecide_text(),
+                        Some(Node::InstrText) => part.undecide_instruction(),
+                        _ if parent == Some(Node::Run) || level(parent) == Some(Level::Run) => {
                             part.drop_unread()
+                        }
+                        // Between paragraphs nothing joins across it, but what it says is not
+                        // read: the paragraph after it warns.
+                        _ if level(parent) == Some(Level::Block) => {
+                            part.hidden
+                                .push((part.ordinal + 1, UNKNOWN_NAMESPACE, None));
                         }
                         _ => {}
                     }
@@ -2907,15 +3050,11 @@ impl Doc<'_> {
         // undecided, and inside an instruction its field's type is.
         match parent {
             Some(Node::Text) => {
-                if let Some(run) = part.run() {
-                    run.drop_text(UNDECIDED);
-                }
+                part.undecide_text();
                 return Ok(Node::Other);
             }
             Some(Node::InstrText) => {
-                if let Some(field) = part.fields.iter_mut().rev().find(|field| field.code) {
-                    field.undecided = true;
-                }
+                part.undecide_instruction();
                 return Ok(Node::Other);
             }
             _ => {}
@@ -3022,8 +3161,11 @@ impl Doc<'_> {
             }
             (Some(Node::Run), "drawing" | "pict") => {
                 part.put(hidden, Put::Gap(Gap::Object));
-                part.objects += 1;
-                Node::Object
+                if local == "drawing" {
+                    Node::Drawing
+                } else {
+                    Node::Pict
+                }
             }
             // Ruby and date blocks: text Word draws there.
             (
@@ -3146,19 +3288,23 @@ impl Doc<'_> {
                 Node::Excluded
             }
             (_, "txbxContent") => {
-                let info = match part.shapes.last() {
-                    Some(shape) => shape.box_info(),
-                    // Text in no shape the reader read: where Word draws it is not known.
-                    None => BoxInfo {
-                        hidden: Some("unknown_paint"),
+                let info = match (parent, part.shapes.last()) {
+                    (Some(Node::ShapeText), Some(shape)) => {
+                        let info = shape.box_info();
+                        // Every shape around it is fixed now.
+                        for shape in &mut part.shapes {
+                            shape.text_read = true;
+                        }
+                        info
+                    }
+                    // Text outside a shape's text box: where Word draws it, if at all, is not
+                    // known.
+                    _ => BoxInfo {
+                        hidden: Some(UNDECIDED),
                         fill: None,
                         text_colour: None,
                     },
                 };
-                // Every shape around it is fixed now.
-                for shape in &mut part.shapes {
-                    shape.text_read = true;
-                }
                 let host = match part.paragraphs.last_mut() {
                     Some(Some(host)) => Some((
                         host.shared
@@ -3174,6 +3320,7 @@ impl Doc<'_> {
                     None => part.chain(),
                 };
                 part.paragraphs.push(None);
+                part.floors.push(part.fields.len());
                 part.containers.push(Container::TextBox(Link::new(
                     Under::Box(Rc::new(info)),
                     outer,
@@ -3245,6 +3392,7 @@ impl Doc<'_> {
                     undecided: hidden,
                     result: false,
                 });
+                part.floors.push(part.fields.len());
                 Node::SimpleField(depth)
             }
             (_, "tbl") => {
@@ -3517,8 +3665,9 @@ impl Doc<'_> {
                 if hidden {
                     shape.undecide(UNKNOWN_NAMESPACE);
                 }
+                shape.frame = true;
                 // A frame outside `w:drawing`, which Word does not lay out there.
-                if part.objects == 0 {
+                if parent != Some(Node::Drawing) {
                     shape.undecide(UNDECIDED);
                 }
                 match toggle(walker.attr(start, None, "simplePos")?) {
@@ -3579,10 +3728,26 @@ impl Doc<'_> {
                 }
                 Node::Other
             }
-            (WPS, "wsp", _) | (WPG, "wgp", _) | (WPC, "wpc", _) => {
-                // A shape in no frame, which Word does not lay out.
-                let framed = part.shapes.last().is_some();
+            (DRAWINGML, "graphic", Some(Node::Shape))
+                if part.shapes.last().is_some_and(|shape| shape.frame) =>
+            {
+                Node::Graphic
+            }
+            (DRAWINGML, "graphicData", Some(Node::Graphic)) => Node::GraphicData,
+            (WPS, "wsp", _) | (WPG, "wgp" | "grpSp", _) | (WPC, "wpc", _) => {
+                // A shape stands in its frame's graphic, or in a group or canvas; elsewhere Word
+                // does not lay it out.
+                let framed = match parent {
+                    Some(Node::GraphicData) => true,
+                    Some(Node::Shape) => part
+                        .shapes
+                        .last()
+                        .is_some_and(|outer| outer.group && !outer.vml),
+                    _ => false,
+                };
                 let mut shape = ShapeState::inside(part.shapes.last());
+                shape.group = local != "wsp";
+                shape.wsp = local == "wsp";
                 if hidden {
                     shape.undecide(UNKNOWN_NAMESPACE);
                 }
@@ -3591,6 +3756,19 @@ impl Doc<'_> {
                 }
                 part.shapes.push(shape);
                 Node::Shape
+            }
+            (WPS, "txbx", Some(Node::Shape))
+                if part.shapes.last().is_some_and(|shape| shape.wsp) =>
+            {
+                Node::ShapeText
+            }
+            (VML, "textbox", Some(Node::Shape))
+                if part
+                    .shapes
+                    .last()
+                    .is_some_and(|shape| shape.vml && !shape.group) =>
+            {
+                Node::ShapeText
             }
             (WPS, "spPr", _) | (WPG, "grpSpPr", _) => {
                 late(part)?;
@@ -3681,14 +3859,19 @@ impl Doc<'_> {
                 _,
             ) => {
                 // A shape inside a VML group is placed in the group's own coordinates.
-                let in_group = part.shapes.last().is_some_and(|outer| outer.vml);
+                let in_group = parent == Some(Node::Shape)
+                    && part
+                        .shapes
+                        .last()
+                        .is_some_and(|outer| outer.vml && outer.group);
                 let mut shape = ShapeState::inside(part.shapes.last());
                 shape.vml = true;
+                shape.group = local == "group";
                 if hidden {
                     shape.undecide(UNKNOWN_NAMESPACE);
                 }
-                // A VML shape outside `w:pict`, which Word does not lay out there.
-                if part.objects == 0 && !in_group {
+                // A VML shape outside `w:pict` or a VML group, which Word does not lay out there.
+                if parent != Some(Node::Pict) && !in_group {
                     shape.undecide(UNDECIDED);
                 }
                 let white = ShapeFill::Colour(ColourSpec::rgb(Rgb::WHITE));
@@ -3782,7 +3965,9 @@ impl Doc<'_> {
                 });
             }
             Some("separate") => {
-                if let Some(field) = part.fields.last_mut() {
+                if !part.outside_floor()
+                    && let Some(field) = part.fields.last_mut()
+                {
                     if hidden || !field.code {
                         field.undecided = true;
                     } else {
@@ -3796,7 +3981,9 @@ impl Doc<'_> {
                     if let Some(field) = part.fields.last_mut() {
                         field.undecided = true;
                     }
-                } else if let Some(field) = part.fields.pop() {
+                } else if !part.outside_floor()
+                    && let Some(field) = part.fields.pop()
+                {
                     part.field_ended(&field);
                 }
             }
@@ -3877,11 +4064,14 @@ impl Doc<'_> {
                 }
             }
             Node::Excluded => part.excluded -= 1,
-            Node::Object => part.objects -= 1,
             Node::Extensions => part.extensions -= 1,
             Node::TextBox => {
                 part.paragraphs.pop();
                 part.containers.pop();
+                // A field begun in the box ends with its story.
+                if let Some(floor) = part.floors.pop() {
+                    part.fields.truncate(floor);
+                }
             }
             Node::Table => {
                 part.containers.pop();
@@ -3920,9 +4110,14 @@ impl Doc<'_> {
                 part.dropping.pop();
             }
             Node::SimpleField(depth) => {
-                let mut closed = part.fields.split_off(depth.min(part.fields.len()));
-                if !closed.is_empty() {
-                    let field = closed.swap_remove(0);
+                part.floors.pop();
+                // A field begun inside it and not ended there stays open, its end still to come,
+                // and undecided.
+                if depth < part.fields.len() {
+                    let field = part.fields.remove(depth);
+                    for inner in &mut part.fields[depth..] {
+                        inner.undecided = true;
+                    }
                     part.field_ended(&field);
                 }
             }
@@ -4792,7 +4987,10 @@ impl Doc<'_> {
         Ok(level)
     }
 
+    /// Records a finished part's warnings and blocks. The blocks copy every visible character, so
+    /// the budget is checked as they are made and once they are all made.
     fn finish_part(&mut self, mut part: Part) -> Result<(), DocError> {
+        deadline::check()?;
         part.out.sort_by_key(|(ordinal, _, _)| *ordinal);
         part.hidden.sort_by_key(|(ordinal, _, _)| *ordinal);
         for (ordinal, why, para_id) in part.hidden {
@@ -4809,6 +5007,9 @@ impl Doc<'_> {
             for (piece, range) in split_pieces(&text)?.into_iter().enumerate() {
                 if self.blocks.len() as u64 >= u64::from(self.limits.max_blocks) {
                     return Err(DocError::TooComplex("blocks"));
+                }
+                if self.blocks.len() % 1024 == 1023 {
+                    deadline::check()?;
                 }
                 self.blocks.push(Block {
                     ordinal,
@@ -4827,7 +5028,7 @@ impl Doc<'_> {
                 });
             }
         }
-        Ok(())
+        deadline::check()
     }
 }
 

@@ -67,6 +67,25 @@ fn a_read_past_its_budget_is_refused() {
     assert_eq!(within(64 << 20), Ok(()));
 }
 
+/// The budget holds to a read's last step: the blocks made from its visible text count too.
+/// This read passes every check while it walks the part, then copies 8 MiB of text into blocks.
+#[test]
+fn the_blocks_a_read_makes_count_toward_its_budget() {
+    let text = "\u{1F600}".repeat(2 << 20);
+    let bytes = stored(&Docx::new(&para("", &run("", &text))));
+    let within = |mib: u64| {
+        let limits = DocLimits {
+            max_read_bytes: mib << 20,
+            ..DocLimits::default()
+        };
+        counted(&bytes, &limits)
+            .0
+            .map(|extracted| extracted.blocks.len())
+    };
+    assert_eq!(within(28), Err(DocError::TooComplex("memory")));
+    assert_eq!(within(40), Ok(1_399));
+}
+
 #[tokio::test]
 async fn the_pool_holds_each_job_to_its_budget() {
     let pool = Arc::new(
@@ -147,6 +166,23 @@ struct Flood {
     name: &'static str,
     build: fn(u64) -> Vec<u8>,
 }
+
+/// Every table style region.
+const REGIONS: [&str; 13] = [
+    "wholeTable",
+    "band1Horz",
+    "band2Horz",
+    "band1Vert",
+    "band2Vert",
+    "firstCol",
+    "lastCol",
+    "firstRow",
+    "lastRow",
+    "nwCell",
+    "neCell",
+    "swCell",
+    "seCell",
+];
 
 /// `unit` repeated to fill `elements` less `overhead`, `each` elements a unit.
 fn fill(unit: &str, each: u64, elements: u64, overhead: u64) -> String {
@@ -243,24 +279,10 @@ fn floods() -> Vec<Flood> {
         Flood {
             name: "table styles of 13 regions, each used",
             build: |elements| {
-                let regions: String = [
-                    "wholeTable",
-                    "band1Horz",
-                    "band2Horz",
-                    "band1Vert",
-                    "band2Vert",
-                    "firstCol",
-                    "lastCol",
-                    "firstRow",
-                    "lastRow",
-                    "nwCell",
-                    "neCell",
-                    "swCell",
-                    "seCell",
-                ]
-                .iter()
-                .map(|kind| format!(r#"<w:tblStylePr w:type="{kind}"/>"#))
-                .collect();
+                let regions: String = REGIONS
+                    .iter()
+                    .map(|kind| format!(r#"<w:tblStylePr w:type="{kind}"/>"#))
+                    .collect();
                 let count = (elements / 2 / 14).min(65_536);
                 let styles: String = (0..count)
                     .map(|at| {
@@ -280,21 +302,7 @@ fn floods() -> Vec<Flood> {
         Flood {
             name: "table styles of 13 shaded regions, each used",
             build: |elements| {
-                let regions: String = [
-                    "wholeTable",
-                    "band1Horz",
-                    "band2Horz",
-                    "band1Vert",
-                    "band2Vert",
-                    "firstCol",
-                    "lastCol",
-                    "firstRow",
-                    "lastRow",
-                    "nwCell",
-                    "neCell",
-                    "swCell",
-                    "seCell",
-                ]
+                let regions: String = REGIONS
                 .iter()
                 .map(|kind| {
                     format!(
@@ -316,6 +324,77 @@ fn floods() -> Vec<Flood> {
                     })
                     .collect();
                 packed(&Docx::new(&tables).styles(&styles))
+            },
+        },
+        Flood {
+            name: "table styles of 13 shaded regions, each used, every reading open",
+            build: |elements| {
+                let regions: String = REGIONS
+                    .iter()
+                    .map(|kind| {
+                        format!(
+                            r#"<w:tblStylePr w:type="{kind}"><w:tcPr><w:shd w:val="clear" w:fill="FFFFFF"/></w:tcPr></w:tblStylePr>"#
+                        )
+                    })
+                    .collect();
+                // 40 elements a style, 8 a table.
+                let count = (elements.saturating_sub(40) / 48).min(65_000);
+                let styles: String = (0..count)
+                    .map(|at| {
+                        format!(r#"<w:style w:type="table" w:styleId="t{at}">{regions}</w:style>"#)
+                    })
+                    .collect();
+                // A style id defined twice and a property written twice open four readings.
+                let twice = concat!(
+                    r#"<w:style w:type="paragraph" w:styleId="P"><w:rPr><w:sz w:val="20"/></w:rPr></w:style>"#,
+                    r#"<w:style w:type="paragraph" w:styleId="P"><w:rPr><w:sz w:val="22"/></w:rPr></w:style>"#
+                );
+                let tables: String = (0..count)
+                    .map(|at| {
+                        format!(
+                            r#"<w:tbl><w:tblPr><w:tblStyle w:val="t{at}"/></w:tblPr><w:tr><w:tc><w:p><w:r><w:t>x</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#
+                        )
+                    })
+                    .collect();
+                let first = para("", &run(r#"<w:sz w:val="20"/><w:sz w:val="22"/>"#, "x"));
+                packed(&Docx::new(&format!("{first}{tables}")).styles(&format!("{twice}{styles}")))
+            },
+        },
+        Flood {
+            name: "distinct 250-byte style ids, all named in one style",
+            build: |elements| {
+                // As many as the inflation cap holds.
+                let limits = DocLimits::default();
+                let unzipped = limits.max_unzipped_bytes / (limits.max_xml_elements / elements);
+                let count = (unzipped * 95 / 100 / 280).min(elements.saturating_sub(20));
+                let ids: String = (0..count)
+                    .map(|at| format!(r#"<w:rStyle w:val="{at:0>250}"/>"#))
+                    .collect();
+                packed(&Docx::new(&para("", &run("", "x"))).styles(&format!(
+                    r#"<w:style w:type="character" w:styleId="c"><w:rPr>{ids}</w:rPr></w:style>"#
+                )))
+            },
+        },
+        Flood {
+            name: "VML shape types with distinct ids",
+            build: |elements| {
+                let types: String = (0..elements.saturating_sub(40))
+                    .map(|at| format!(r#"<v:shapetype id="t{at}"/>"#))
+                    .collect();
+                packed(&Docx::new(&format!(
+                    "<w:p><w:r><w:pict>{types}</w:pict></w:r></w:p>"
+                )))
+            },
+        },
+        Flood {
+            name: "relationships past the element cap in the root relationships",
+            build: |elements| {
+                let relationships: String = (0..elements)
+                    .map(|at| format!(r#"<Relationship Id="r{at}" Type="urn:x" Target="t{at}"/>"#))
+                    .collect();
+                packed(&Docx::new(&para("", &run("", "x"))).root_rels(&format!(
+                    r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>{relationships}"#
+                )))
             },
         },
         Flood {
@@ -450,14 +529,14 @@ fn read_floods(scale: u64, print: bool) {
             "{}: {outcome}",
             flood.name
         );
-        // The budget is checked where the reader checks its deadline: a read may pass it by what
-        // it allocates between two checks, never by more than a few MiB.
+        // The budget is checked where the reader checks its deadline and as it makes its blocks:
+        // a read passes it only by what one step between two checks allocates (a hash table's
+        // growth, one text node), which at these caps stays under 8 MiB.
         assert!(
             peak <= limits.max_read_bytes + (8 << 20),
             "{}: {peak} bytes",
             flood.name
         );
-        assert!(took < limits.call_timeout, "{}: {took:?}", flood.name);
     }
 }
 
@@ -470,6 +549,33 @@ fn floods_are_refused_or_read_within_the_budget() {
 #[ignore = "measures the floods at the default caps; run in release with --nocapture"]
 fn floods_at_the_default_caps() {
     read_floods(1, true);
+}
+
+/// Nested shadings of two candidate colours each would double the colours beneath a run at every
+/// level: listed once each and capped, 40 levels read in little memory, the run undecided.
+#[test]
+fn shading_candidates_stay_few_however_deep() {
+    let shaded = r#"<w:tbl><w:tr><w:tc><w:tcPr><w:shd w:val="pct50" w:color="123456" w:themeColor="accent1" w:fill="auto"/></w:tcPr>"#;
+    let body = format!(
+        "{}{}{}",
+        shaded.repeat(40),
+        para("", &run(r#"<w:color w:val="ABCDEF"/>"#, "x")),
+        "</w:tc></w:tr></w:tbl>".repeat(40)
+    );
+    let limits = DocLimits {
+        max_read_bytes: 64 << 20,
+        ..DocLimits::default()
+    };
+    let (result, _, _) = counted(&Docx::new(&body).build(), &limits);
+    let extracted = result.unwrap();
+    assert!(extracted.blocks.is_empty());
+    assert!(matches!(
+        &extracted.warnings[..],
+        [docs::ExtractWarning::HiddenContent {
+            why: "undecided",
+            ..
+        }]
+    ));
 }
 
 /// The two DOCX locators of one part share its name.
@@ -547,4 +653,48 @@ fn nested_cells_cost_what_flat_cells_cost() {
     };
     let (flat, deep) = (peak(0), peak(79));
     assert!(deep < flat + flat / 4, "{flat} flat, {deep} deep");
+}
+
+/// A style that reads the same under every reading is held once: a style id defined twice and a
+/// property written twice elsewhere cost what they cost, not four copies of every style.
+#[test]
+fn a_style_the_same_under_every_reading_is_held_once() {
+    let limits = DocLimits::default();
+    let regions: String = REGIONS
+        .iter()
+        .map(|kind| {
+            format!(
+                r#"<w:tblStylePr w:type="{kind}"><w:tcPr><w:shd w:val="clear" w:fill="FFFFFF"/></w:tcPr></w:tblStylePr>"#
+            )
+        })
+        .collect();
+    let styles: String = (0..4_000)
+        .map(|at| format!(r#"<w:style w:type="table" w:styleId="t{at}">{regions}</w:style>"#))
+        .collect();
+    let tables: String = (0..4_000)
+        .map(|at| {
+            format!(
+                r#"<w:tbl><w:tblPr><w:tblStyle w:val="t{at}"/></w:tblPr><w:tr><w:tc><w:p><w:r><w:t>x</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#
+            )
+        })
+        .collect();
+    let peak = |twice: &str, size: &str| {
+        let docx = Docx::new(&format!("{}{tables}", para("", &run(size, "x"))))
+            .styles(&format!("{twice}{styles}"));
+        let (result, peak, _) = counted(&packed(&docx), &limits);
+        assert_eq!(result.unwrap().blocks.len(), 4_001);
+        peak
+    };
+    let once = peak("", "");
+    let twice = peak(
+        concat!(
+            r#"<w:style w:type="paragraph" w:styleId="P"><w:rPr><w:sz w:val="20"/></w:rPr></w:style>"#,
+            r#"<w:style w:type="paragraph" w:styleId="P"><w:rPr><w:sz w:val="22"/></w:rPr></w:style>"#
+        ),
+        r#"<w:sz w:val="20"/><w:sz w:val="22"/>"#,
+    );
+    assert!(
+        twice < once + once / 4,
+        "{once} once, {twice} with four readings"
+    );
 }

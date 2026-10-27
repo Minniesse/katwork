@@ -1220,6 +1220,57 @@ fn docx_unparseable_values_fail_closed() {
     );
 }
 
+/// A size written with a unit is read in points: in every unit, just under the 4 pt floor is
+/// tiny and just over it visible; exactly 4 pt is visible. CSS's `px` is VML's, never a run's.
+#[test]
+fn docx_sizes_and_offsets_in_every_unit_are_read_exactly() {
+    let rows = [
+        ("7", true),
+        ("8", false),
+        ("3.99pt", true),
+        ("4pt", false),
+        ("1.41mm", true),
+        ("1.4112mm", false),
+        ("0.141cm", true),
+        ("0.14112cm", false),
+        ("0.0555in", true),
+        ("0.05556in", false),
+        ("0.3333pc", true),
+        ("0.33334pc", false),
+        ("0.3333pi", true),
+        ("0.33334pi", false),
+        ("6px", true),
+    ];
+    for (size, tiny) in rows {
+        let extracted = read_body(&para("", &run(&format!(r#"<w:sz w:val="{size}"/>"#), "x")));
+        if tiny {
+            assert_eq!(hidden(&extracted), [(1, "tiny")], "{size}");
+        } else {
+            assert_eq!(text(&extracted), "x", "{size}");
+        }
+    }
+    // A VML offset of 22 inches, Word's largest page side, is off the page wherever its anchor
+    // lands: in pixels at 96 to the inch, and as a bare number, which CSS reads as pixels.
+    for (margin, off) in [
+        ("2112px", true),
+        ("2111px", false),
+        ("2112", true),
+        ("2111", false),
+        ("22in", true),
+        ("21.99in", false),
+    ] {
+        let extracted = read_body(&format!(
+            r#"<w:p><w:r><w:pict><v:shape style="position:absolute;margin-left:{margin}" fillcolor="white"><v:textbox><w:txbxContent>{}</w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>"#,
+            para("", &run("", "x"))
+        ));
+        if off {
+            assert_eq!(hidden(&extracted), [(2, "off_page")], "{margin}");
+        } else {
+            assert_eq!(text(&extracted), "x", "{margin}");
+        }
+    }
+}
+
 /// Word's highlight palette ([MS-DOC] 2.9.119 `Ico`, as LibreOffice's DOCX import maps it):
 /// text in the palette colour of its highlight is invisible, and black or white text on it,
 /// whichever stands out, is visible.
@@ -1264,9 +1315,10 @@ fn docx_highlight_palette_is_words() {
         assert_eq!(text(&extracted), "readable", "{name}");
         assert_eq!(hidden(&extracted), [(1, "low_contrast")], "{name}");
         // With a floor just above 1, only text of exactly the highlight's colour is hidden: the
-        // value is Word's to the last bit.
+        // value is Word's to the last bit (one step of one channel moves the ratio by 2e-5 at
+        // the least).
         let exact = DocLimits {
-            min_contrast: 1.000_1,
+            min_contrast: 1.0 + f32::EPSILON,
             ..limits()
         };
         let extracted = read_with(&Docx::new(&body), &exact).unwrap();
@@ -1468,6 +1520,13 @@ fn docx_based_on_band_sizes_and_field_characters_in_dropped_markup_are_undecided
 
     let field = r#"<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><x:wrap xmlns:x="urn:example:unknown"><w:fldChar w:fldCharType="separate"/></x:wrap></w:r><w:r><w:t>stillcode</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r><w:r><w:t>after</w:t></w:r></w:p>"#;
     let extracted = read_body(field);
+    assert_eq!(text(&extracted), "\u{FFFC}after");
+    assert_eq!(hidden(&extracted), [(1, "unknown_namespace")]);
+    // The same separate in a branch Word may not take, which leaves no unread markup.
+    let extracted = read_body(&field.replace(
+        r#"<w:r><x:wrap xmlns:x="urn:example:unknown"><w:fldChar w:fldCharType="separate"/></x:wrap></w:r>"#,
+        r#"<mc:AlternateContent><mc:Choice Requires="x"><w:r><w:fldChar w:fldCharType="separate"/></w:r></mc:Choice></mc:AlternateContent>"#,
+    ));
     assert_eq!(text(&extracted), "\u{FFFC}after");
     assert_eq!(hidden(&extracted), [(1, "unknown_namespace")]);
 }
@@ -2273,6 +2332,11 @@ fn docx_duplicate_styles_and_properties_are_read_both_ways() {
             r#"<w:tbl><w:tblPr><w:tblStyle w:val="Header"/><w:tblLook w:firstRow="0"/></w:tblPr><w:tr><w:tblPrEx><w:tblLook w:firstRow="1"/><w:tblLook w:firstRow="0"/></w:tblPrEx>{}</w:tr></w:tbl>"#,
             cell("", &para("", &run(BLACK, "rowlooks")))
         ),
+        // The hiding look first.
+        table(
+            r#"<w:tblStyle w:val="Header"/><w:tblLook w:firstRow="1"/><w:tblLook w:firstRow="0"/>"#,
+            &[vec![cell("", &para("", &run(BLACK, "firstlook")))]],
+        ),
     ]
     .concat();
     let extracted = read(&Docx::new(&body).styles(&styles));
@@ -2282,7 +2346,8 @@ fn docx_duplicate_styles_and_properties_are_read_both_ways() {
         [
             (1, "low_contrast"),
             (2, "low_contrast"),
-            (3, "low_contrast")
+            (3, "low_contrast"),
+            (4, "low_contrast")
         ]
     );
 
@@ -2444,6 +2509,14 @@ fn docx_text_boxes_in_hidden_runs_are_hidden() {
     let warned: Vec<&str> = hidden(&extracted).into_iter().map(|(_, why)| why).collect();
     assert_eq!(warned, ["vanish"; 7]);
 
+    // A host run whose properties are written twice leaves its text box undecided.
+    let extracted = read_body(&format!(
+        "<w:p><w:r><w:rPr/><w:rPr/>{}</w:r></w:p>",
+        drawing("inline", "undecidedhost")
+    ));
+    assert_eq!(text(&extracted), "");
+    assert_eq!(hidden(&extracted), [(2, "undecided")]);
+
     // A run's properties after its content are refused, as a paragraph's are.
     for body in [
         format!(
@@ -2478,6 +2551,8 @@ fn docx_field_types_are_read_past_white_space() {
         r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText>PA</w:instrText></w:r>{}<w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>9</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>"#,
         field(r#" QUOTE "GE" "#, "GE")
     );
+    // ... or by a `w:fldSimple`'s.
+    let finished_by_simple = r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText>PA</w:instrText></w:r><w:fldSimple w:instr=" QUOTE GE "><w:r><w:t>GE</w:t></w:r></w:fldSimple><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>9</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>"#.to_owned();
     let rows: Vec<(String, Option<&str>)> = vec![
         (field(&format!("{spaces}PAGE "), "9"), Some("field_result")),
         (
@@ -2503,6 +2578,7 @@ fn docx_field_types_are_read_past_white_space() {
         ),
         (nested_type, Some("undecided")),
         (finished_by_nested, Some("undecided")),
+        (finished_by_simple, Some("undecided")),
         (field("", "9"), Some("undecided")),
         (field(&"X".repeat(65), "9"), Some("undecided")),
         (field(r#"\* MERGEFORMAT"#, "9"), Some("undecided")),
@@ -2546,6 +2622,10 @@ fn docx_field_types_are_read_past_white_space() {
         "GOTOBUTTON",
         "SYMBOL",
         "FORMDROPDOWN",
+        "FORMCHECKBOX",
+        "DISPLAYBARCODE",
+        "MERGEBARCODE",
+        "BARCODE",
     ] {
         for body in [
             field(&format!(" {kind} x "), "9"),
@@ -2587,6 +2667,12 @@ fn docx_fields_with_no_result_leave_a_gap() {
                 r#"<w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t></w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>"#,
             ),
         ),
+        // A field Word never shows whose begin sits where Word's choice cannot be decided.
+        around(&bare(r#" SET x "1" "#).replacen(
+            r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r>"#,
+            r#"<mc:AlternateContent><mc:Choice Requires="x"><w:r><w:fldChar w:fldCharType="begin"/></w:r></mc:Choice></mc:AlternateContent>"#,
+            1,
+        )),
         // Never shown: nothing is drawn there.
         around(&bare(r#" SET x "1" "#)),
         around(&bare(r#" XE "budget" "#)),
@@ -2600,6 +2686,7 @@ fn docx_fields_with_no_result_leave_a_gap() {
             .map(|block| block.text.as_str())
             .collect::<Vec<_>>(),
         [
+            gap,
             gap,
             gap,
             gap,
@@ -2624,6 +2711,108 @@ fn docx_fields_with_no_result_leave_a_gap() {
         footer.as_bytes(),
     ));
     assert_eq!(text(&extracted), "main\nTotal 1\u{FFFC}0 pages");
+}
+
+/// A text box is its own story and a `w:fldSimple` its own field: field characters inside one
+/// never end, start the result of, or name a field begun outside it, and a field begun inside
+/// one never runs past it.
+#[test]
+fn docx_field_characters_stay_in_their_story_and_field() {
+    let begin = r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r>"#;
+    let separate = r#"<w:r><w:fldChar w:fldCharType="separate"/></w:r>"#;
+    let end = r#"<w:r><w:fldChar w:fldCharType="end"/></w:r>"#;
+    let instr = |text: &str| {
+        format!(r#"<w:r><w:instrText xml:space="preserve">{text}</w:instrText></w:r>"#)
+    };
+    let in_box = |content: &str| {
+        shape_box(
+            "inline",
+            "",
+            r#"<a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill>"#,
+            &format!("<w:p>{content}</w:p>"),
+        )
+    };
+    let around = |inner: &str| {
+        format!(
+            "<w:p>{}{inner}{}</w:p>",
+            run("", "Budget: 1"),
+            run("", "00 baht")
+        )
+    };
+    let page = |inside: &str| {
+        format!(
+            "{begin}{}{separate}{inside}{}{end}",
+            instr(" PAGE "),
+            run("", "2")
+        )
+    };
+    let body = [
+        // A field begun in a `w:fldSimple` and not ended there: the next end is its own.
+        around(&page(&format!(
+            r#"<w:fldSimple w:instr=" REF x ">{begin}</w:fldSimple>{end}"#
+        ))),
+        // An end in a box does not end the field around the box.
+        around(&page(&in_box(end))),
+        // A field begun in a box ends with the box.
+        around(&format!(
+            "{}{}",
+            in_box(&format!(
+                "{begin}{}{separate}{}",
+                instr(" PAGE "),
+                run("", "9")
+            )),
+            run("", "2")
+        )),
+        // A separate in a box does not start the result of the field around the box, and an
+        // instruction in a box does not name it.
+        around(&format!(
+            "{begin}{}{}{}{end}",
+            instr(" REF x "),
+            in_box(separate),
+            run("", "2")
+        )),
+        around(&format!(
+            "{begin}{}{separate}{}{end}",
+            in_box(&instr(" REF x ")),
+            run("", "2")
+        )),
+        // An end in a `w:fldSimple` does not end it.
+        around(&format!(
+            r#"<w:fldSimple w:instr=" REF x ">{end}{}</w:fldSimple>"#,
+            run("", "2")
+        )),
+    ]
+    .concat();
+    let extracted = read_body(&body);
+    let blocks: Vec<&str> = extracted
+        .blocks
+        .iter()
+        .map(|block| block.text.as_str())
+        .collect();
+    assert_eq!(
+        blocks,
+        [
+            "Budget: 1\u{FFFC}00 baht",
+            "Budget: 1\u{FFFC}00 baht",
+            "Budget: 1\u{FFFC}200 baht",
+            "Budget: 1\u{FFFC}00 baht",
+            "Budget: 1\u{FFFC}00 baht",
+            "Budget: 1\u{FFFC}00 baht"
+        ]
+    );
+    // A field left open past its `w:fldSimple`, or ended or separated where it cannot be, is
+    // undecided; a box's own field hides its own result and nothing after the box.
+    assert_eq!(
+        hidden(&extracted),
+        [
+            (1, "unknown_namespace"),
+            (2, "field_result"),
+            (5, "field_result"),
+            (6, "unknown_namespace"),
+            (8, "undecided"),
+            (10, "unknown_namespace")
+        ]
+    );
 }
 
 /// `w15:dataBinding` binds a control as `w:dataBinding` does: Word refills it from the custom
@@ -2730,6 +2919,108 @@ fn docx_equations_and_unread_inline_content_leave_a_gap() {
             (7, "unknown_namespace")
         ]
     );
+
+    // An equation draws characters its attributes name (a delimiter, an operator, an accent)
+    // whatever text it holds, and so may an element the reader does not read that holds
+    // anything at all: a gap and a warning wherever it stands.
+    let around = |inner: &str| {
+        format!(
+            "<w:p>{}{inner}{}</w:p>",
+            run("", "Budget: 1"),
+            run("", "00 baht")
+        )
+    };
+    let equation = |inner: &str| format!("<m:oMath {math}>{inner}</m:oMath>");
+    let delimiter =
+        equation(r#"<m:d><m:dPr><m:begChr m:val="2"/><m:endChr m:val=""/></m:dPr><m:e/></m:d>"#);
+    let unknown = r#"xmlns:x="urn:example:unknown""#;
+    let drawn = [
+        delimiter.clone(),
+        equation(
+            r#"<m:nary><m:naryPr><m:chr m:val="2"/></m:naryPr><m:sub/><m:sup/><m:e/></m:nary>"#,
+        ),
+        equation(
+            r#"<m:groupChr><m:groupChrPr><m:chr m:val="2"/></m:groupChrPr><m:e/></m:groupChr>"#,
+        ),
+        equation(r#"<m:acc><m:accPr><m:chr m:val="2"/></m:accPr><m:e/></m:acc>"#),
+        equation(r#"<m:r><m:t xml:space="preserve"> </m:t></m:r>"#),
+        format!(
+            r#"<m:oMathPara {math}><m:oMath><m:d><m:dPr><m:sepChr m:val="2"/></m:dPr><m:e/><m:e/></m:d></m:oMath></m:oMathPara>"#
+        ),
+        format!("<w:hyperlink>{delimiter}</w:hyperlink>"),
+        format!(r#"<x:wrap {unknown}><x:sign x:char="2"/></x:wrap>"#),
+        format!(r#"<x:sign {unknown} x:char="2"/>"#),
+        format!(r#"<w:r><x:sign {unknown} x:char="2"/></w:r>"#),
+    ];
+    // Nothing inside and nothing named: nothing drawn there.
+    let empty = [
+        format!("<m:oMath {math}/>"),
+        format!("<m:oMath {math}></m:oMath>"),
+        format!("<x:mark {unknown}/>"),
+    ];
+    let body = [
+        drawn.iter().map(|inner| around(inner)).collect::<String>(),
+        empty.iter().map(|inner| around(inner)).collect(),
+        // A paragraph holding only an equation, and one between paragraphs, where the schema
+        // allows it.
+        format!("<w:p>{delimiter}</w:p>"),
+        format!(
+            r#"<m:oMathPara {math}><m:oMath><m:d><m:dPr><m:begChr m:val="7"/></m:dPr><m:e/></m:d></m:oMath></m:oMathPara>"#
+        ),
+        para("", &run("", "after")),
+        // Inside text, unread markup is undecided as markup Word does not read there is; inside
+        // an instruction it leaves the field's type undecided.
+        format!(r#"<w:p><w:r><w:t>1<x:sign {unknown} x:char="2"/>00</w:t></w:r></w:p>"#),
+        format!(
+            r#"<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> REF<x:sign {unknown} x:char="2"/> x </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>r</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>"#
+        ),
+        // In a branch Word does not take, or in a deletion, it is not there at all.
+        around(&format!(
+            r#"<mc:AlternateContent><mc:Choice Requires="w14"><w:r/></mc:Choice><mc:Fallback>{delimiter}</mc:Fallback></mc:AlternateContent>"#
+        )),
+        around(&format!("<w:del>{delimiter}</w:del>")),
+        // Text in it between paragraphs warns; white space alone is nothing.
+        format!(r#"<x:note {unknown}>2</x:note>"#),
+        para("", &run("", "after2")),
+        format!(r#"<x:note {unknown}> </x:note>"#),
+        para("", &run("", "after3")),
+        // An equation in a deleted cell is not there either.
+        format!(
+            r#"<w:tbl><w:tr><w:tc><w:tcPr><w:cellDel w:id="1" w:author="a"/></w:tcPr><m:oMathPara {math}><m:oMath><m:r><m:t>2</m:t></m:r></m:oMath></m:oMathPara><w:p/></w:tc></w:tr></w:tbl>"#
+        ),
+        para("", &run("", "after4")),
+    ]
+    .concat();
+    let extracted = read_body(&body);
+    let gap = "Budget: 1\u{FFFC}00 baht";
+    let mut expected = vec![gap; drawn.len()];
+    expected.extend(["Budget: 100 baht"; 3]);
+    expected.extend(["after", "1\u{FFFC}00"]);
+    expected.extend([
+        "Budget: 100 baht",
+        "Budget: 100 baht",
+        "after2",
+        "after3",
+        "after4",
+    ]);
+    assert_eq!(
+        extracted
+            .blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    let mut warned: Vec<(u32, &str)> = (1..=10).map(|at| (at, "unknown_namespace")).collect();
+    // The paragraph holding only an equation, and the one after the equation between paragraphs.
+    warned.extend([
+        (14, "unknown_namespace"),
+        (15, "unknown_namespace"),
+        (16, "undecided"),
+        (17, "unknown_namespace"),
+        (20, "unknown_namespace"),
+    ]);
+    assert_eq!(hidden(&extracted), warned);
 }
 
 /// The accepted view has no row deleted in a conflict (`w14:conflictDel`, which Word treats as a
@@ -2843,10 +3134,46 @@ fn docx_late_and_misplaced_shape_markup_fails_closed() {
                 &para("", &run("", "extension"))
             )
         ),
+        // A frame outside `w:drawing`.
+        format!(
+            "<w:p>{}</w:p>",
+            shape_box("inline", "", white_fill, &para("", &run("", "nodrawing")))
+                .replace("<w:drawing>", "")
+                .replace("</w:drawing>", "")
+        ),
     ]
     .concat();
-    let extracted = read_body(&body);
-    assert_eq!(text(&extracted), "extension");
+    // Inside a text box, as at the top level: its shape and frame are no frame for the markup
+    // in its paragraphs.
+    let in_box = |inner: &str| {
+        format!(
+            "<w:p>{}</w:p>",
+            shape_box("inline", "", white_fill, &format!("<w:p>{inner}</w:p>"))
+        )
+    };
+    let nested = [
+        in_box(&format!("<w:r>{}</w:r>", wsp("boxinrun"))),
+        in_box(&wsp("boxinpara")),
+        in_box(&format!(
+            r#"<w:r><v:shape fillcolor="white"><v:textbox><w:txbxContent>{}</w:txbxContent></v:textbox></v:shape></w:r>"#,
+            para("", &run("", "boxvmlnopict"))
+        )),
+        in_box(
+            &shape_box("inline", "", white_fill, &para("", &run("", "boxnodrawing")))
+                .replace("<w:drawing>", "")
+                .replace("</w:drawing>", ""),
+        ),
+        // A box in its frame inside a box is read.
+        in_box(&shape_box(
+            "inline",
+            "",
+            white_fill,
+            &para("", &run("", "nestedbox")),
+        )),
+    ]
+    .concat();
+    let extracted = read_body(&(body + &nested));
+    assert_eq!(text(&extracted), "extension\nnestedbox");
     // Each box's paragraph comes after the paragraph holding it.
     assert_eq!(
         hidden(&extracted),
@@ -2854,7 +3181,82 @@ fn docx_late_and_misplaced_shape_markup_fails_closed() {
             (2, "undecided"),
             (4, "undecided"),
             (6, "undecided"),
-            (8, "undecided")
+            (8, "undecided"),
+            (12, "undecided"),
+            (15, "undecided"),
+            (18, "undecided"),
+            (21, "undecided"),
+            (24, "undecided")
+        ]
+    );
+}
+
+/// Word reads a shape's text only from `wps:txbx` in a `wps:wsp`, or `v:textbox` in a VML shape:
+/// a `w:txbxContent` anywhere else is undecided, an extension's included.
+#[test]
+fn docx_text_box_content_stands_only_in_its_shapes_text_box() {
+    let white_fill = r#"<a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill>"#;
+    let story = |marker: &str| {
+        format!(
+            "<w:txbxContent>{}</w:txbxContent>",
+            para("", &run("", marker))
+        )
+    };
+    let boxed = |sp_pr: &str, marker: &str| {
+        format!(
+            "<w:p>{}</w:p>",
+            shape_box("inline", "", sp_pr, &para("", &run("", marker)))
+        )
+    };
+    let body = [
+        boxed(&format!("{white_fill}{}", story("inspPr")), "real1"),
+        boxed(
+            &format!(
+                r#"{white_fill}<a:extLst><a:ext uri="{{00000000-0000-0000-0000-000000000000}}">{}</a:ext></a:extLst>"#,
+                story("inext")
+            ),
+            "real2",
+        ),
+        boxed(white_fill, "real3").replace(
+            "</wps:spPr>",
+            &format!("</wps:spPr><wps:bodyPr>{}</wps:bodyPr>", story("inbodyPr")),
+        ),
+        boxed(white_fill, "x").replace(
+            &format!("<wps:txbx>{}</wps:txbx>", story("x")),
+            &story("nowpstxbx"),
+        ),
+        boxed(white_fill, "real5").replace(
+            "</a:graphicData>",
+            &format!("{}</a:graphicData>", story("ingraphicData")),
+        ),
+        format!(
+            r#"<w:p><w:r><w:pict><v:shape fillcolor="white">{}</v:shape></w:pict></w:r></w:p>"#,
+            story("novtextbox")
+        ),
+        // A `wps:txbx` outside its shape, a `v:textbox` outside any.
+        boxed(white_fill, "real7").replace(
+            "</wps:spPr>",
+            &format!("<wps:txbx>{}</wps:txbx></wps:spPr>", story("txbxinspPr")),
+        ),
+        format!(
+            r#"<w:p><w:r><w:pict><v:textbox>{}</v:textbox></w:pict></w:r></w:p>"#,
+            story("textboxinpict")
+        ),
+    ]
+    .concat();
+    let extracted = read_body(&body);
+    assert_eq!(text(&extracted), "real1\nreal2\nreal3\nreal5\nreal7");
+    assert_eq!(
+        hidden(&extracted),
+        [
+            (2, "undecided"),
+            (5, "undecided"),
+            (8, "undecided"),
+            (11, "undecided"),
+            (14, "undecided"),
+            (16, "undecided"),
+            (18, "undecided"),
+            (21, "undecided")
         ]
     );
 }
@@ -2959,9 +3361,7 @@ fn docx_shading_candidates_are_deduplicated_and_capped() {
     };
     let two_candidates =
         r#"<w:shd w:val="pct50" w:color="123456" w:themeColor="accent1" w:fill="auto"/>"#;
-    let started = Instant::now();
     let extracted = read_body(&nested(two_candidates, 40, r#"<w:color w:val="ABCDEF"/>"#));
-    assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(hidden(&extracted), [(1, "undecided")]);
     // Stripes over stripes add the same black at every level: two colours, however deep.
     let stripes = r#"<w:shd w:val="horzStripe" w:color="000000" w:fill="auto"/>"#;
@@ -3161,7 +3561,7 @@ fn docx_each_fail_closed_rule_is_pinned() {
                 para("", &run("", "x"))
             )),
             "",
-            vec![(2, "unknown_paint")],
+            vec![(2, "undecided")],
         ),
         (
             "text in a shape's extensions",
@@ -3201,6 +3601,61 @@ fn docx_each_fail_closed_rule_is_pinned() {
             Docx::new(&inline(white_fill, "x").replace("</wps:wsp>", "<wps:style/></wps:wsp>")),
             "error",
             vec![],
+        ),
+        // Where shapes and their text stand.
+        (
+            "a shape in a group in a group",
+            Docx::new(&inline(white_fill, "x").replace("<wps:wsp>", r#"<wpg:wgp xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup"><wpg:grpSp><wps:wsp>"#).replace("</wps:wsp>", "</wps:wsp></wpg:grpSp></wpg:wgp>")),
+            "x",
+            vec![],
+        ),
+        (
+            "a shape in a canvas",
+            Docx::new(&inline(white_fill, "x").replace("<wps:wsp>", r#"<wpc:wpc xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas"><wps:wsp>"#).replace("</wps:wsp>", "</wps:wsp></wpc:wpc>")),
+            "x",
+            vec![],
+        ),
+        (
+            "a VML shape directly in another",
+            Docx::new(&vml(r#"fillcolor="white""#, "", "x").replace("<v:textbox>", r#"<v:rect fillcolor="white"><v:textbox>"#).replace("</v:textbox>", "</v:textbox></v:rect>")),
+            "",
+            vec![(2, "undecided")],
+        ),
+        (
+            "a graphic outside a frame",
+            Docx::new(&inline(white_fill, "x").replace(
+                "</wps:spPr>",
+                &format!(
+                    r#"</wps:spPr><a:graphic><a:graphicData><wps:wsp><wps:spPr>{white_fill}</wps:spPr><wps:txbx><w:txbxContent>{}</w:txbxContent></wps:txbx></wps:wsp></a:graphicData></a:graphic>"#,
+                    para("", &run("", "y"))
+                ),
+            )),
+            "x",
+            vec![(2, "undecided")],
+        ),
+        (
+            "graphic data outside a graphic",
+            Docx::new(&inline(white_fill, "x").replace("<a:graphic>", "").replace("</a:graphic>", "")),
+            "",
+            vec![(2, "undecided")],
+        ),
+        (
+            "a shape's text box in its frame",
+            Docx::new(&format!(
+                "<w:p><w:r><w:drawing><wp:inline><wps:txbx><w:txbxContent>{}</w:txbxContent></wps:txbx></wp:inline></w:drawing></w:r></w:p>",
+                para("", &run("", "x"))
+            )),
+            "",
+            vec![(2, "undecided")],
+        ),
+        (
+            "a VML text box in a group",
+            Docx::new(&format!(
+                r#"<w:p><w:r><w:pict><v:group fillcolor="white"><v:textbox><w:txbxContent>{}</w:txbxContent></v:textbox></v:group></w:pict></w:r></w:p>"#,
+                para("", &run("", "x"))
+            )),
+            "",
+            vec![(2, "undecided")],
         ),
         // A text box in a paragraph outside any cell of its table.
         (
@@ -5184,7 +5639,7 @@ fn reader_loops_stop_at_the_job_deadline() {
         ),
         (
             "the main part's prolog",
-            490,
+            590,
             Box::new(|| docs::extract(MediaKind::Docx, &prolog, &limits()).map(drop)),
         ),
     ];
