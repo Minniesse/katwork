@@ -47,3 +47,8 @@ caseless = "0.2.2"
 unicode-segmentation = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
 regex-syntax = { version = "0.8", default-features = false, features = ["std", "unicode-bool"] }
+# The defaults pull bzip2 and ppmd code under licences deny.toml does not allow.
+zip = { version = "9.0.1", default-features = false, features = ["deflate"] }
+quick-xml = "0.42"
+crc32fast = "1"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }

@@ -1219,3 +1219,85 @@ fn empty_lock_timeout_uses_default() {
     .unwrap();
     assert_eq!(config.lock_timeout, std::time::Duration::from_millis(5000));
 }
+
+#[test]
+fn doc_workers_is_one_to_sixteen() {
+    let workers = |value: Option<&str>| {
+        Config::from_lookup(|name| {
+            if name == "KATWORK_DOC_WORKERS" {
+                value.map(str::to_owned)
+            } else {
+                lookup(name)
+            }
+        })
+    };
+    for (value, expected) in [(None, 2), (Some(""), 2), (Some("1"), 1), (Some("16"), 16)] {
+        assert_eq!(workers(value).unwrap().doc_workers, expected);
+    }
+    for value in ["0", "17", "-1", "+2", "two", "2.0"] {
+        let error = workers(Some(value)).unwrap_err();
+        assert_eq!(error.to_string(), "config_invalid (KATWORK_DOC_WORKERS)");
+    }
+}
+
+#[test]
+fn doc_max_xml_elements_is_bounded() {
+    let elements = |value: Option<&str>| {
+        Config::from_lookup(|name| {
+            if name == "KATWORK_DOC_MAX_XML_ELEMENTS" {
+                value.map(str::to_owned)
+            } else {
+                lookup(name)
+            }
+        })
+    };
+    let default = katwork::docs::DocLimits::default().max_xml_elements;
+    assert_eq!(default, 2_000_000);
+    for (value, expected) in [
+        (None, default),
+        (Some(""), default),
+        (Some("1000"), 1_000),
+        (Some("20000000"), 20_000_000),
+    ] {
+        assert_eq!(elements(value).unwrap().doc_max_xml_elements, expected);
+    }
+    for value in ["999", "20000001", "-1", "+1000", "1e6", "1,000"] {
+        let error = elements(Some(value)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "config_invalid (KATWORK_DOC_MAX_XML_ELEMENTS)"
+        );
+    }
+}
+
+#[test]
+fn doc_max_read_bytes_is_bounded() {
+    let bytes = |value: Option<&str>| {
+        Config::from_lookup(|name| {
+            if name == "KATWORK_DOC_MAX_READ_BYTES" {
+                value.map(str::to_owned)
+            } else {
+                lookup(name)
+            }
+        })
+    };
+    assert_eq!(
+        katwork::docs::DocLimits::default().max_read_bytes,
+        1_073_741_824
+    );
+    for (value, expected) in [
+        (None, 1_073_741_824),
+        (Some(""), 1_073_741_824),
+        (Some("67108864"), 67_108_864),
+        (Some("68719476736"), 68_719_476_736),
+    ] {
+        assert_eq!(bytes(value).unwrap().doc_max_read_bytes, expected);
+    }
+    for value in ["67108863", "68719476737", "-1", "+67108864", "1e9", "1g"] {
+        let error = bytes(Some(value)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "config_invalid (KATWORK_DOC_MAX_READ_BYTES)"
+        );
+    }
+}

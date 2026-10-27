@@ -693,6 +693,51 @@ async fn restart_smoke_posts_one_reply() {
 
 #[tokio::test]
 #[ignore = "Docker daemon; run scripts/smoke.sh"]
+async fn wedged_pool_restarts_the_container() {
+    let mut stack = Stack::new(false);
+    // Only this stack wedges: the switches go in its own .env, which Compose interpolates.
+    let settings = stack.dir.join(".env");
+    let mut env = fs::read_to_string(&settings).unwrap();
+    env.push_str(
+        "\nKATWORK_SMOKE_DOC_CALL_TIMEOUT_MS=200\nKATWORK_SMOKE_WEDGE_ONCE=/tmp/katwork-wedged\n",
+    );
+    fs::write(settings, env).unwrap();
+    stack.start().await;
+    let id = stack.run(&["ps", "-q", "katwork"]);
+    let restarts = || {
+        checked(Command::new("docker").args([
+            "inspect",
+            "--format",
+            "{{.RestartCount}}",
+            id.trim(),
+        ]))
+        .trim()
+        .to_owned()
+    };
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while restarts() != "1" {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("the watchdog restarted katwork within 60 s");
+    stack.connect().await;
+    let logs = stack.run(&["logs", "--no-color", "katwork"]);
+    assert_eq!(
+        logs.lines()
+            .filter(|line| line.contains("doc_pool_wedged_exit"))
+            .count(),
+        1,
+        "{logs}"
+    );
+    let health = stack.request("GET", "/healthz").send().await.unwrap();
+    assert_eq!(health.status(), 200);
+    // The marker survives the restart, so the new process does not wedge again.
+    assert_eq!(restarts(), "1");
+}
+
+#[tokio::test]
+#[ignore = "Docker daemon; run scripts/smoke.sh"]
 async fn backup_archive_restores_seeded_data() {
     let mut stack = Stack::new(false);
     stack.start().await;
