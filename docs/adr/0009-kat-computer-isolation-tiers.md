@@ -1,6 +1,6 @@
 # 0009. Kat computers: agentOS for light code until KatsAgentOS, a container runtime ladder for Chromium, one egress gateway
 
-- Status: Proposed (2026-10-24), with the sub-project 2a plan; it becomes Accepted when the founder approves that plan. Revised the same day after the plan reviews (the code tier's switch target is gVisor only; R21 keeps agentOS with a warning on a host without gVisor); built in sub-project 2b, recorded now
+- Status: Accepted (2026-10-24), with the sub-project 2a plan, which the founder approved that day. Revised the same day after the plan reviews (the code tier's switch target is gVisor only; R21 keeps agentOS with a warning on a host without gVisor); built in sub-project 2b, recorded now
 - Decision owner: Founder
 - Spec: §1.2 (non-goals), §4 (Task), §9, §13 (isolation), §14, §19 item 2; amends §1.2, §4 and §14 item 3
 
