@@ -1208,6 +1208,7 @@ fn docx_unparseable_values_fail_closed() {
     .concat();
     let extracted = read_body(&body);
     assert_eq!(text(&extracted), "fine");
+    // A `w:t` outside a run is not read, and Word would not read it as the reader does.
     assert_eq!(
         hidden(&extracted),
         [
@@ -1215,7 +1216,8 @@ fn docx_unparseable_values_fail_closed() {
             (2, "tiny"),
             (3, "low_contrast"),
             (4, "low_contrast"),
-            (5, "low_contrast")
+            (5, "low_contrast"),
+            (6, "undecided")
         ]
     );
 }
@@ -3023,6 +3025,468 @@ fn docx_equations_and_unread_inline_content_leave_a_gap() {
     assert_eq!(hidden(&extracted), warned);
 }
 
+/// An equation inside WordprocessingML the reader passes over in a run or a paragraph (a run in
+/// a run, a container a run cannot hold, an element Word does not define) leaves the gap and the
+/// warning it leaves between runs; inside a drawing or a run's properties Word draws nothing of
+/// it.
+#[test]
+fn docx_unread_content_in_markup_the_reader_passes_over_leaves_a_gap() {
+    let math = r#"xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math""#;
+    let delimiter = format!(
+        r#"<m:oMath {math}><m:d><m:dPr><m:begChr m:val="2"/><m:endChr m:val=""/></m:dPr><m:e/></m:d></m:oMath>"#
+    );
+    let written = format!(r#"<m:oMath {math}><m:r><m:t>2</m:t></m:r></m:oMath>"#);
+    let around = |inner: &str| {
+        format!(
+            "<w:p>{}{inner}{}</w:p>",
+            run("", "Budget: 1"),
+            run("", "00 baht")
+        )
+    };
+    let in_run = |inner: &str| {
+        format!("<w:p><w:r><w:t>Budget: 1</w:t>{inner}<w:t>00 baht</w:t></w:r></w:p>")
+    };
+    let gap = "Budget: 1\u{FFFC}00 baht";
+    let unread = vec![(1, "unknown_namespace")];
+    let rows = [
+        ("a run in a run", in_run(&format!("<w:r>{delimiter}</w:r>"))),
+        (
+            "a run in a run between runs",
+            around(&format!("<w:r><w:r>{written}</w:r></w:r>")),
+        ),
+        (
+            "a hyperlink in a run",
+            in_run(&format!("<w:hyperlink>{delimiter}</w:hyperlink>")),
+        ),
+        (
+            "a content control in a run",
+            in_run(&format!(
+                "<w:sdt><w:sdtContent>{delimiter}</w:sdtContent></w:sdt>"
+            )),
+        ),
+        (
+            "an insertion in a run",
+            in_run(&format!(
+                r#"<w:ins w:id="1" w:author="a">{delimiter}</w:ins>"#
+            )),
+        ),
+        (
+            "a simple field in a run",
+            in_run(&format!(
+                r#"<w:fldSimple w:instr=" REF x ">{delimiter}</w:fldSimple>"#
+            )),
+        ),
+        (
+            "custom XML in a run",
+            in_run(&format!(
+                r#"<w:customXml w:element="x">{delimiter}</w:customXml>"#
+            )),
+        ),
+        (
+            "a smart tag in a run",
+            in_run(&format!(
+                r#"<w:smartTag w:element="x">{delimiter}</w:smartTag>"#
+            )),
+        ),
+        (
+            "an element Word does not define in a run",
+            in_run(&format!("<w:notAnElement>{delimiter}</w:notAnElement>")),
+        ),
+        (
+            "an element Word does not define in a paragraph",
+            around(&format!("<w:notAnElement>{delimiter}</w:notAnElement>")),
+        ),
+        (
+            "a content control's own markup",
+            around(&format!(
+                "<w:sdt><w:sdtPr/>{delimiter}<w:sdtContent/></w:sdt>"
+            )),
+        ),
+    ];
+    for (case, body) in rows {
+        let extracted = read_body(&body);
+        assert_eq!(text(&extracted), gap, "{case}");
+        assert_eq!(hidden(&extracted), unread, "{case}");
+    }
+
+    // Text in a run in a run is undecided, as it was; an unknown element in a drawing or in a
+    // run's properties is nothing drawn there.
+    let chart = r#"<w:r><w:drawing><wp:inline><wp:extent cx="914400" cy="914400"/><wp:docPr id="1" name="Chart 1"><a:extLst><a:ext uri="{FF2B5EF4-FFF2-40B4-BE49-F238E27FC236}"><a16:creationId xmlns:a16="http://schemas.microsoft.com/office/drawing/2014/main" id="{00000000-0000-0000-0000-000000000001}"/></a:ext></a:extLst></wp:docPr><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rId9"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"#;
+    let rows = [
+        (
+            "text in a run in a run",
+            in_run("<w:r><w:t>2</w:t></w:r>"),
+            gap,
+            vec![(1, "undecided")],
+        ),
+        ("a chart", around(chart), gap, vec![]),
+        (
+            "an unknown element in a run's properties",
+            format!(
+                r#"<w:p>{}<w:r><w:rPr><x:a xmlns:x="urn:example:unknown" x:b="2"/></w:rPr><w:t>00 baht</w:t></w:r></w:p>"#,
+                run("", "Budget: 1")
+            ),
+            "Budget: 100 baht",
+            vec![],
+        ),
+        (
+            "an unknown element in a section's properties",
+            format!(
+                r#"{}<w:sectPr><x:a xmlns:x="urn:example:unknown" x:b="2"/></w:sectPr>"#,
+                around("")
+            ),
+            "Budget: 100 baht",
+            vec![],
+        ),
+        (
+            "an unknown element in a content control's end properties",
+            around(
+                r#"<w:sdt><w:sdtPr/><w:sdtEndPr><x:a xmlns:x="urn:example:unknown" x:b="2"/></w:sdtEndPr><w:sdtContent/></w:sdt>"#,
+            ),
+            "Budget: 100 baht",
+            vec![],
+        ),
+        (
+            "an unknown element in custom XML properties",
+            around(
+                r#"<w:customXml w:element="x"><w:customXmlPr><x:a xmlns:x="urn:example:unknown" x:b="2"/></w:customXmlPr></w:customXml>"#,
+            ),
+            "Budget: 100 baht",
+            vec![],
+        ),
+        (
+            "an unknown element in smart tag properties",
+            around(
+                r#"<w:smartTag w:element="x"><w:smartTagPr><x:a xmlns:x="urn:example:unknown" x:b="2"/></w:smartTagPr></w:smartTag>"#,
+            ),
+            "Budget: 100 baht",
+            vec![],
+        ),
+    ];
+    for (case, body, shown, warned) in rows {
+        let extracted = read_body(&body);
+        assert_eq!(text(&extracted), shown, "{case}");
+        assert_eq!(hidden(&extracted), warned, "{case}");
+    }
+}
+
+/// Unread content between paragraphs gives the paragraph after it one warning, its first reason,
+/// with that paragraph's id; after the last paragraph, the last one; with no paragraph, none.
+#[test]
+fn docx_unread_content_between_paragraphs_warns_one_paragraph_once() {
+    let math = r#"xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math""#;
+    let equation = format!(
+        r#"<m:oMathPara {math}><m:oMath><m:d><m:dPr><m:begChr m:val="2"/></m:dPr><m:e/></m:d></m:oMath></m:oMathPara>"#
+    );
+    let plain = para("", &run("", "plain"));
+    let vanished = para("", &[run("", "shown"), run("<w:vanish/>", "gone")].concat());
+    let rows = [
+        (
+            "three before a paragraph",
+            format!("{equation}{equation}{equation}{plain}"),
+            "plain",
+            vec![(1, "unknown_namespace")],
+        ),
+        (
+            "two before a paragraph that hides a run",
+            format!("{equation}{equation}{vanished}"),
+            "shown\u{FFFC}",
+            vec![(1, "unknown_namespace")],
+        ),
+        (
+            "after the last paragraph",
+            format!("{plain}{equation}"),
+            "plain",
+            vec![(1, "unknown_namespace")],
+        ),
+        (
+            "after the last paragraph, which warns already",
+            format!("{vanished}{equation}"),
+            "shown\u{FFFC}",
+            vec![(1, "vanish")],
+        ),
+        (
+            "between paragraphs in a cell",
+            table(
+                "",
+                &[vec![cell(
+                    "",
+                    &format!("{plain}{equation}{equation}{plain}"),
+                )]],
+            ),
+            "plain\nplain",
+            vec![(2, "unknown_namespace")],
+        ),
+        ("and no paragraph", equation.clone(), "", vec![]),
+    ];
+    for (case, body, shown, warned) in rows {
+        let extracted = read_body(&body);
+        assert_eq!(text(&extracted), shown, "{case}");
+        assert_eq!(hidden(&extracted), warned, "{case}");
+    }
+
+    // The warning names the paragraph as its block does, before it or after it.
+    let ids = |locators: Vec<&Locator>| -> Vec<Option<String>> {
+        locators
+            .into_iter()
+            .map(|locator| match locator {
+                Locator::DocxParagraph { para_id, .. } => para_id.clone(),
+                _ => unreachable!("a DOCX locator"),
+            })
+            .collect()
+    };
+    let identified = format!(r#"<w:p w14:paraId="1A2B3C4D">{}</w:p>"#, run("", "x"));
+    for body in [
+        format!("{equation}{identified}"),
+        format!("{identified}{equation}"),
+    ] {
+        let extracted = read_body(&body);
+        let warned = ids(extracted
+            .warnings
+            .iter()
+            .filter_map(|warning| match warning {
+                ExtractWarning::HiddenContent { at, .. } => Some(at),
+                _ => None,
+            })
+            .collect());
+        let shown = ids(extracted
+            .blocks
+            .iter()
+            .map(|block| &block.locator)
+            .collect());
+        assert_eq!(warned, [Some("1A2B3C4D".to_owned())], "{body}");
+        assert_eq!(shown, warned, "{body}");
+    }
+}
+
+/// Text in markup Word would not read as the reader does is undecided where it stands, never
+/// dropped unmarked: a `w:delText` or `w:delInstrText` outside a deletion, a `w:t` or
+/// `w:instrText` out of its place, an instruction no field takes, an element Word does not
+/// define, and character data where WordprocessingML holds none. In a paragraph it leaves a gap
+/// and an `undecided` warning, so the figures either side never join; between paragraphs the
+/// paragraph after it warns. Deleted text, field data and white space between elements are not
+/// text Word draws.
+#[test]
+fn docx_text_word_would_not_read_there_is_undecided() {
+    let around = |inner: &str| {
+        format!(
+            "<w:p>{}{inner}{}</w:p>",
+            run("", "Payment: 1"),
+            run("", "00,000 baht")
+        )
+    };
+    let in_run = |inner: &str| {
+        format!("<w:p><w:r><w:t>Payment: 1</w:t>{inner}<w:t>00,000 baht</w:t></w:r></w:p>")
+    };
+    let begin = r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r>"#;
+    let instr = |text: &str| {
+        format!(r#"<w:r><w:instrText xml:space="preserve">{text}</w:instrText></w:r>"#)
+    };
+    let separate = r#"<w:r><w:fldChar w:fldCharType="separate"/></w:r>"#;
+    let end = r#"<w:r><w:fldChar w:fldCharType="end"/></w:r>"#;
+    let gap = "Payment: 1\u{FFFC}00,000 baht";
+    let joined = "Payment: 100,000 baht";
+    let undecided = vec![(1, "undecided")];
+    type Row = (&'static str, String, &'static str, Vec<(u32, &'static str)>);
+    let rows: Vec<Row> = vec![
+        // Text elements out of their place.
+        ("delText in a run", in_run("<w:delText>2</w:delText>"), gap, undecided.clone()),
+        ("a run of delText", around("<w:r><w:delText>2</w:delText></w:r>"), gap, undecided.clone()),
+        (
+            "a run of delText in an insertion",
+            around(r#"<w:ins w:id="1" w:author="a"><w:r><w:delText>2</w:delText></w:r></w:ins>"#),
+            gap,
+            undecided.clone(),
+        ),
+        (
+            "delText of a space",
+            around(r#"<w:r><w:delText xml:space="preserve"> </w:delText></w:r>"#),
+            gap,
+            undecided.clone(),
+        ),
+        ("delText in a paragraph", around("<w:delText>2</w:delText>"), gap, undecided.clone()),
+        (
+            "a paragraph of delText",
+            "<w:p><w:r><w:delText>Pay 1,200,000 baht</w:delText></w:r></w:p>".into(),
+            "",
+            undecided.clone(),
+        ),
+        (
+            "delText at a paragraph's end",
+            format!("<w:p>{}<w:r><w:delText>0</w:delText></w:r></w:p>", run("", "Total 100")),
+            "Total 100\u{FFFC}",
+            undecided.clone(),
+        ),
+        (
+            "delInstrText in no field",
+            around("<w:r><w:delInstrText>2</w:delInstrText></w:r>"),
+            gap,
+            undecided.clone(),
+        ),
+        (
+            "instrText in no field",
+            around("<w:r><w:instrText>2</w:instrText></w:r>"),
+            gap,
+            undecided.clone(),
+        ),
+        (
+            "instrText in a field's result",
+            around(&format!(
+                "{begin}{}{separate}<w:r><w:instrText>2</w:instrText></w:r>{end}",
+                instr(" REF x ")
+            )),
+            gap,
+            undecided.clone(),
+        ),
+        (
+            "instrText out of its run",
+            around("<w:instrText>2</w:instrText>"),
+            gap,
+            undecided.clone(),
+        ),
+        ("t out of its run", around("<w:t>2</w:t>"), gap, undecided.clone()),
+        (
+            "a paragraph of t out of its run",
+            "<w:p><w:t>loose</w:t></w:p>".into(),
+            "",
+            undecided.clone(),
+        ),
+        // Elements Word does not define, and character data where none may be.
+        (
+            "an element Word does not define in a run",
+            in_run("<w:notAnElement>2</w:notAnElement>"),
+            gap,
+            undecided.clone(),
+        ),
+        (
+            "an element Word does not define in a paragraph",
+            around("<w:notAnElement>2</w:notAnElement>"),
+            gap,
+            undecided.clone(),
+        ),
+        (
+            "text in an element that holds none",
+            in_run("<w:lastRenderedPageBreak>2</w:lastRenderedPageBreak>"),
+            gap,
+            undecided.clone(),
+        ),
+        ("text directly in a run", in_run("2"), gap, undecided.clone()),
+        ("text directly in a paragraph", around("2"), gap, undecided.clone()),
+        (
+            "text directly in a hyperlink",
+            around("<w:hyperlink>2</w:hyperlink>"),
+            gap,
+            undecided.clone(),
+        ),
+        (
+            "text in a run in a run",
+            in_run("<w:r>2</w:r>"),
+            gap,
+            undecided.clone(),
+        ),
+        (
+            "a field's data out of its place",
+            around("<w:fldData>2</w:fldData>"),
+            gap,
+            undecided.clone(),
+        ),
+        (
+            "a field character out of its place",
+            around("<w:fldChar>2</w:fldChar>"),
+            gap,
+            undecided.clone(),
+        ),
+        // Between paragraphs, the paragraph after it warns.
+        (
+            "delText between paragraphs",
+            format!("<w:delText>2</w:delText>{}", para("", &run("", "after"))),
+            "after",
+            undecided.clone(),
+        ),
+        (
+            "an element Word does not define between paragraphs",
+            format!("<w:notAnElement>2</w:notAnElement>{}", para("", &run("", "after"))),
+            "after",
+            undecided.clone(),
+        ),
+        (
+            "text directly in the body",
+            format!("2{}", para("", &run("", "after"))),
+            "after",
+            undecided.clone(),
+        ),
+        // Not text Word draws.
+        (
+            "delText in a deletion",
+            around(r#"<w:del w:id="1" w:author="a"><w:r><w:delText>2</w:delText></w:r></w:del>"#),
+            joined,
+            vec![],
+        ),
+        (
+            "delText moved away",
+            around(r#"<w:moveFrom w:id="1" w:author="a"><w:r><w:delText>2</w:delText></w:r></w:moveFrom>"#),
+            joined,
+            vec![],
+        ),
+        (
+            "an empty element Word does not define",
+            around(r#"<w:notAnElement w:val="2"/>"#),
+            joined,
+            vec![],
+        ),
+        (
+            "white space between elements",
+            "<w:p>\n  <w:r>\n    <w:t>Payment: 1</w:t>\n  </w:r>\n  <w:r>\n    <w:t>00,000 baht</w:t>\n  </w:r>\n</w:p>\n".into(),
+            joined,
+            vec![],
+        ),
+        (
+            "a field's data",
+            format!(
+                r#"<w:p>{}<w:r><w:fldChar w:fldCharType="begin"><w:fldData xml:space="preserve">CNDJ6nn5us4RjIIAqgBLqQsCAAAACAAAAA4AAABfAFIAZQBmADEAMgAzADQANQA2ADcAOAAAAA==</w:fldData></w:fldChar></w:r>{}{separate}<w:r><w:t>Table 1</w:t></w:r>{end}</w:p>"#,
+                run("", "See "),
+                instr(r#" REF _Ref12345678 \h "#)
+            ),
+            "See Table 1",
+            vec![],
+        ),
+        (
+            "a field's data in its separator",
+            format!(
+                r#"<w:p>{}{begin}{}<w:r><w:fldChar w:fldCharType="separate"><w:fldData>AAAA</w:fldData></w:fldChar></w:r><w:r><w:t>Table 1</w:t></w:r>{end}</w:p>"#,
+                run("", "See "),
+                instr(" REF x ")
+            ),
+            "See Table 1",
+            vec![],
+        ),
+        (
+            "a simple field's data",
+            format!(
+                r#"<w:p>{}<w:fldSimple w:instr=" REF x "><w:fldData>AAAA</w:fldData><w:r><w:t>Table 1</w:t></w:r></w:fldSimple></w:p>"#,
+                run("", "See ")
+            ),
+            "See Table 1",
+            vec![],
+        ),
+        (
+            "a form field's data",
+            format!(
+                r#"<w:p>{}<w:r><w:fldChar w:fldCharType="begin"><w:ffData><w:name w:val="Text1"/><w:enabled/><w:calcOnExit w:val="0"/><w:textInput/></w:ffData></w:fldChar></w:r>{}{separate}<w:r><w:t>Somchai</w:t></w:r>{end}</w:p>"#,
+                run("", "Name: "),
+                instr(" FORMTEXT ")
+            ),
+            "Name: Somchai",
+            vec![],
+        ),
+    ];
+    for (case, body, shown, warned) in rows {
+        let extracted = read_body(&body);
+        assert_eq!(text(&extracted), shown, "{case}");
+        assert_eq!(hidden(&extracted), warned, "{case}");
+    }
+}
+
 /// The accepted view has no row deleted in a conflict (`w14:conflictDel`, which Word treats as a
 /// tracked deletion), and no cell a tracked change merged into the one above.
 #[test]
@@ -3261,6 +3725,160 @@ fn docx_text_box_content_stands_only_in_its_shapes_text_box() {
     );
 }
 
+/// Word lays out no `v:shapetype`: it is a template the shapes built on it take their fill from.
+/// Text in a shapetype's text box is undecided wherever the shapetype stands and whatever uses
+/// it; a shape lays out only its own `v:textbox`, as Word's own text box does.
+#[test]
+fn docx_a_shapetype_is_never_laid_out() {
+    let story = |marker: &str| {
+        format!(
+            "<v:textbox><w:txbxContent>{}</w:txbxContent></v:textbox>",
+            para("", &run("", marker))
+        )
+    };
+    let pict = |inner: &str| format!("<w:p><w:r><w:pict>{inner}</w:pict></w:r></w:p>");
+    let shapetype = |id: &str, inner: &str| {
+        format!(
+            r#"<v:shapetype id="{id}" coordsize="21600,21600" fillcolor="white">{inner}</v:shapetype>"#
+        )
+    };
+    let body = [
+        pict(&shapetype("unused", &story("unused"))),
+        pict(&format!(
+            r##"{}<v:shape type="#hiddenonly" style="position:absolute;visibility:hidden"/>"##,
+            shapetype("hiddenonly", &story("hiddenonly"))
+        )),
+        pict(&format!(
+            r#"<v:group style="position:absolute;width:100pt;height:100pt" coordsize="21600,21600">{}</v:group>"#,
+            shapetype("ingroup", &story("ingroup"))
+        )),
+        pict(&format!(
+            r##"{}<v:shape type="#used" style="position:absolute" fillcolor="white"/>"##,
+            shapetype("used", &story("used"))
+        )),
+        pict(&format!(
+            r##"{}<v:shape type="#both" style="position:absolute" fillcolor="white">{}</v:shape>"##,
+            shapetype("both", &story("typetext")),
+            story("shapetext")
+        )),
+        // Word's own text box: the shapetype Word writes holds no text box.
+        pict(&format!(
+            r##"<v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202" path="m,l,21600r21600,l21600,xe"><v:stroke joinstyle="miter"/><v:path gradientshapeok="t" o:connecttype="rect"/></v:shapetype><v:shape id="Text Box 2" o:spid="_x0000_s1026" type="#_x0000_t202" style="position:absolute;margin-left:0;margin-top:14.4pt;width:185.9pt;height:110.6pt;z-index:251659264;visibility:visible;mso-wrap-style:square;mso-position-horizontal:center;mso-position-horizontal-relative:text;mso-position-vertical:absolute;mso-position-vertical-relative:text"><v:textbox style="mso-fit-shape-to-text:t"><w:txbxContent>{}</w:txbxContent></v:textbox></v:shape>"##,
+            para("", &run("", "word2007"))
+        )),
+        pict(&format!(
+            r#"<v:rect style="position:absolute" fillcolor="white">{}</v:rect>"#,
+            story("rect")
+        )),
+    ]
+    .concat();
+    let extracted = read_body(&body);
+    assert_eq!(text(&extracted), "shapetext\nword2007\nrect");
+    assert_eq!(
+        hidden(&extracted),
+        [
+            (2, "undecided"),
+            (4, "undecided"),
+            (6, "undecided"),
+            (8, "undecided"),
+            (10, "undecided")
+        ]
+    );
+}
+
+/// A `wp:posOffset` is one number however its text is written: a comment, a character reference,
+/// CDATA or a processing instruction inside it splits it into pieces, which are read whole.
+#[test]
+fn docx_an_offset_written_in_pieces_is_read_whole() {
+    let boxed = |offset: &str| {
+        format!(
+            "<w:p>{}</w:p>",
+            shape_box(
+                "anchor",
+                &format!(
+                    r#"<wp:positionH relativeFrom="page"><wp:posOffset>{offset}</wp:posOffset></wp:positionH><wp:extent cx="914400" cy="914400"/>"#
+                ),
+                r#"<a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill>"#,
+                &para("", &run("", "x"))
+            )
+        )
+    };
+    for (offset, shown, warned) in [
+        ("30000000", "", vec![(2, "off_page")]),
+        ("3<!-- -->0000000", "", vec![(2, "off_page")]),
+        ("3&#48;000000", "", vec![(2, "off_page")]),
+        ("3<![CDATA[0]]>000000", "", vec![(2, "off_page")]),
+        ("-3<!-- -->0000000", "", vec![(2, "off_page")]),
+        ("30000<?x y?>000", "", vec![(2, "off_page")]),
+        // On the page, and a piece of white space after the number.
+        ("9<!-- -->14400", "x", vec![]),
+        ("914400<!-- --> ", "x", vec![]),
+    ] {
+        let extracted = read_body(&boxed(offset));
+        assert_eq!(text(&extracted), shown, "{offset}");
+        assert_eq!(hidden(&extracted), warned, "{offset}");
+    }
+}
+
+/// Markup as Word writes it is untouched by the rules for markup Word would not read: bookmarks,
+/// proofing marks, field data, a form field, equations, a chart, a picture with its extensions,
+/// SmartArt, a text box with its VML fallback, a table, a content control, tracked changes, a
+/// note mark and section properties read with gaps only at the equations, the picture and the
+/// note mark.
+#[test]
+fn docx_word_markup_reads_as_word_draws_it() {
+    let math = r#"xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math""#;
+    let cambria = r#"<w:rPr><w:rFonts w:ascii="Cambria Math" w:hAnsi="Cambria Math"/></w:rPr>"#;
+    let body = [
+        r#"<w:p w14:paraId="0A1B2C3D" w14:textId="77777777" w:rsidR="00A10001" w:rsidRDefault="00A10001"><w:pPr><w:pStyle w:val="Title"/></w:pPr><w:bookmarkStart w:id="0" w:name="_GoBack"/><w:bookmarkEnd w:id="0"/><w:r><w:t>Quarterly</w:t></w:r><w:proofErr w:type="spellStart"/><w:r><w:t xml:space="preserve"> reprot</w:t></w:r><w:proofErr w:type="spellEnd"/></w:p>"#.to_owned(),
+        r#"<w:p><w:r><w:t xml:space="preserve">See </w:t></w:r><w:r><w:fldChar w:fldCharType="begin"><w:fldData xml:space="preserve">CNDJ6nn5us4RjIIAqgBLqQsCAAAACAAAAA4AAABfAFIAZQBmADEAMgAzADQANQA2ADcAOAAAAA==</w:fldData></w:fldChar></w:r><w:r><w:instrText xml:space="preserve"> REF _Ref12345678 \h </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>Table 1</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r><w:r><w:t xml:space="preserve"> below.</w:t></w:r></w:p>"#.to_owned(),
+        r#"<w:p><w:r><w:t xml:space="preserve">Name: </w:t></w:r><w:r><w:fldChar w:fldCharType="begin"><w:ffData><w:name w:val="Text1"/><w:enabled/><w:calcOnExit w:val="0"/><w:textInput/></w:ffData></w:fldChar></w:r><w:r><w:instrText xml:space="preserve"> FORMTEXT </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:rPr><w:noProof/></w:rPr><w:t>Somchai</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>"#.to_owned(),
+        r#"<w:p><w:r><w:lastRenderedPageBreak/><w:t>Page two</w:t></w:r></w:p>"#.to_owned(),
+        format!(
+            r#"<w:p><w:r><w:t xml:space="preserve">Area </w:t></w:r><m:oMath {math}><m:sSup><m:sSupPr><m:ctrlPr><w:rPr><w:rFonts w:ascii="Cambria Math" w:hAnsi="Cambria Math"/><w:i/></w:rPr></m:ctrlPr></m:sSupPr><m:e><m:r>{cambria}<m:t>x</m:t></m:r></m:e><m:sup><m:r>{cambria}<m:t>2</m:t></m:r></m:sup></m:sSup></m:oMath><w:r><w:t xml:space="preserve"> units</w:t></w:r></w:p>"#
+        ),
+        format!(
+            r#"<w:p><m:oMathPara {math}><m:oMath><m:f><m:fPr><m:ctrlPr><w:rPr><w:rFonts w:ascii="Cambria Math" w:hAnsi="Cambria Math"/><w:i/></w:rPr></m:ctrlPr></m:fPr><m:num><m:r>{cambria}<m:t>a</m:t></m:r></m:num><m:den><m:r>{cambria}<m:t>b</m:t></m:r></m:den></m:f></m:oMath></m:oMathPara></w:p>"#
+        ),
+        r#"<w:p><w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="5486400" cy="3200400"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:docPr id="1" name="Chart 1"/><wp:cNvGraphicFramePr/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rId4"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#.to_owned(),
+        r#"<w:p><w:r><w:t>Logo</w:t></w:r><w:r><w:drawing><wp:inline><wp:extent cx="952500" cy="952500"/><wp:docPr id="2" name="Picture 2"><a:extLst><a:ext uri="{FF2B5EF4-FFF2-40B4-BE49-F238E27FC236}"><a16:creationId xmlns:a16="http://schemas.microsoft.com/office/drawing/2014/main" id="{00000000-0000-0000-0000-000000000002}"/></a:ext></a:extLst></wp:docPr><wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="2" name="logo.png"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="rId5"><a:extLst><a:ext uri="{28A0092B-C50C-407E-A947-70E740481C1C}"><a14:useLocalDpi xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main" val="0"/></a:ext></a:extLst></a:blip><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="952500" cy="952500"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r><w:r><w:t xml:space="preserve"> here</w:t></w:r></w:p>"#.to_owned(),
+        r#"<w:p><w:r><w:drawing><wp:inline><wp:extent cx="5486400" cy="3200400"/><wp:docPr id="3" name="Diagram 3"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram"><dgm:relIds xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" r:dm="rId6" r:lo="rId7" r:qs="rId8" r:cs="rId9"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#.to_owned(),
+        r##"<w:p><w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:drawing><wp:anchor distT="45720" distB="45720" distL="114300" distR="114300" simplePos="0" relativeHeight="251659264" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="column"><wp:align>center</wp:align></wp:positionH><wp:positionV relativeFrom="paragraph"><wp:posOffset>182880</wp:posOffset></wp:positionV><wp:extent cx="2360930" cy="1404620"/><wp:effectExtent l="0" t="0" r="22860" b="11430"/><wp:wrapSquare wrapText="bothSides"/><wp:docPr id="217" name="Text Box 2"/><wp:cNvGraphicFramePr/><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:cNvSpPr txBox="1"><a:spLocks noChangeArrowheads="1"/></wps:cNvSpPr><wps:spPr bwMode="auto"><a:xfrm><a:off x="0" y="0"/><a:ext cx="2360930" cy="1404620"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill><a:ln w="9525"><a:solidFill><a:srgbClr val="000000"/></a:solidFill><a:miter lim="800000"/><a:headEnd/><a:tailEnd/></a:ln></wps:spPr><wps:txbx><w:txbxContent><w:p><w:r><w:t>Boxed note</w:t></w:r></w:p></w:txbxContent></wps:txbx><wps:bodyPr rot="0" vert="horz" wrap="square" lIns="91440" tIns="45720" rIns="91440" bIns="45720" anchor="t" anchorCtr="0"><a:spAutoFit/></wps:bodyPr></wps:wsp></a:graphicData></a:graphic><wp14:sizeRelH xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing" relativeFrom="margin"><wp14:pctWidth>40000</wp14:pctWidth></wp14:sizeRelH><wp14:sizeRelV xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing" relativeFrom="margin"><wp14:pctHeight>20000</wp14:pctHeight></wp14:sizeRelV></wp:anchor></w:drawing></mc:Choice><mc:Fallback><w:pict><v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202" path="m,l,21600r21600,l21600,xe"><v:stroke joinstyle="miter"/><v:path gradientshapeok="t" o:connecttype="rect"/></v:shapetype><v:shape id="Text Box 2" o:spid="_x0000_s1026" type="#_x0000_t202" style="position:absolute;margin-left:0;margin-top:14.4pt;width:185.9pt;height:110.6pt;z-index:251659264;visibility:visible;mso-wrap-style:square;mso-position-horizontal:center;mso-position-horizontal-relative:text;mso-position-vertical:absolute;mso-position-vertical-relative:text"><v:textbox style="mso-fit-shape-to-text:t"><w:txbxContent><w:p><w:r><w:t>Boxed note</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></mc:Fallback></mc:AlternateContent></w:r></w:p>"##.to_owned(),
+        r#"<w:tbl><w:tblPr><w:tblStyle w:val="TableGrid"/><w:tblW w:w="0" w:type="auto"/><w:tblLook w:val="04A0" w:firstRow="1" w:lastRow="0" w:firstColumn="1" w:lastColumn="0" w:noHBand="0" w:noVBand="1"/></w:tblPr><w:tblGrid><w:gridCol w:w="4508"/><w:gridCol w:w="4508"/></w:tblGrid><w:tr w:rsidR="00A10001" w14:paraId="11111111" w14:textId="22222222"><w:tc><w:tcPr><w:tcW w:w="4508" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>Cell A</w:t></w:r></w:p></w:tc><w:tc><w:tcPr><w:tcW w:w="4508" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>Cell B</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#.to_owned(),
+        r#"<w:p><w:hyperlink r:id="rId11" w:history="1"><w:r><w:rPr><w:rStyle w:val="Hyperlink"/></w:rPr><w:t>example.com</w:t></w:r></w:hyperlink><w:r><w:t xml:space="preserve"> and </w:t></w:r><w:sdt><w:sdtPr><w:id w:val="-1"/><w:placeholder><w:docPart w:val="DefaultPlaceholder_-1854013440"/></w:placeholder><w15:appearance xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml" w15:val="hidden"/></w:sdtPr><w:sdtEndPr/><w:sdtContent><w:r><w:t>control</w:t></w:r></w:sdtContent></w:sdt></w:p>"#.to_owned(),
+        r#"<w:p><w:r><w:t xml:space="preserve">Total: </w:t></w:r><w:del w:id="1" w:author="A" w:date="2026-10-01T00:00:00Z"><w:r><w:delText>1,000</w:delText></w:r></w:del><w:ins w:id="2" w:author="A" w:date="2026-10-01T00:00:00Z"><w:r><w:t>2,000</w:t></w:r></w:ins></w:p>"#.to_owned(),
+        r#"<w:p><w:r><w:t>Note</w:t></w:r><w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr><w:footnoteReference w:id="1"/></w:r><w:r><w:tab/><w:t>tabbed</w:t><w:br/><w:t>next</w:t></w:r></w:p>"#.to_owned(),
+        r#"<w:sectPr w:rsidR="00A10001"><w:headerReference w:type="default" r:id="rId10"/><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/><w:cols w:space="708"/><w:docGrid w:linePitch="360"/></w:sectPr>"#.to_owned(),
+    ]
+    .concat();
+    let extracted = read_body(&body);
+    assert_eq!(
+        extracted
+            .blocks
+            .iter()
+            .map(|block| (block.ordinal, block.text.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (1, "Quarterly reprot"),
+            (2, "See Table 1 below."),
+            (3, "Name: Somchai"),
+            (4, "Page two"),
+            (5, "Area \u{FFFC} units"),
+            (8, "Logo\u{FFFC} here"),
+            (11, "Boxed note"),
+            (13, "Cell A"),
+            (14, "Cell B"),
+            (15, "example.com and control"),
+            (16, "Total: 2,000"),
+            (17, "Note\u{FFFC}\ttabbed\nnext"),
+        ]
+    );
+    assert_eq!(
+        hidden(&extracted),
+        [(5, "unknown_namespace"), (6, "unknown_namespace")]
+    );
+}
+
 /// A followed relationship's mode is `Internal` (or none) or `External`; any other is refused,
 /// and a Strict relationship named from a transitional package is unsupported.
 #[test]
@@ -3462,6 +4080,37 @@ fn docx_each_fail_closed_rule_is_pinned() {
             "",
             vec![(2, "undecided")],
         ),
+        // A position written twice: which Word takes is not known.
+        (
+            "an offset written twice",
+            Docx::new(&anchored(
+                r#"<wp:positionH relativeFrom="page"><wp:posOffset>40000000</wp:posOffset><wp:posOffset>0</wp:posOffset></wp:positionH>"#,
+                white_fill,
+                "x",
+            )),
+            "",
+            vec![(2, "undecided")],
+        ),
+        (
+            "a position written twice",
+            Docx::new(&anchored(
+                r#"<wp:positionH relativeFrom="page"><wp:posOffset>40000000</wp:posOffset></wp:positionH><wp:positionH relativeFrom="page"><wp:posOffset>0</wp:posOffset></wp:positionH>"#,
+                white_fill,
+                "x",
+            )),
+            "",
+            vec![(2, "undecided")],
+        ),
+        (
+            "a simple position written twice",
+            Docx::new(&anchored(
+                r#"<wp:simplePos x="40000000" y="0"/><wp:simplePos x="0" y="0"/>"#,
+                white_fill,
+                "x",
+            ).replace("<wp:anchor>", r#"<wp:anchor simplePos="1">"#)),
+            "",
+            vec![(2, "undecided")],
+        ),
         (
             "an inline shape is never off the page",
             Docx::new(&inline(white_fill, "x").replace(
@@ -3656,6 +4305,90 @@ fn docx_each_fail_closed_rule_is_pinned() {
             )),
             "",
             vec![(2, "undecided")],
+        ),
+        (
+            "a VML shape inside a VML group's fill",
+            Docx::new(&format!(
+                r#"<w:p><w:r><w:pict><v:group style="position:absolute;width:100pt;height:100pt" coordsize="21600,21600"><v:fill><v:shape fillcolor="white"><v:textbox><w:txbxContent>{}</w:txbxContent></v:textbox></v:shape></v:fill></v:group></w:pict></w:r></w:p>"#,
+                para("", &run("", "x"))
+            )),
+            "",
+            vec![(2, "undecided")],
+        ),
+        (
+            "a DrawingML shape directly in a VML group",
+            Docx::new(&format!(
+                r#"<w:p><w:r><w:pict><v:group style="position:absolute;width:100pt;height:100pt" coordsize="21600,21600"><wps:wsp><wps:spPr>{white_fill}</wps:spPr><wps:txbx><w:txbxContent>{}</w:txbxContent></wps:txbx></wps:wsp></v:group></w:pict></w:r></w:p>"#,
+                para("", &run("", "x"))
+            )),
+            "",
+            vec![(2, "undecided")],
+        ),
+        (
+            "a VML text box in a DrawingML shape",
+            Docx::new(
+                &inline(white_fill, "x")
+                    .replace("<wps:txbx>", "<v:textbox>")
+                    .replace("</wps:txbx>", "</v:textbox>"),
+            ),
+            "",
+            vec![(2, "undecided")],
+        ),
+        // A shape's text is one story: one written twice is markup Word does not lay out as the
+        // reader would read it.
+        (
+            "a second wps:txbx in a shape",
+            Docx::new(&inline(white_fill, "x").replace(
+                "</wps:txbx>",
+                &format!(
+                    "</wps:txbx><wps:txbx><w:txbxContent>{}</w:txbxContent></wps:txbx>",
+                    para("", &run("", "y"))
+                ),
+            )),
+            "error",
+            vec![],
+        ),
+        (
+            "a second story in one wps:txbx",
+            Docx::new(&inline(white_fill, "x").replace(
+                "</wps:txbx>",
+                &format!("<w:txbxContent>{}</w:txbxContent></wps:txbx>", para("", &run("", "y"))),
+            )),
+            "error",
+            vec![],
+        ),
+        (
+            "a second v:textbox in a shape",
+            Docx::new(&vml(r#"fillcolor="white""#, "", "x").replace(
+                "</v:textbox>",
+                &format!(
+                    "</v:textbox><v:textbox><w:txbxContent>{}</w:txbxContent></v:textbox>",
+                    para("", &run("", "y"))
+                ),
+            )),
+            "error",
+            vec![],
+        ),
+        (
+            "a second story in one v:textbox",
+            Docx::new(&vml(r#"fillcolor="white""#, "", "x").replace(
+                "</v:textbox>",
+                &format!("<w:txbxContent>{}</w:txbxContent></v:textbox>", para("", &run("", "y"))),
+            )),
+            "error",
+            vec![],
+        ),
+        (
+            "two shapes in a group, a story each",
+            Docx::new(&inline(white_fill, "x").replace(
+                "<wps:wsp>",
+                &format!(
+                    r#"<wpg:wgp xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup"><wps:wsp><wps:spPr>{white_fill}</wps:spPr><wps:txbx><w:txbxContent>{}</w:txbxContent></wps:txbx></wps:wsp><wps:wsp>"#,
+                    para("", &run("", "w"))
+                ),
+            ).replace("</wps:wsp></a:graphicData>", "</wps:wsp></wpg:wgp></a:graphicData>")),
+            "w\nx",
+            vec![],
         ),
         // A text box in a paragraph outside any cell of its table.
         (
@@ -6287,6 +7020,38 @@ fn seeds() -> Vec<(&'static str, &'static str, &'static str, Vec<u8>)> {
         text_box(&para("", &run("", "box"))),
         para("", &run("", "box"))
     );
+    let math = r#"xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math""#;
+    let unknown = r#"xmlns:x="urn:example:unknown""#;
+    let delimiter = format!(
+        r#"<m:oMath {math}><m:d><m:dPr><m:begChr m:val="2"/></m:dPr><m:e/></m:d></m:oMath>"#
+    );
+    let unread = [
+        format!("<w:p>{}{delimiter}{}</w:p>", run("", "Budget: 1"), run("", "00 baht")),
+        format!(
+            r#"<w:p><w:r><w:t>1</w:t><x:a {unknown} x:b="2"/><w:t>00</w:t><w:r>{delimiter}</w:r></w:r></w:p>"#
+        ),
+        format!(r#"<x:note {unknown}>2</x:note>"#),
+        format!(
+            "<w:p>{}<w:r><w:delText>2</w:delText></w:r><w:notAnElement>3</w:notAnElement>{}</w:p>",
+            run("", "Payment: 1"),
+            run("", "00 baht")
+        ),
+        format!(
+            r#"<w:p><w:r><w:pict><v:shapetype id="t" fillcolor="white"><v:textbox><w:txbxContent>{}</w:txbxContent></v:textbox></v:shapetype><v:shape type="t" style="position:absolute"/></w:pict></w:r></w:p>"#,
+            para("", &run("", "template"))
+        ),
+        format!(
+            "<w:p>{}</w:p>",
+            shape_box(
+                "anchor",
+                r#"<wp:positionH relativeFrom="page"><wp:posOffset>3<!-- -->0000000</wp:posOffset></wp:positionH>"#,
+                r#"<a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill>"#,
+                &para("", &run("", "offpage"))
+            )
+        ),
+        format!(r#"<m:oMathPara {math}><m:oMath><m:r><m:t>x</m:t></m:r></m:oMath></m:oMathPara>"#),
+    ]
+    .concat();
     let docx = |docx: Docx| docx.build();
     vec![
         ("package", "docx-deflated.zip", "a one-paragraph DOCX, deflated", simple.clone()),
@@ -6389,6 +7154,12 @@ fn seeds() -> Vec<(&'static str, &'static str, &'static str, Vec<u8>)> {
                 r#"<w:p><w:r><w:rPr><mc:AlternateContent xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main"><mc:Choice Requires="a14"><w:vanish/></mc:Choice><mc:Fallback/></mc:AlternateContent></w:rPr><w:t>x</w:t></w:r><w:r><w:rPr><w:webHidden/></w:rPr><w:t>2</w:t></w:r><w:r><w:t>y</w:t></w:r></w:p>"#.to_owned(),
                 r#"<w:tbl><w:tr><w:trPr><w:del w:id="1" w:author="a"/></w:trPr><w:tc><w:p><w:r><w:t>gone</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p><w:r><w:t>merged</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#.to_owned(),
             ].concat()).settings(r#"<w:clrSchemeMapping w:bg1="light1" w:t1="dark1" w:bg2="light2" w:t2="dark2" w:accent1="light1" w:accent2="accent2" w:accent3="accent3" w:accent4="accent4" w:accent5="accent5" w:accent6="accent6" w:hyperlink="hyperlink" w:followedHyperlink="followedHyperlink"/>"#)),
+        ),
+        (
+            "docx",
+            "unread.docx",
+            "equations and an unknown element with an attribute between runs, in a run and between paragraphs, text Word would not read there, a shapetype's text box and an offset in pieces",
+            docx(Docx::new(&unread)),
         ),
         (
             "docx",

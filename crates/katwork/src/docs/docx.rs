@@ -2400,12 +2400,18 @@ struct ShapeState {
     /// Horizontal and vertical offsets from where it is anchored, and its extent, in EMU.
     offset: [Option<i64>; 2],
     extent: [i64; 2],
+    /// Its own position was read on each axis: a second is a value written twice, which Word's
+    /// choice of is not known.
+    placed: [bool; 2],
     vml: bool,
     /// A frame (`wp:inline`, `wp:anchor`), a group or canvas (whose shapes stand directly in
     /// it), a WordprocessingML shape (`wps:wsp`, which holds a text box in `wps:txbx`).
     frame: bool,
     group: bool,
     wsp: bool,
+    /// A `v:shapetype`: a template the shapes built on it take their fill from, which Word does
+    /// not lay out.
+    definition: bool,
     /// The fill a VML shape has when it sets none: its `v:shapetype`'s, else VML's own white;
     /// unknown when it names a shapetype not defined before it.
     vml_default: Option<ShapeFill>,
@@ -2413,6 +2419,8 @@ struct ShapeState {
     shapetype: Option<String>,
     /// A text box in it was read: a shape property after that is refused.
     text_read: bool,
+    /// Its own text box's story was read: Word lays out one.
+    story: bool,
     /// The fill or font reference just opened, until its first colour is read.
     awaiting: Option<Target>,
 }
@@ -2596,8 +2604,12 @@ enum Node {
     /// A container whose text is dropped whole (`Part::dropping`): a data-bound control's
     /// content, an override of the reading order.
     Dropping(Level),
-    /// A content control and where it sits (`None`: nowhere content may be).
-    Sdt(Option<Level>),
+    /// WordprocessingML the reader passes over (a run in a run, a container a run cannot hold, an
+    /// element Word does not define), at the level it stands at: what Word may draw in it is
+    /// undecided there.
+    Passed(Level),
+    /// A content control, at the level of the content it holds.
+    Sdt(Level),
     SdtProps,
     /// A `w:fldSimple`, and how many fields were open before it.
     SimpleField(usize),
@@ -2625,7 +2637,8 @@ enum Node {
     Colour(Target),
     /// `a:extLst`: extensions Word does not draw from.
     Extensions,
-    /// `wps:txbx` in a `wps:wsp`, or `v:textbox` in a VML shape: where Word reads a shape's text.
+    /// `wps:txbx` in a `wps:wsp`, or `v:textbox` in a VML shape that is not a shapetype: where
+    /// Word reads a shape's one story.
     ShapeText,
     TextBox,
     Excluded,
@@ -2647,6 +2660,18 @@ fn level(parent: Option<Node>) -> Option<Level> {
         Node::Row => Some(Level::Cell),
         Node::Container(level) | Node::Dropping(level) => Some(level),
         _ => None,
+    }
+}
+
+/// Where content the reader does not read stands, by the innermost element around it: in a
+/// paragraph's text, among its runs or in one (`Level::Run`), between paragraphs
+/// (`Level::Block`), or among a table's rows or cells; `None` where Word draws no text of it
+/// (properties, drawings).
+fn unread_level(parent: Option<Node>) -> Option<Level> {
+    match parent? {
+        Node::Run => Some(Level::Run),
+        Node::Passed(level) | Node::Sdt(level) => Some(level),
+        node => level(Some(node)),
     }
 }
 
@@ -2693,6 +2718,14 @@ struct Part {
     /// The properties seen in the open `w:rPr`, `w:pPr`, `w:tcPr`, `w:trPr`, `w:tblPr` or
     /// `w:tblPrEx`.
     seen: u32,
+    /// Why content between paragraphs was left out since the last paragraph began: the next
+    /// paragraph takes it as its first reason.
+    before: Option<&'static str>,
+    /// The ordinal and id of the last paragraph read, which content left out after it warns.
+    last: Option<(u32, Option<String>)>,
+    /// The text of the open `wp:posOffset`, read whole when it ends: a comment, a reference or
+    /// CDATA splits one number into pieces.
+    offset: String,
     out: Vec<(u32, String, Option<String>)>,
     hidden: Vec<(u32, &'static str, Option<String>)>,
 }
@@ -2722,6 +2755,11 @@ impl Part {
     /// fields, controls and markup allow; with no run open, a gap goes to the paragraph.
     fn put(&mut self, hidden: bool, put: Put) {
         let shown = self.shown(hidden);
+        self.place(shown, put);
+    }
+
+    /// Adds `put` as `shown` says the open fields, controls and markup allow.
+    fn place(&mut self, shown: Shown, put: Put) {
         if matches!(&put, Put::Text(text) if text.is_empty()) {
             return;
         }
@@ -2747,11 +2785,20 @@ impl Part {
         }
     }
 
-    /// Content of the paragraph that the reader does not read (an equation, an element of a
-    /// namespace it does not understand): a gap, and why it was left out.
-    fn drop_unread(&mut self) {
-        if !matches!(self.shown(false), Shown::Code) {
-            self.put(true, Put::Gap(Gap::Text));
+    /// Content Word may draw that the reader does not read as Word does (an equation, text in
+    /// markup Word does not read there), where it stands: in a paragraph a gap, and why it was
+    /// left out (`undecided`, or `unknown_namespace` inside markup Word may not read); between
+    /// paragraphs, the next paragraph's first reason. Nothing in a field's instruction, which
+    /// Word does not draw.
+    fn stray(&mut self, level: Option<Level>, hidden: bool) {
+        let shown = match self.shown(hidden) {
+            Shown::Yes => Shown::Dropped(UNDECIDED),
+            shown => shown,
+        };
+        match (level, shown) {
+            (Some(Level::Run), shown) => self.place(shown, Put::Gap(Gap::Text)),
+            (Some(Level::Block), Shown::Dropped(why)) => self.before = self.before.or(Some(why)),
+            _ => {}
         }
     }
 
@@ -2933,6 +2980,9 @@ impl Doc<'_> {
             extensions: 0,
             pending: Vec::new(),
             seen: 0,
+            before: None,
+            last: None,
+            offset: String::new(),
             out: Vec::new(),
             hidden: Vec::new(),
         };
@@ -2971,17 +3021,22 @@ impl Doc<'_> {
                     match nodes.last() {
                         Some(Node::Text) => part.put(hidden, Put::Text(text)),
                         Some(Node::InstrText) => part.instruction(&text, hidden),
-                        Some(&Node::PosOffset(axis)) => {
-                            if let Some(shape) = part.shapes.last_mut() {
-                                match text.trim().parse::<i64>() {
-                                    _ if hidden => shape.undecide(UNKNOWN_NAMESPACE),
-                                    Ok(offset) => shape.offset[axis] = Some(offset),
-                                    Err(_) => shape.undecide(UNDECIDED),
-                                }
+                        Some(Node::PosOffset(_)) => {
+                            if hidden && let Some(shape) = part.shapes.last_mut() {
+                                shape.undecide(UNKNOWN_NAMESPACE);
+                            }
+                            if part.offset.is_empty() {
+                                part.offset = text;
+                            } else {
+                                part.offset.push_str(&text);
                             }
                         }
-                        // Text of an element the reader does not read is reported with it
-                        // (`Item::Unread`).
+                        // Character data where WordprocessingML holds none, in a paragraph or
+                        // between paragraphs: Word would not read it as the reader does. White
+                        // space between elements is their layout.
+                        parent if !text.chars().all(char::is_whitespace) => {
+                            part.stray(unread_level(parent.copied()), hidden)
+                        }
                         _ => {}
                     }
                 }
@@ -2989,20 +3044,12 @@ impl Doc<'_> {
                     if skipped || part.excluded > 0 {
                         continue;
                     }
-                    let parent = nodes.last().copied();
-                    match parent {
+                    match nodes.last().copied() {
                         Some(Node::Text) => part.undecide_text(),
                         Some(Node::InstrText) => part.undecide_instruction(),
-                        _ if parent == Some(Node::Run) || level(parent) == Some(Level::Run) => {
-                            part.drop_unread()
-                        }
-                        // Between paragraphs nothing joins across it, but what it says is not
-                        // read: the paragraph after it warns.
-                        _ if level(parent) == Some(Level::Block) => {
-                            part.hidden
-                                .push((part.ordinal + 1, UNKNOWN_NAMESPACE, None));
-                        }
-                        _ => {}
+                        // In a paragraph a gap; between paragraphs nothing joins across it, but
+                        // what it says is not read, and the paragraph after it warns.
+                        parent => part.stray(unread_level(parent), true),
                     }
                 }
                 Item::Eof => break,
@@ -3062,7 +3109,7 @@ impl Doc<'_> {
         if !w {
             return self.open_drawing(part, walker, start, parent, namespace, local, hidden);
         }
-        Ok(match (parent, local) {
+        let node = match (parent, local) {
             (None, "document") if part.story == Story::Main => Node::Document,
             (None, "hdr" | "ftr") if part.story != Story::Main => Node::Story,
             (None, "footnotes" | "endnotes") if part.story != Story::Main => Node::Notes,
@@ -3103,6 +3150,7 @@ impl Doc<'_> {
                 } else {
                     None
                 };
+                part.last = Some((part.ordinal, para_id.clone()));
                 part.paragraphs.push(Some(Para {
                     ordinal: part.ordinal,
                     para_id,
@@ -3114,7 +3162,8 @@ impl Doc<'_> {
                     run: None,
                     under,
                     gap: Gap::None,
-                    dropped: None,
+                    // What was left out between the paragraphs before it.
+                    dropped: part.before.take(),
                     content: false,
                     has_props: false,
                     shared: None,
@@ -3134,11 +3183,21 @@ impl Doc<'_> {
                 _ => Node::Other,
             },
             (Some(Node::Run), "t") => Node::Text,
-            // Text not directly in its run.
-            (_, "t") => {
-                if let Some(run) = part.run() {
-                    run.drop_text(UNDECIDED);
-                }
+            (Some(Node::Run), "instrText")
+                if part.fields[part.floor()..].iter().any(|field| field.code) =>
+            {
+                Node::InstrText
+            }
+            // Text Word would not read as the reader does: a `w:t` or `w:instrText` not directly
+            // in its run, an instruction no field takes, a `w:delText` or `w:delInstrText`
+            // outside a deletion.
+            (_, "t" | "instrText" | "delText" | "delInstrText") => {
+                // In a drawing it stands in the run that holds the drawing.
+                let level = match part.run() {
+                    Some(_) => Some(Level::Run),
+                    None => unread_level(parent),
+                };
+                part.stray(level, hidden);
                 Node::Other
             }
             (Some(Node::Run), "tab" | "ptab") => {
@@ -3197,7 +3256,6 @@ impl Doc<'_> {
                 self.field_char(part, walker, start, hidden)?;
                 Node::Other
             }
-            (Some(Node::Run), "instrText") => Node::InstrText,
             (Some(Node::Run), "rPr") => {
                 if let Some(run) = part.run() {
                     // Properties after the run's content: the reader has read that content
@@ -3290,10 +3348,18 @@ impl Doc<'_> {
             (_, "txbxContent") => {
                 let info = match (parent, part.shapes.last()) {
                     (Some(Node::ShapeText), Some(shape)) => {
+                        // Word lays out one story in a shape: a second is text the reader cannot
+                        // read as Word does.
+                        if shape.story {
+                            return Err(DocError::Malformed("docx_structure"));
+                        }
                         let info = shape.box_info();
                         // Every shape around it is fixed now.
                         for shape in &mut part.shapes {
                             shape.text_read = true;
+                        }
+                        if let Some(shape) = part.shapes.last_mut() {
+                            shape.story = true;
                         }
                         info
                     }
@@ -3327,10 +3393,14 @@ impl Doc<'_> {
                 )));
                 Node::TextBox
             }
-            (_, "sdt") => {
-                part.sdts.push(Sdt::default());
-                Node::Sdt(level(parent))
-            }
+            // Where no content may be, it is markup the reader passes over.
+            (_, "sdt") => match level(parent) {
+                Some(level) => {
+                    part.sdts.push(Sdt::default());
+                    Node::Sdt(level)
+                }
+                None => Node::Other,
+            },
             (Some(Node::Sdt(_)), "sdtPr") => {
                 // Properties after the control's content, which the reader read unbound.
                 if part.sdts.last().is_some_and(|sdt| sdt.content) {
@@ -3350,13 +3420,11 @@ impl Doc<'_> {
                     }
                     None => false,
                 };
-                match (level, bound) {
-                    (Some(level), true) => {
-                        part.dropping.push("data_binding");
-                        Node::Dropping(level)
-                    }
-                    (Some(level), false) => Node::Container(level),
-                    (None, _) => Node::Other,
+                if bound {
+                    part.dropping.push("data_binding");
+                    Node::Dropping(level)
+                } else {
+                    Node::Container(level)
                 }
             }
             (_, "customXml") => level(parent).map_or(Node::Other, Node::Container),
@@ -3589,6 +3657,23 @@ impl Doc<'_> {
                 Node::Other
             }
             _ => Node::Other,
+        };
+        // Markup the reader passes over where content stands, besides a field's or a section's
+        // data and a container's properties where they belong.
+        Ok(match node {
+            Node::Other
+                if !matches!(
+                    (parent, local),
+                    (Some(Node::Run), "fldChar")
+                        | (Some(Node::SimpleField(_)), "fldData")
+                        | (Some(Node::Body), "sectPr")
+                        | (Some(Node::Sdt(_)), "sdtEndPr")
+                        | (Some(Node::Container(_)), "customXmlPr" | "smartTagPr")
+                ) =>
+            {
+                unread_level(parent).map_or(Node::Other, Node::Passed)
+            }
+            node => node,
         })
     }
 
@@ -3695,6 +3780,9 @@ impl Doc<'_> {
                     && shape.simple
                 {
                     for (axis, name) in ["x", "y"].into_iter().enumerate() {
+                        if std::mem::replace(&mut shape.placed[axis], true) {
+                            shape.undecide(UNDECIDED);
+                        }
                         match walker.attr(start, None, name)?.map(|v| v.parse::<i64>()) {
                             Some(Ok(offset)) => shape.offset[axis] = Some(offset),
                             Some(Err(_)) => shape.undecide(UNDECIDED),
@@ -3766,7 +3854,7 @@ impl Doc<'_> {
                 if part
                     .shapes
                     .last()
-                    .is_some_and(|shape| shape.vml && !shape.group) =>
+                    .is_some_and(|shape| shape.vml && !shape.group && !shape.definition) =>
             {
                 Node::ShapeText
             }
@@ -3867,6 +3955,7 @@ impl Doc<'_> {
                 let mut shape = ShapeState::inside(part.shapes.last());
                 shape.vml = true;
                 shape.group = local == "group";
+                shape.definition = local == "shapetype";
                 if hidden {
                     shape.undecide(UNKNOWN_NAMESPACE);
                 }
@@ -4101,6 +4190,18 @@ impl Doc<'_> {
                     && let Some(id) = shape.shapetype
                 {
                     part.shapetypes.insert(id, shape.fill);
+                }
+            }
+            Node::PosOffset(axis) => {
+                let text = std::mem::take(&mut part.offset);
+                if let Some(shape) = part.shapes.last_mut() {
+                    if std::mem::replace(&mut shape.placed[axis], true) {
+                        shape.undecide(UNDECIDED);
+                    }
+                    match text.trim().parse::<i64>() {
+                        Ok(offset) => shape.offset[axis] = Some(offset),
+                        Err(_) => shape.undecide(UNDECIDED),
+                    }
                 }
             }
             Node::Sdt(_) => {
@@ -4991,6 +5092,14 @@ impl Doc<'_> {
     /// the budget is checked as they are made and once they are all made.
     fn finish_part(&mut self, mut part: Part) -> Result<(), DocError> {
         deadline::check()?;
+        // Content left out after the part's last paragraph warns that paragraph, unless it warns
+        // already; with no paragraph read, none names it.
+        if let Some(why) = part.before.take()
+            && let Some((ordinal, para_id)) = part.last.take()
+            && !part.hidden.iter().any(|(at, _, _)| *at == ordinal)
+        {
+            part.hidden.push((ordinal, why, para_id));
+        }
         part.out.sort_by_key(|(ordinal, _, _)| *ordinal);
         part.hidden.sort_by_key(|(ordinal, _, _)| *ordinal);
         for (ordinal, why, para_id) in part.hidden {

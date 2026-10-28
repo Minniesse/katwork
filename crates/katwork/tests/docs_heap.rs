@@ -2,8 +2,9 @@
 //! measured, generated here (never committed) and read inside a job scope that counts its live
 //! bytes. Each is refused or read within `max_read_bytes` and the call timeout.
 //!
-//! The floods run at a twentieth of the default element cap here. To read them at the default
-//! caps and print each read's peak, build in release:
+//! The floods run at a twentieth of the default element cap here, under that scale's budget and
+//! under one most of them pass. To read them at the default caps and print each read's peak, and
+//! under budgets from 64 MiB to 1 GiB how far each goes past its budget, build in release:
 //! `cargo test --release -p katwork --test docs_heap -- --ignored --nocapture`
 #[path = "support/ooxml.rs"]
 mod ooxml;
@@ -84,6 +85,73 @@ fn the_blocks_a_read_makes_count_toward_its_budget() {
     };
     assert_eq!(within(28), Err(DocError::TooComplex("memory")));
     assert_eq!(within(40), Ok(1_399));
+}
+
+/// A read past its budget when its blocks begin is refused there, before it copies its text into
+/// them. Its one paragraph, a single grapheme of 3 MB (an `e` and 1,500,000 combining accents)
+/// and one more character, splits into two pieces with no check of its own, and holds its text in
+/// room for twice its length; its peak comes as the copy ends, with that room still held. The
+/// peak less half again the text's length lies below what it holds when its blocks begin and
+/// above what it holds before and after.
+#[test]
+fn a_read_past_its_budget_before_its_blocks_is_refused_there() {
+    let paragraph = format!(
+        "<w:p>{}{}</w:p>",
+        run("", &format!("e{}", "\u{301}".repeat(1_500_000))),
+        run("", "b")
+    );
+    let bytes = stored(&Docx::new(&paragraph));
+    let limits = DocLimits::default();
+    let (result, peak, _) = counted(&bytes, &limits);
+    let extracted = result.unwrap();
+    assert_eq!(extracted.blocks.len(), 2);
+    let text: u64 = extracted
+        .blocks
+        .iter()
+        .map(|block| block.text.len() as u64)
+        .sum();
+    let limits = DocLimits {
+        max_read_bytes: peak - text * 3 / 2,
+        ..limits
+    };
+    assert_eq!(
+        counted(&bytes, &limits).0.map(drop),
+        Err(DocError::TooComplex("memory"))
+    );
+}
+
+/// A read whose blocks pass its budget only as the last of them are made is refused: the check
+/// after its last block sees them all. Its 32,800 one-character paragraphs double their blocks'
+/// room after the last check of the loop that makes them; its budget, that room, is less than the
+/// read holds at the end and more than it held at any check before.
+#[test]
+fn a_read_past_its_budget_with_its_last_blocks_is_refused() {
+    let bytes = stored(&Docx::new(&para("", &run("", "x")).repeat(32_800)));
+    let limits = DocLimits::default();
+    let extracted = counted(&bytes, &limits).0.unwrap();
+    assert_eq!(extracted.blocks.len(), 32_800);
+    let limits = DocLimits {
+        max_read_bytes: (extracted.blocks.capacity() * std::mem::size_of::<docs::Block>()) as u64,
+        ..limits
+    };
+    assert_eq!(
+        counted(&bytes, &limits).0.map(drop),
+        Err(DocError::TooComplex("memory"))
+    );
+}
+
+/// Unread content between paragraphs warns the paragraph after it once, however much of it stands
+/// there: a flood of it costs what its part does.
+#[test]
+fn unread_content_between_paragraphs_costs_what_its_part_does() {
+    let unread = r#"<x:a xmlns:x="urn:example:unknown" x:b="1"/>"#.repeat(200_000);
+    let bytes = stored(&Docx::new(&format!(
+        "{unread}{}",
+        para("", &run("", "after"))
+    )));
+    let (result, peak, _) = counted(&bytes, &DocLimits::default());
+    assert_eq!(result.unwrap().warnings.len(), 1);
+    assert!(peak < 3 * bytes.len() as u64 + (4 << 20), "{peak}");
 }
 
 #[tokio::test]
@@ -361,6 +429,42 @@ fn floods() -> Vec<Flood> {
             },
         },
         Flood {
+            name: "table styles of 13 shaded regions on a base read four ways",
+            build: |elements| {
+                let regions: String = REGIONS
+                    .iter()
+                    .map(|kind| {
+                        format!(
+                            r#"<w:tblStylePr w:type="{kind}"><w:tcPr><w:shd w:val="clear" w:fill="FFFFFF"/></w:tcPr></w:tblStylePr>"#
+                        )
+                    })
+                    .collect();
+                // 41 elements a style, 8 a table.
+                let count = (elements.saturating_sub(40) / 49).min(65_000);
+                // Their base is defined twice, each definition writing a size twice: each style
+                // built on it differs under all four readings, and none is held once.
+                let base = concat!(
+                    r#"<w:style w:type="table" w:styleId="B"><w:rPr><w:sz w:val="20"/><w:sz w:val="22"/></w:rPr></w:style>"#,
+                    r#"<w:style w:type="table" w:styleId="B"><w:rPr><w:sz w:val="24"/><w:sz w:val="26"/></w:rPr></w:style>"#
+                );
+                let styles: String = (0..count)
+                    .map(|at| {
+                        format!(
+                            r#"<w:style w:type="table" w:styleId="t{at}"><w:basedOn w:val="B"/>{regions}</w:style>"#
+                        )
+                    })
+                    .collect();
+                let tables: String = (0..count)
+                    .map(|at| {
+                        format!(
+                            r#"<w:tbl><w:tblPr><w:tblStyle w:val="t{at}"/></w:tblPr><w:tr><w:tc><w:p><w:r><w:t>x</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#
+                        )
+                    })
+                    .collect();
+                packed(&Docx::new(&tables).styles(&format!("{base}{styles}")))
+            },
+        },
+        Flood {
             name: "distinct 250-byte style ids, all named in one style",
             build: |elements| {
                 // As many as the inflation cap holds.
@@ -420,6 +524,30 @@ fn floods() -> Vec<Flood> {
                 let len = (190 << 20) / (DocLimits::default().max_xml_elements / elements);
                 let text = "x".repeat(len as usize);
                 packed(&Docx::new(&para("", &run("", &text))))
+            },
+        },
+        Flood {
+            name: "the same text after a character in its run",
+            build: |elements| {
+                // The run copies the text onto its character while the node is still held.
+                let len = (190 << 20) / (DocLimits::default().max_xml_elements / elements);
+                let text = "x".repeat(len as usize);
+                packed(&Docx::new(&format!(
+                    "<w:p><w:r><w:t>a</w:t><w:t>{text}</w:t></w:r></w:p>"
+                )))
+            },
+        },
+        Flood {
+            name: "the same text in three nodes of one run, its room doubled",
+            build: |elements| {
+                // The second node doubles the room of the first; the third doubles it again
+                // while the node is held.
+                let scale = DocLimits::default().max_xml_elements / elements;
+                let first = "x".repeat(((94 << 20) / scale) as usize);
+                let last = "x".repeat(((95 << 20) / scale) as usize);
+                packed(&Docx::new(&format!(
+                    "<w:p><w:r><w:t>{first}</w:t><w:t>x</w:t><w:t>{last}</w:t></w:r></w:p>"
+                )))
             },
         },
         Flood {
@@ -499,11 +627,13 @@ fn scaled(scale: u64) -> DocLimits {
     }
 }
 
-fn read_floods(scale: u64, print: bool) {
-    let limits = scaled(scale);
+/// Reads every flood made for `limits`, each refused or read within its budget; returns the most
+/// any read went past its budget.
+fn read_floods(limits: &DocLimits, print: bool) -> u64 {
+    let mut past = 0;
     for flood in floods() {
         let bytes = (flood.build)(limits.max_xml_elements);
-        let (result, peak, took) = counted(&bytes, &limits);
+        let (result, peak, took) = counted(&bytes, limits);
         let outcome = match &result {
             Ok(extracted) => format!(
                 "read ({} blocks, {} warnings)",
@@ -514,10 +644,11 @@ fn read_floods(scale: u64, print: bool) {
         };
         if print {
             println!(
-                "{:<58} {:>9} KB in  {:>7.1} MB peak  {:>8.2?}  {outcome}",
+                "{:<62} {:>9} KB in  {:>7.1} MB peak  {:>7.1} MB past  {:>8.2?}  {outcome}",
                 flood.name,
                 bytes.len() >> 10,
                 peak as f64 / 1e6,
+                peak.saturating_sub(limits.max_read_bytes) as f64 / 1e6,
                 took
             );
         }
@@ -530,25 +661,54 @@ fn read_floods(scale: u64, print: bool) {
             flood.name
         );
         // The budget is checked where the reader checks its deadline and as it makes its blocks:
-        // a read passes it only by what one step between two checks allocates (a hash table's
-        // growth, one text node), which at these caps stays under 8 MiB.
+        // a read passes it only by what it allocates between two checks, the text it reads then
+        // twice over with the room a run's text doubles into (under two and a half times the
+        // inflation cap), or a hash table's growth (less than that at these element caps).
         assert!(
-            peak <= limits.max_read_bytes + (8 << 20),
+            peak <= limits.max_read_bytes + 3 * limits.max_unzipped_bytes,
             "{}: {peak} bytes",
             flood.name
         );
+        past = past.max(peak.saturating_sub(limits.max_read_bytes));
     }
+    past
 }
 
+/// At a twentieth of the default caps every flood fits the budget a twentieth of the default
+/// gives; under a budget of 8 MiB most pass it, and each stops at its next check.
 #[test]
 fn floods_are_refused_or_read_within_the_budget() {
-    read_floods(20, false);
+    read_floods(&scaled(20), false);
+    read_floods(
+        &DocLimits {
+            max_read_bytes: 8 << 20,
+            ..scaled(20)
+        },
+        false,
+    );
 }
 
 #[test]
 #[ignore = "measures the floods at the default caps; run in release with --nocapture"]
 fn floods_at_the_default_caps() {
-    read_floods(1, true);
+    read_floods(&DocLimits::default(), true);
+}
+
+/// The floods at the default caps under budgets from 64 MiB to 1 GiB, which most pass: how far
+/// past its budget a read goes between two checks.
+#[test]
+#[ignore = "measures how far one step goes past a budget; run in release with --nocapture"]
+fn floods_past_smaller_budgets() {
+    let mut past = 0;
+    for mib in (64..=1_024).step_by(32) {
+        let limits = DocLimits {
+            max_read_bytes: mib << 20,
+            ..DocLimits::default()
+        };
+        println!("max_read_bytes {mib} MiB");
+        past = past.max(read_floods(&limits, true));
+    }
+    println!("most past a budget: {:.1} MB", past as f64 / 1e6);
 }
 
 /// Nested shadings of two candidate colours each would double the colours beneath a run at every
