@@ -17,7 +17,8 @@ it and the reason on stderr goes back to the agent. Blocks:
   over REST when that fails); or with --delete-branch while open PRs use the
   head branch as their base
 - `gh api` writes that merge, move or delete refs or write contents, in any
-  flag spelling, and GraphQL merge or ref mutations, including bodies read
+  flag spelling and any endpoint spelling GitHub routes there (see api_path),
+  and GraphQL merge or ref mutations, including bodies read
   from stdin or files (an unreadable GraphQL body is refused). One REST merge
   passes, for sessions without GraphQL, when every part is written out and a
   review covers the head it names (see rest_merge_request):
@@ -41,6 +42,7 @@ import re
 import shlex
 import subprocess
 import sys
+import urllib.parse
 
 PROTECTED = {"main", "master"}
 NOREPLY = "@users.noreply.github.com"
@@ -1117,8 +1119,8 @@ def check_http_client(args):
                              "--post-file", "--body-data")) for t in texts)
     write = (method or ("POST" if data else "GET")) not in ("GET", "HEAD")
     for url in urls:
-        path = re.sub(r"^.*api\.github\.com", "", url).split("?", 1)[0].rstrip("/")
-        if path.endswith("/graphql") and GRAPHQL_WRITES.search(joined):
+        path = api_path(re.sub(r"^.*api\.github\.com", "", url))
+        if path == "graphql" and GRAPHQL_WRITES.search(joined):
             raise Blocked(f"GraphQL mutations that merge PRs or move refs are blocked. {MERGE_WAYS}")
         if write and API_WRITE_PATHS.search(path):
             raise Blocked(f"GitHub API writes that merge PRs or move, delete or write branches are blocked. {MERGE_WAYS}")
@@ -1137,6 +1139,28 @@ GRAPHQL_WRITES = re.compile(r"\b(mergePullRequest|enablePullRequestAutoMerge|upd
                             r"createCommitOnBranch|mergeBranch|updatePullRequestBranch)\b")
 API_WRITE_PATHS = re.compile(r"(^|/)(pulls/[^/]+/merge|merges|git/refs(/.*)?|contents/.*|branches/[^/]+/rename)$")
 MERGE_PATH = re.compile(r"(^|/)pulls/[^/]+/merge$")
+
+
+def api_path(endpoint):
+    """The path GitHub routes for an API endpoint or URL, for matching: no
+    scheme or host, percent-decoded, cut at `?`, `#` and `;`, `\\` read as
+    `/`, empty and `.` segments dropped, `..` applied, in lower case. So
+    `pulls/1/merge#`, `merge/.`, `./merge`, `//merge`, `%6Derge`, `1%2Fmerge`
+    and `MERGE` all read as `pulls/1/merge`."""
+    path = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/?#]*", "", endpoint)
+    for _ in range(8):  # %256D decodes to %6D, then to m
+        decoded = urllib.parse.unquote(path)
+        if decoded == path:
+            break
+        path = decoded
+    segments = []
+    for segment in re.split(r"[?#]", path.replace("\\", "/"), maxsplit=1)[0].split("/"):
+        segment = segment.split(";", 1)[0].strip()
+        if segment == "..":
+            segments = segments[:-1]
+        elif segment not in ("", "."):
+            segments.append(segment)
+    return "/".join(segments).lower()
 REST_MERGE = "gh api -X PUT repos/<owner>/<repo>/pulls/<n>/merge -f merge_method=merge -f sha=<head sha>"
 REST_MERGE_ENDPOINT = re.compile(r"/?repos/([A-Za-z0-9][A-Za-z0-9-]*/(?!\.+/)[A-Za-z0-9._-]+)/pulls/([1-9][0-9]*)/merge")
 MERGE_WAYS = (f"Merge with `gh pr merge <n> --merge`, or where GraphQL is unavailable `{REST_MERGE}` with the "
@@ -1335,7 +1359,8 @@ def check_gh_api(args, cwd, stdin=([], True), opaque=False, leading=()):
             unreadable = unreadable or not c
     if endpoint is None:
         return
-    if endpoint.text == "graphql":
+    path = api_path(endpoint.text)  # as GitHub routes it: `/graphql` and `merge#` are spellings too
+    if path == "graphql":
         texts = []
         for body, dynamic in bodies:
             t, c = resolve_text(body, dynamic, cwd, 0)
@@ -1348,7 +1373,6 @@ def check_gh_api(args, cwd, stdin=([], True), opaque=False, leading=()):
                           "Pass the query inline with -f query=..., or from a file in the repo.")
         return
     write = (method or ("POST" if writes else "GET")) not in ("GET", "HEAD")
-    path = endpoint.text.split("?", 1)[0].rstrip("/")
     if write and (endpoint.dynamic or API_WRITE_PATHS.search(path)):
         if not MERGE_PATH.search(path):
             raise Blocked(f"`gh api` writes that merge PRs or move, delete or write branches are blocked. {MERGE_WAYS}")
@@ -1986,7 +2010,7 @@ def real_merge_cases():
     ]
 
 
-REST_CASES = 57
+REST_CASES = 81
 
 
 def rest_self_test():
@@ -2111,6 +2135,26 @@ def rest_self_test():
          False, False),
         ("gh api graphql -f query='mutation { mergePullRequest(input: {pullRequestId: \"x\"}) { clientMutationId } }'",
          False, False),
+        # endpoint spellings GitHub routes to the merge, ref, merges and contents endpoints (review round 1)
+        *((f"gh api -X PUT '{ep}' -f merge_method=squash", False, False) for ep in (
+            "repos/o/r/pulls/24/merge#", "repos/o/r/pulls/24/merge#x", "repos/o/r/pulls/24/merge/.",
+            "repos/o/r/pulls/24/./merge", "repos/o/r/pulls/24/x/../merge", "repos/o/r/pulls/24//merge",
+            "repos/o/r/pulls//24/merge", "repos/o/r/pulls/24/%6Derge", "repos/o/r/pulls/24%2Fmerge",
+            "repos/o/r/pulls/24/merge;x", "repos/o/r/pulls/24/MERGE", "repos/o/r/PULLS/24/merge",
+            "repos/o/r/pulls/24/%256Derge")),
+        (f"gh api -X PUT repos/o/r/pulls/21/merge# -f merge_method=merge -f sha={a}", False, False),
+        (f"gh api -X PATCH repos/o/r/git/./refs/heads/main -f sha={a}", False, False),
+        (f"gh api -X PATCH repos/o/r/git//refs/heads/main -f sha={a}", False, False),
+        (f"gh api -X PATCH repos/o/r/GIT/REFS/heads/main -f sha={a}", False, False),
+        ("gh api repos/o/r/merges# -f base=main -f head=x", False, False),
+        ("gh api repos/o/r/merges/. -f base=main -f head=x", False, False),
+        ("gh api -X PUT repos/o/r/CONTENTS/a.txt -f message=m", False, False),
+        ("gh api /graphql -f query='mutation { mergePullRequest(input: {pullRequestId: \"x\"}) { clientMutationId } }'",
+         False, False),
+        ("gh api https://api.github.com/graphql -f query='mutation { updateRef(input: {}) { clientMutationId } }'",
+         False, False),
+        ("curl -X PUT 'https://api.github.com/repos/o/r/pulls/24/merge#' -d '{\"merge_method\":\"squash\"}'", False, False),
+        ("curl -X PUT https://api.github.com/repos/o/r/pulls/24/./merge -d '{\"merge_method\":\"squash\"}'", False, False),
         # gh pr merge reads the PR with gh pr view where GraphQL works, and over REST where it doesn't
         ("gh pr merge 22 --merge", True, True),
         ("gh pr merge 24 --merge", False, True),
