@@ -37,3 +37,10 @@ path = "fuzz_targets/text.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "xlsx"
+path = "fuzz_targets/xlsx.rs"
+test = false
+doc = false
+bench = false

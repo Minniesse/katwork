@@ -294,11 +294,10 @@ fn theme_colours_parse_tint_and_map_xlsx_indexes() {
 
 #[test]
 fn extract_refuses_kinds_whose_readers_come_later() {
+    // The XLSX reader has come (Task 4): the minimal workbook reads as its one cell.
     let workbook = xlsx(r#"<row r="1"><c r="A1" t="inlineStr"><is><t>x</t></is></c></row>"#);
-    assert_eq!(
-        docs::extract(MediaKind::Xlsx, &workbook, &limits()),
-        Err(DocError::Unsupported("xlsx"))
-    );
+    let read = docs::extract(MediaKind::Xlsx, &workbook, &limits()).unwrap();
+    assert_eq!(text(&read), "x");
     assert_eq!(
         docs::extract(MediaKind::Pdf, b"%PDF-1.7", &limits()),
         Err(DocError::Unsupported("pdf"))
@@ -7193,6 +7192,44 @@ fn seeds() -> Vec<(&'static str, &'static str, &'static str, Vec<u8>)> {
         ("text", "odd-utf16.txt", "UTF-16 with an odd byte count", vec![0xFF, 0xFE, b'a']),
         ("text", "lone-surrogate.txt", "UTF-16 with a lone surrogate", vec![0xFF, 0xFE, 0x00, 0xD8]),
         ("text", "nul.txt", "a NUL character", b"a\0b".to_vec()),
+        ("xlsx", "minimal.xlsx", "one sheet of one inline string", xlsx(r#"<row r="1"><c r="A1" t="inlineStr"><is><t>seed</t></is></c></row>"#)),
+        ("xlsx", "styled.xlsx", "styles, shared strings with runs, a theme, number formats and white, tiny and empty-format cells", {
+            let mut styles = StyleSet::new();
+            let white = styles.with_font(r#"<sz val="11"/><color theme="0"/>"#);
+            let tiny = styles.with_font(r#"<sz val="3"/>"#);
+            let millions = styles.with_format("#,##0,,");
+            let blank = styles.with_format(";;;");
+            let black = styles.solid("FF000000");
+            let on_black = styles.xf(0, 1, black);
+            Xlsx::new()
+                .styles(&styles.xml())
+                .theme(&theme(&[]))
+                .shared_strings(&["<t>shared</t>", r#"<r><t>รายได้ </t></r><r><rPr><color rgb="FFFFFFFF"/></rPr><t>9,999</t></r><rPh sb="0" eb="1"><t>hint</t></rPh>"#])
+                .sheet("Sheet1", &format!(
+                    r#"<sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c><c r="C1" s="{white}"><v>1</v></c><c r="D1" s="{tiny}"><v>2</v></c><c r="E1" s="{millions}"><v>1250000000</v></c><c r="F1" s="{blank}"><v>3</v></c><c r="G1" s="{on_black}"><v>4</v></c></row></sheetData>"#
+                ))
+                .build()
+        }),
+        ("xlsx", "hidden.xlsx", "hidden and very hidden sheets, a hidden row, columns hidden in both tag forms, and a merged range", Xlsx::new()
+            .sheet("Visible", r#"<cols><col min="2" max="2" hidden="1"></col><col min="4" max="5" hidden="1"/></cols><sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c><c r="D1"><v>3</v></c><c r="F1"><v>4</v></c><c r="G1"><v>5</v></c></row><row r="2" hidden="1"><c r="A2"><v>6</v></c></row></sheetData><mergeCells count="1"><mergeCell ref="F1:G1"/></mergeCells>"#)
+            .sheet_state("Hidden", "hidden", r#"<sheetData><row r="1"><c r="A1"><v>7</v></c></row></sheetData>"#)
+            .sheet_state("VeryHidden", "veryHidden", r#"<sheetData><row r="1"><c r="A1"><v>8</v></c></row></sheetData>"#)
+            .build()),
+        ("xlsx", "formulas.xlsx", "a 1904 workbook that recalculates on load, with shared formulas, every cell type and escapes", Xlsx::new()
+            .workbook_head(r#"<workbookPr date1904="1"/>"#)
+            .workbook_tail(r#"<calcPr calcId="124519" fullCalcOnLoad="1"/>"#)
+            .sheet("S_x0031_", r#"<sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><f t="shared" ref="B1:B2" si="0">A1*2</f><v>2</v></c><c r="C1" t="str"><f>"a"&amp;"_x000D_"</f><v>a_x000D_</v></c><c r="D1" t="b"><v>1</v></c><c r="E1" t="e"><v>#N/A</v></c><c r="F1" t="d"><v>2024-01-31</v></c></row><row r="2"><c r="A2"><v>2</v></c><c r="B2"><f t="shared" si="0"/><v>4</v></c><c><f>NOW()</f></c></row></sheetData>"#)
+            .build()),
+        ("xlsx", "prefixed.xlsx", "SpreadsheetML under a prefix, with an external link and macros the reader warns about", Xlsx::new()
+            .sheet("S", "")
+            .workbook_xml(&format!(r#"<?xml version="1.0"?><x:workbook xmlns:x="{SML}" xmlns:r="{RELATIONSHIPS}"><x:sheets><x:sheet name="S" sheetId="1" r:id="rIdS0"/></x:sheets></x:workbook>"#))
+            .related("externalLink", "externalLinks/externalLink1.xml", Some(format!(r#"<?xml version="1.0"?><externalLink xmlns="{SML}"/>"#).as_bytes()))
+            .entry("xl/vbaProject.bin", b"\xD0\xCF")
+            .build_with_sheet_xml(0, &format!(r#"<?xml version="1.0"?><x:worksheet xmlns:x="{SML}"><x:sheetData><x:row r="1"><x:c r="A1" t="inlineStr"><x:is><x:t>prefixed</x:t></x:is></x:c></x:row></x:sheetData></x:worksheet>"#))),
+        ("xlsx", "strict.xlsx", "a Strict SpreadsheetML workbook", Xlsx::new()
+            .sheet("S", r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#)
+            .workbook_xml(&format!(r#"<?xml version="1.0"?><workbook xmlns="{STRICT_SML}" xmlns:r="{RELATIONSHIPS}"><sheets><sheet name="S" sheetId="1" r:id="rIdS0"/></sheets></workbook>"#))
+            .build()),
     ]
 }
 
@@ -7208,7 +7245,7 @@ fn sha256(bytes: &[u8]) -> String {
 #[ignore = "rewrites fuzz/corpus and tests/fixtures/docs/MANIFEST.md"]
 fn regenerate_fuzz_seeds() {
     let mut rows = String::new();
-    for target in ["package", "docx", "text"] {
+    for target in ["package", "docx", "text", "xlsx"] {
         let dir = format!("{CORPUS}/{target}");
         if std::path::Path::new(&dir).exists() {
             std::fs::remove_dir_all(&dir).unwrap();
@@ -7245,7 +7282,7 @@ fn fuzz_seeds_match_the_manifest() {
         );
     }
     let mut committed = std::collections::BTreeMap::new();
-    for target in ["package", "docx", "text"] {
+    for target in ["package", "docx", "text", "xlsx"] {
         let files: Vec<_> = std::fs::read_dir(format!("{CORPUS}/{target}"))
             .unwrap()
             .map(|entry| entry.unwrap())

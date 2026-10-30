@@ -339,7 +339,9 @@ fn unqualified(start: &quick_xml::events::BytesStart, name: &str) -> Option<Stri
         })
 }
 
-fn apply_tint(colour: Rgb, tint: f64) -> Rgb {
+/// `colour` with `tint` applied to its HSL luminance (ECMA-376 Part 1 §18.8.19): the XLSX reader
+/// applies a `tint` to RGB and palette colours too.
+pub(crate) fn apply_tint(colour: Rgb, tint: f64) -> Rgb {
     if !tint.is_finite() || tint == 0.0 {
         return colour;
     }
