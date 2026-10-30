@@ -50,9 +50,19 @@ In Claude Code, every command run inside a worktree of this repo gets that workt
 - deleting a remote branch, by `git push --delete` or `gh pr merge --delete-branch`, while open PRs use it as their base
 - `git reset --hard`, and `git clean` that would delete files (dry runs pass)
 - commits and merges whose author or committer email isn't a GitHub noreply address
-- `gh pr merge` with `--admin`, `--auto`, `--squash` or `--rebase`, or when no review covers the code being merged, and `gh api` or `curl` writes that merge PRs or move refs
+- `gh pr merge` with `--admin`, `--auto`, `--squash` or `--rebase`, or when no review covers the code being merged, and `gh api` or `curl` writes that merge PRs or move refs, except the one REST merge below
 
-A review covers the head when it was posted on the head commit, or on an earlier commit followed only by merges of the base branch, each byte-identical to git's own clean merge of its two parents (`git merge-tree --write-tree`). Merging `main` into a reviewed PR keeps the review valid; resolving a conflict, changing code in the merge or adding a commit needs a new review. The guard doesn't read what a review says; the coordinator weighs that at the merge gate.
+A review covers the head when it was posted on the head commit, or on an earlier commit followed only by merges of the base branch, each byte-identical to git's own clean merge of its two parents (`git merge-tree --write-tree`). Merging `main` into a reviewed PR keeps the review valid; resolving a conflict, changing code in the merge or adding a commit needs a new review. A pending review, created but not yet submitted, covers nothing. The guard doesn't read what a review says; the coordinator weighs that at the merge gate.
+
+Without GraphQL (a cloud session, where every GraphQL call, so every `gh pr` command, fails with HTTP 403), use REST:
+
+- create a PR: `gh api repos/{owner}/{repo}/pulls -f title=... -f head=<branch> -f base=<base> -F body=@<file>`
+- view it and its head: `gh api repos/{owner}/{repo}/pulls/<n>`; its diff: the same with `-H 'Accept: application/vnd.github.diff'`, or `git diff` of the fetched refs
+- its checks: `gh api repos/{owner}/{repo}/commits/<sha>/check-runs`
+- review it: `gh api repos/{owner}/{repo}/pulls/<n>/reviews -f commit_id=<sha> -f event=COMMENT -F body=@<file>` (without `event` the review stays pending)
+- merge it: `gh api -X PUT repos/<owner>/<repo>/pulls/<n>/merge -f merge_method=merge -f sha=<head sha>`, the one REST merge the guard allows, under the same review rule. The owner, repo, PR number and full head SHA are written out (no `{owner}/{repo}`, no variables), nothing else is on the command, and the SHA is the PR's current head, so GitHub refuses the merge if the head moves after the check.
+
+`gh pr merge` also reads the PR over REST when `gh pr view` fails.
 
 The blocking message says what to do instead. Run `.claude/hooks/guard.py --self-test` after changing it.
 
@@ -62,7 +72,7 @@ The guard stops accidents, not deliberate evasion. The boundary for `main` is th
 
 These ways around the guard are known and accepted, because only someone deliberately evading it would write them:
 
-- Git environment and repository overrides (`GIT_DIR`, `GIT_WORK_TREE`, `env -C`, a `-C` path computed at run time)
+- Git environment and repository overrides (`GIT_DIR`, `GIT_WORK_TREE`, `env -C`, a `-C` path computed at run time), and `GH_HOST` or `GH_REPO` set for one `gh` command, which the guard's own `gh` reads don't see
 - unusual push configuration (`--repo` combined with `remote.<name>.push`, a configured `:` matching refspec)
 - command substitutions nested in parameter or arithmetic expansions, and `function` bodies
 - destructive options passed through variables, or abbreviated (`git clean --for`)
