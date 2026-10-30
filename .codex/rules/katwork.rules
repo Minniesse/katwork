@@ -57,9 +57,11 @@ prefix_rule(
 )
 
 # The REST merge (gh api -X PUT repos/<owner>/<repo>/pulls/<n>/merge ...) too. The guard allows it only as a
-# command of its own that starts `gh api` and the method, so these prefixes cover it; they ask before any other
-# PUT as well. gh upper-cases the method, so every letter case is listed for when hooks are off. A prefix rule
-# can't see a merge under a wrapper (`timeout`, `env`) or with the method after the endpoint; the guard refuses those.
+# command of its own that starts `gh api` and the method, on a line of plain words (the only lines Codex splits
+# into commands), so these prefixes cover it; they ask before any other PUT as well. gh upper-cases the method,
+# so every letter case is listed for when hooks are off. A prefix rule can't see a merge under a wrapper, on a
+# line with quotes, escapes, redirections, `&`, parentheses or a comment, or with the method after the
+# endpoint; the guard refuses those.
 prefix_rule(
     pattern = ["gh", "api", ["-X", "--method"], ["PUT", "PUt", "PuT", "Put", "pUT", "pUt", "puT", "put"]],
     decision = "prompt",

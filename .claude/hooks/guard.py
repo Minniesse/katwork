@@ -620,12 +620,27 @@ def check_script(text, cwd, depth=0):
     for sub in parsed.subs:
         check_script(sub, cwd, depth + 1)
     shell_vars = {}  # NAME=value assignments seen so far, to resolve $NAME as a program
+    plain = depth == 0 and plain_words(text)
     for pipeline in parsed.pipelines:
         for k, cmd in enumerate(pipeline):
             feeds_shell = any(is_stdin_shell(later, depth) for later in pipeline[k + 1 :])
             stdin = stdin_of(pipeline, k, cwd, depth)
-            cwd = check_command(cmd, cwd, depth, feeds_shell, shell_vars, stdin)
+            cwd = check_command(cmd, cwd, depth, feeds_shell, shell_vars, stdin, plain)
     return cwd
+
+
+PLAIN_WORD = r"[A-Za-z0-9_@%+=:,./-]+"
+PLAIN_COMMAND = re.compile(rf"{PLAIN_WORD}(?:[ \t]+{PLAIN_WORD})*")
+
+
+def plain_words(text):
+    """True when the command line is commands of plain words joined by `&&`,
+    `||`, `;` or `|`: no quotes, escapes, `$`, globs, braces, comments,
+    redirections, a lone `&`, parentheses or newlines. Codex splits only such
+    a line into commands before its prefix rules match; anything else it
+    matches as one `bash -lc ...` command, which no `gh` rule sees."""
+    parts = re.split(r"[ \t]*(?:&&|\|\||;|\|)[ \t]*", text.strip(" \t"))
+    return all(PLAIN_COMMAND.fullmatch(part) for part in parts)
 
 
 def stdin_of(pipeline, k, cwd, depth):
@@ -729,7 +744,7 @@ def read_script_file(path, cwd):
     return None
 
 
-def check_command(cmd, cwd, depth, feeds_shell, shell_vars, stdin=([], True)):
+def check_command(cmd, cwd, depth, feeds_shell, shell_vars, stdin=([], True), plain=False):
     argv, env, opaque, scripts = unwrap(cmd.words, depth)
     for script in scripts:
         check_script(script, cwd, depth + 1)
@@ -781,8 +796,8 @@ def check_command(cmd, cwd, depth, feeds_shell, shell_vars, stdin=([], True)):
         check_git(args, cwd, opaque, depth, env)
         return cwd
     if head == "gh":
-        # typed: `gh` is the first word of a command on the line itself, as prefix rules (Codex's) see it
-        typed = depth == 0 and len(argv) == len(cmd.words) and prog.text == "gh"
+        # typed: `gh` starts a command of plain words on the line itself, the form Codex's prefix rules see
+        typed = plain and depth == 0 and len(argv) == len(cmd.words) and prog.text == "gh"
         check_gh(args, cwd, opaque, depth, stdin, typed)
         return cwd
     if head in ("curl", "wget", "http", "https", "xh"):
@@ -1430,12 +1445,13 @@ def rest_merge_request(args, leading, opaque, typed):
     """The one `gh api` merge the guard lets through, for sessions without
     GraphQL: REST_MERGE and nothing else. It is a command of its own that
     starts `gh api` and then the method (`-X PUT`, `-XPUT`, `-X=PUT`, `--method
-    PUT`, `--method=PUT`), so a prefix rule such as Codex's, which sees the
-    command as typed and unwraps nothing, can ask a person first, as it does
-    for `gh pr merge`. The endpoint and -f/-F/--raw-field/--field follow in
-    any order and spelling. Every word must be written out, and each field
-    given once (gh applies -F after -f, whatever their order). Returns
-    (owner/repo, number, sha), or raises Blocked naming what differs."""
+    PUT`, `--method=PUT`), on a line of plain words (plain_words), so a prefix
+    rule such as Codex's, which sees the command as typed and unwraps nothing,
+    can ask a person first, as it does for `gh pr merge`. The endpoint and
+    -f/-F/--raw-field/--field follow in any order and spelling. Every word
+    must be written out, and each field given once (gh applies -F after -f,
+    whatever their order). Returns (owner/repo, number, sha), or raises
+    Blocked naming what differs."""
 
     def refuse(why):
         raise Blocked(f"this REST merge isn't the one form the guard checks: {why}. Write `{REST_MERGE}`, "
@@ -1446,8 +1462,9 @@ def rest_merge_request(args, leading, opaque, typed):
     if leading:
         refuse(f"`gh {' '.join(leading)}` before `api` isn't part of it")
     if not typed:
-        refuse("it must be a command of its own that starts `gh api`, not one under a wrapper (`timeout`, `env`), "
-               "after `VAR=`, through an alias, or inside `bash -c`, `eval` or `$(...)`")
+        refuse("it must be a command of its own that starts `gh api`, on a line of plain words joined only by `&&`, "
+               "`||`, `;` or `|`: no wrapper (`timeout`, `env`), `VAR=` or alias, no quotes, escapes or `$`, no "
+               "redirection (`2>&1`), `&`, parentheses or comment, and not inside `bash -c`, `eval` or `$(...)`")
     methods, fields, positionals = [], [], []
     i = 0
     while i < len(args):
@@ -2041,7 +2058,7 @@ def real_merge_cases():
     ]
 
 
-REST_CASES = 123
+REST_CASES = 145
 
 
 def rest_self_test():
@@ -2220,6 +2237,17 @@ def rest_self_test():
          "-d '{\"query\":\"mutation { mergePullRequest(input: {}) { clientMutationId } }\"}'", False, False),
         ("curl -X PUT 'https://api.github.com/repos/o/r/pulls/24/merge?x=api.github.com' -d '{}'", False, False),
         ("curl -X PUT https://api.github.com:443/repos/o/r/pulls/24/merge -d '{}'", False, False),
+        # api_path's `\` step and its trimming each have a case (review round 2)
+        ("gh api -X PUT 'repos/o/r/pulls/24\\merge' -f merge_method=squash", False, False),
+        ("gh api -X PUT repos/o/r/pulls/24/merge%20 -f merge_method=squash", False, False),
+        # lines Codex doesn't split into plain commands, so its prefix rules never see `gh api -X PUT` (round 2)
+        *((form.format(p=put.format(n=21, sha=a)), False, False) for form in (
+            "( {p} )", "{p} &", "true & {p}", "{p} 2>&1", "{p} 2>/dev/null", "{p} > out.txt", "{p} < /dev/null",
+            "{p} <<< x", "{p} # comment", "case x in x) {p} ;; esac", "f() ( {p} ); f", "true\n{p}")),
+        *((put.format(n=21, sha=a).replace(old, new), False, False) for old, new in (
+            ("gh api", "\\gh api"), ("gh api", '"gh" api'), ("gh api", 'g"h" api'), ("gh api", "gh a\\pi"),
+            ("-X PUT", "-X $'PUT'"), ("-X PUT", "-X PU\\T"), ("repos/o/r/pulls/21/merge", "'repos/o/r/pulls/21/merge'"))),
+        (put.format(n=21, sha=a) + " | cat", True, False),
         # options and run-time words the review found no failing case for (review round 1)
         *((put.format(n=21, sha=a) + extra, False, False) for extra in (
             " --input=body.json", " --hostname=example.com", " --verbose", " --silent", " -i")),
