@@ -138,6 +138,7 @@ async fn upload(
         name,
         MediaType::Text,
         staged,
+        u64::MAX,
         LOCK,
     )
     .await
@@ -772,6 +773,7 @@ async fn create_input_refused_by_the_schema_leaves_no_blob(pool: PgPool) {
         "refused.txt",
         MediaType::Text,
         staged,
+        u64::MAX,
         LOCK,
     )
     .await;
@@ -1611,6 +1613,7 @@ async fn create_input_waits_for_the_blob_lock(pool: PgPool) {
         "locked.txt",
         MediaType::Text,
         staged,
+        u64::MAX,
         Duration::from_secs(30),
     ));
     tokio::select! {
@@ -2247,6 +2250,7 @@ async fn create_input_cancelled_during_its_statement_leaves_pool_clean(pool: PgP
             "cancelled.txt",
             MediaType::Text,
             staged,
+            u64::MAX,
             LOCK,
         )
     })

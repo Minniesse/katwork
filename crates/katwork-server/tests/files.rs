@@ -687,6 +687,61 @@ async fn storage_quota_and_free_space_floor_are_507(pool: PgPool) {
     full.assert_nothing_stored().await;
 }
 
+/// A body that signals `started` when the server first reads it, then sends `bytes` once `go`
+/// has a permit for it.
+fn gated(bytes: Vec<u8>, started: Arc<Semaphore>, go: Arc<Semaphore>) -> Body {
+    Body::from_stream(async_stream::stream! {
+        started.add_permits(1);
+        go.acquire().await.unwrap().forget();
+        yield Ok::<_, std::io::Error>(Bytes::from(bytes));
+    })
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn concurrent_uploads_never_pass_the_quota(pool: PgPool) {
+    let env = Env::new(&pool, |config| {
+        config.workspace_storage_bytes = MIB;
+        config.upload_min_bytes_per_sec = 0;
+    })
+    .await;
+    let (started, go) = (Arc::new(Semaphore::new(0)), Arc::new(Semaphore::new(0)));
+    // Each upload fits the quota alone; the two together do not.
+    let size = 600 * 1024;
+    let uploads: Vec<_> = [("one.txt", b'q'), ("two.txt", b'r')]
+        .into_iter()
+        .map(|(name, byte)| {
+            let request = post(
+                &env.upload_uri(name),
+                &env.cookie,
+                Some("application/octet-stream"),
+                Some(size as u64),
+                gated(vec![byte; size], started.clone(), go.clone()),
+            );
+            tokio::spawn(env.app.clone().oneshot(request))
+        })
+        .collect();
+    // Both bodies are being read, so both passed the check before the body, each against an
+    // empty workspace.
+    tokio::time::timeout(Duration::from_secs(10), started.acquire_many(2))
+        .await
+        .expect("both uploads reach their bodies")
+        .unwrap()
+        .forget();
+    go.add_permits(2);
+    let mut responses = Vec::new();
+    for upload in uploads {
+        responses.push(upload.await.unwrap().unwrap());
+    }
+    responses.sort_by_key(|response| response.status());
+    let mut responses = responses.into_iter();
+    assert_eq!(responses.next().unwrap().status(), 201);
+    assert_code(responses.next().unwrap(), 507, "storage_quota_exceeded").await;
+    assert_eq!(env.rows().await, 1);
+    assert_eq!(env.blob_files().len(), 1);
+    wait_for(|| env.tmp_files().is_empty()).await;
+    env.assert_slots_free();
+}
+
 #[sqlx::test(migrations = "../katwork/migrations")]
 async fn upload_from_another_origin_is_403(pool: PgPool) {
     let env = Env::new(&pool, |_| {}).await;

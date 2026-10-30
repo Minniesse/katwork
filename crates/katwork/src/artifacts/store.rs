@@ -135,6 +135,20 @@ pub fn blob_lock_key(workspace: WorkspaceId, sha256: &str) -> i64 {
     i64::from_be_bytes(first)
 }
 
+/// The advisory lock that uploads of one workspace take in turn, from the quota's check to their
+/// COMMIT: the two big-endian halves of the first 8 bytes of SHA-256 over `upload quota` and the
+/// workspace id's 16 bytes. A two-key advisory lock never shares a key with a one-key blob lock.
+fn upload_lock_keys(workspace: WorkspaceId) -> (i32, i32) {
+    let digest = Sha256::new()
+        .chain_update(b"upload quota")
+        .chain_update(workspace.0.as_bytes())
+        .finalize();
+    let (mut high, mut low) = ([0u8; 4], [0u8; 4]);
+    high.copy_from_slice(&digest[..4]);
+    low.copy_from_slice(&digest[4..8]);
+    (i32::from_be_bytes(high), i32::from_be_bytes(low))
+}
+
 /// Commits a staged blob inside the caller's guarded transaction, under
 /// `pg_advisory_xact_lock(blob_lock_key(..))`, so a removal of the same bytes never interleaves.
 /// The caller has set its lock timeout; the rename is the only file I/O in the transaction.
@@ -150,9 +164,14 @@ pub async fn commit_blob_on(
     blobs.commit(staged).await
 }
 
-/// An uploaded file: one guarded transaction inserts the artifact and its version 1, then
-/// commits the blob. The rename comes last, so whatever refuses the upload leaves no blob, and
-/// only a crash between the rename and the COMMIT can leave an unreferenced one.
+/// An uploaded file: one guarded transaction checks the workspace's `quota` again, inserts the
+/// artifact and its version 1, then commits the blob.
+///
+/// Uploads of one workspace take the upload lock in turn from the quota's check to their
+/// COMMIT, so each sees every upload committed before it and concurrent uploads never pass the
+/// quota together (`StorageQuotaExceeded`). The rename comes last, so whatever refuses the
+/// upload leaves no blob, and only a crash between the rename and the COMMIT can leave an
+/// unreferenced one.
 #[allow(clippy::too_many_arguments, reason = "The plan's interface")]
 pub async fn create_input(
     pool: &PgPool,
@@ -162,6 +181,7 @@ pub async fn create_input(
     name: &str,
     media: MediaType,
     staged: StagedBlob,
+    quota: u64,
     lock_timeout: Duration,
 ) -> Result<ArtifactView, KatError> {
     let name = names::validate_name(name)?;
@@ -172,6 +192,16 @@ pub async fn create_input(
     db::guarded(pool, async |conn| {
         let mut tx = conn.begin().await?;
         db::set_lock_timeout(&mut tx, lock_timeout).await?;
+        let (high, low) = upload_lock_keys(tenant.workspace_id());
+        sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+            .bind(high)
+            .bind(low)
+            .execute(&mut *tx)
+            .await?;
+        let used = workspace_bytes_on(&mut tx, tenant.workspace_id()).await?;
+        if used.saturating_add(staged.bytes) > quota {
+            return Err(KatError::StorageQuotaExceeded);
+        }
         let bytes = i64::try_from(staged.bytes).map_err(|_| KatError::BodyTooLarge)?;
         sqlx::query(
             "INSERT INTO artifacts (id, workspace_id, space_id, name, role, created_by_user)

@@ -126,6 +126,7 @@ pub(crate) async fn upload(
             &name,
             media,
             staged,
+            core.config.workspace_storage_bytes,
             core.config.lock_timeout,
         )
         .await
