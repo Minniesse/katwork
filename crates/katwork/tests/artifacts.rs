@@ -754,6 +754,36 @@ async fn utf8_probe_survives_chunk_boundaries() {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn create_input_refused_by_the_schema_leaves_no_blob(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let tenant = tenant(&pool, &f).await;
+    let dir = TestDir::new();
+    let blobs = dir.store();
+    let staged = blobs
+        .stage_bytes(tenant.workspace_id(), b"refused")
+        .await
+        .unwrap();
+    // A Space that does not exist: the artifact's foreign key refuses the insert.
+    let result = store::create_input(
+        &pool,
+        &blobs,
+        &tenant,
+        SpaceId::new(),
+        "refused.txt",
+        MediaType::Text,
+        staged,
+        LOCK,
+    )
+    .await;
+    let Err(KatError::Database(error)) = result else {
+        panic!("{result:?}");
+    };
+    support::sqlstate(error, "23503");
+    assert!(blob_files(&dir.root(), tenant.workspace_id()).is_empty());
+    assert!(tmp_files(&dir.root(), tenant.workspace_id()).is_empty());
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn input_artifact_never_gets_second_version(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let tenant = tenant(&pool, &f).await;

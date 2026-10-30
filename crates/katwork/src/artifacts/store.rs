@@ -150,8 +150,9 @@ pub async fn commit_blob_on(
     blobs.commit(staged).await
 }
 
-/// An uploaded file: one guarded transaction commits its blob and inserts the artifact and its
-/// version 1.
+/// An uploaded file: one guarded transaction inserts the artifact and its version 1, then
+/// commits the blob. The rename comes last, so whatever refuses the upload leaves no blob, and
+/// only a crash between the rename and the COMMIT can leave an unreferenced one.
 #[allow(clippy::too_many_arguments, reason = "The plan's interface")]
 pub async fn create_input(
     pool: &PgPool,
@@ -171,7 +172,7 @@ pub async fn create_input(
     db::guarded(pool, async |conn| {
         let mut tx = conn.begin().await?;
         db::set_lock_timeout(&mut tx, lock_timeout).await?;
-        let blob = commit_blob_on(&mut tx, blobs, staged).await?;
+        let bytes = i64::try_from(staged.bytes).map_err(|_| KatError::BodyTooLarge)?;
         sqlx::query(
             "INSERT INTO artifacts (id, workspace_id, space_id, name, role, created_by_user)
              VALUES ($1, $2, $3, $4, 'input', $5)",
@@ -190,11 +191,12 @@ pub async fn create_input(
         .bind(ArtifactVersionId::new())
         .bind(tenant.workspace_id())
         .bind(id)
-        .bind(&blob.sha256)
-        .bind(stored_bytes(&blob)?)
+        .bind(&staged.sha256)
+        .bind(bytes)
         .bind(media)
         .execute(&mut *tx)
         .await?;
+        commit_blob_on(&mut tx, blobs, staged).await?;
         let (view, _) = version_on(&mut tx, tenant, None, id, None).await?;
         tx.commit().await?;
         Ok(view)

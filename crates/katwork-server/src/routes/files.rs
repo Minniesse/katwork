@@ -68,7 +68,10 @@ pub(crate) struct FileList {
 /// `POST …/files?name=<path>` with the file as an `application/octet-stream` body: membership
 /// (the extractor), the name, a declared length over the cap (before any body byte), the Space,
 /// the limiter and the room for it, then the body under the rate floor and the upload timeout,
-/// the type, and one transaction for the blob and the rows. 201 with the file.
+/// the type, and one transaction for the rows and the blob. 201 with the file.
+///
+/// Once the body is in, the commit runs in a task of its own that holds the upload's slot, so a
+/// client that leaves then gets a 201 nobody reads, never a blob without its rows.
 pub(crate) async fn upload(
     State(state): State<AppState>,
     tenant: Tenant,
@@ -85,8 +88,8 @@ pub(crate) async fn upload(
         return Err(KatError::BodyTooLarge.into());
     }
     space::get(&core.pool, &tenant, space_id).await?;
-    // Held to the end of the handler, so every way out frees it.
-    let _permit = core.uploads.try_acquire(tenant.user_id())?;
+    // Held to the end of the commit, so every way out frees it.
+    let permit = core.uploads.try_acquire(tenant.user_id())?;
     let free = core.blobs.free_bytes().await?;
     let used = db::guarded(&core.pool, async |conn| {
         store::workspace_bytes_on(conn, tenant.workspace_id()).await
@@ -110,19 +113,26 @@ pub(crate) async fn upload(
         uploads::UPLOAD_TIMEOUT,
     )
     .await?;
-    let staged = staging.finish().await?;
-    let media = media::sniff(&name, &staged.head, staged.text)?;
-    let view = store::create_input(
-        &core.pool,
-        core.blobs.as_ref(),
-        &tenant,
-        space_id,
-        &name,
-        media,
-        staged,
-        core.config.lock_timeout,
-    )
-    .await?;
+    let core = state.core.clone();
+    let commit = tokio::spawn(async move {
+        let _permit = permit;
+        let staged = staging.finish().await?;
+        let media = media::sniff(&name, &staged.head, staged.text)?;
+        store::create_input(
+            &core.pool,
+            core.blobs.as_ref(),
+            &tenant,
+            space_id,
+            &name,
+            media,
+            staged,
+            core.config.lock_timeout,
+        )
+        .await
+    });
+    let view = commit
+        .await
+        .map_err(|error| KatError::Io(std::io::Error::other(error)))??;
     Ok((StatusCode::CREATED, Json(view)))
 }
 

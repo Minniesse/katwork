@@ -23,7 +23,10 @@ use axum::{
     response::Response,
 };
 use katwork::{
-    artifacts::{BlobRef, BlobStore, BlobStream, LocalBlobStore, StagedBlob, Staging, store},
+    artifacts::{
+        BlobRef, BlobStore, BlobStream, LocalBlobStore, StagedBlob, Staging,
+        store::{self, test_hooks::Gate},
+    },
     auth,
     config::{Config, TransportConfig},
     error::KatError,
@@ -40,7 +43,7 @@ use support::{assert_code, assert_pool_clean, body, cancel_sql};
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
-    sync::Semaphore,
+    sync::{Notify, Semaphore},
 };
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -70,6 +73,9 @@ impl Drop for TestDir {
 struct FreeBytes {
     inner: LocalBlobStore,
     free: u64,
+    /// When set, `commit` signals it after the real rename and waits for its release, so a test
+    /// can act while the blob is in place and its transaction has not committed.
+    after_rename: Option<Gate>,
 }
 
 #[async_trait::async_trait]
@@ -79,7 +85,12 @@ impl BlobStore for FreeBytes {
     }
 
     async fn commit(&self, staged: StagedBlob) -> Result<BlobRef, KatError> {
-        self.inner.commit(staged).await
+        let blob = self.inner.commit(staged).await?;
+        if let Some(gate) = &self.after_rename {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
+        Ok(blob)
     }
 
     async fn read(&self, blob: &BlobRef, max_bytes: u64) -> Result<Vec<u8>, KatError> {
@@ -115,7 +126,12 @@ impl Env {
     }
 
     async fn with_free(pool: &PgPool, tweak: impl FnOnce(&mut Config), free: u64) -> Self {
-        Self::build(pool, pool.clone(), tweak, free).await
+        Self::build(pool, pool.clone(), tweak, free, None).await
+    }
+
+    /// The app whose store pauses at `gate` after each rename.
+    async fn paused_after_rename(pool: &PgPool, gate: Gate) -> Self {
+        Self::build(pool, pool.clone(), |_| {}, u64::MAX / 4, Some(gate)).await
     }
 
     /// The app on a pool of one connection, which `drop_during_guarded_statement` needs.
@@ -125,7 +141,7 @@ impl Env {
             .connect_with((*pool.connect_options()).clone())
             .await
             .unwrap();
-        Self::build(pool, single, |_| {}, u64::MAX / 4).await
+        Self::build(pool, single, |_| {}, u64::MAX / 4, None).await
     }
 
     async fn build(
@@ -133,6 +149,7 @@ impl Env {
         app_pool: PgPool,
         tweak: impl FnOnce(&mut Config),
         free: u64,
+        after_rename: Option<Gate>,
     ) -> Self {
         let (user, cookie) = person(pool).await;
         let workspace = workspace::create(pool, "Files", user, LOCK).await.unwrap();
@@ -151,6 +168,7 @@ impl Env {
         let store = FreeBytes {
             inner: LocalBlobStore::new(dir.0.join("artifacts")).unwrap(),
             free,
+            after_rename,
         };
         let core = Arc::new(Core::new(app_pool, Arc::new(config)).with_blob_store(Arc::new(store)));
         let app = build_router(AppState { core: core.clone() });
@@ -1079,6 +1097,48 @@ async fn client_disconnect_mid_upload_leaves_no_row_and_no_blob(pool: PgPool) {
     })
     .await;
     server.abort();
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn upload_commits_when_its_client_leaves_after_the_rename(pool: PgPool) {
+    let gate = Gate {
+        reached: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+    };
+    let env = Env::paused_after_rename(&pool, gate.clone()).await;
+    let bytes = b"kept after the client left";
+    let request = post(
+        &env.upload_uri("kept.txt"),
+        &env.cookie,
+        Some("application/octet-stream"),
+        Some(bytes.len() as u64),
+        Body::from(bytes.to_vec()),
+    );
+    let client = tokio::spawn(env.app.clone().oneshot(request));
+    tokio::time::timeout(Duration::from_secs(10), gate.reached.notified())
+        .await
+        .expect("the upload never reached its rename");
+    // The blob is in place and its rows are not committed when the client goes away: hyper
+    // drops the request's future, as this abort does.
+    client.abort();
+    assert!(client.await.unwrap_err().is_cancelled());
+    gate.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while env.rows().await == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the upload's rows never committed after its client left");
+    assert_eq!(env.blob_files(), vec![env.blob_path(&sha256(bytes))]);
+    wait_for(|| {
+        let first = env.core.uploads.try_acquire(env.user);
+        let second = env.core.uploads.try_acquire(env.user);
+        first.is_ok() && second.is_ok()
+    })
+    .await;
+    wait_for(|| env.tmp_files().is_empty()).await;
+    assert_pool_clean(&env.core.pool).await;
 }
 
 #[sqlx::test(migrations = "../katwork/migrations")]
