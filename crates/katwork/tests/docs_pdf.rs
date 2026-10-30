@@ -2473,18 +2473,27 @@ fn pdf_quote_operators_show_text() {
 
 #[test]
 fn pdf_even_odd_fill_clears_its_path() {
-    // After f*, B* and b the path is empty, so the last rectangle is the last area alone and
-    // the white text has nothing beneath it.
+    // Every painting operator ends its path, even-odd fills too, so the last rectangle is the
+    // last area alone and the white text has nothing beneath it.
+    let ops = ["f*", "B*", "b*", "f", "F", "B", "b"];
     let mut doc = Doc::new();
-    doc.page(
-        "0 g 0 0 10 10 re f* 20 20 10 10 re B* 40 40 10 10 re b 1 g 200 200 50 50 re f \
-         1 g BT /F1 10 Tf 100 100 Td (WHITE) Tj ET",
-        "",
-    );
-    assert_eq!(
-        hidden(&read(&doc.build())),
-        vec![("WHITE", HiddenWhy::LowContrast)]
-    );
+    for op in ops {
+        doc.page(
+            &format!(
+                "0 g 0 0 10 10 re {op} 1 g 200 200 50 50 re f \
+                 1 g BT /F1 10 Tf 100 100 Td (WHITE) Tj ET"
+            ),
+            "",
+        );
+    }
+    let extracted = read(&doc.build());
+    for (index, op) in ops.iter().enumerate() {
+        assert_eq!(
+            on_page(&extracted, index as u32 + 1),
+            vec![("WHITE".to_owned(), Some(HiddenWhy::LowContrast), None)],
+            "{op}"
+        );
+    }
 }
 
 #[test]
