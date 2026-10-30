@@ -1145,6 +1145,43 @@ fn file_names_table() {
             "{name:?} was accepted"
         );
     }
+    // Beyond Cc and Cf: line and paragraph separators, U+FFFD and Unicode's other
+    // default-ignorable code points, which most fonts draw as nothing. A listing prefix refuses
+    // them too.
+    for hidden in [
+        '\u{2028}',
+        '\u{2029}',
+        '\u{FFFD}',
+        '\u{034F}',
+        '\u{115F}',
+        '\u{1160}',
+        '\u{17B4}',
+        '\u{180B}',
+        '\u{180F}',
+        '\u{2065}',
+        '\u{3164}',
+        '\u{FE00}',
+        '\u{FE0F}',
+        '\u{FFA0}',
+        '\u{FFF0}',
+        '\u{E0000}',
+        '\u{E0100}',
+        '\u{E0FFF}',
+    ] {
+        for name in [format!("a{hidden}b.txt"), format!("{hidden}.txt")] {
+            assert!(
+                matches!(names::validate_name(&name), Err(KatError::FileNameInvalid)),
+                "{name:?} was accepted"
+            );
+            assert!(
+                matches!(
+                    names::validate_prefix(&name),
+                    Err(KatError::FileNameInvalid)
+                ),
+                "prefix {name:?} was accepted"
+            );
+        }
+    }
     let unchanged = [
         "ประชุม 2568-10/วาระ.docx".to_owned(),
         "a/b/c/d/e/f/g/h.txt".to_owned(),
@@ -1155,6 +1192,9 @@ fn file_names_table() {
         ".pdf".to_owned(),
         "a b.txt".to_owned(),
         "q1 (ร่าง).xlsx".to_owned(),
+        // Next to the hidden characters: visible ones that stay allowed.
+        "\u{1F4C4} notes.txt".to_owned(),
+        "\u{3131}\u{314F}.txt".to_owned(),
     ];
     for name in &unchanged {
         assert_eq!(names::validate_name(name).unwrap(), *name);
