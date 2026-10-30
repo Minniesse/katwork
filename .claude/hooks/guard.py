@@ -1120,10 +1120,12 @@ def check_http_client(args):
                              "--post-file", "--body-data")) for t in texts)
     write = (method or ("POST" if data else "GET")) not in ("GET", "HEAD")
     for url in urls:
-        path = api_path(re.sub(r"^.*api\.github\.com", "", url))
-        if path == "graphql" and GRAPHQL_WRITES.search(joined):
+        rest = re.sub(r"^(?:[A-Za-z][A-Za-z0-9+.-]*://)?[^/?#]*", "", url)  # after the scheme, host and any port
+        path = api_path(rest)
+        legacy = legacy_path(re.sub(r"^.*api\.github\.com", "", url))  # as main read it
+        if (path == "graphql" or legacy.endswith("/graphql")) and GRAPHQL_WRITES.search(joined):
             raise Blocked(f"GraphQL mutations that merge PRs or move refs are blocked. {MERGE_WAYS}")
-        if write and API_WRITE_PATHS.search(path):
+        if write and (hides_delimiter(rest) or API_WRITE_PATHS.search(path) or API_WRITE_PATHS.search(legacy)):
             raise Blocked(f"GitHub API writes that merge PRs or move, delete or write branches are blocked. {MERGE_WAYS}")
 
 
@@ -1144,26 +1146,56 @@ MERGE_PATH = re.compile(r"(^|/)pulls/[^/]+/merge$")
 AUTO_MERGE_PATH = re.compile(r"(^|/)pulls/[^/]+/ccr/auto_merge$")  # the cloud session's route for auto-merge
 
 
-def api_path(endpoint):
-    """The path GitHub routes for an API endpoint or URL, for matching: no
-    scheme or host, percent-decoded, cut at `?`, `#` and `;`, `\\` read as
-    `/`, empty and `.` segments dropped, `..` applied, in lower case. So
-    `pulls/1/merge#`, `merge/.`, `./merge`, `//merge`, `%6Derge`, `1%2Fmerge`
-    and `MERGE` all read as `pulls/1/merge`."""
-    path = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/?#]*", "", endpoint)
-    for _ in range(8):  # %256D decodes to %6D, then to m
-        decoded = urllib.parse.unquote(path)
-        if decoded == path:
+def raw_path(endpoint):
+    """An endpoint or URL's path as written: no scheme, host or port, cut at
+    its first `?` or `#` (the query and fragment), nothing decoded."""
+    return re.split(r"[?#]", re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/?#]*", "", endpoint), maxsplit=1)[0]
+
+
+def decoded(text):
+    """text percent-decoded until it stops changing: %256D gives %6D, then m."""
+    for _ in range(8):
+        once = urllib.parse.unquote(text)
+        if once == text:
             break
-        path = decoded
+        text = once
+    return text
+
+
+def api_path(endpoint):
+    """The path GitHub routes for an API endpoint or URL, for matching. The
+    raw path (raw_path) has `\\` read as `/`; each segment is cut at `;` (its
+    parameters); empty and `.` segments are dropped and `..` applied; only
+    then is each segment percent-decoded until stable and trimmed, and the
+    whole is lower-cased. So `merge#`, `merge/.`, `./merge`, `//merge`,
+    `%6Derge`, `merge;x` and `MERGE` read as `merge`, while an encoded
+    delimiter stays inside its segment: `pulls/24%3F/merge` reads as
+    `pulls/24?/merge`, still a merge (and hides_delimiter refuses it)."""
     segments = []
-    for segment in re.split(r"[?#]", path.replace("\\", "/"), maxsplit=1)[0].split("/"):
-        segment = segment.split(";", 1)[0].strip()
+    for segment in raw_path(endpoint).replace("\\", "/").split("/"):
+        segment = segment.split(";", 1)[0]
         if segment == "..":
             segments = segments[:-1]
         elif segment not in ("", "."):
-            segments.append(segment)
+            segment = decoded(segment).strip()
+            if segment:
+                segments.append(segment)
     return "/".join(segments).lower()
+
+
+def hides_delimiter(endpoint):
+    """True when percent-encoding, once or more, hides a `?`, `#`, `/`, `\\`,
+    `.` or `;` in the path. GitHub may route that either way, so a write to
+    it is refused rather than guessed."""
+    path = raw_path(endpoint)
+    plain = decoded(path)
+    return any(plain.count(c) > path.count(c) for c in "?#/\\.;")
+
+
+def legacy_path(endpoint):
+    """The path as main's guard read it (cut at `?`, trailing `/` stripped).
+    Writes are checked against it as well, so protection only grows."""
+    return endpoint.split("?", 1)[0].rstrip("/")
 REST_MERGE = "gh api -X PUT repos/<owner>/<repo>/pulls/<n>/merge -f merge_method=merge -f sha=<head sha>"
 REST_MERGE_ENDPOINT = re.compile(r"/?repos/([A-Za-z0-9][A-Za-z0-9-]*/(?!\.+/)[A-Za-z0-9._-]+)/pulls/([1-9][0-9]*)/merge")
 MERGE_WAYS = (f"Merge with `gh pr merge <n> --merge`, or where GraphQL is unavailable `{REST_MERGE}` with the "
@@ -1364,7 +1396,8 @@ def check_gh_api(args, cwd, stdin=([], True), opaque=False, leading=(), typed=Fa
     if endpoint is None:
         return
     path = api_path(endpoint.text)  # as GitHub routes it: `/graphql` and `merge#` are spellings too
-    if path == "graphql":
+    legacy = legacy_path(endpoint.text)  # as main read it
+    if path == "graphql" or legacy == "graphql":
         texts = []
         for body, dynamic in bodies:
             t, c = resolve_text(body, dynamic, cwd, 0)
@@ -1377,11 +1410,15 @@ def check_gh_api(args, cwd, stdin=([], True), opaque=False, leading=(), typed=Fa
                           "Pass the query inline with -f query=..., or from a file in the repo.")
         return
     write = (method or ("POST" if writes else "GET")) not in ("GET", "HEAD")
-    if write and (endpoint.dynamic or API_WRITE_PATHS.search(path)):
-        if AUTO_MERGE_PATH.search(path):
+    hidden = hides_delimiter(endpoint.text)
+    if write and (endpoint.dynamic or hidden or API_WRITE_PATHS.search(path) or API_WRITE_PATHS.search(legacy)):
+        if hidden:
+            raise Blocked("this write's endpoint hides a `?`, `#`, `/`, `\\`, `.` or `;` behind percent-encoding, so "
+                          f"GitHub may route it either way. Write the path out plainly. {MERGE_WAYS}")
+        if AUTO_MERGE_PATH.search(path) or AUTO_MERGE_PATH.search(legacy):
             raise Blocked("auto-merge (`pulls/<n>/ccr/auto_merge`) merges later, after the review check, like "
                           f"`gh pr merge --auto`. Merge once a review covers the head, with `{REST_MERGE}`.")
-        if not MERGE_PATH.search(path):
+        if not (MERGE_PATH.search(path) or MERGE_PATH.search(legacy)):
             raise Blocked(f"`gh api` writes that merge PRs or move, delete or write branches are blocked. {MERGE_WAYS}")
         slug, number, sha = rest_merge_request(args, leading, opaque, typed)
         reason = rest_review_check(slug, number, sha, cwd)
@@ -2004,7 +2041,7 @@ def real_merge_cases():
     ]
 
 
-REST_CASES = 107
+REST_CASES = 123
 
 
 def rest_self_test():
@@ -2166,6 +2203,23 @@ def rest_self_test():
             "env {}", "GH_X=1 {}", "nice {}", "{{ {}; }}", "bash -c '{}'", "eval '{}'", "x=$({})")),
         (put.format(n=21, sha=a).replace("gh api", "/usr/bin/gh api"), False, False),
         (f"gh mrg 21 {a}", False, False),
+        # an encoded `?` or `#` is part of its segment, not a cut (review round 2): `main` refuses all of these
+        *((f"gh api -X PUT repos/o/r/pulls/{ep} -f merge_method={how}", False, False) for ep, how in (
+            ("24%3F/merge", "squash"), ("24%23/merge", "squash"), ("24%3f/merge", "squash"),
+            ("24%3Fx/merge", "rebase"), ("24%253F/merge", "squash"), ("24%2523/merge", "squash"))),
+        ("gh api -X PUT repos/o/r/pulls/24%3F/ccr/auto_merge", False, False),
+        ("gh api -X PUT repos/o/r/pulls/24%23/update-branch", False, False),
+        ("curl -X PUT https://api.github.com/repos/o/r/pulls/24%3F/merge -d '{\"merge_method\":\"squash\"}'", False, False),
+        # a write whose endpoint hides `/`, `.`, `\` or `;` behind percent-encoding is refused, not guessed
+        *((f"gh api -X PUT repos/o/r/pulls/24/{ep} -f merge_method=squash", False, False)
+          for ep in ("merge%2F%2E%2E", "merge%5C", "merge%3Bx")),
+        # curl's host with a port, and its host found by a greedy match (review round 2)
+        ("curl -X POST https://api.github.com:443/graphql "
+         "-d '{\"query\":\"mutation { mergePullRequest(input: {}) { clientMutationId } }\"}'", False, False),
+        ("curl -X POST https://api.github.com:443/graphql/ "
+         "-d '{\"query\":\"mutation { mergePullRequest(input: {}) { clientMutationId } }\"}'", False, False),
+        ("curl -X PUT 'https://api.github.com/repos/o/r/pulls/24/merge?x=api.github.com' -d '{}'", False, False),
+        ("curl -X PUT https://api.github.com:443/repos/o/r/pulls/24/merge -d '{}'", False, False),
         # options and run-time words the review found no failing case for (review round 1)
         *((put.format(n=21, sha=a) + extra, False, False) for extra in (
             " --input=body.json", " --hostname=example.com", " --verbose", " --silent", " -i")),
