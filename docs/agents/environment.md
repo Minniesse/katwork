@@ -63,7 +63,7 @@ Without GraphQL (a cloud session, where every GraphQL call fails with HTTP 403, 
 - review it: `gh api repos/{owner}/{repo}/pulls/<n>/reviews -f commit_id=<sha> -f event=COMMENT -F body=@<file>` (without `event` the review stays pending)
 - merge it: `gh api -X PUT repos/<owner>/<repo>/pulls/<n>/merge -f merge_method=merge -f sha=<head sha>`, the one REST merge the guard allows, under the same review rule. It is a command of its own that starts `gh api -X PUT` (or `--method PUT`), on a line of plain words joined only by `&&`, `||`, `;` or `|`. So no wrapper (`timeout`, `env`), `VAR=` or alias, no quotes, escapes or `$`, no redirection (`2>&1`), `&`, parentheses or comment, and not inside `bash -c`, `eval` or `$(...)`. Only such a line is split into commands by Codex, so its prefix rules ask a person first, as they do for `gh pr merge`. The owner, repo, PR number and full head SHA are written out (no `{owner}/{repo}`, no variables), nothing else is on the command, and the SHA is the PR's current head, so GitHub refuses the merge if the head moves after the check.
 
-The blocking message says what to do instead. Run `.claude/hooks/guard.py --self-test` after changing it.
+The blocking message says what to do instead. Run `.claude/hooks/guard.py --self-test` after changing it. Its differential part runs some two thousand merge, ref, contents and GraphQL writes, in every spelling found so far, through this guard and through the guard as it was before the REST merge (read from git at `DIFF_BASELINE`). It fails if this one allows anything the old one refused, other than the REST merge itself.
 
 ## Guard scope
 

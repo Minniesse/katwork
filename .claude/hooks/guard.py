@@ -1712,7 +1712,8 @@ def main():
 
 
 def self_test():
-    """Offline: no network, no `gh`. Scratch repos stand in for this one."""
+    """Offline: no network, no `gh`. Scratch repos stand in for this one, and
+    the differential reads the guard at DIFF_BASELINE from this clone's git."""
     import tempfile
 
     empty = tempfile.mkstemp()[1]
@@ -1954,7 +1955,7 @@ def self_test():
                 failures += 1
     failures += merge_self_test()
     failures += rest_self_test()
-    total = len(blocked) + len(allowed) + generated + MERGE_CASES + REST_CASES
+    total = len(blocked) + len(allowed) + generated + MERGE_CASES + REST_CASES + DIFF_CASES
     print(f"guard self-test: {total - failures}/{total} passed")
     return 1 if failures else 0
 
@@ -2280,9 +2281,103 @@ def rest_self_test():
                 where = "with" if graphql else "without"
                 print(f"FAIL (merge {where} GraphQL, should {'allow' if ok else 'block'}): {cmd!r}: {reason}")
                 failures += 1
+        # Protection only grows: what main's guard refuses, this one refuses, but the canonical REST merge.
+        corpus, baseline = diff_corpus({21: a, 22: m, 24: a}), baseline_guard()
+        assert len(corpus) == DIFF_CASES
+        if baseline is None:
+            print(f"FAIL (differential): can't read the guard at {DIFF_BASELINE[:7]} from git. Fetch it, then rerun.")
+            failures += DIFF_CASES
+        for cmd, graphql, may_allow in corpus if baseline else ():
+            run = baseline.run = faking(answers(graphql))
+            payload = {"tool_input": {"command": cmd}, "cwd": repo}
+            new, old = decide(payload), baseline.decide(payload)
+            if new is None and old is not None and not may_allow:
+                print(f"FAIL (differential: main refuses, this guard allows): {cmd!r}: main says {old}")
+                failures += 1
+            elif may_allow and new is not None:
+                print(f"FAIL (differential: the canonical REST merge should pass): {cmd!r}: {new}")
+                failures += 1
     finally:
         run = real_run
     return failures
+
+
+DIFF_BASELINE = "a536fa524711e1042d6fcee54cd4e849e51e3b66"  # main's guard before it learned the REST merge
+DIFF_CASES = 2136
+
+
+def baseline_guard():
+    """The guard at DIFF_BASELINE, read from git and loaded as a module, or
+    None when this clone doesn't have that commit."""
+    import types
+
+    for where in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
+        out = subprocess.run(["git", "-C", where, "show", f"{DIFF_BASELINE}:.claude/hooks/guard.py"],
+                             capture_output=True, text=True)
+        if out.returncode == 0:
+            module = types.ModuleType("guard_at_" + DIFF_BASELINE[:7])
+            exec(compile(out.stdout, f"guard.py@{DIFF_BASELINE[:7]}", "exec"), module.__dict__)
+            return module
+    return None
+
+
+def diff_corpus(heads):
+    """Write commands for the differential: each merge, auto-merge,
+    update-branch, ref, merges, contents and rename endpoint (on PRs 21, 22
+    and 24 where it names one) in 25 spellings (fragments, queries, case,
+    `.`, `..`, `//`, `\\`, `;`, spaces, and single and double percent-
+    encoding of letters, `/`, `.`, `?` and `#`), each through gh api as a
+    squash, a merge with the head's sha, a DELETE and a POST, and through curl
+    with and without a port; then GraphQL mutations by gh api and curl, the
+    REST merge under wrappers and in other line forms, and gh pr merge. Items
+    are (command, GraphQL served, may pass where main refused): only the
+    canonical REST merge of a covered head (PR 21 or 22) may."""
+    def spellings(ep):
+        head, _, last = ep.rpartition("/")
+        enc = "%%%02X" % ord(last[0])
+        return [("plain", ep), ("slash", "/" + ep), ("trailing", ep + "/"), ("fragment", ep + "#"),
+                ("fragment2", ep + "#x"), ("query", ep + "?x=1"), ("upper", ep.upper()), ("dot", f"{head}/./{last}"),
+                ("dotdot", f"{head}/x/../{last}"), ("double", f"{head}//{last}"), ("enc", f"{head}/{enc}{last[1:]}"),
+                ("enc-lower", f"{head}/{enc.lower()}{last[1:]}"), ("enc2", f"{head}/%25{enc[1:]}{last[1:]}"),
+                ("enc-slash", f"{head}%2F{last}"), ("enc2-slash", f"{head}%252F{last}"), ("enc-?", f"{head}%3F/{last}"),
+                ("enc-#", f"{head}%23/{last}"), ("enc2-?", f"{head}%253F/{last}"), ("enc2-#", f"{head}%2523/{last}"),
+                ("param", f"{ep};x"), ("param-mid", f"{head};x/{last}"), ("backslash", f"{head}\\{last}"),
+                ("space", f"{ep}%20"), ("enc-dot", f"{head}/%2E/{last}"), ("enc-dotdot", f"{head}/x/%2E%2E/{last}")]
+
+    def quoted(text):  # its own pattern, so this self-test also runs against older checking code
+        return text if re.fullmatch(r"[A-Za-z0-9_@%+=:,./-]+", text) else shlex.quote(text)
+
+    corpus = []
+    targets = [(f"repos/o/r/pulls/{n}/{tail}", n) for tail in ("merge", "ccr/auto_merge", "update-branch")
+               for n in (21, 22, 24)]
+    targets += [(ep, 24) for ep in ("repos/o/r/git/refs/heads/main", "repos/o/r/git/refs", "repos/o/r/merges",
+                                    "repos/o/r/contents/a.txt", "repos/o/r/branches/main/rename")]
+    for ep, n in targets:
+        for name, spelled in spellings(ep):
+            canonical = n in (21, 22) and ep.endswith(f"/{n}/merge") and name in ("plain", "slash")
+            q = quoted(spelled)
+            url, port = (quoted(f"https://api.github.com{p}/{spelled.lstrip('/')}") for p in ("", ":443"))
+            corpus += [(f"gh api -X PUT {q} -f merge_method=squash", False, False),
+                       (f"gh api -X PUT {q} -f merge_method=merge -f sha={heads[n]}", False, canonical),
+                       (f"gh api -X DELETE {q}", False, False), (f"gh api {q} -f x=1", False, False),
+                       (f"curl -X PUT {url} -d '{{}}'", False, False), (f"curl -X PUT {port} -d '{{}}'", False, False)]
+    mutation = 'mutation { mergePullRequest(input: {pullRequestId: "x"}) { clientMutationId } }'
+    for g in ("graphql", "/graphql", "graphql/", "/graphql/", "GRAPHQL", "graphql#", "graphql?x=1",
+              "https://api.github.com/graphql", "https://api.github.com:443/graphql",
+              "https://api.github.com:443/graphql/", "https://API.GITHUB.COM/graphql"):
+        corpus.append((f"gh api {quoted(g)} -f query={shlex.quote(mutation)}", False, False))
+    for u in ("https://api.github.com/graphql", "https://api.github.com/graphql/", "https://api.github.com:443/graphql",
+              "https://api.github.com:443/graphql/", "api.github.com/graphql", "api.github.com:443/graphql"):
+        corpus.append((f"curl -X POST {u} -d {shlex.quote(json.dumps({'query': mutation}))}", False, False))
+    put = f"gh api -X PUT repos/o/r/pulls/21/merge -f merge_method=merge -f sha={heads[21]}"
+    for form in ("env {p}", "timeout 60 {p}", "GH_X=1 {p}", "bash -c {q}", "eval {q}", "x=$({p})", "( {p} )",
+                 "{p} &", "{p} 2>&1", "{p} # c", "echo x | xargs {p}", "true; {p}"):
+        corpus.append((form.format(p=put, q=shlex.quote(put)), False, form == "true; {p}"))
+    for flags, graphql in (("24 --merge", True), ("21 --squash", True), ("21 --auto --merge", True),
+                           ("21 --admin --merge", True), ("25 --merge", True), ("21 --merge", False),
+                           ("24 --rebase", False)):
+        corpus.append((f"gh pr merge {flags}", graphql, False))
+    return corpus
 
 
 if __name__ == "__main__":
