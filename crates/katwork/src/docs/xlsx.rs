@@ -345,6 +345,10 @@ pub(super) fn read(bytes: &[u8], limits: &DocLimits) -> Result<Extracted, DocErr
             content.ole_object,
             ExtractWarning::EmbeddedContentIgnored { what: "ole_object" },
         ),
+        (
+            content.activex,
+            ExtractWarning::EmbeddedContentIgnored { what: "activex" },
+        ),
     ] {
         if found {
             warnings.once(warning)?;
@@ -485,11 +489,15 @@ fn followed(kind: &str) -> bool {
                     | "connections"
                     | "oleObject"
                     | "package"
+                    | "control"
             )
         })
-        || kind
-            .strip_prefix(MS_RELATIONSHIP)
-            .is_some_and(|kind| matches!(kind, "vbaProject" | "xlMacrosheet" | "xlIntlMacrosheet"))
+        || kind.strip_prefix(MS_RELATIONSHIP).is_some_and(|kind| {
+            matches!(
+                kind,
+                "vbaProject" | "xlMacrosheet" | "xlIntlMacrosheet" | "activeXControlBinary"
+            )
+        })
 }
 
 /// The relationships part of `part` (`""` for the package's own).
@@ -742,11 +750,15 @@ impl Parts {
         Ok(sheets)
     }
 
-    /// The macros, external links and embedded objects the package holds, which the reader never
-    /// reads: from `xl/vbaProject.bin` and from every relationships part.
+    /// The macros, external links and embedded objects (ActiveX controls among them) the package
+    /// holds, which the reader never reads: from `xl/vbaProject.bin`, from any part under
+    /// `xl/activeX/`, and from every relationships part.
     fn content(&self, package: &Package, limits: &DocLimits) -> Result<Content, DocError> {
         let mut content = Content {
             vba_project: package.part("xl/vbaProject.bin").is_some(),
+            activex: package
+                .names()
+                .any(|name| name.to_ascii_lowercase().starts_with("xl/activex/")),
             ..Content::default()
         };
         content.note(&self.workbook_rels);
@@ -779,6 +791,7 @@ struct Content {
     macro_sheet: bool,
     external_link: bool,
     ole_object: bool,
+    activex: bool,
 }
 
 impl Content {
@@ -788,6 +801,7 @@ impl Content {
             self.macro_sheet |= rel.is("xlMacrosheet") || rel.is("xlIntlMacrosheet");
             self.external_link |= rel.is("externalLink") || rel.is("connections");
             self.ole_object |= rel.is("oleObject") || rel.is("package");
+            self.activex |= rel.is("control") || rel.is("activeXControlBinary");
         }
     }
 }

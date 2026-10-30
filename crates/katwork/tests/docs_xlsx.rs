@@ -3110,6 +3110,50 @@ fn xlsx_macros_and_embedded_objects_are_warned_once() {
 }
 
 #[test]
+fn xlsx_activex_controls_are_warned_once() {
+    // An ActiveX control is an embedded object: never read, and one warning however many there
+    // are, found by a sheet's `control` relationship, by a part under `xl/activeX/` or by a
+    // control's `activeXControlBinary` relationship, wherever the control is stored.
+    let one = data(&row(1, &num("A1", 0, "1")));
+    let control = format!(
+        r#"<?xml version="1.0"?><ax:ocx xmlns:ax="http://schemas.microsoft.com/office/2006/activeX" xmlns:r="{RELATIONSHIPS}" ax:classid="{{8BD21D40-EC42-11CE-9E0D-00AA006002F3}}" ax:persistence="persistStreamInit" r:id="rId1"/>"#
+    );
+    let expected = [ExtractWarning::EmbeddedContentIgnored { what: "activex" }];
+    let mut related = Xlsx::new().sheet("S", &one);
+    related.last_sheet().rels.extend([
+        (
+            "control".to_owned(),
+            "../activeX/activeX1.xml".to_owned(),
+            None,
+        ),
+        (
+            "control".to_owned(),
+            "../activeX/activeX2.xml".to_owned(),
+            None,
+        ),
+    ]);
+    let extracted = read(&related);
+    assert_eq!(extracted.blocks.len(), 1);
+    assert_eq!(extracted.warnings, expected);
+    let named = Xlsx::new()
+        .sheet("S", &one)
+        .entry("xl/ActiveX/activeX1.xml", control.as_bytes())
+        .entry("xl/ActiveX/activeX1.bin", b"\xD0\xCF\x11\xE0");
+    assert_eq!(read(&named).warnings, expected);
+    let binary = Xlsx::new()
+        .sheet("S", &one)
+        .entry("xl/controls/ctl.xml", control.as_bytes())
+        .entry(
+            "xl/controls/_rels/ctl.xml.rels",
+            format!(
+                r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{MS_REL}activeXControlBinary" Target="ctl.bin"/></Relationships>"#
+            )
+            .as_bytes(),
+        );
+    assert_eq!(read(&binary).warnings, expected);
+}
+
+#[test]
 fn xlsx_reader_loops_stop_at_the_job_deadline() {
     let rows: String = (1..=5_000)
         .map(|r| {
