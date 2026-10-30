@@ -2152,6 +2152,16 @@ async fn drop_during_guarded_statement_rejects_an_unguarded_query(pool: PgPool) 
 }
 
 #[sqlx::test(migrations = "./migrations")]
+#[should_panic(expected = "did not run on the pool it was given")]
+async fn drop_during_guarded_statement_rejects_an_op_on_another_pool(pool: PgPool) {
+    let single = single(&pool).await;
+    cancel_sql::drop_during_guarded_statement(&single, "artifacts", || {
+        sqlx::query("SELECT count(*) FROM artifacts").fetch_one(&pool)
+    })
+    .await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn drop_during_guarded_statement_accepts_a_guarded_query(pool: PgPool) {
     let single = single(&pool).await;
     cancel_sql::drop_during_guarded_statement(&single, "artifacts", || {

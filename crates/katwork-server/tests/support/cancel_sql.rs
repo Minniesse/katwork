@@ -31,10 +31,11 @@ where
 }
 
 /// `drop_during_statement` for an operation that runs inside `db::guarded` on `pool`, a pool of
-/// one connection: the dropped operation's connection must also be closed, so the pool's next
-/// connection is a new backend. A plain pool query is drained back into the pool instead and
-/// comes back with the same backend; the plan's check cannot tell the two apart, since a test
-/// pool soon closes an idle connection anyway.
+/// one connection: the operation must wait on that connection's backend, and once dropped it
+/// must also close it, so the pool's next connection is a new backend. A plain pool query is
+/// drained back into the pool instead and comes back with the same backend; the plan's check
+/// cannot tell the two apart, since a test pool soon closes an idle connection anyway. An
+/// operation on another pool fails here too: its backend says nothing about `pool`.
 pub async fn drop_during_guarded_statement<F, Fut, T>(pool: &PgPool, table: &str, op: F)
 where
     F: FnOnce() -> Fut,
@@ -45,7 +46,16 @@ where
         1,
         "the op's pool must hold one connection, so its next connection shows whether it closed"
     );
+    let own: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(pool)
+        .await
+        .unwrap();
     let pid = drop_and_settle(pool, table, op).await;
+    assert_eq!(
+        pid, own,
+        "the op dropped on {table} did not run on the pool it was given: \
+         it waited on backend {pid}, the pool's connection is backend {own}"
+    );
     let next: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(pool)
         .await
