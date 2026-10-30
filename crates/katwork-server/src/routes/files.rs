@@ -17,10 +17,12 @@ use katwork::{
     db,
     error::KatError,
     ids::{ArtifactId, SpaceId},
+    runtime::Core,
     tenancy::{Tenant, space},
 };
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
+use sqlx::{Connection, PgConnection};
 
 use crate::{app::AppState, error::ApiError, extract::path as route_path};
 
@@ -87,11 +89,14 @@ pub(crate) async fn upload(
     if declared.is_some_and(|length| length > cap) {
         return Err(KatError::BodyTooLarge.into());
     }
-    space::get(&core.pool, &tenant, space_id).await?;
+    read_bounded(core, async |conn| {
+        space::get_on(conn, &tenant, space_id).await
+    })
+    .await?;
     // Held to the end of the commit, so every way out frees it.
     let permit = core.uploads.try_acquire(tenant.user_id())?;
     let free = core.blobs.free_bytes().await?;
-    let used = db::guarded(&core.pool, async |conn| {
+    let used = read_bounded(core, async |conn| {
         store::workspace_bytes_on(conn, tenant.workspace_id()).await
     })
     .await?;
@@ -135,6 +140,22 @@ pub(crate) async fn upload(
         .await
         .map_err(|error| KatError::Io(std::io::Error::other(error)))??;
     Ok((StatusCode::CREATED, Json(view)))
+}
+
+/// A read before the body, in a guarded transaction of its own under the lock timeout, so an
+/// upload never waits on a lock longer than that, with or without its slot.
+async fn read_bounded<T>(
+    core: &Core,
+    read: impl AsyncFnOnce(&mut PgConnection) -> Result<T, KatError>,
+) -> Result<T, KatError> {
+    db::guarded(&core.pool, async |conn| {
+        let mut tx = conn.begin().await?;
+        db::set_lock_timeout(&mut tx, core.config.lock_timeout).await?;
+        let value = read(&mut tx).await?;
+        tx.commit().await?;
+        Ok(value)
+    })
+    .await
 }
 
 /// `GET …/spaces/{space_id}/files?prefix=<p>`: the Space's files, by name, at most 500.

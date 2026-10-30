@@ -1442,6 +1442,35 @@ async fn list_and_download_cancelled_during_their_statements_leave_pool_clean(po
 }
 
 #[sqlx::test(migrations = "../katwork/migrations")]
+async fn reads_before_the_body_wait_at_most_the_lock_timeout(pool: PgPool) {
+    let env = Env::new(&pool, |config| {
+        config.lock_timeout = Duration::from_millis(200);
+    })
+    .await;
+    for table in ["spaces", "artifact_versions"] {
+        let mut blocker = PgConnection::connect_with(&pool.connect_options())
+            .await
+            .unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "BEGIN; LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"
+        )))
+        .execute(&mut blocker)
+        .await
+        .unwrap();
+        // The deadline only bounds a hang: the lock timeout ends the wait long before it.
+        let response = tokio::time::timeout(Duration::from_secs(10), env.upload("a.txt", b"bytes"))
+            .await
+            .unwrap_or_else(|_| panic!("an upload waited past its lock timeout on {table}"));
+        assert_code(response, 503, "busy").await;
+        sqlx::query("ROLLBACK").execute(&mut blocker).await.unwrap();
+        blocker.close().await.unwrap();
+        env.assert_nothing_stored().await;
+        env.assert_slots_free();
+    }
+    assert_eq!(env.upload("a.txt", b"bytes").await.status(), 201);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
 async fn upload_route_cancelled_during_space_and_quota_reads_leaves_pool_clean(pool: PgPool) {
     let env = Env::single(&pool).await;
     let app_pool = &env.core.pool;
