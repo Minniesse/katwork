@@ -192,10 +192,16 @@ Stopping first matters: a failed backup cannot stop an app that was already
 running. Every startup waits for the backup to succeed before it runs migrations
 or starts the app. Do not run migrations by hand around that gate.
 
-Existing databases are saved under `backups/katwork-<database>-<UTC timestamp>-<suffix>.dump`.
+Every startup saves the existing database, then the uploaded files and the files
+Kats write (the `artifacts` volume), as a pair that shares one name:
+
+- `backups/katwork-<database>-<UTC timestamp>-<suffix>.dump`, the database;
+- `backups/katwork-<database>-<UTC timestamp>-<suffix>.files/`, a folder of the files,
+  copied just after that dump, so it holds every file the dump names.
+
 The timestamp uses sortable `YYYYMMDDTHHMMSSZ` format. The demo writes only to
 `backups-demo/`, using the same naming pattern. Check the folder and database
-name when choosing an archive; do not restore a demo archive into your real installation.
+name when choosing a backup; do not restore a demo backup into your real installation.
 
 On Linux, prepare each folder you use with the root owner and permissions `755`:
 
@@ -206,30 +212,24 @@ sudo install -d -o 0 -g 0 -m 0755 backups-demo
 
 These private files belong to the container's root user; use operator privileges
 to copy or restore them. If startup reports a folder permission error, run the
-matching command above and start again. The script writes a private `.partial` file and renames it only after `pg_dump`
-succeeds. A failed backup stops startup. Check free disk space and file permissions,
-fix the cause, then start again. No retention policy deletes old backups; copy them
-to secure storage and remove old files yourself after checking a restore.
+matching command above and start again. The script writes a private `.partial` file
+and folder and renames them only after `pg_dump` and the file copy succeed. A failed
+backup stops startup. Check free disk space and file permissions, fix the cause, then
+start again. No retention policy deletes old backups; copy them to secure storage and
+remove old pairs yourself, the `.dump` and its `.files/` together, after checking a
+restore.
+
+Each file is stored under its SHA-256 and never changes, so a backup copies only the
+files that are new since the previous backup and hard-links the others to it: a backup
+adds the size of its new files, and removing an old pair frees only the files no newer
+backup holds. Each new file is checked against its SHA-256 as it is copied; a damaged
+one is left out and named in `docker compose logs backup`. To copy backups elsewhere,
+keep the hard links (`sudo cp -a backups DESTINATION`, or `rsync -aH`), or each folder
+takes its full size.
 
 A dump contains **one database**, including users and migration history. It does
-not contain PostgreSQL roles or tablespaces, `.env`, Caddy's certificates or
-uploaded files. Keep those separately.
-
-Uploaded files, and the files Kats write, are kept in the `artifacts` volume, not
-in the database. Copy the volume after a database backup, never before: each file
-is stored once under its SHA-256 and never changed, so a file newer than the dump
-does no harm, while a dump newer than the copy can name files the copy lacks. The
-copy can run while the app runs; `-a` keeps the files' owner, the app's user:
-
-```sh
-sudo docker compose cp -a katwork:/var/lib/katwork/artifacts ./artifacts-YOUR_TIMESTAMP
-```
-
-After restoring a database (below), copy back the folder saved after that backup:
-
-```sh
-sudo docker compose cp -a ./artifacts-YOUR_TIMESTAMP/. katwork:/var/lib/katwork/artifacts
-``` SP1 Compose supports only its bundled PostgreSQL 17
+not contain PostgreSQL roles or tablespaces, `.env`, or Caddy's certificates.
+Keep those separately. SP1 Compose supports only its bundled PostgreSQL 17
 service. Backup and migrate stay on the private database network; external
 database hosts are not supported by these files.
 
@@ -248,18 +248,28 @@ docker compose exec -T postgres pg_restore --exit-on-error --no-owner -U katwork
 docker compose exec -T postgres rm /tmp/restore.dump
 ```
 
+Then copy back the files saved with that dump: its `.files` folder of the same name.
+This adds the backup's files to the `artifacts` volume and keeps the files already
+there. It checks each file against its SHA-256 and gives it to the app's user, and
+it fails, naming the file, if one was damaged in the backup:
+
+```sh
+docker compose run --rm restore-files katwork-katwork-YOUR_TIMESTAMP-SUFFIX.files
+```
+
 In `.env`, change only the final database name in `DATABASE_URL` from `/katwork`
 to `/restored`, preserving the user, password, `postgres` host and port `5432`.
 Run `docker compose up -d`. Backup reads this same URL, so it saves the restored
-database before migration. Check your data before removing the old database.
-If `restored` already exists, choose a new name rather than overwriting it.
+database and the files before migration. Check your data before removing the old
+database. If `restored` already exists, choose a new name rather than overwriting it.
 
 Keep the simple URL form written by `init-env.sh`:
 `postgres://USER:PASSWORD@HOST:PORT/DATABASE`. Fields accept letters, digits,
 `_`, `.`, `~` and `-`; the port must be 1–65535. Percent escapes, query options,
 IPv6 addresses and multi-host URLs are rejected before migration. The generated
 password already fits this form. The restore checks verify the documented
-commands, the selected database, the demo user and every migration version.
+commands, the selected database, the demo user, every migration version and a
+restored file.
 
 ### Local model provider (development)
 
@@ -432,9 +442,10 @@ docker compose cp caddy:/data/caddy/pki/authorities/local/root.crt ./katwork-roo
 
 ### สำรองข้อมูลก่อนอัปเกรด
 
-ทุกครั้งที่เริ่มระบบ ฐานข้อมูลเดิมจะถูกสำรองก่อนปรับโครงสร้างข้อมูล หากสำรองไม่สำเร็จ ระบบจะไม่เริ่ม
-ไฟล์จริงอยู่ใน `backups/katwork-<database>-<UTC timestamp>-<suffix>.dump` ส่วนเดโมอยู่ใน `backups-demo/` เท่านั้น
-ชื่อไฟล์บอกชื่อฐานข้อมูลและเวลา UTC รูปแบบ `YYYYMMDDTHHMMSSZ` อย่าเลือกไฟล์เดโมมาใช้กับข้อมูลจริง
+ทุกครั้งที่เริ่มระบบ ฐานข้อมูลเดิมจะถูกสำรองก่อนปรับโครงสร้างข้อมูล ตามด้วยไฟล์ที่อัปโหลดและไฟล์ที่ Kat เขียน (volume `artifacts`) หากสำรองไม่สำเร็จ ระบบจะไม่เริ่ม
+ข้อมูลสำรองแต่ละชุดมีสองส่วนที่ใช้ชื่อเดียวกัน: ฐานข้อมูลใน `backups/katwork-<database>-<UTC timestamp>-<suffix>.dump` และไฟล์ในโฟลเดอร์ `backups/katwork-<database>-<UTC timestamp>-<suffix>.files/` ส่วนเดโมอยู่ใน `backups-demo/` เท่านั้น
+ชื่อบอกชื่อฐานข้อมูลและเวลา UTC รูปแบบ `YYYYMMDDTHHMMSSZ` อย่าเลือกข้อมูลสำรองของเดโมมาใช้กับข้อมูลจริง
+ไฟล์ที่ไม่เปลี่ยนตั้งแต่การสำรองครั้งก่อนเป็น hard link ไปยังชุดก่อน การสำรองแต่ละครั้งจึงเพิ่มขนาดเท่าไฟล์ใหม่เท่านั้น เมื่อลบชุดเก่า ให้ลบทั้ง `.dump` และ `.files/` พร้อมกัน
 หากมีข้อผิดพลาดเรื่องสิทธิ์โฟลเดอร์ บน Linux ให้รันคำสั่ง `sudo install` ของโฟลเดอร์นั้นอีกครั้ง
 ก่อนอัปเกรด ให้หยุดระบบโดยเก็บข้อมูลไว้ แล้วเริ่มรุ่นใหม่:
 
@@ -446,19 +457,12 @@ docker compose up -d
 ```
 
 ห้ามเติม `-v` หลัง `down` เพราะจะลบฐานข้อมูล ไฟล์ที่อัปโหลด และใบรับรอง
-เก็บสำเนาไฟล์สำรองในที่ปลอดภัย และเก็บ `.env` กับใบรับรองแยกไว้ด้วย เพราะไฟล์ `.dump` มีเฉพาะฐานข้อมูล
-
-ไฟล์ที่อัปโหลดและไฟล์ที่ Kat เขียนเก็บอยู่ใน volume ชื่อ `artifacts` ไม่ได้อยู่ในฐานข้อมูล
-โปรดคัดลอก volume นี้หลังสำรองฐานข้อมูลเสร็จทุกครั้ง อย่าคัดลอกก่อน เพราะไฟล์ที่ใหม่กว่าไฟล์ `.dump` ไม่เป็นปัญหา
-แต่ไฟล์ `.dump` ที่ใหม่กว่าสำเนาอาจอ้างถึงไฟล์ที่สำเนาไม่มี คัดลอกได้ขณะระบบทำงาน และใช้ `-a` เพื่อคงเจ้าของไฟล์ไว้:
-
-```sh
-sudo docker compose cp -a katwork:/var/lib/katwork/artifacts ./artifacts-YOUR_TIMESTAMP
-```
+เก็บสำเนาข้อมูลสำรองในที่ปลอดภัย และเก็บ `.env` กับใบรับรองแยกไว้ด้วย เพราะข้อมูลสำรองไม่มีสองอย่างนี้
+เมื่อคัดลอกข้อมูลสำรองไปที่อื่น ให้คง hard link ไว้ (เช่น `sudo cp -a backups DESTINATION` หรือ `rsync -aH`)
 
 ### กู้คืนข้อมูล
 
-เลือกไฟล์จาก `backups/` และตรวจชื่อฐานข้อมูลในชื่อไฟล์ก่อน
+เลือกข้อมูลสำรองจาก `backups/` และตรวจชื่อฐานข้อมูลในชื่อไฟล์ก่อน
 แทน `katwork-katwork-YOUR_TIMESTAMP-SUFFIX.dump` ด้วยชื่อไฟล์จริง แล้วกู้คืนลงฐานข้อมูลใหม่:
 
 ```sh
@@ -470,14 +474,15 @@ docker compose exec -T postgres pg_restore --exit-on-error --no-owner -U katwork
 docker compose exec -T postgres rm /tmp/restore.dump
 ```
 
-ใน `.env` เปลี่ยนเฉพาะชื่อฐานข้อมูลท้าย `DATABASE_URL` จาก `/katwork` เป็น `/restored` แล้วรัน `docker compose up -d`
-หากมีฐานข้อมูล `restored` อยู่แล้ว ให้เลือกชื่อใหม่ อย่าเขียนทับข้อมูลเดิม
-จากนั้นคัดลอกโฟลเดอร์ไฟล์ที่สำรองไว้หลังฐานข้อมูลชุดนั้นกลับเข้าไป:
+จากนั้นคัดลอกไฟล์ของชุดเดียวกัน (โฟลเดอร์ `.files` ที่ชื่อเดียวกับไฟล์ `.dump`) กลับเข้า volume `artifacts`
+คำสั่งนี้เพิ่มไฟล์จากข้อมูลสำรองโดยไม่ลบไฟล์ที่มีอยู่ ตรวจ SHA-256 ของทุกไฟล์ และแจ้งชื่อไฟล์ที่เสียหาย:
 
 ```sh
-sudo docker compose cp -a ./artifacts-YOUR_TIMESTAMP/. katwork:/var/lib/katwork/artifacts
+docker compose run --rm restore-files katwork-katwork-YOUR_TIMESTAMP-SUFFIX.files
 ```
 
+ใน `.env` เปลี่ยนเฉพาะชื่อฐานข้อมูลท้าย `DATABASE_URL` จาก `/katwork` เป็น `/restored` แล้วรัน `docker compose up -d`
+หากมีฐานข้อมูล `restored` อยู่แล้ว ให้เลือกชื่อใหม่ อย่าเขียนทับข้อมูลเดิม
 ตรวจข้อมูลให้ครบก่อนลบฐานข้อมูลเก่า รายละเอียดข้อจำกัดของ URL อยู่ในหัวข้อ [Backups and upgrades](#backups-and-upgrades) ภาษาอังกฤษ
 
 KatWork ยังอยู่ระหว่างพัฒนาครับ การช่วยเตรียมร่างรายงานพร้อมแหล่งอ้างอิง

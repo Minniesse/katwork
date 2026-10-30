@@ -39,15 +39,53 @@ case "$schema" in
     *) printf '%s\n' 'Could not determine database migration state.' >&2; exit 1 ;;
 esac
 directory=${KATWORK_BACKUP_DIR:-/backups}
+# The artifacts volume, mounted read-only: the uploaded files and the files Kats write.
+files_root=${KATWORK_ARTIFACT_DIR:-/var/lib/katwork/artifacts}
 folder_error() {
     printf 'Cannot write backup folder %s. On Linux, fix its host folder (backups/; demo: backups-demo/) with: sudo chown 0 FOLDER && sudo chmod 0755 FOLDER\n' "$directory" >&2
     exit 1
 }
+if [ ! -d "$files_root" ]; then
+    printf 'Cannot read the files volume at %s.\n' "$files_root" >&2
+    exit 1
+fi
 mkdir -p "$directory" || folder_error
 # The random suffix prevents two starts in one second from replacing a good archive.
-partial=$(mktemp "$directory/katwork-$PGDATABASE-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXXXXXXXX") || folder_error
-trap 'rm -f "$partial"' EXIT HUP INT TERM
-mv "$partial" "$partial.dump.partial"
-partial="$partial.dump.partial"
-pg_dump --format=custom --file "$partial"
-mv "$partial" "${partial%.partial}"
+base=$(mktemp "$directory/katwork-$PGDATABASE-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXXXXXXXX") || folder_error
+dump="$base.dump.partial"
+files="$base.files.partial"
+list=''
+trap 'rm -rf "$base" "$dump" "$files"; [ -z "$list" ] || rm -f "$list"' EXIT HUP INT TERM
+mv "$base" "$dump"
+pg_dump --format=custom --file "$dump"
+# The files, copied after the dump so the copy holds every file the dump names. Each stored
+# file is named by its SHA-256 and never changed, so a name the newest earlier backup holds is
+# linked from it, costing no space; a new one is copied and checked against its name.
+digest() {
+    if command -v sha256sum > /dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -c1-64
+}
+previous=$(ls -1dt "$directory"/katwork-*.files 2> /dev/null | head -n 1)
+list=$(mktemp)
+find "$files_root" -type f -path "$files_root/*/sha256/*" > "$list"
+mkdir "$files"
+while IFS= read -r source; do
+    relative=${source#"$files_root"/}
+    name=${source##*/}
+    rest=${name#??}
+    case "$name" in *[!0-9a-f]*) continue ;; esac
+    # Only <workspace>/sha256/<aa>/<bb>/<64 hex digits>, as the app stores a file.
+    [ "${#name}" -eq 64 ] || continue
+    [ "$relative" = "${relative%%/*}/sha256/${name%"$rest"}/${rest%"${rest#??}"}/$name" ] || continue
+    target="$files/$relative"
+    [ -d "${target%/*}" ] || mkdir -p "${target%/*}"
+    if [ -n "$previous" ] && [ -f "$previous/$relative" ] && ln "$previous/$relative" "$target" 2> /dev/null; then
+        continue
+    fi
+    cp "$source" "$target"
+    if [ "$(digest < "$target")" != "$name" ]; then
+        rm -f "$target"
+        printf 'Skipped a damaged file: %s does not match its SHA-256 name.\n' "$relative" >&2
+    fi
+done < "$list"
+mv "$files" "$base.files"
+mv "$dump" "$base.dump"
