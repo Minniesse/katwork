@@ -1247,6 +1247,16 @@ fn pdf_encrypted_variants_are_refused_before_any_decode() {
 
 #[test]
 fn pdf_one_lopdf_in_the_lock_file_without_rayon() {
+    // The host's packages only: another platform's (Android's, Windows') are never fetched for
+    // this build, and --offline cannot fetch them.
+    let version = std::process::Command::new(env!("CARGO"))
+        .arg("-vV")
+        .output()
+        .unwrap();
+    let host = String::from_utf8_lossy(&version.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("host: ").map(str::to_owned))
+        .expect("cargo -vV names its host");
     let output = std::process::Command::new(env!("CARGO"))
         .args([
             "metadata",
@@ -1254,6 +1264,8 @@ fn pdf_one_lopdf_in_the_lock_file_without_rayon() {
             "1",
             "--locked",
             "--offline",
+            "--filter-platform",
+            &host,
             "--manifest-path",
         ])
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"))
