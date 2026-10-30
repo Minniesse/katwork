@@ -189,7 +189,7 @@ async fn pool_clean_probe_does_not_reserve_unused_parent_capacity(pool: PgPool) 
         .await
         .unwrap();
     assert_eq!(child.size(), 1);
-    timeout(Duration::from_secs(5), assert_pool_clean(&child))
+    timeout(Duration::from_secs(5), support::assert_pool_clean(&child))
         .await
         .expect("pool inspection tried to reserve another test's connection permit");
     drop(held);
@@ -200,27 +200,6 @@ async fn pool_clean_probe_does_not_reserve_unused_parent_capacity(pool: PgPool) 
     timeout(Duration::from_secs(5), parent.close())
         .await
         .unwrap();
-}
-
-pub(super) async fn assert_pool_clean(pool: &PgPool) {
-    // sqlx test pools share permits: inspecting a pool must never grow it to maximum capacity.
-    timeout(Duration::from_secs(30), async {
-        use sqlx::Connection;
-        let mut observer = sqlx::PgConnection::connect_with(&pool.connect_options())
-            .await
-            .unwrap();
-        loop {
-            let clean: bool = sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND backend_type='client backend' AND pid<>pg_backend_pid() AND state IS DISTINCT FROM 'idle')")
-                .fetch_one(&mut observer).await.unwrap();
-            if pool.num_idle() as u32 == pool.size() && clean {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        observer.close().await.unwrap();
-    })
-    .await
-    .expect("worker shutdown left a busy pool or a backend inside a transaction");
 }
 
 #[sqlx::test(migrations = "../katwork/migrations")]
@@ -236,12 +215,15 @@ async fn pool_clean_probe_rejects_idle_transaction(pool: PgPool) {
     conn.return_to_pool().await;
     assert_eq!(single.num_idle(), 1);
     assert!(
-        timeout(Duration::from_millis(200), assert_pool_clean(&single))
-            .await
-            .is_err(),
+        timeout(
+            Duration::from_millis(200),
+            support::assert_pool_clean(&single)
+        )
+        .await
+        .is_err(),
         "pool inspection accepted a backend idle in transaction"
     );
     sqlx::query("ROLLBACK").execute(&single).await.unwrap();
-    assert_pool_clean(&single).await;
+    support::assert_pool_clean(&single).await;
     single.close().await;
 }

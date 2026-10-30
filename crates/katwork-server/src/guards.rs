@@ -8,7 +8,7 @@ use axum::{
     Router,
     body::{Body, Bytes, HttpBody},
     error_handling::HandleErrorLayer,
-    extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, FromRequest, MatchedPath, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, uri::Authority},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -179,20 +179,41 @@ fn check(request: &Request, config: &GuardConfig) -> Result<(), KatError> {
             }
             return Err(KatError::CrossSiteRequest);
         }
-        if !request.body().is_end_stream()
-            && !single_header(request.headers(), "content-type").is_some_and(|value| {
-                value
-                    .split(';')
-                    .next()
-                    .unwrap_or_default()
-                    .trim()
-                    .eq_ignore_ascii_case("application/json")
-            })
+        // The upload route takes a file as its body, even an empty one; every other route
+        // takes JSON.
+        if is_upload(request) {
+            if !content_type_is(request.headers(), "application/octet-stream") {
+                return Err(KatError::OctetStreamRequired);
+            }
+        } else if !request.body().is_end_stream()
+            && !content_type_is(request.headers(), "application/json")
         {
             return Err(KatError::JsonRequired);
         }
     }
     Ok(())
+}
+
+/// `POST` on the upload route, as the router matched it (never the raw path).
+fn is_upload(request: &Request) -> bool {
+    request.method() == Method::POST
+        && request
+            .extensions()
+            .get::<MatchedPath>()
+            .is_some_and(|path| path.as_str() == crate::routes::files::UPLOAD_ROUTE)
+}
+
+/// Whether the single `Content-Type` header names `media_type`, in any case, whatever its
+/// parameters.
+fn content_type_is(headers: &HeaderMap, media_type: &str) -> bool {
+    single_header(headers, "content-type").is_some_and(|value| {
+        value
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .eq_ignore_ascii_case(media_type)
+    })
 }
 
 async fn guard(State(config): State<GuardConfig>, request: Request, next: Next) -> Response {
@@ -205,10 +226,13 @@ async fn guard(State(config): State<GuardConfig>, request: Request, next: Next) 
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
     );
-    response.headers_mut().insert(
-        "content-security-policy",
-        HeaderValue::from_static("default-src 'self'; frame-ancestors 'none'"),
-    );
+    // A handler that set its own policy (a download's sandbox) keeps it.
+    if !response.headers().contains_key("content-security-policy") {
+        response.headers_mut().insert(
+            "content-security-policy",
+            HeaderValue::from_static("default-src 'self'; frame-ancestors 'none'"),
+        );
+    }
     response
         .headers_mut()
         .insert("referrer-policy", HeaderValue::from_static("no-referrer"));

@@ -18,6 +18,13 @@ x-katwork-environment: &katwork-environment
   KATWORK_DOC_WORKERS: ${KATWORK_DOC_WORKERS:-}
   KATWORK_DOC_MAX_XML_ELEMENTS: ${KATWORK_DOC_MAX_XML_ELEMENTS:-}
   KATWORK_DOC_MAX_READ_BYTES: ${KATWORK_DOC_MAX_READ_BYTES:-}
+  # Uploaded and written files: pinned to the artifacts volume's mount point, so .env cannot
+  # move them off the volume.
+  KATWORK_ARTIFACT_DIR: /var/lib/katwork/artifacts
+  KATWORK_UPLOAD_MAX_BYTES: ${KATWORK_UPLOAD_MAX_BYTES:-}
+  KATWORK_WORKSPACE_STORAGE_BYTES: ${KATWORK_WORKSPACE_STORAGE_BYTES:-}
+  KATWORK_UPLOAD_MIN_BYTES_PER_SEC: ${KATWORK_UPLOAD_MIN_BYTES_PER_SEC:-}
+  KATWORK_UPLOAD_RATE_WINDOW_MS: ${KATWORK_UPLOAD_RATE_WINDOW_MS:-}
   KATWORK_IDLE_TIMEOUT_SECONDS: ${KATWORK_IDLE_TIMEOUT_SECONDS:-}
   KATWORK_MAX_CONNECTIONS: ${KATWORK_MAX_CONNECTIONS:-}
   KATWORK_MAX_CONNECTIONS_PER_IP: ${KATWORK_MAX_CONNECTIONS_PER_IP:-}
@@ -98,6 +105,10 @@ services:
     networks: [backend, default]
     extra_hosts: ["host.docker.internal:host-gateway"]
     environment: *katwork-environment
+    # The image creates the mount point owned by its non-root user, and a new volume copies
+    # that owner. Back it up with the database (README, Backups and upgrades).
+    volumes:
+      - artifacts:/var/lib/katwork/artifacts
     healthcheck:
       test: ["CMD", "/app/katwork-server", "healthcheck"]
       interval: 5s
@@ -118,3 +129,4 @@ networks:
 volumes:
   postgres_data:
   qdrant_data:
+  artifacts:

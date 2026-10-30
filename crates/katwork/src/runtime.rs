@@ -3,6 +3,10 @@ use std::sync::Arc;
 use sqlx::PgPool;
 
 use crate::{
+    artifacts::{
+        BlobStore, LocalBlobStore, blob,
+        uploads::{UPLOADS_AT_ONCE, UPLOADS_PER_PERSON, UploadLimiter},
+    },
     config::Config,
     docs::{DocLimits, DocPool},
     error::KatError,
@@ -17,12 +21,30 @@ pub struct Core {
     pub registry: Arc<Registry>,
     pub mailer: Arc<dyn crate::auth::mailer::Mailer>,
     pub docs: Arc<DocPool>,
+    pub blobs: Arc<dyn BlobStore>,
+    pub uploads: Arc<UploadLimiter>,
 }
 
 impl Core {
-    /// Builds the core and starts the document pool's threads. A thread that cannot be spawned
-    /// is this function's error, so the server does not start without its pool.
+    /// Builds the core: checks that the artifact directory is writable, then starts the
+    /// document pool's threads. Either failure is this function's error, so the server does not
+    /// start without its files or its pool.
     pub fn start(pool: PgPool, config: Arc<Config>) -> Result<Self, KatError> {
+        let blobs = Arc::new(LocalBlobStore::new(config.artifact_dir.clone())?);
+        Self::assemble(pool, config, blobs)
+    }
+
+    /// `start` for tests and tools, which have no startup error to report. It touches no
+    /// directory: its blob store refuses every call until `with_blob_store` replaces it.
+    pub fn new(pool: PgPool, config: Arc<Config>) -> Self {
+        Self::assemble(pool, config, Arc::new(blob::Unconfigured)).expect("start the document pool")
+    }
+
+    fn assemble(
+        pool: PgPool,
+        config: Arc<Config>,
+        blobs: Arc<dyn BlobStore>,
+    ) -> Result<Self, KatError> {
         let registry = Arc::new(Registry::from_config(&config));
         let mailer = crate::auth::mailer::from_config(&config);
         let docs = Arc::new(DocPool::new(config.doc_workers, doc_limits(&config))?);
@@ -34,12 +56,15 @@ impl Core {
             registry,
             mailer,
             docs,
+            blobs,
+            uploads: Arc::new(UploadLimiter::new(UPLOADS_AT_ONCE, UPLOADS_PER_PERSON)),
         })
     }
 
-    /// `start` for tests and tools, which have no startup error to report.
-    pub fn new(pool: PgPool, config: Arc<Config>) -> Self {
-        Self::start(pool, config).expect("start the document pool")
+    /// Replaces the blob store (tests use it).
+    pub fn with_blob_store(mut self, blobs: Arc<dyn BlobStore>) -> Self {
+        self.blobs = blobs;
+        self
     }
 
     pub fn with_registry(mut self, registry: Registry) -> Self {

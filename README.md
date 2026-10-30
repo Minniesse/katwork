@@ -187,7 +187,7 @@ docker compose build katwork
 docker compose up -d
 ```
 
-Do not add `-v` to `down`: that deletes the database and certificate volumes.
+Do not add `-v` to `down`: that deletes the database, uploaded files and certificate volumes.
 Stopping first matters: a failed backup cannot stop an app that was already
 running. Every startup waits for the backup to succeed before it runs migrations
 or starts the app. Do not run migrations by hand around that gate.
@@ -212,8 +212,24 @@ fix the cause, then start again. No retention policy deletes old backups; copy t
 to secure storage and remove old files yourself after checking a restore.
 
 A dump contains **one database**, including users and migration history. It does
-not contain PostgreSQL roles or tablespaces, `.env`, or Caddy's certificates.
-Keep those separately. SP1 Compose supports only its bundled PostgreSQL 17
+not contain PostgreSQL roles or tablespaces, `.env`, Caddy's certificates or
+uploaded files. Keep those separately.
+
+Uploaded files, and the files Kats write, are kept in the `artifacts` volume, not
+in the database. Copy the volume after a database backup, never before: each file
+is stored once under its SHA-256 and never changed, so a file newer than the dump
+does no harm, while a dump newer than the copy can name files the copy lacks. The
+copy can run while the app runs; `-a` keeps the files' owner, the app's user:
+
+```sh
+sudo docker compose cp -a katwork:/var/lib/katwork/artifacts ./artifacts-YOUR_TIMESTAMP
+```
+
+After restoring a database (below), copy back the folder saved after that backup:
+
+```sh
+sudo docker compose cp -a ./artifacts-YOUR_TIMESTAMP/. katwork:/var/lib/katwork/artifacts
+``` SP1 Compose supports only its bundled PostgreSQL 17
 service. Backup and migrate stay on the private database network; external
 database hosts are not supported by these files.
 
@@ -429,8 +445,16 @@ docker compose build katwork
 docker compose up -d
 ```
 
-ห้ามเติม `-v` หลัง `down` เพราะจะลบฐานข้อมูลและใบรับรอง
+ห้ามเติม `-v` หลัง `down` เพราะจะลบฐานข้อมูล ไฟล์ที่อัปโหลด และใบรับรอง
 เก็บสำเนาไฟล์สำรองในที่ปลอดภัย และเก็บ `.env` กับใบรับรองแยกไว้ด้วย เพราะไฟล์ `.dump` มีเฉพาะฐานข้อมูล
+
+ไฟล์ที่อัปโหลดและไฟล์ที่ Kat เขียนเก็บอยู่ใน volume ชื่อ `artifacts` ไม่ได้อยู่ในฐานข้อมูล
+โปรดคัดลอก volume นี้หลังสำรองฐานข้อมูลเสร็จทุกครั้ง อย่าคัดลอกก่อน เพราะไฟล์ที่ใหม่กว่าไฟล์ `.dump` ไม่เป็นปัญหา
+แต่ไฟล์ `.dump` ที่ใหม่กว่าสำเนาอาจอ้างถึงไฟล์ที่สำเนาไม่มี คัดลอกได้ขณะระบบทำงาน และใช้ `-a` เพื่อคงเจ้าของไฟล์ไว้:
+
+```sh
+sudo docker compose cp -a katwork:/var/lib/katwork/artifacts ./artifacts-YOUR_TIMESTAMP
+```
 
 ### กู้คืนข้อมูล
 
@@ -448,6 +472,12 @@ docker compose exec -T postgres rm /tmp/restore.dump
 
 ใน `.env` เปลี่ยนเฉพาะชื่อฐานข้อมูลท้าย `DATABASE_URL` จาก `/katwork` เป็น `/restored` แล้วรัน `docker compose up -d`
 หากมีฐานข้อมูล `restored` อยู่แล้ว ให้เลือกชื่อใหม่ อย่าเขียนทับข้อมูลเดิม
+จากนั้นคัดลอกโฟลเดอร์ไฟล์ที่สำรองไว้หลังฐานข้อมูลชุดนั้นกลับเข้าไป:
+
+```sh
+sudo docker compose cp -a ./artifacts-YOUR_TIMESTAMP/. katwork:/var/lib/katwork/artifacts
+```
+
 ตรวจข้อมูลให้ครบก่อนลบฐานข้อมูลเก่า รายละเอียดข้อจำกัดของ URL อยู่ในหัวข้อ [Backups and upgrades](#backups-and-upgrades) ภาษาอังกฤษ
 
 KatWork ยังอยู่ระหว่างพัฒนาครับ การช่วยเตรียมร่างรายงานพร้อมแหล่งอ้างอิง

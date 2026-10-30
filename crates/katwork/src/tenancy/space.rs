@@ -52,13 +52,18 @@ pub async fn list(pool: &PgPool, tenant: &Tenant) -> Result<Vec<Space>, KatError
         .collect())
 }
 
+/// The tenant's Space; another workspace's or a missing one is `NotFound`. A guarded read: a
+/// request dropped during it closes its connection.
 pub async fn get(pool: &PgPool, tenant: &Tenant, id: SpaceId) -> Result<Space, KatError> {
-    let (id, name, allow_external) = sqlx::query_as(
-        "SELECT id, name, allow_external FROM spaces WHERE workspace_id = $1 AND id = $2",
-    )
-    .bind(tenant.workspace_id())
-    .bind(id)
-    .fetch_optional(pool)
+    let (id, name, allow_external) = crate::db::guarded(pool, async |conn| {
+        Ok(sqlx::query_as(
+            "SELECT id, name, allow_external FROM spaces WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(tenant.workspace_id())
+        .bind(id)
+        .fetch_optional(conn)
+        .await?)
+    })
     .await?
     .ok_or(KatError::NotFound)?;
     Ok(Space {

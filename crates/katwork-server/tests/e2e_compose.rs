@@ -468,6 +468,21 @@ fn first_run_and_profile_configuration() {
                 .to_str()
                 .unwrap()
         );
+        // Uploaded and written files live on the artifacts volume in every profile, and .env
+        // cannot move them off it.
+        assert!(
+            app["volumes"].as_array().unwrap().iter().any(|v| {
+                v["type"] == "volume"
+                    && v["source"] == "artifacts"
+                    && v["target"] == "/var/lib/katwork/artifacts"
+            }),
+            "katwork must mount the artifacts volume: {overrides:?}"
+        );
+        assert!(config["volumes"]["artifacts"].is_object());
+        assert_eq!(
+            app["environment"]["KATWORK_ARTIFACT_DIR"],
+            "/var/lib/katwork/artifacts"
+        );
         assert_eq!(config["networks"]["backend"]["internal"], true);
         assert_eq!(
             config["services"]["postgres"]["networks"]

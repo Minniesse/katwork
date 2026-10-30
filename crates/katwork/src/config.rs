@@ -1,9 +1,16 @@
-use std::{collections::BTreeSet, env, fmt, net::IpAddr, time::Duration};
+use std::{
+    collections::BTreeSet, env, fmt, net::IpAddr, ops::RangeInclusive, path::PathBuf,
+    time::Duration,
+};
 
 use percent_encoding::percent_decode_str;
 use url::Url;
 
 use crate::error::KatError;
+
+/// Where uploaded and written files live when `KATWORK_ARTIFACT_DIR` is unset: the Compose
+/// volume's mount point.
+pub const DEFAULT_ARTIFACT_DIR: &str = "/var/lib/katwork/artifacts";
 
 pub struct Config {
     pub lock_timeout: Duration,
@@ -15,6 +22,18 @@ pub struct Config {
     /// `KATWORK_DOC_MAX_READ_BYTES`: the bytes one document read may hold at once
     /// (`DocLimits::max_read_bytes`), 64 MiB to 64 GiB.
     pub doc_max_read_bytes: u64,
+    /// `KATWORK_ARTIFACT_DIR`: the blob store's root, an absolute path.
+    pub artifact_dir: PathBuf,
+    /// `KATWORK_UPLOAD_MAX_BYTES`: the upload cap, 1 to 26,214,400 (the readers' input cap,
+    /// `DocLimits::max_input_bytes`).
+    pub upload_max_bytes: u64,
+    /// `KATWORK_WORKSPACE_STORAGE_BYTES`: one workspace's storage quota, at least 1.
+    pub workspace_storage_bytes: u64,
+    /// `KATWORK_UPLOAD_MIN_BYTES_PER_SEC`: the upload rate floor; 0 turns it off.
+    pub upload_min_bytes_per_sec: u64,
+    /// `KATWORK_UPLOAD_RATE_WINDOW_MS`: the window the rate floor is checked over, 100 ms to
+    /// 300 s (the upload timeout).
+    pub upload_rate_window: Duration,
     pub database_url: String,
     pub secret: String,
     pub demo: bool,
@@ -443,6 +462,46 @@ impl Config {
                 .filter(|bytes| (67_108_864..=68_719_476_736).contains(bytes))
                 .ok_or(invalid("KATWORK_DOC_MAX_READ_BYTES"))?,
         };
+        let digits = |name: &'static str,
+                      default: u64,
+                      range: RangeInclusive<u64>|
+         -> Result<u64, KatError> {
+            match optional(name) {
+                None => Ok(default),
+                Some(value) => value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit())
+                    .then(|| value.parse::<u64>().ok())
+                    .flatten()
+                    .filter(|value| range.contains(value))
+                    .ok_or(invalid(name)),
+            }
+        };
+        let artifact_dir = optional("KATWORK_ARTIFACT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_ARTIFACT_DIR));
+        if !artifact_dir.is_absolute() {
+            return Err(invalid("KATWORK_ARTIFACT_DIR"));
+        }
+        // A larger upload would be one no reader opens.
+        let max_input_bytes = crate::docs::DocLimits::default().max_input_bytes;
+        let upload_max_bytes = digits(
+            "KATWORK_UPLOAD_MAX_BYTES",
+            max_input_bytes,
+            1..=max_input_bytes,
+        )?;
+        let workspace_storage_bytes = digits(
+            "KATWORK_WORKSPACE_STORAGE_BYTES",
+            10_737_418_240,
+            1..=u64::MAX,
+        )?;
+        let upload_min_bytes_per_sec =
+            digits("KATWORK_UPLOAD_MIN_BYTES_PER_SEC", 32_768, 0..=u64::MAX)?;
+        let upload_rate_window = Duration::from_millis(digits(
+            "KATWORK_UPLOAD_RATE_WINDOW_MS",
+            10_000,
+            100..=300_000,
+        )?);
         let smtp = if let Some(host) = optional("SMTP_HOST") {
             if host.contains('@') {
                 return Err(invalid("SMTP_HOST"));
@@ -485,6 +544,11 @@ impl Config {
             doc_workers,
             doc_max_xml_elements,
             doc_max_read_bytes,
+            artifact_dir,
+            upload_max_bytes,
+            workspace_storage_bytes,
+            upload_min_bytes_per_sec,
+            upload_rate_window,
             local,
             database_url,
             secret,

@@ -1300,6 +1300,7 @@ dependencies = [
  "futures",
  "jsonschema",
  "lettre",
+ "nix",
  "percent-encoding",
  "pulldown-cmark",
  "quick-xml",
