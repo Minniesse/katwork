@@ -2041,6 +2041,111 @@ async fn artifact_author_check_rejects_mixed_authors(pool: PgPool) {
     }
 }
 
+async fn insert_artifact(
+    pool: &PgPool,
+    workspace: Uuid,
+    space: Uuid,
+    user: Option<Uuid>,
+    kat: Option<Uuid>,
+    job: Option<Uuid>,
+) -> Result<Uuid, sqlx::Error> {
+    let id = Uuid::now_v7();
+    let role = if kat.is_some() { "output" } else { "input" };
+    sqlx::query(
+        "INSERT INTO artifacts (id, workspace_id, space_id, name, role, created_by_user, created_by_kat, job_id)
+         VALUES ($1, $2, $3, 'f.txt', $4, $5, $6, $7)",
+    )
+    .bind(id)
+    .bind(workspace)
+    .bind(space)
+    .bind(role)
+    .bind(user)
+    .bind(kat)
+    .bind(job)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+async fn insert_version(
+    pool: &PgPool,
+    workspace: Uuid,
+    artifact: Uuid,
+    version: i32,
+    run: Option<Uuid>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO artifact_versions (id, workspace_id, artifact_id, version, sha256, bytes, media_type, run_id)
+         VALUES ($1, $2, $3, $4, $5, 1, 'text', $6)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(workspace)
+    .bind(artifact)
+    .bind(version)
+    .bind("0".repeat(64))
+    .bind(run)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// Tenant isolation lives in the schema: every reference 0011 adds is a composite key with the
+/// row's workspace, so no row can point into another workspace.
+#[sqlx::test(migrations = "./migrations")]
+async fn composite_keys_keep_every_reference_in_its_workspace(pool: PgPool) {
+    let a = Fixture::new(&pool).await;
+    let b = Fixture::new(&pool).await;
+    // Each reference inside workspace a is accepted...
+    let input = insert_artifact(&pool, a.workspace, a.space, Some(a.user), None, None)
+        .await
+        .unwrap();
+    let output = insert_artifact(&pool, a.workspace, a.space, None, Some(a.kat), Some(a.job))
+        .await
+        .unwrap();
+    insert_version(&pool, a.workspace, input, 1, None)
+        .await
+        .unwrap();
+    insert_version(&pool, a.workspace, output, 1, Some(a.run))
+        .await
+        .unwrap();
+    // ...and the same reference into workspace b is a foreign-key violation.
+    let theirs = insert_artifact(&pool, b.workspace, b.space, Some(b.user), None, None)
+        .await
+        .unwrap();
+    let refused = [
+        (
+            "space",
+            insert_artifact(&pool, a.workspace, b.space, Some(a.user), None, None)
+                .await
+                .map(|_| ()),
+        ),
+        (
+            "kat",
+            insert_artifact(&pool, a.workspace, a.space, None, Some(b.kat), Some(a.job))
+                .await
+                .map(|_| ()),
+        ),
+        (
+            "job",
+            insert_artifact(&pool, a.workspace, a.space, None, Some(a.kat), Some(b.job))
+                .await
+                .map(|_| ()),
+        ),
+        (
+            "artifact",
+            insert_version(&pool, a.workspace, theirs, 1, None).await,
+        ),
+        (
+            "run",
+            insert_version(&pool, a.workspace, output, 2, Some(b.run)).await,
+        ),
+    ];
+    for (reference, result) in refused {
+        let error = result.expect_err(reference);
+        support::sqlstate(error, "23503");
+    }
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn deleted_columns_are_set_together(pool: PgPool) {
     let f = Fixture::new(&pool).await;
