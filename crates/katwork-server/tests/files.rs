@@ -1248,9 +1248,11 @@ async fn download_version_path_table(pool: PgPool) {
 async fn download_of_another_workspace_file_is_404(pool: PgPool) {
     let env = Env::new(&pool, |_| {}).await;
     let other = Env::new(&pool, |_| {}).await;
-    let theirs = other
-        .uploaded("secret.txt", b"another workspace's bytes")
-        .await;
+    // The requester holds the same bytes, so its own store has the blob: only the query's
+    // tenant filter can answer 404, never a missing file.
+    let bytes = b"identical bytes in both workspaces";
+    env.uploaded("mine.txt", bytes).await;
+    let theirs = other.uploaded("secret-name.txt", bytes).await;
     let at_our_path = format!(
         "/api/workspaces/{}/files/{}/versions/1/content",
         env.workspace,
