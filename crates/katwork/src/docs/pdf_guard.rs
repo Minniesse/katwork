@@ -714,7 +714,7 @@ fn stream_section(
             .ok()
             .and_then(|stream| stream.as_i64().ok()),
     };
-    for pair in index.chunks_exact(2) {
+    for pair in index.as_chunks::<2>().0 {
         for at in 0..pair[1].max(0) {
             let Some(row) = rows.next() else {
                 return Ok(None);
@@ -1006,11 +1006,11 @@ impl Capped {
     }
 }
 
+/// One filter of a stream: its name and its `/DecodeParms`.
+type Filter = (Vec<u8>, Option<Dictionary>);
+
 /// `/Filter` and `/DecodeParms` resolved: each filter name with its parameters.
-fn filters(
-    doc: Option<&Document>,
-    dict: &Dictionary,
-) -> Result<Vec<(Vec<u8>, Option<Dictionary>)>, DocError> {
+fn filters(doc: Option<&Document>, dict: &Dictionary) -> Result<Vec<Filter>, DocError> {
     let malformed = DocError::Malformed("stream_filter");
     let resolve = |object: &Object| -> Result<Object, DocError> {
         match object {
@@ -1176,8 +1176,7 @@ fn ascii85(input: &[u8], out: &mut Capped) -> Result<(), DocError> {
             .ok_or(malformed)?;
         out.extend(&value.to_be_bytes()[..group.len() - 1])
     };
-    let mut bytes = input.iter().copied().peekable();
-    while let Some(byte) = bytes.next() {
+    for byte in input.iter().copied() {
         match byte {
             b'~' => break,
             b'z' if group.is_empty() => out.extend(&[0; 4])?,
@@ -1406,6 +1405,9 @@ fn dict_of<'a>(doc: &'a Document, object: &'a Object) -> Option<&'a Dictionary> 
     }
 }
 
+/// A page-tree node to visit: the node, its depth, and the media and crop boxes it inherits.
+type TreeNode<'a> = (&'a Object, u32, Option<[f32; 4]>, Option<[f32; 4]>);
+
 /// The page tree in reading order, iteratively: a node seen twice is `page_tree_cycle`, depth
 /// past `max_page_tree_depth` is `TooComplex`, and the pages are counted against `max_pages`
 /// before any page is read. Media and crop boxes inherit down the tree.
@@ -1421,8 +1423,7 @@ fn page_tree(doc: &Document, limits: &DocLimits) -> Result<Vec<PrescanPage>, Doc
     let mut seen: HashSet<ObjectId> = HashSet::new();
     let mut pages = Vec::new();
     // (node, depth, inherited media box, inherited crop box)
-    let mut stack: Vec<(&Object, u32, Option<[f32; 4]>, Option<[f32; 4]>)> =
-        vec![(top, 1, None, None)];
+    let mut stack: Vec<TreeNode> = vec![(top, 1, None, None)];
     let mut visits = 0u64;
     while let Some((node, depth, media, crop)) = stack.pop() {
         visits += 1;
@@ -1435,10 +1436,10 @@ fn page_tree(doc: &Document, limits: &DocLimits) -> Result<Vec<PrescanPage>, Doc
         let Some((id, Object::Dictionary(dict))) = resolve(doc, node) else {
             continue;
         };
-        if let Some(id) = id {
-            if !seen.insert(id) {
-                return Err(DocError::Malformed("page_tree_cycle"));
-            }
+        if let Some(id) = id
+            && !seen.insert(id)
+        {
+            return Err(DocError::Malformed("page_tree_cycle"));
         }
         let media = rect_of(doc, dict.get(b"MediaBox").ok()).or(media);
         let crop = rect_of(doc, dict.get(b"CropBox").ok()).or(crop);

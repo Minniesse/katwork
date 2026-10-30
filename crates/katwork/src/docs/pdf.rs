@@ -197,10 +197,10 @@ impl OutputDev for Collector<'_> {
         if self.operators > self.limits.max_content_ops {
             return Err(self.fail(DocError::TooComplex("content_ops")));
         }
-        if self.operators.is_multiple_of(1024) {
-            if let Err(error) = deadline::check() {
-                return Err(self.fail(error));
-            }
+        if self.operators.is_multiple_of(1024)
+            && let Err(error) = deadline::check()
+        {
+            return Err(self.fail(error));
         }
         Ok(())
     }
