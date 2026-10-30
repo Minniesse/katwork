@@ -63,8 +63,9 @@ impl Raw {
     }
 
     pub fn add(&mut self, body: impl Into<Vec<u8>>) -> u32 {
+        // A number just reserved has no body yet.
         let id = self.reserve();
-        self.set(id, body);
+        self.objects.push((id, body.into()));
         id
     }
 
@@ -96,10 +97,14 @@ impl Raw {
 
     /// A classic xref table for `offsets` (every listed number in use, the rest free).
     fn table(size: u32, offsets: &[(u32, usize)]) -> String {
+        let mut by_number = vec![None; size as usize];
+        for (id, offset) in offsets {
+            by_number[*id as usize] = Some(*offset);
+        }
         let mut table = format!("xref\n0 {size}\n0000000000 65535 f \n");
-        for number in 1..size {
-            match offsets.iter().find(|(id, _)| *id == number) {
-                Some((_, offset)) => table.push_str(&format!("{offset:010} 00000 n \n")),
+        for offset in &by_number[1..] {
+            match offset {
+                Some(offset) => table.push_str(&format!("{offset:010} 00000 n \n")),
                 None => table.push_str("0000000000 00000 f \n"),
             }
         }
@@ -163,6 +168,60 @@ impl Raw {
             &flate(&rows),
         ));
         out.extend_from_slice(format!("\nendobj\nstartxref\n{start}\n%%EOF\n").as_bytes());
+        out
+    }
+}
+
+impl Raw {
+    /// A hybrid-reference file: an object stream holding the objects `packed`, a classic table
+    /// that marks them free (for readers that know no object streams), and a `/XRefStm` stream,
+    /// listed in no section, that gives them as compressed.
+    pub fn build_hybrid(&self, root: u32, packed: &[u32]) -> Vec<u8> {
+        let mut plain = self.clone();
+        let mut index = String::new();
+        let mut data = Vec::new();
+        for id in packed {
+            let body = &self.objects.iter().find(|(number, _)| number == id).unwrap().1;
+            index.push_str(&format!("{id} {} ", data.len()));
+            data.extend_from_slice(body);
+            data.push(b'\n');
+        }
+        plain.objects.retain(|(id, _)| !packed.contains(id));
+        let container = plain.reserve();
+        let mut content = index.into_bytes();
+        let first = content.len();
+        content.extend_from_slice(&data);
+        plain.set(
+            container,
+            stream(&format!("/Type /ObjStm /N {} /First {first} /Filter /FlateDecode", packed.len()), &flate(&content)),
+        );
+        let (mut out, offsets) = plain.body();
+        let size = plain.size() + 1;
+        let mut rows = Vec::new();
+        let mut subsections = String::new();
+        for (position, id) in packed.iter().enumerate() {
+            subsections.push_str(&format!("{id} 1 "));
+            rows.extend_from_slice(&[2, (container >> 24) as u8, (container >> 16) as u8, (container >> 8) as u8, container as u8, 0, position as u8]);
+        }
+        let stream_at = out.len();
+        out.extend_from_slice(format!("{} 0 obj\n", plain.size()).as_bytes());
+        out.extend_from_slice(&stream(
+            &format!("/Type /XRef /Size {size} /W [1 4 2] /Index [{subsections}] /Filter /FlateDecode"),
+            &flate(&rows),
+        ));
+        out.extend_from_slice(b"\nendobj\n");
+        let start = out.len();
+        let mut table = format!("xref\n0 {}\n0000000000 65535 f \n", plain.size());
+        for number in 1..plain.size() {
+            match offsets.iter().find(|(id, _)| *id == number) {
+                Some((_, offset)) => table.push_str(&format!("{offset:010} 00000 n \n")),
+                None => table.push_str("0000000000 00000 f \n"),
+            }
+        }
+        out.extend_from_slice(table.as_bytes());
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root {root} 0 R /XRefStm {stream_at} >>\nstartxref\n{start}\n%%EOF\n").as_bytes(),
+        );
         out
     }
 }

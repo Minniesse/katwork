@@ -11,15 +11,16 @@
 //! - Lines join one block while the vertical gap between them is at most half the earlier
 //!   line's height; a new page starts a block; lines are joined with U+000A.
 //! - Hidden characters leave their line: each run of them (spaces between two hidden characters
-//!   included) is cut out, the two sides are joined by exactly one U+0020, and the runs of a
-//!   block form one hidden block right after it, its reason the runs' most common.
+//!   included) is cut out, the two sides are joined by exactly one U+0020 (none before a
+//!   combining mark, which stays on its base), and the runs of a block form one hidden block
+//!   right after it, its reason the runs' most common.
 //! - A marked-content `/ActualText` replaces the text of the glyphs it encloses (Typst writes
 //!   one around every Thai cluster its ToUnicode map cannot express); the span is hidden when
 //!   any of its glyphs is, and suspect when any is suspect.
 //! - A glyph whose text repeats that of a glyph or span not hidden earlier on its line, with its
-//!   box centre inside that one's box (within 5% of the font size), adds no text: it draws over a character already read
-//!   (Typst draws a cluster's positioned mark again with the cluster's text; some producers
-//!   overprint text to embolden it).
+//!   box centre inside that one's box (within 5% of the font size), adds no text: it draws over
+//!   a character already read (Typst draws a cluster's positioned mark again with the cluster's
+//!   text; some producers overprint text to embolden it).
 //! - Ordinals count emitted blocks from 1 across the file, hidden blocks included.
 use std::{cell::Cell, collections::HashMap, rc::Rc};
 
@@ -528,7 +529,8 @@ fn assemble_block(block: &mut [Line]) -> Assembled {
                             if out.visible.ends_with_space() {
                                 continue;
                             }
-                        } else if !out.visible.ends_with_space() {
+                        } else if !out.visible.ends_with_space() && !item.text.starts_with(is_mark) {
+                            // A combining mark stays on its base: a space would split its cluster.
                             out.visible.push(" ", None, Some(line_at));
                         }
                     }

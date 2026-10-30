@@ -741,6 +741,18 @@ async fn pdf_font_and_cmap_bombs_fail_bounded() {
     }
 }
 
+/// A one-page file of exactly `total` objects.
+fn objects(total: u32) -> Vec<u8> {
+    let mut doc = Doc::new();
+    // The catalog, the page tree, two fonts with a descendant and a map, and the page with its
+    // content stream are eight.
+    for _ in 8..total {
+        doc.add("0");
+    }
+    doc.page("", "");
+    doc.build()
+}
+
 /// `count` objects; each `/Type /ObjStm` holds one member, `inflate` makes one inflate past
 /// `max_objstm_bytes`.
 fn object_streams(count: usize, inflate: bool) -> Vec<u8> {
@@ -766,19 +778,19 @@ fn pdf_object_stream_budget_is_enforced_during_load() {
     assert_eq!(result.unwrap_err(), DocError::TooComplex("objstm_bytes"));
     assert!(decoded <= limits.max_objstm_bytes);
     assert_eq!(walks, 0);
-    // Objects: 1,001 of them past a cap of 1,000.
+    // A file of 500,001 objects, past the default cap of 500,000.
+    let file = objects(500_001);
+    assert!(file.len() as u64 <= limits.max_input_bytes);
+    let (result, _, walks) = read_counted(&file, &limits);
+    assert_eq!(result.unwrap_err(), DocError::TooComplex("objects"));
+    assert_eq!(walks, 0);
+    // And at a scaled cap: 1,000 objects read, 1,001 do not.
     let small = DocLimits {
         max_pdf_objects: 1_000,
         ..DocLimits::default()
     };
-    let mut doc = Doc::new();
-    while doc.raw.size() <= 1_001 {
-        doc.add("<< >>");
-    }
-    doc.page("", "");
-    let (result, _, walks) = read_counted(&doc.build(), &small);
-    assert_eq!(result.unwrap_err(), DocError::TooComplex("objects"));
-    assert_eq!(walks, 0);
+    assert!(read_with(&objects(1_000), &small).is_ok());
+    assert_eq!(read_with(&objects(1_001), &small).unwrap_err(), DocError::TooComplex("objects"));
     // A container that does not decode is malformed, never a page missing its objects.
     let mut doc = Doc::new();
     doc.add(stream("/Type /ObjStm /N 1 /First 4 /Filter /FlateDecode", b"\x78\x9c\xff\xff\xff"));
@@ -1407,5 +1419,643 @@ fn every_pdf_fuzz_seed_reads_or_fails_bounded() {
             Ok(_) | Err(DocError::TooComplex(_) | DocError::Malformed(_) | DocError::Encrypted) => {}
             Err(other) => panic!("{file}: {other:?}"),
         }
+    }
+}
+
+// Revisions, rebuilt cross-reference tables and the load's other edges.
+
+#[test]
+fn pdf_freed_object_in_an_object_stream_stays_freed() {
+    // Revision 1: the page's /Contents is object 7, an array in an object stream naming the
+    // stream that shows OLD. Revision 2 frees object 7; the object stream still holds it.
+    let mut doc = Doc::new();
+    let array = doc.raw.reserve();
+    let page = doc.page(&text(10.0, 10.0, 100.0, "OLD"), "");
+    let (mut raw, catalog) = doc.into_raw();
+    let content = page - 1;
+    raw.set(array, format!("[{content} 0 R]"));
+    let body = raw_body(&raw, page).replace(&format!("/Contents {content} 0 R"), &format!("/Contents {array} 0 R"));
+    raw.set(page, body);
+    let base = raw.build_packed(catalog, &[3, array]);
+    assert_eq!(visible(&read(&base)), vec!["OLD"]);
+    // The object stream and the cross-reference stream took the next two numbers.
+    let size = raw.size() + 2;
+    let updated = append_update(&base, &[], &[array], size, catalog, startxref(&base));
+    let extracted = read(&updated);
+    assert_eq!(extracted.pages.len(), 1);
+    assert!(extracted.blocks.is_empty(), "{:?}", texts(&extracted));
+    assert_eq!(extracted.pages[0].text_layer, TextLayer::Ok);
+    // The same for an object a classic table listed: revision 2 frees the content stream.
+    let mut doc = Doc::new();
+    let page = doc.page(&text(10.0, 10.0, 100.0, "OLD"), "");
+    let (raw, catalog) = doc.into_raw();
+    let base = raw.build(catalog, "");
+    let updated = append_update(&base, &[], &[page - 1], raw.size(), catalog, startxref(&base));
+    assert!(read(&updated).blocks.is_empty());
+}
+
+#[test]
+fn pdf_hybrid_reference_files_read_their_stream_entries() {
+    // The table marks the catalog, the page tree and the font free; the /XRefStm stream gives
+    // them as compressed, and they are in use.
+    let mut doc = Doc::new();
+    doc.page(&text(10.0, 10.0, 100.0, "hybrid"), "");
+    let (raw, catalog) = doc.into_raw();
+    let extracted = read(&raw.build_hybrid(catalog, &[1, 2, 3]));
+    assert_eq!(visible(&extracted), vec!["hybrid"]);
+    assert_eq!(extracted.pages[0].text_layer, TextLayer::Ok);
+}
+
+#[test]
+fn pdf_incremental_update_reads_the_newest_revision() {
+    let mut doc = Doc::new();
+    let page = doc.page(&text(10.0, 10.0, 100.0, "OLD"), "");
+    let (raw, catalog) = doc.into_raw();
+    let base = raw.build(catalog, "");
+    assert_eq!(visible(&read(&base)), vec!["OLD"]);
+    let replaced = stream("", text(10.0, 10.0, 100.0, "NEW").as_bytes());
+    let updated = append_update(&base, &[(page - 1, replaced)], &[], raw.size(), catalog, startxref(&base));
+    let extracted = read(&updated);
+    assert_eq!(visible(&extracted), vec!["NEW"]);
+    assert_eq!(extracted.pages[0].text_layer, TextLayer::Ok);
+}
+
+#[test]
+fn pdf_reconstructed_xref_marks_pages_suspect() {
+    let mut doc = Doc::new();
+    doc.page(&text(10.0, 10.0, 100.0, "kept"), "");
+    let (raw, catalog) = doc.into_raw();
+    let file = raw.build(catalog, "");
+    let start = startxref(&file);
+    let moved = |by: usize| {
+        let tail = format!("startxref\n{start}\n%%EOF\n");
+        let mut out = file[..file.len() - tail.len()].to_vec();
+        out.extend_from_slice(format!("startxref\n{}\n%%EOF\n", start + by).as_bytes());
+        out
+    };
+    // A few bytes off: lopdf finds the table beside it and reads it as written.
+    let near = read(&moved(3));
+    assert_eq!(visible(&near), vec!["kept"]);
+    assert_eq!(near.pages[0].text_layer, TextLayer::Ok);
+    // Far off: lopdf rebuilds the table by scanning the file, so objects may come from an older
+    // revision than a viewer shows, and every page is suspect.
+    let far = read(&moved(3_000));
+    assert_eq!(visible(&far), vec!["kept"]);
+    assert_eq!(far.pages[0].text_layer, TextLayer::Suspect("xref_recovered"));
+    assert!(far.warnings.contains(&ExtractWarning::SuspectTextLayer { page: 1, why: "xref_recovered" }));
+    // An older section's /Prev a few bytes off: lopdf finds the table nearby, but the sections
+    // cannot be read again as lopdf read them, so a deleted object could be back.
+    let update = append_update(&file, &[], &[], raw.size(), catalog, start + 3);
+    let shifted = read(&update);
+    assert_eq!(visible(&shifted), vec!["kept"]);
+    assert_eq!(shifted.pages[0].text_layer, TextLayer::Suspect("xref_recovered"));
+}
+
+#[test]
+fn pdf_prev_loop_terminates() {
+    let mut doc = Doc::new();
+    doc.page(&text(10.0, 10.0, 100.0, "looped"), "");
+    let (raw, catalog) = doc.into_raw();
+    // The trailer's /Prev names its own table.
+    let start = startxref(&raw.build(catalog, ""));
+    assert_eq!(visible(&read(&raw.build(catalog, &format!("/Prev {start}")))), vec!["looped"]);
+    // 32 sections read; a 33rd is refused before lopdf follows any.
+    let mut file = raw.build(catalog, "");
+    for _ in 1..32 {
+        file = append_update(&file, &[], &[], raw.size(), catalog, startxref(&file));
+    }
+    assert_eq!(visible(&read(&file)), vec!["looped"]);
+    let file = append_update(&file, &[], &[], raw.size(), catalog, startxref(&file));
+    let (result, decoded, walks) = read_counted(&file, &limits());
+    assert_eq!(result.unwrap_err(), DocError::TooComplex("xref_sections"));
+    assert_eq!((decoded, walks), (0, 0));
+}
+
+/// A page whose `/Contents` array names `content` (a stream in `doc`) `uses` times.
+fn repeated_contents(mut doc: Doc, content: u32, uses: usize) -> Vec<u8> {
+    let page = doc.page("", "");
+    let (mut raw, catalog) = doc.into_raw();
+    let refs = format!("{content} 0 R ").repeat(uses);
+    let body = raw_body(&raw, page).replace(&format!("/Contents {} 0 R", page - 1), &format!("/Contents [{refs}]"));
+    raw.set(page, body);
+    raw.build(catalog, "")
+}
+
+#[test]
+fn pdf_repeated_content_refs_are_charged_per_use() {
+    // One stream that inflates to 1 MiB: eight uses fit a budget of 8 MiB, nine do not.
+    let limits = DocLimits {
+        max_stream_bytes: 1 << 20,
+        max_decoded_bytes: 8 << 20,
+        ..DocLimits::default()
+    };
+    let file = |uses: usize| {
+        let mut doc = Doc::new();
+        let content = doc.add(stream("/Filter /FlateDecode", &zeros(1 << 20)));
+        repeated_contents(doc, content, uses)
+    };
+    assert!(read_with(&file(8), &limits).is_ok());
+    let (result, decoded, walks) = read_counted(&file(9), &limits);
+    assert_eq!(result.unwrap_err(), DocError::TooComplex("decoded_bytes"));
+    assert!(decoded <= limits.max_stream_bytes, "decoded once: {decoded}");
+    assert_eq!(walks, 0);
+    // At most 1,024 content streams on a page.
+    let mut doc = Doc::new();
+    let content = doc.add(stream("", b"q Q"));
+    assert!(read_with(&repeated_contents(doc, content, 1_024), &limits).is_ok());
+    let mut doc = Doc::new();
+    let content = doc.add(stream("", b"q Q"));
+    assert_eq!(read_with(&repeated_contents(doc, content, 1_025), &limits).unwrap_err(), DocError::TooComplex("contents"));
+}
+
+/// The page of `doc` drawing the content stream `content` instead of its own.
+fn with_contents(doc: Doc, content: u32) -> Vec<u8> {
+    repeated_contents(doc, content, 1)
+}
+
+#[test]
+fn pdf_indirect_filter_names_are_resolved() {
+    let mut doc = Doc::new();
+    let name = doc.add("/FlateDecode");
+    let names = doc.add(format!("[{name} 0 R]"));
+    let content = doc.add(stream(&format!("/Filter {names} 0 R"), &flate(text(10.0, 10.0, 100.0, "indirect").as_bytes())));
+    assert_eq!(visible(&read(&with_contents(doc, content))), vec!["indirect"]);
+    // An image codec named indirectly outside an image is still refused.
+    let mut doc = Doc::new();
+    let name = doc.add("/DCTDecode");
+    let content = doc.add(stream(&format!("/Filter {name} 0 R"), b"\xFF\xD8"));
+    assert_eq!(error(&with_contents(doc, content)), DocError::Malformed("stream_filter"));
+}
+
+#[test]
+fn pdf_hostile_predictor_parameters_fail_bounded() {
+    // PNG "Up" rows of 8 columns, with /DecodeParms an indirect object.
+    let mut plain = text(10.0, 10.0, 100.0, "predicted").into_bytes();
+    plain.resize(plain.len().div_ceil(8) * 8, b' ');
+    let mut rows = Vec::new();
+    let mut above = [0u8; 8];
+    for row in plain.chunks(8) {
+        rows.push(2);
+        rows.extend(row.iter().zip(above).map(|(byte, up)| byte.wrapping_sub(up)));
+        above.copy_from_slice(row);
+    }
+    let mut doc = Doc::new();
+    let params = doc.add("<< /Predictor 12 /Columns 8 >>");
+    let content = doc.add(stream(&format!("/Filter /FlateDecode /DecodeParms {params} 0 R"), &flate(&rows)));
+    assert_eq!(visible(&read(&with_contents(doc, content))), vec!["predicted"]);
+    // TIFF predictor 2 over one 8-bit colour: each byte is the difference from the one before.
+    let mut deltas = vec![0u8; plain.len()];
+    for at in 0..plain.len() {
+        deltas[at] = plain[at].wrapping_sub(if at % 8 == 0 { 0 } else { plain[at - 1] });
+    }
+    let mut doc = Doc::new();
+    let content = doc.add(stream("/Filter /FlateDecode /DecodeParms << /Predictor 2 /Columns 8 >>", &flate(&deltas)));
+    assert_eq!(visible(&read(&with_contents(doc, content))), vec!["predicted"]);
+    for params in [
+        "/Predictor 12 /Columns 4294967295",
+        "/Predictor 12 /Columns 65537",
+        "/Predictor 12 /Columns -1",
+        "/Predictor 2 /Colors 33",
+        "/Predictor 12 /BitsPerComponent 3",
+        "/Predictor 12 /Columns 8.5",
+        "/Predictor 7",
+    ] {
+        let mut doc = Doc::new();
+        let content = doc.add(stream(&format!("/Filter /FlateDecode /DecodeParms << {params} >>"), &flate(&rows)));
+        let (result, decoded, _) = read_counted(&with_contents(doc, content), &limits());
+        assert_eq!(result.unwrap_err(), DocError::Malformed("stream_predictor"), "{params}");
+        assert!(decoded <= rows.len() as u64 * 2, "{params}: {decoded}");
+    }
+}
+
+#[test]
+fn pdf_content_ops_cap_counts_executions() {
+    // A Form of 100 operators drawn 200 times: 300 operators written, 20,000 executed.
+    let limits = DocLimits {
+        max_content_ops: 10_000,
+        ..DocLimits::default()
+    };
+    let file = |draws: usize| {
+        let mut doc = Doc::new();
+        let form = doc.form("", &"q Q ".repeat(50));
+        doc.page(&"/Fm Do ".repeat(draws), &format!("/XObject << /Fm {form} 0 R >>"));
+        doc.build()
+    };
+    assert!(read_with(&file(50), &limits).is_ok());
+    assert_eq!(read_with(&file(200), &limits).unwrap_err(), DocError::TooComplex("content_ops"));
+}
+
+#[tokio::test]
+async fn pdf_cmap_and_type1_bombs_fail_bounded() {
+    let font_with = |cmap: &[u8], program: &[u8]| {
+        let mut doc = Doc::new();
+        let cmap = doc.add(stream("", cmap));
+        let program = doc.add(stream("", program));
+        let descriptor = doc.add(format!("<< /Type /FontDescriptor /FontName /N /FontFile {program} 0 R >>"));
+        let font = doc.add(format!("<< /Type /Font /Subtype /Type1 /BaseFont /N /FontDescriptor {descriptor} 0 R /ToUnicode {cmap} 0 R >>"));
+        doc.page("BT /N 10 Tf 10 100 Td (abc) Tj ET", &format!("/Font << /N {font} 0 R >>"));
+        doc.build()
+    };
+    // One range over every four-byte code, never expanded.
+    let range = font_with(b"1 begincodespacerange <00> <FF> endcodespacerange 1 beginbfrange <00000000> <FFFFFFFF> <0041> endbfrange", b"");
+    // 70,000 ranges and 300,000 single mappings: the parser keeps its caps.
+    let many: String = (0..70_000u32).map(|at| format!("<{at:08X}> <{at:08X}> <0041>\n")).collect();
+    let ranges = font_with(format!("70000 beginbfrange {many} endbfrange").as_bytes(), b"");
+    let singles: String = (0..300_000u32).map(|at| format!("<{at:06X}> <0041>\n")).collect();
+    let singles = font_with(format!("300000 beginbfchar {singles} endbfchar").as_bytes(), b"");
+    // 200,000 nested brackets in a CMap and braces in a Type 1 program, read without recursion.
+    let nested = font_with(&[b'['; 200_000], &[b"/Encoding ".as_slice(), &[b'{'; 200_000]].concat());
+    // Each reads on a pool thread within the call timeout, and the thread lives on.
+    let pool = docs::DocPool::new(1, limits()).unwrap();
+    let workspace = katwork::ids::WorkspaceId::new();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    for (what, file) in [("range", range), ("ranges", ranges), ("singles", singles), ("nested", nested)] {
+        let extracted = pool
+            .run(workspace, &cancel, None, move |limits| docs::extract(MediaKind::Pdf, &file, limits))
+            .await
+            .unwrap_or_else(|error| panic!("{what}: {error:?}"));
+        assert_eq!(extracted.pages.len(), 1, "{what}");
+    }
+}
+
+// The fork's walker.
+
+#[test]
+fn pdf_form_font_names_do_not_alias_the_pages() {
+    // The page's /F1 is Helvetica; the Form's own /F1 is the Type 0 font.
+    let mut doc = Doc::new();
+    let form = doc.form(
+        &format!("/Resources << /Font << /F1 {} 0 R >> >>", doc.unicode),
+        &format!("BT /F1 10 Tf 10 50 Td {} Tj ET", Doc::utf16("กา")),
+    );
+    let content = format!("{} /Fm Do {}", text(10.0, 10.0, 150.0, "AB"), text(10.0, 10.0, 100.0, "CD"));
+    doc.page(&content, &format!("/XObject << /Fm {form} 0 R >>"));
+    assert_eq!(visible(&read(&doc.build())), vec!["AB", "กา", "CD"]);
+}
+
+#[test]
+fn pdf_cid_width_ranges_are_read_without_expansion() {
+    let mut doc = Doc::new();
+    let cid = doc.add("<< /Type /Font /Subtype /CIDFontType2 /BaseFont /W /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /W [0 4294967295 500] >>");
+    let font = doc.add(format!("<< /Type /Font /Subtype /Type0 /BaseFont /W /Encoding /Identity-H /DescendantFonts [{cid} 0 R] /ToUnicode 4 0 R >>"));
+    doc.page("BT /W 10 Tf 10 100 Td <00410042> Tj ET", &format!("/Font << /W {font} 0 R >>"));
+    let extracted = read(&doc.build());
+    assert_eq!(visible(&extracted), vec!["AB"]);
+    // Two glyphs 500/1000 of 10 pt wide.
+    assert_eq!(extracted.blocks[0].lines[0].rect, [10.0, 98.0, 20.0, 108.0]);
+}
+
+#[test]
+fn pdf_common_malformations_do_not_panic() {
+    let cases: &[(&str, &str, &str, &[&str])] = &[
+        ("a dangling font", "/Font << /D 999 0 R >>", "BT /D 10 Tf 10 100 Td (dangling) Tj ET", &[]),
+        ("Differences past 255", "/Font << /D << /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << /Differences [300 /A 65 /B] >> >> >>", "BT /D 10 Tf 10 100 Td (A) Tj ET", &["B"]),
+        ("FirstChar and Widths disagree", "/Font << /D << /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 65 /LastChar 70 /Widths [500] >> >>", "BT /D 10 Tf 10 100 Td (ABCDEFGH) Tj ET", &["ABCDEFGH"]),
+        ("StandardEncoding", "/Font << /D << /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /StandardEncoding >> >>", "BT /D 10 Tf 10 100 Td (std) Tj ET", &["std"]),
+        ("Identity-H on a simple font", "/Font << /D << /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /Identity-H >> >>", "BT /D 10 Tf 10 100 Td (id) Tj ET", &["id"]),
+        ("Tj before Tf", "", "BT 10 100 Td (nofont) Tj ET BT /F1 10 Tf 10 50 Td (after) Tj ET", &["after"]),
+        ("cm with five operands", "", "1 0 0 1 0 cm BT /F1 10 Tf 10 100 Td (five) Tj ET", &["five"]),
+        ("v first", "", "10 10 20 20 v f BT /F1 10 Tf 10 100 Td (curve) Tj ET", &["curve"]),
+        ("Q without q, EMC without BMC", "", "Q Q EMC BT /F1 10 Tf 10 100 Td (unbalanced) Tj ET", &["unbalanced"]),
+        ("a missing XObject and shading", "", "/Nope Do /Nope sh BT /F1 10 Tf 10 100 Td (missing) Tj ET", &["missing"]),
+        ("a Type 0 font without descendants", "/Font << /D << /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H /DescendantFonts [] >> >>", "BT /D 10 Tf 10 100 Td <0041> Tj ET BT /F1 10 Tf 10 50 Td (after) Tj ET", &["after"]),
+        ("a Type 3 font without procedures", "/Font << /D << /Type /Font /Subtype /Type3 /FontMatrix [0.001 0 0 0.001 0 0] /FontBBox [0 0 1 1] /Encoding << /Differences [65 /a] >> /FirstChar 65 /LastChar 65 /Widths [] >> >>", "BT /D 10 Tf 10 100 Td (A) Tj ET", &["a"]),
+        ("a ToUnicode that is not a CMap", "/Font << /D << /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 3 0 R >> >>", "BT /D 10 Tf 10 100 Td (plain) Tj ET", &["plain"]),
+        ("operands of the wrong kinds", "", "(x) (y) Td /F1 (z) Tf 1 Tf BT /F1 10 Tf 10 100 Td [(a) [(b)] 5] TJ (q) Tz ET", &["a"]),
+        ("a negative and a huge font size", "", "BT /F1 -10 Tf 10 100 Td (neg) Tj /F1 1e30 Tf (huge) Tj ET", &[]),
+    ];
+    for (what, fonts, content, expected) in cases {
+        let mut doc = Doc::new();
+        doc.page(content, fonts);
+        let extracted = read_with(&doc.build(), &limits()).unwrap_or_else(|error| panic!("{what}: {error:?}"));
+        if !expected.is_empty() {
+            assert_eq!(visible(&extracted), *expected, "{what}");
+        }
+    }
+    // A page with no /MediaBox anywhere reads on US Letter.
+    let mut doc = Doc::new();
+    let page = doc.page(&text(10.0, 10.0, 100.0, "letter"), "");
+    let (mut raw, catalog) = doc.into_raw();
+    let body = raw_body(&raw, page).replace("/MediaBox [0 0 300 300]", "");
+    raw.set(page, body);
+    let extracted = read(&raw.build(catalog, ""));
+    assert_eq!(extracted.pages[0].media_box, [0.0, 0.0, 612.0, 792.0]);
+    assert_eq!(visible(&extracted), vec!["letter"]);
+}
+
+#[test]
+fn pdf_quote_operators_show_text() {
+    let mut doc = Doc::new();
+    doc.page("BT /F1 10 Tf 12 TL 10 200 Td (first) Tj (second) ' 1 2 (third) \" ET", "");
+    assert_eq!(visible(&read(&doc.build())), vec!["first\nsecond\nthird"]);
+}
+
+#[test]
+fn pdf_even_odd_fill_clears_its_path() {
+    // After f*, B* and b the path is empty, so the last rectangle is the last area alone and
+    // the white text has nothing beneath it.
+    let mut doc = Doc::new();
+    doc.page(
+        "0 g 0 0 10 10 re f* 20 20 10 10 re B* 40 40 10 10 re b 1 g 200 200 50 50 re f \
+         1 g BT /F1 10 Tf 100 100 Td (WHITE) Tj ET",
+        "",
+    );
+    assert_eq!(hidden(&read(&doc.build())), vec![("WHITE", HiddenWhy::LowContrast)]);
+}
+
+#[test]
+fn pdf_type3_widths_follow_the_font_matrix() {
+    let mut doc = Doc::new();
+    let procedure = doc.add_stream("", b"50 0 d0");
+    let font = doc.add(format!(
+        "<< /Type /Font /Subtype /Type3 /FontMatrix [0.01 0 0 0.01 0 0] /FontBBox [0 0 100 100] \
+         /CharProcs << /a {procedure} 0 R /b {procedure} 0 R >> /Encoding << /Type /Encoding /Differences [65 /a /b] >> \
+         /FirstChar 65 /LastChar 66 /Widths [50 50] /Resources << >> >>"
+    ));
+    doc.page("BT /T3 10 Tf 10 100 Td (ABAB) Tj ET", &format!("/Font << /T3 {font} 0 R >>"));
+    let extracted = read(&doc.build());
+    assert_eq!(visible(&extracted), vec!["abab"]);
+    // Each glyph is 50 × 0.01 × 10 = 5 pt wide.
+    let rect = extracted.blocks[0].lines[0].rect;
+    assert_eq!((rect[0], rect[2]), (10.0, 30.0));
+}
+
+// Visibility details.
+
+#[test]
+fn pdf_text_with_no_colour_operator_is_visible() {
+    let mut doc = Doc::new();
+    let content = lines_at(&[
+        "BT /F1 10 Tf 10 {y} Td (DEFAULTBLACK) Tj ET\n",
+        "q /DeviceCMYK cs BT /F1 10 Tf 10 {y} Td (CMYKINITIAL) Tj ET Q\n",
+        "q /DeviceRGB cs BT /F1 10 Tf 10 {y} Td (RGBINITIAL) Tj ET Q\n",
+        "q /DN cs BT /F1 10 Tf 10 {y} Td (DEVICENINITIAL) Tj ET Q\n",
+        "q /SP cs BT /F1 10 Tf 10 {y} Td (SEPARATIONINITIAL) Tj ET Q\n",
+        "q 1 0 0 RG BT 1 Tr /F1 10 Tf 10 {y} Td (STROKEDEFAULT) Tj ET Q\n",
+    ]);
+    doc.page(
+        &content,
+        "/ColorSpace << /DN [/DeviceN [/Spot] /DeviceGray << /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1 >>] \
+         /SP [/Separation /Spot /DeviceGray << /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1 >>] >>",
+    );
+    let extracted = read(&doc.build());
+    for text in ["DEFAULTBLACK", "CMYKINITIAL", "RGBINITIAL", "DEVICENINITIAL", "SEPARATIONINITIAL", "STROKEDEFAULT"] {
+        assert_eq!((block(&extracted, text).hidden, block(&extracted, text).suspect), (None, None), "{text}");
+    }
+}
+
+#[test]
+fn pdf_composite_rounding_boundary() {
+    // A white veil at ca 0.91 makes black text E8E8E8 (contrast 1.23, visible); at 0.92,
+    // EBEBEB (1.19, hidden). Truncating 234.6 to EA would read 1.20 and show it.
+    let mut doc = Doc::new();
+    let a = doc.add("<< /Type /ExtGState /ca 0.91 >>");
+    let b = doc.add("<< /Type /ExtGState /ca 0.92 >>");
+    let content = lines_at(&[
+        "BT /F1 10 Tf 10 {y} Td (NINETYONE) Tj ET q /A gs 1 g 5 {low} 150 16 re f Q\n",
+        "BT /F1 10 Tf 10 {y} Td (NINETYTWO) Tj ET q /B gs 1 g 5 {low} 150 16 re f Q\n",
+    ]);
+    doc.page(&content, &format!("/ExtGState << /A {a} 0 R /B {b} 0 R >>"));
+    assert_verdicts(&read(&doc.build()), &[("NINETYONE", None), ("NINETYTWO", Some(HiddenWhy::LowContrast))]);
+}
+
+#[test]
+fn pdf_clip_applies_after_its_painting_operator() {
+    // `re W f` paints its rectangle, then clips what follows to it.
+    let mut doc = Doc::new();
+    doc.page(
+        "BT /F1 10 Tf 110 120 Td (UNDERFILL) Tj ET \
+         q 0 g 100 100 100 50 re W f BT /F1 10 Tf 10 20 Td (OUTSIDE) Tj ET 1 g BT /F1 10 Tf 110 220 Td (ABOVE) Tj ET \
+         BT /F1 10 Tf 104 120 Td (INSIDE) Tj ET Q 0 g BT /F1 10 Tf 10 50 Td (RESTORED) Tj ET",
+        "",
+    );
+    let extracted = read(&doc.build());
+    assert_verdicts(
+        &extracted,
+        &[
+            ("UNDERFILL", Some(HiddenWhy::Covered)),
+            ("OUTSIDE", Some(HiddenWhy::Clipped)),
+            ("ABOVE", Some(HiddenWhy::Clipped)),
+            ("INSIDE", None),
+            ("RESTORED", None),
+        ],
+    );
+}
+
+#[test]
+fn pdf_text_clip_modes_clip_what_follows() {
+    let mut doc = Doc::new();
+    // Mode 4 fills its glyphs and adds them to the clip, which takes effect at ET.
+    doc.page(
+        "q BT 4 Tr /F1 10 Tf 10 250 Td (WWWWWWWWWW) Tj ET 0 Tr BT /F1 10 Tf 10 200 Td (BELOW) Tj ET \
+         BT /F1 10 Tf 12 250 Td (in) Tj ET Q BT /F1 10 Tf 10 150 Td (AFTERQ) Tj ET",
+        "",
+    );
+    // Mode 7 only clips.
+    doc.page("q BT 7 Tr /F1 10 Tf 10 250 Td (CLIPONLY) Tj ET 0 Tr BT /F1 10 Tf 10 200 Td (BELOWSEVEN) Tj ET Q", "");
+    let extracted = read(&doc.build());
+    assert_verdicts(
+        &extracted,
+        &[
+            ("WWWWWWWWWW", None),
+            ("BELOW", Some(HiddenWhy::Clipped)),
+            ("in", None),
+            ("AFTERQ", None),
+            ("CLIPONLY", Some(HiddenWhy::InvisibleMode)),
+            ("BELOWSEVEN", Some(HiddenWhy::Clipped)),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn pdf_flood_of_areas_fails_bounded() {
+    // 20,000 characters, then 100,000 areas drawn after them: one-point squares spread over the
+    // page read; page-sized rectangles piled on the text end in TooComplex, never at the call
+    // timeout.
+    let flood = |spread: bool| {
+        let mut content = String::new();
+        for row in 0..200 {
+            content.push_str(&format!("BT /F1 5 Tf 10 {} Td ({}) Tj ET\n", 1990 - row * 10, "x".repeat(100)));
+        }
+        for at in 0..100_000u32 {
+            let square = if spread { format!("{} {} 1 1", (at % 1000) * 2, (at / 1000) * 20) } else { "0 0 2000 2000".to_owned() };
+            content.push_str(&format!("{square} re f\n"));
+        }
+        let mut doc = Doc::new();
+        doc.size = (2000.0, 2000.0);
+        doc.page(&content, "");
+        doc.build()
+    };
+    let limits = limits();
+    let pool = docs::DocPool::new(1, limits.clone()).unwrap();
+    let workspace = katwork::ids::WorkspaceId::new();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    for (spread, file) in [(true, flood(true)), (false, flood(false))] {
+        let outcome = pool
+            .run(workspace, &cancel, None, move |limits| Ok(docs::extract(MediaKind::Pdf, &file, limits)))
+            .await
+            .expect("no call timeout");
+        match (spread, outcome) {
+            (true, Ok(extracted)) => assert_eq!(extracted.pages.len(), 1),
+            (false, Err(DocError::TooComplex("areas"))) => {}
+            (spread, other) => panic!("spread {spread}: {:?}", other.map(|extracted| extracted.blocks.len())),
+        }
+    }
+}
+
+#[test]
+fn pdf_masked_images_are_not_opaque() {
+    let mut doc = Doc::new();
+    let mask = doc.add_stream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray", &[255]);
+    let image = "/Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray";
+    let soft = doc.add_stream(&format!("{image} /SMask {mask} 0 R"), &[0]);
+    let keyed = doc.add_stream(&format!("{image} /Mask [0 0]"), &[0]);
+    let stencil = doc.add_stream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /ImageMask true", &[0]);
+    let content = lines_at(&[
+        "BT /F1 10 Tf 10 {y} Td (UNDERSOFTMASK) Tj ET q 150 0 0 16 5 {low} cm /SM Do Q\n",
+        "BT /F1 10 Tf 10 {y} Td (UNDERCOLOURKEY) Tj ET q 150 0 0 16 5 {low} cm /KM Do Q\n",
+        "BT /F1 10 Tf 10 {y} Td (UNDERSTENCIL) Tj ET q 150 0 0 16 5 {low} cm /ST Do Q\n",
+        "BT /F1 10 Tf 10 {y} Td (UNDERINLINESTENCIL) Tj ET q 150 0 0 16 5 {low} cm BI /W 1 /H 1 /BPC 1 /IM true ID \x00 EI Q\n",
+        "q 150 0 0 16 5 {low} cm /SM Do Q BT /F1 10 Tf 10 {y} Td (OVERSOFTMASK) Tj ET\n",
+    ]);
+    doc.page(&content, &format!("/XObject << /SM {soft} 0 R /KM {keyed} 0 R /ST {stencil} 0 R >>"));
+    let extracted = read(&doc.build());
+    let unknown = Some(HiddenWhy::UnknownPaint);
+    assert_verdicts(
+        &extracted,
+        &[
+            ("UNDERSOFTMASK", unknown),
+            ("UNDERCOLOURKEY", unknown),
+            ("UNDERSTENCIL", unknown),
+            ("UNDERINLINESTENCIL", unknown),
+            ("OVERSOFTMASK", None),
+        ],
+    );
+    assert_eq!(block(&extracted, "OVERSOFTMASK").suspect, Some("unknown_background"));
+}
+
+#[test]
+fn pdf_optional_content_details() {
+    let mut doc = Doc::new();
+    let a = doc.add("<< /Type /OCG /Name (a) >>");
+    let on = doc.add("<< /Type /OCG /Name (on) >>");
+    doc.catalog(&format!("/OCProperties << /OCGs [{a} 0 R {on} 0 R] /D << /BaseState /OFF /ON [{on} 0 R] >> >>"));
+    let black = doc.add_stream(&format!("/Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray /OC {a} 0 R"), &[0]);
+    let content = lines_at(&[
+        "/OC /A BDC BT /F1 10 Tf 10 {y} Td (BASESTATEOFF) Tj ET EMC\n",
+        "/OC /On BDC BT /F1 10 Tf 10 {y} Td (LISTEDON) Tj ET EMC\n",
+        "/OC /On BDC /OC /A BDC BT /F1 10 Tf 10 {y} Td (INNEROFF) Tj ET EMC EMC\n",
+        "/OC /A BDC /OC /On BDC BT /F1 10 Tf 10 {y} Td (OUTEROFF) Tj ET EMC EMC\n",
+        "/OC /A BDC EMC BT /F1 10 Tf 10 {y} Td (AFTEREMC) Tj ET\n",
+        "/OC << /Type /OCG /Name (direct) >> BDC BT /F1 10 Tf 10 {y} Td (DIRECTLIST) Tj ET EMC\n",
+        "BT /F1 10 Tf 10 {y} Td (UNDERHIDDENIMAGE) Tj ET q 150 0 0 16 5 {low} cm /Im Do Q\n",
+    ]);
+    doc.page(&content, &format!("/Properties << /A {a} 0 R /On {on} 0 R >> /XObject << /Im {black} 0 R >>"));
+    let off = Some(HiddenWhy::OptionalContentOff);
+    assert_verdicts(
+        &read(&doc.build()),
+        &[
+            ("BASESTATEOFF", off),
+            ("LISTEDON", None),
+            ("INNEROFF", off),
+            ("OUTEROFF", off),
+            ("AFTEREMC", None),
+            ("DIRECTLIST", None),
+            ("UNDERHIDDENIMAGE", None),
+        ],
+    );
+}
+
+#[test]
+fn pdf_effective_size_uses_the_product_matrix() {
+    let cases: &[(&str, Option<HiddenWhy>)] = &[
+        // Sheared until 3 pt tall, though its y basis vector is 10 long.
+        ("BT /F1 10 Tf 1 0 10 0.3 20 100 Tm (SIZE) Tj ET", Some(HiddenWhy::Tiny)),
+        // Italic: sheared, still 10 pt tall.
+        ("BT /F1 10 Tf 1 0 0.5 1 20 100 Tm (SIZE) Tj ET", None),
+        ("BT /F1 10 Tf 0 1 -1 0 100 50 Tm (SIZE) Tj ET", None),
+        ("BT /F1 3 Tf 0 1 -1 0 100 50 Tm (SIZE) Tj ET", Some(HiddenWhy::Tiny)),
+        ("BT /F1 10 Tf 0.3 0 0 1 20 100 Tm (SIZE) Tj ET", Some(HiddenWhy::Tiny)),
+        ("q 0.7071 0.7071 -0.7071 0.7071 150 0 cm BT /F1 10 Tf 20 100 Td (SIZE) Tj ET Q", None),
+        ("q 0.3 0 0 0.3 0 0 cm BT /F1 20 Tf 3 0 0 3 20 100 Tm (SIZE) Tj ET Q", None),
+    ];
+    let mut doc = Doc::new();
+    for (content, _) in cases {
+        doc.page(content, "");
+    }
+    let extracted = read(&doc.build());
+    for (index, (content, why)) in cases.iter().enumerate() {
+        assert_eq!(on_page(&extracted, index as u32 + 1), vec![("SIZE".to_owned(), *why, None)], "{content}");
+    }
+}
+
+#[test]
+fn pdf_hidden_mark_between_thai_letters_keeps_clusters() {
+    // KO KAI, a white MAI HAN-AKAT, then MAI EK and NO NU: the tone mark stays on its base.
+    let mut doc = Doc::new();
+    doc.page(
+        &format!(
+            "BT /U 10 Tf 10 100 Td {} Tj 1 g {} Tj 0 g {} Tj ET",
+            Doc::utf16("ก"),
+            Doc::utf16("\u{E31}"),
+            Doc::utf16("\u{E48}น")
+        ),
+        "",
+    );
+    let extracted = read(&doc.build());
+    assert_eq!(visible(&extracted), vec!["ก\u{E48}น"]);
+    assert_eq!(hidden(&extracted), vec![("\u{E31}", HiddenWhy::LowContrast)]);
+    assert_eq!(extracted.pages[0].text_layer, TextLayer::Ok);
+}
+
+#[test]
+fn pdf_line_boxes_follow_block_pieces() {
+    // One block of 50 lines of 80 code points, split into pieces of at most 1,500.
+    let mut doc = Doc::new();
+    doc.size = (600.0, 700.0);
+    let content: String = (0..50)
+        .map(|line| text(10.0, 10.0, 650.0 - 12.0 * line as f32, &format!("l{line:02} {}", "word ".repeat(15))))
+        .collect();
+    doc.page(&content, "");
+    let extracted = read(&doc.build());
+    assert!(extracted.blocks.iter().all(|block| block.ordinal == 1));
+    assert!(extracted.blocks.len() >= 3);
+    for (index, piece) in extracted.blocks.iter().enumerate() {
+        assert_eq!(piece.piece, index as u32);
+        let chars: Vec<char> = piece.text.chars().collect();
+        assert!(chars.len() <= docs::MAX_BLOCK_CHARS);
+        let mut end = 0;
+        for line in &piece.lines {
+            assert!(end <= line.start && line.start < line.end && line.end as usize <= chars.len(), "{line:?}");
+            end = line.end;
+            assert!(!chars[line.start as usize..line.end as usize].contains(&'\n'));
+        }
+    }
+    // The line the first cut falls in has a box in each piece, side by side on one baseline.
+    let (before, after) = (extracted.blocks[0].lines.last().unwrap(), &extracted.blocks[1].lines[0]);
+    assert_eq!(after.start, 0);
+    assert_eq!((before.rect[1], before.rect[3]), (after.rect[1], after.rect[3]));
+    assert!(before.rect[2] <= after.rect[0] + 0.01, "{before:?} {after:?}");
+}
+
+#[test]
+fn hidden_why_names_match_serde() {
+    use HiddenWhy::*;
+    for why in [
+        InvisibleMode,
+        OptionalContentOff,
+        OutsideCropBox,
+        Clipped,
+        Transparent,
+        Tiny,
+        LowContrast,
+        Covered,
+        UnknownPaint,
+        HiddenRow,
+        HiddenColumn,
+        HiddenSheet,
+        EmptyFormat,
+    ] {
+        assert_eq!(serde_json::to_value(why).unwrap(), serde_json::Value::String(why.as_str().to_owned()));
     }
 }

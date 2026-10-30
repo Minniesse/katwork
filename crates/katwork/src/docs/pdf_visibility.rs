@@ -313,7 +313,7 @@ const GRID: usize = 32;
 /// An area wider than this many cells is checked against every character instead.
 const MAX_CELLS: usize = 64;
 /// Area-character comparisons one page may cost.
-const MAX_COMPARISONS: u64 = 50_000_000;
+const MAX_COMPARISONS: u64 = 10_000_000;
 
 fn contains_point(rect: [f32; 4], (x, y): (f32, f32)) -> bool {
     rect[0] <= x && x <= rect[2] && rect[1] <= y && y <= rect[3]
@@ -378,11 +378,26 @@ impl Index {
         )
     }
 
-    /// The areas whose box may hold `point`, in drawing order.
-    fn near(&self, point: (f32, f32)) -> Vec<usize> {
+    /// The cell's areas and the wide ones: each list is in drawing order.
+    fn lists(&self, point: (f32, f32)) -> (&[usize], &[usize]) {
         let (x, y) = self.cell_of(point);
-        let mut near: Vec<usize> = self.cells[y * GRID + x].iter().chain(&self.wide).copied().collect();
-        near.sort_unstable();
+        (&self.cells[y * GRID + x], &self.wide)
+    }
+
+    /// The areas whose box may hold `point`, in drawing order: the two lists merged.
+    fn near(&self, point: (f32, f32)) -> Vec<usize> {
+        let (cell, wide) = self.lists(point);
+        let mut near = Vec::with_capacity(cell.len() + wide.len());
+        let (mut a, mut b) = (0, 0);
+        while a < cell.len() || b < wide.len() {
+            if b == wide.len() || (a < cell.len() && cell[a] < wide[b]) {
+                near.push(cell[a]);
+                a += 1;
+            } else {
+                near.push(wide[b]);
+                b += 1;
+            }
+        }
         near
     }
 }
@@ -415,17 +430,19 @@ pub(crate) fn try_classify(
             deadline::check()?;
         }
         let point = centre(char.bbox);
+        // The budget counts the areas looked at, before any is.
+        let (cell, wide) = index.lists(point);
+        let in_knockout = char.groups.iter().any(|group| group.knockout);
+        comparisons += (cell.len() + wide.len()) as u64 + 1 + if in_knockout { knocked.len() as u64 } else { 0 };
+        if comparisons > MAX_COMPARISONS {
+            return Err(DocError::TooComplex("areas"));
+        }
         let near: Vec<&AreaPaint> = index
             .near(point)
             .into_iter()
             .map(|area| &paints[area])
             .filter(|area| contains_point(area.bbox, point))
             .collect();
-        let in_knockout = char.groups.iter().any(|group| group.knockout);
-        comparisons += near.len() as u64 + 1 + if in_knockout { knocked.len() as u64 } else { 0 };
-        if comparisons > MAX_COMPARISONS {
-            return Err(DocError::TooComplex("areas"));
-        }
         let before = near.iter().rev().find(|area| area.order < char.order).copied();
         let after: Vec<&AreaPaint> = near.into_iter().filter(|area| area.order > char.order).collect();
         let knocked_later = in_knockout

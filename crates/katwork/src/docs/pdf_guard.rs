@@ -13,7 +13,7 @@ use std::{
 };
 
 use lopdf::{
-    Dictionary, Document, LoadOptions, Object, ObjectId, Stream,
+    Dictionary, Document, LoadOptions, Object, ObjectId, Stream, StringFormat,
     content::Content,
     xref::{XrefEntry, XrefRecovery},
 };
@@ -260,10 +260,503 @@ fn scan_bytes(bytes: &[u8], limits: &DocLimits) -> Result<(), DocError> {
     Ok(())
 }
 
+/// One cross-reference section as written, free entries included (lopdf drops them as it
+/// reads): each in-use entry as lopdf reads it, each number marked free (or with an entry
+/// type lopdf does not know), and the trailer's `/Prev` and `/XRefStm` offsets.
+struct Section {
+    used: Vec<(u32, XrefEntry)>,
+    free: Vec<u32>,
+    prev: Option<i64>,
+    stream: Option<i64>,
+}
+
+/// A cursor over the cross-reference syntax.
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl Cursor<'_> {
+    fn rest(&self) -> &[u8] {
+        self.bytes.get(self.at..).unwrap_or_default()
+    }
+
+    /// Skips white space and comments.
+    fn skip(&mut self) {
+        loop {
+            while self.bytes.get(self.at).is_some_and(|byte| is_white(*byte)) {
+                self.at += 1;
+            }
+            if self.bytes.get(self.at) != Some(&b'%') {
+                return;
+            }
+            while self.bytes.get(self.at).is_some_and(|byte| !b"\r\n".contains(byte)) {
+                self.at += 1;
+            }
+        }
+    }
+
+    fn unsigned(&mut self) -> Option<u64> {
+        self.skip();
+        let start = self.at;
+        let mut value = 0u64;
+        while let Some(digit) = self.bytes.get(self.at).filter(|byte| byte.is_ascii_digit()) {
+            value = value.checked_mul(10)?.checked_add(u64::from(digit - b'0'))?;
+            self.at += 1;
+        }
+        (self.at > start).then_some(value)
+    }
+
+    /// Steps over one literal string, nested parentheses and escapes included.
+    fn skip_string(&mut self) -> Option<()> {
+        let mut depth = 0usize;
+        while let Some(&byte) = self.bytes.get(self.at) {
+            self.at += 1;
+            match byte {
+                b'\\' => self.at += 1,
+                b'(' => depth += 1,
+                b')' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(());
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// One direct object (a reference stays a reference), nested at most 32 deep. String
+    /// values keep their raw bytes: nothing here reads them.
+    fn object(&mut self, depth: u32) -> Option<Object> {
+        if depth > 32 {
+            return None;
+        }
+        self.skip();
+        match *self.rest().first()? {
+            b'<' if self.rest().starts_with(b"<<") => {
+                self.at += 2;
+                let mut dict = Dictionary::new();
+                loop {
+                    self.skip();
+                    if self.rest().starts_with(b">>") {
+                        self.at += 2;
+                        return Some(Object::Dictionary(dict));
+                    }
+                    if self.rest().first() != Some(&b'/') {
+                        return None;
+                    }
+                    let (key, end) = name_at(self.bytes, self.at + 1, 127);
+                    self.at = end;
+                    let value = self.object(depth + 1)?;
+                    dict.set(key, value);
+                }
+            }
+            b'[' => {
+                self.at += 1;
+                let mut items = Vec::new();
+                loop {
+                    self.skip();
+                    if self.rest().first() == Some(&b']') {
+                        self.at += 1;
+                        return Some(Object::Array(items));
+                    }
+                    items.push(self.object(depth + 1)?);
+                }
+            }
+            b'/' => {
+                let (name, end) = name_at(self.bytes, self.at + 1, 127);
+                self.at = end;
+                Some(Object::Name(name))
+            }
+            b'(' => {
+                let start = self.at;
+                self.skip_string()?;
+                Some(Object::String(self.bytes[start + 1..self.at - 1].to_vec(), StringFormat::Literal))
+            }
+            b'<' => {
+                let end = self.rest().iter().position(|byte| *byte == b'>')?;
+                let raw = self.rest()[1..end].to_vec();
+                self.at += end + 1;
+                Some(Object::String(raw, StringFormat::Hexadecimal))
+            }
+            b'+' | b'-' | b'.' | b'0'..=b'9' => {
+                let start = self.at;
+                while self.bytes.get(self.at).is_some_and(|byte| matches!(byte, b'+' | b'-' | b'.' | b'0'..=b'9')) {
+                    self.at += 1;
+                }
+                let text = std::str::from_utf8(&self.bytes[start..self.at]).ok()?;
+                if text.contains('.') {
+                    return text.parse::<f32>().ok().map(Object::Real);
+                }
+                let value = text.parse::<i64>().ok()?;
+                let after = self.at;
+                if let (Some(generation), Ok(number)) = (self.unsigned(), u32::try_from(value)) {
+                    self.skip();
+                    if self.rest().first() == Some(&b'R') && self.bytes.get(self.at + 1).is_none_or(|byte| is_white(*byte) || is_delimiter(*byte)) {
+                        self.at += 1;
+                        return u16::try_from(generation).ok().map(|generation| Object::Reference((number, generation)));
+                    }
+                }
+                self.at = after;
+                Some(Object::Integer(value))
+            }
+            _ => {
+                let start = self.at;
+                while self.bytes.get(self.at).is_some_and(|byte| !(is_white(*byte) || is_delimiter(*byte))) {
+                    self.at += 1;
+                }
+                match &self.bytes[start..self.at] {
+                    b"true" => Some(Object::Boolean(true)),
+                    b"false" => Some(Object::Boolean(false)),
+                    b"null" => Some(Object::Null),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// One value of a dictionary: `Some(n)` for an integer that is not the start of a
+    /// reference, `None` for any other value. A dictionary or array value leaves the cursor
+    /// on its opening delimiter for the caller to step into.
+    fn integer_value(&mut self) -> Option<i64> {
+        self.skip();
+        let start = self.at;
+        if matches!(self.bytes.get(self.at), Some(b'+' | b'-')) {
+            self.at += 1;
+        }
+        let digits = self.at;
+        while self.bytes.get(self.at).is_some_and(u8::is_ascii_digit) {
+            self.at += 1;
+        }
+        if self.at == digits || self.bytes.get(self.at).is_some_and(|byte| *byte == b'.' || !(is_white(*byte) || is_delimiter(*byte))) {
+            self.at = start;
+            return None;
+        }
+        let value = std::str::from_utf8(&self.bytes[start..self.at]).ok()?.parse::<i64>().ok()?;
+        // `n g R` is a reference, which lopdf does not read as an offset.
+        let after = self.at;
+        let reference = self.unsigned().is_some() && {
+            self.skip();
+            self.rest().first() == Some(&b'R')
+                && self.bytes.get(self.at + 1).is_none_or(|byte| is_white(*byte) || is_delimiter(*byte))
+        };
+        self.at = after;
+        (!reference).then_some(value)
+    }
+}
+
+/// `/Prev` and `/XRefStm` of the trailer dictionary at `at`, as lopdf reads them: an integer
+/// is an offset, any other value is none, and a repeated key's last value wins.
+fn trailer_offsets(bytes: &[u8], at: usize) -> Option<(Option<i64>, Option<i64>)> {
+    let mut cursor = Cursor { bytes, at };
+    cursor.skip();
+    if !cursor.rest().starts_with(b"<<") {
+        return None;
+    }
+    cursor.at += 2;
+    let (mut prev, mut stream) = (None, None);
+    // Dictionaries and arrays open inside the trailer.
+    let mut depth = 0usize;
+    loop {
+        cursor.skip();
+        let byte = *cursor.rest().first()?;
+        match byte {
+            b'>' if cursor.rest().starts_with(b">>") => {
+                cursor.at += 2;
+                match depth.checked_sub(1) {
+                    Some(outer) => depth = outer,
+                    None => return Some((prev, stream)),
+                }
+            }
+            b'<' if cursor.rest().starts_with(b"<<") => {
+                cursor.at += 2;
+                depth += 1;
+            }
+            b'[' => {
+                cursor.at += 1;
+                depth += 1;
+            }
+            b']' => {
+                cursor.at += 1;
+                depth = depth.checked_sub(1)?;
+            }
+            b'(' => cursor.skip_string()?,
+            b'<' => {
+                let end = cursor.rest().iter().position(|byte| *byte == b'>')?;
+                cursor.at += end + 1;
+            }
+            b'/' => {
+                let (name, end) = name_at(bytes, cursor.at + 1, 64);
+                cursor.at = end;
+                if depth == 0 && (name == b"Prev" || name == b"XRefStm") {
+                    let value = cursor.integer_value();
+                    if name == b"Prev" {
+                        prev = value;
+                    } else {
+                        stream = value;
+                    }
+                }
+            }
+            _ => {
+                let start = cursor.at;
+                while cursor.bytes.get(cursor.at).is_some_and(|byte| !(is_white(*byte) || is_delimiter(*byte))) {
+                    cursor.at += 1;
+                }
+                if cursor.at == start {
+                    // A stray delimiter: `)`, `>`, `{` or `}`.
+                    cursor.at += 1;
+                }
+            }
+        }
+    }
+}
+
+/// The classic table at `offset` (which starts with `xref`). lopdf reads every entry that
+/// follows a subsection header, whatever its count says.
+fn table_section(bytes: &[u8], offset: usize) -> Result<Option<Section>, DocError> {
+    let mut cursor = Cursor { bytes, at: offset + 4 };
+    let mut section = Section {
+        used: Vec::new(),
+        free: Vec::new(),
+        prev: None,
+        stream: None,
+    };
+    let mut read = 0u64;
+    loop {
+        cursor.skip();
+        if cursor.rest().starts_with(b"trailer") {
+            cursor.at += 7;
+            break;
+        }
+        let (Some(start), Some(_count)) = (cursor.unsigned(), cursor.unsigned()) else {
+            return Ok(None);
+        };
+        for index in 0u64.. {
+            let row = cursor.at;
+            let (Some(position), Some(generation)) = (cursor.unsigned(), cursor.unsigned()) else {
+                cursor.at = row;
+                break;
+            };
+            cursor.skip();
+            let kind = cursor.rest().first().copied();
+            if !matches!(kind, Some(b'n' | b'f')) {
+                cursor.at = row;
+                break;
+            }
+            cursor.at += 1;
+            read += 1;
+            if read.is_multiple_of(4096) {
+                deadline::check()?;
+            }
+            // lopdf skips a number past u32.
+            let Some(number) = start.checked_add(index).and_then(|number| u32::try_from(number).ok()) else {
+                continue;
+            };
+            match (kind, u32::try_from(position), u16::try_from(generation)) {
+                (Some(b'n'), Ok(offset), Ok(generation)) => section.used.push((number, XrefEntry::Normal { offset, generation })),
+                // An offset past u32 is one lopdf could not have read.
+                (Some(b'n'), Err(_), _) => return Ok(None),
+                // lopdf drops an in-use entry whose generation is out of range, as a free one.
+                _ => section.free.push(number),
+            }
+        }
+    }
+    let Some((prev, stream)) = trailer_offsets(bytes, cursor.at) else {
+        return Ok(None);
+    };
+    section.prev = prev;
+    section.stream = stream;
+    Ok(Some(section))
+}
+
+/// The cross-reference stream at `offset`, read from the file's bytes (a hybrid file's
+/// `/XRefStm` stream is often listed in no section, so lopdf never loads it as an object).
+fn stream_section(bytes: &[u8], doc: &Document, offset: usize, limits: &DocLimits) -> Result<Option<Section>, DocError> {
+    let mut cursor = Cursor { bytes, at: offset };
+    let (Some(_), Some(_)) = (cursor.unsigned(), cursor.unsigned()) else {
+        return Ok(None);
+    };
+    cursor.skip();
+    if !cursor.rest().starts_with(b"obj") {
+        return Ok(None);
+    }
+    cursor.at += 3;
+    let Some(Object::Dictionary(dict)) = cursor.object(0) else {
+        return Ok(None);
+    };
+    cursor.skip();
+    if !cursor.rest().starts_with(b"stream") {
+        return Ok(None);
+    }
+    cursor.at += 6;
+    if cursor.rest().starts_with(b"\r\n") {
+        cursor.at += 2;
+    } else if cursor.rest().first().is_some_and(|byte| b"\r\n".contains(byte)) {
+        cursor.at += 1;
+    }
+    let start = cursor.at;
+    let length = match dict.get(b"Length").ok() {
+        Some(Object::Reference(id)) => doc.objects.get(id).and_then(|length| length.as_i64().ok()),
+        Some(other) => other.as_i64().ok(),
+        None => None,
+    };
+    let end = match length.and_then(|length| usize::try_from(length).ok()).and_then(|length| start.checked_add(length)) {
+        Some(end) if end <= bytes.len() => end,
+        _ => match bytes[start..].windows(9).position(|window| window == b"endstream") {
+            Some(at) => start + at,
+            None => return Ok(None),
+        },
+    };
+    let stream = Stream::new(dict, bytes[start..end].to_vec());
+    let data = decode(Some(doc), &stream, limits.max_stream_bytes)?;
+    charge(data.len() as u64)?;
+    let dict = &stream.dict;
+    let integers = |key: &[u8]| -> Option<Vec<i64>> {
+        match dict.get(key).ok()? {
+            Object::Array(items) => items.iter().map(|item| item.as_i64().ok()).collect(),
+            _ => None,
+        }
+    };
+    let (Some(size), Some(widths)) = (dict.get(b"Size").ok().and_then(|size| size.as_i64().ok()), integers(b"W")) else {
+        return Ok(None);
+    };
+    let widths: Vec<usize> = widths.iter().take(3).filter_map(|width| usize::try_from(*width).ok().filter(|width| *width <= 8)).collect();
+    let [first, second, third] = widths[..] else {
+        return Ok(None);
+    };
+    let width = first + second + third;
+    if width == 0 {
+        return Ok(None);
+    }
+    let index = integers(b"Index").unwrap_or_else(|| vec![0, size]);
+    let mut rows = data.chunks_exact(width);
+    let mut section = Section {
+        used: Vec::new(),
+        free: Vec::new(),
+        prev: dict.get(b"Prev").ok().and_then(|prev| prev.as_i64().ok()),
+        stream: dict.get(b"XRefStm").ok().and_then(|stream| stream.as_i64().ok()),
+    };
+    for pair in index.chunks_exact(2) {
+        for at in 0..pair[1].max(0) {
+            let Some(row) = rows.next() else {
+                return Ok(None);
+            };
+            // Big-endian fields, kept to 32 bits as lopdf keeps them.
+            let field = |from: usize, len: usize| row[from..from + len].iter().fold(0u32, |value, byte| (value << 8) | u32::from(*byte));
+            let kind = if first == 0 { 1 } else { field(0, first) };
+            let (middle, last) = (field(first, second), field(first + second, third));
+            let Some(number) = pair[0].checked_add(at).and_then(|number| u32::try_from(number).ok()) else {
+                continue;
+            };
+            match kind {
+                1 => section.used.push((number, XrefEntry::Normal { offset: middle, generation: last as u16 })),
+                2 => section.used.push((number, XrefEntry::Compressed { container: middle, index: last as u16 })),
+                _ => section.free.push(number),
+            }
+        }
+    }
+    Ok(Some(section))
+}
+
+fn same_entry(a: &XrefEntry, b: &XrefEntry) -> bool {
+    match (a, b) {
+        (XrefEntry::Normal { offset, generation }, XrefEntry::Normal { offset: other, generation: other_generation }) => {
+            offset == other && generation == other_generation
+        }
+        (XrefEntry::Compressed { container, index }, XrefEntry::Compressed { container: other, index: other_index }) => {
+            container == other && index == other_index
+        }
+        _ => false,
+    }
+}
+
+/// The object numbers whose newest cross-reference entry is free, read again from the
+/// sections lopdf followed. lopdf drops free entries as it reads a section, so an older
+/// section's in-use entry for the same number survives its merge and brings back an object
+/// every viewer treats as deleted. `None` when the sections cannot be read here exactly as
+/// lopdf read them: lopdf's merged table must come out the same.
+fn freed_numbers(bytes: &[u8], doc: &Document, limits: &DocLimits) -> Result<Option<HashSet<u32>>, DocError> {
+    // lopdf reads from the header on, and its offsets count from there.
+    let base = bytes.windows(5).position(|five| five == b"%PDF-").unwrap_or(0);
+    let bytes = &bytes[base..];
+    let read = |offset: i64| -> Result<Option<Section>, DocError> {
+        deadline::check()?;
+        let Some(offset) = usize::try_from(offset).ok().filter(|offset| *offset < bytes.len()) else {
+            return Ok(None);
+        };
+        if bytes[offset..].starts_with(b"xref") {
+            table_section(bytes, offset)
+        } else {
+            stream_section(bytes, doc, offset, limits)
+        }
+    };
+    // lopdf's merge: each section's in-use entries (the last of a number within a section),
+    // then its /XRefStm's, each kept unless a newer one is already in. And whether each
+    // number's newest section uses it: in a hybrid section, an entry the table marks free and
+    // the stream lists is in use.
+    let mut merged: HashMap<u32, XrefEntry> = HashMap::new();
+    let mut newest: HashMap<u32, bool> = HashMap::new();
+    let mut seen: HashSet<i64> = HashSet::new();
+    let Ok(mut next) = i64::try_from(doc.xref_start) else {
+        return Ok(None);
+    };
+    loop {
+        if !seen.insert(next) {
+            break;
+        }
+        if seen.len() > 2 * MAX_XREF_SECTIONS as usize {
+            return Ok(None);
+        }
+        let Some(section) = read(next)? else {
+            return Ok(None);
+        };
+        let mut parts = vec![section];
+        if let Some(stream) = parts[0].stream {
+            // lopdf ignores a /XRefStm it cannot read; the check below catches any difference.
+            if let Some(hybrid) = read(stream)? {
+                parts.push(hybrid);
+            }
+        }
+        for part in &parts {
+            let mut own: HashMap<u32, &XrefEntry> = HashMap::new();
+            for (number, entry) in &part.used {
+                own.insert(*number, entry);
+            }
+            for (number, entry) in own {
+                merged.entry(number).or_insert_with(|| entry.clone());
+            }
+        }
+        for part in &parts {
+            for (number, _) in &part.used {
+                newest.entry(*number).or_insert(true);
+            }
+        }
+        for part in &parts {
+            for number in &part.free {
+                newest.entry(*number).or_insert(false);
+            }
+        }
+        match parts[0].prev {
+            Some(prev) => next = prev,
+            None => break,
+        }
+    }
+    let table = &doc.reference_table.entries;
+    let agrees = merged.len() == table.len()
+        && table.iter().all(|(number, entry)| merged.get(number).is_some_and(|mine| same_entry(mine, entry)));
+    if !agrees {
+        return Ok(None);
+    }
+    Ok(Some(newest.into_iter().filter(|(number, used)| *number != 0 && !used).map(|(number, _)| number).collect()))
+}
+
 /// Loads `bytes` with lopdf under the open budget (`BudgetScope`), then refuses an encrypted
 /// result and, when lopdf read the cross-reference table as written, drops every object the
-/// table does not list as in use, so a freed object's old copy in an object stream is never
-/// read.
+/// table does not list as in use and every object a newer section frees, so a deleted
+/// object's old copy is never read. When the sections cannot be read again as lopdf read them,
+/// the document is treated as one whose table lopdf rebuilt (`PrescanReport::xref_rebuilt`).
 pub(crate) fn load(bytes: &[u8], limits: &DocLimits) -> Result<Document, DocError> {
     scan_bytes(bytes, limits)?;
     let options = LoadOptions {
@@ -288,20 +781,30 @@ pub(crate) fn load(bytes: &[u8], limits: &DocLimits) -> Result<Document, DocErro
     if doc.trailer.get(b"Encrypt").is_ok() || doc.was_encrypted() || doc.is_encrypted() {
         return Err(DocError::Encrypted);
     }
+    let rebuilt = matches!(doc.xref_recovery, Some(XrefRecovery::Reconstructed));
+    let freed = if rebuilt { None } else { freed_numbers(bytes, &doc, limits)? };
+    let is_freed = |number: u32| freed.as_ref().is_some_and(|freed| freed.contains(&number));
     // An object stream lopdf could not parse is dropped with its members; never read a file
     // with objects silently missing.
     for (number, entry) in &doc.reference_table.entries {
-        if matches!(entry, XrefEntry::Compressed { .. }) && !doc.objects.contains_key(&(*number, 0)) {
+        if matches!(entry, XrefEntry::Compressed { .. }) && !is_freed(*number) && !doc.objects.contains_key(&(*number, 0)) {
             return Err(DocError::Malformed("object_stream"));
         }
     }
-    if !matches!(doc.xref_recovery, Some(XrefRecovery::Reconstructed)) {
+    if !rebuilt {
         let entries = &doc.reference_table.entries;
-        doc.objects.retain(|id, _| match entries.get(&id.0) {
-            Some(XrefEntry::Normal { generation, .. }) => *generation == id.1,
-            Some(XrefEntry::Compressed { .. }) => id.1 == 0,
-            _ => false,
+        doc.objects.retain(|id, _| {
+            !is_freed(id.0)
+                && match entries.get(&id.0) {
+                    Some(XrefEntry::Normal { generation, .. }) => *generation == id.1,
+                    Some(XrefEntry::Compressed { .. }) => id.1 == 0,
+                    _ => false,
+                }
         });
+        if freed.is_none() {
+            // A deleted object may be back: read the file as one whose table was rebuilt.
+            doc.xref_recovery = Some(XrefRecovery::Reconstructed);
+        }
     }
     Ok(doc)
 }
@@ -698,8 +1201,9 @@ pub struct PrescanReport {
     pub pages: Vec<PrescanPage>,
     /// Scripts, actions, XFA forms and attachments, once per kind.
     pub warnings: Vec<ExtractWarning>,
-    /// lopdf rebuilt the cross-reference table by scanning the file, so objects may come from an
-    /// older revision than a viewer shows.
+    /// lopdf rebuilt the cross-reference table by scanning the file, or its sections could not
+    /// be read again as lopdf read them, so objects may come from an older revision than a
+    /// viewer shows.
     pub xref_rebuilt: bool,
     /// Content operators in the page streams and each Form XObject they draw, counted once.
     pub content_ops: u64,
