@@ -1137,8 +1137,10 @@ GH_FLAGS_WITH_VALUE = {"-R", "--repo", "-b", "--body", "-F", "--body-file", "-t"
                        "--author-email", "--match-head-commit", "--hostname"}
 GRAPHQL_WRITES = re.compile(r"\b(mergePullRequest|enablePullRequestAutoMerge|updateRefs?|deleteRef|createRef|"
                             r"createCommitOnBranch|mergeBranch|updatePullRequestBranch)\b")
-API_WRITE_PATHS = re.compile(r"(^|/)(pulls/[^/]+/merge|merges|git/refs(/.*)?|contents/.*|branches/[^/]+/rename)$")
+API_WRITE_PATHS = re.compile(r"(^|/)(pulls/[^/]+/(merge|ccr/auto_merge|update-branch)|merges|git/refs(/.*)?|"
+                             r"contents/.*|branches/[^/]+/rename)$")
 MERGE_PATH = re.compile(r"(^|/)pulls/[^/]+/merge$")
+AUTO_MERGE_PATH = re.compile(r"(^|/)pulls/[^/]+/ccr/auto_merge$")  # the cloud session's route for auto-merge
 
 
 def api_path(endpoint):
@@ -1374,6 +1376,9 @@ def check_gh_api(args, cwd, stdin=([], True), opaque=False, leading=()):
         return
     write = (method or ("POST" if writes else "GET")) not in ("GET", "HEAD")
     if write and (endpoint.dynamic or API_WRITE_PATHS.search(path)):
+        if AUTO_MERGE_PATH.search(path):
+            raise Blocked("auto-merge (`pulls/<n>/ccr/auto_merge`) merges later, after the review check, like "
+                          f"`gh pr merge --auto`. Merge once a review covers the head, with `{REST_MERGE}`.")
         if not MERGE_PATH.search(path):
             raise Blocked(f"`gh api` writes that merge PRs or move, delete or write branches are blocked. {MERGE_WAYS}")
         slug, number, sha = rest_merge_request(args, leading, opaque)
@@ -2010,7 +2015,7 @@ def real_merge_cases():
     ]
 
 
-REST_CASES = 81
+REST_CASES = 89
 
 
 def rest_self_test():
@@ -2155,6 +2160,15 @@ def rest_self_test():
          False, False),
         ("curl -X PUT 'https://api.github.com/repos/o/r/pulls/24/merge#' -d '{\"merge_method\":\"squash\"}'", False, False),
         ("curl -X PUT https://api.github.com/repos/o/r/pulls/24/./merge -d '{\"merge_method\":\"squash\"}'", False, False),
+        # the cloud session's auto-merge route, and REST update-branch (review round 1); other CCR routes pass
+        ("gh api -X PUT repos/o/r/pulls/24/ccr/auto_merge", False, False),
+        ("gh api -X PUT repos/o/r/pulls/21/ccr/auto_merge -f merge_method=SQUASH", False, False),
+        ("gh api -X DELETE repos/o/r/pulls/21/ccr/auto_merge", False, False),
+        ("gh api -X PUT 'repos/o/r/pulls/24/ccr//auto_merge'", False, False),
+        (f"gh api -X PUT repos/o/r/pulls/21/update-branch -f expected_head_sha={a}", False, False),
+        ("curl -X PUT https://api.github.com/repos/o/r/pulls/24/ccr/auto_merge", False, False),
+        ("gh api repos/o/r/pulls/21/ccr/review_threads", True, False),
+        ("gh api -X POST repos/o/r/pulls/21/ccr/ready_for_review", True, False),
         # gh pr merge reads the PR with gh pr view where GraphQL works, and over REST where it doesn't
         ("gh pr merge 22 --merge", True, True),
         ("gh pr merge 24 --merge", False, True),
