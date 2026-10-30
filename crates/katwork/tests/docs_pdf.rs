@@ -491,6 +491,7 @@ fn pdf_text_over_an_image_or_shading_is_suspect() {
             "1 g BT /F1 10 Tf 10 {y} Td (WHITEONIMAGE) Tj ET 0 g\n",
             "BT /F1 10 Tf 10 {y} Td (BLACKONIMAGE) Tj ET\n",
         ]),
+        // An empty clip inside q … Q ends at its Q, and hides nothing after it.
         "q 0 0 0 0 re W n Q\n".to_owned(),
         lines_from(130, &[
             "q 5 {low} 150 16 re W n /Sh sh Q BT /F1 10 Tf 10 {y} Td (OVERSHADING) Tj ET\n",
