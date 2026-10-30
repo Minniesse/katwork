@@ -11,7 +11,7 @@ One plan task per branch, one PR, stacked on the task it depends on. Opus builds
 
 1. **Read the task.** If a research brief for the task was supplied, read it first. Then open the task's plan (`docs/plans/2026-10-22-sp1-core-runtime.md` for SP1, `docs/plans/2026-10-24-sp2a-documents-evidence.md` for SP2a) and read the task, the Global Constraints, the Review Focus items the task names, and the **Dependency order** section. Check the task's **Builder** line: an SP2a task names `Opus` or `Sonnet`; if it is not the model you are running on, stop and say so. Then read `CODING_STANDARDS.md`: the review enforces every rule in it, and the Sonnet reviewer works through its checklist item by item. Done when you can list the task's Files, Interfaces and Tests, and the issue it closes.
 
-2. **Branch, in a worktree of your own.** Another session switching branches in a shared checkout moves your commits onto its branch. Find the base: the branch of the task this one depends on, or `main` once that task's PR has merged (`gh pr list --state all --json number,headRefName,baseRefName,state`; without GraphQL, `gh api 'repos/{owner}/{repo}/pulls?state=all&per_page=100' --jq '.[] | {number, head: .head.ref, base: .base.ref, state}'`). Then:
+2. **Branch, in a worktree of your own.** Another session switching branches in a shared checkout moves your commits onto its branch. Find the base: the branch of the task this one depends on, or `main` once that task's PR has merged (`gh pr list --state all --json number,headRefName,baseRefName,state`; without GraphQL, `gh api 'repos/{owner}/{repo}/pulls?state=all&per_page=100' --jq '.[] | {number, head: .head.ref, base: .base.ref, state, merged: (.merged_at != null)}'`, where `state` is only `open` or `closed`). Then:
 
    ```sh
    git fetch origin
@@ -47,7 +47,7 @@ One plan task per branch, one PR, stacked on the task it depends on. Opus builds
    gh pr create --base <base> --title "<SP1|SP2a> Task <N>: <task title>" --body-file <file>
    ```
 
-   Without GraphQL (a cloud session, where every `gh pr` command fails with HTTP 403), open it over REST: `gh api repos/{owner}/{repo}/pulls -f title="<title>" -f head=<branch> -f base=<base> -F body=@<file>`.
+   Without GraphQL (a cloud session, where most `gh pr` commands fail with HTTP 403), open it over REST: `gh api repos/{owner}/{repo}/pulls -f title="<title>" -f head=<branch> -f base=<base> -F body=@<file>`.
 
    The body, in this order:
    - `Closes #<issue>.`
@@ -58,7 +58,7 @@ One plan task per branch, one PR, stacked on the task it depends on. Opus builds
    - **Out of scope**: what the task leaves for later tasks
    - **Written by**: your model and the task's Builder line; trust-core changes (approval, policy, evidence, sandbox) also flag that they need a security review, which the Opus reviewer gives
 
-   Done when the PR is open against the right base, CI is green on its head (`gh pr checks <n>`; without GraphQL, `gh api repos/{owner}/{repo}/commits/<sha>/check-runs`), and the body has every item. Then hand off: the two reviewers, the verifier and the coordinator's merge gate take it from here.
+   Done when the PR is open against the right base, CI is green on its head (`gh pr checks <n>`; without GraphQL, `gh api 'repos/{owner}/{repo}/commits/<sha>/check-runs?per_page=100'`), and the body has every item. Then hand off: the two reviewers, the verifier and the coordinator's merge gate take it from here.
 
 8. **Clean up** when you leave the worktree: `scripts/test-db.sh stop`.
 

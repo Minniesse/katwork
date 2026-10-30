@@ -6,7 +6,7 @@ The plans' **Global Constraints** (`docs/plans/2026-10-22-sp1-core-runtime.md`, 
 
 ## Mechanical
 
-- **CI is green on the reviewed head.** `gh pr checks <n>`. CI runs fmt, clippy with `-D warnings`, the workspace tests, MSRV, `cargo deny check`, the Compose checks and, once `web/` exists, the web tests, contrast check and build. A check the author couldn't run locally is named in the PR body.
+- **CI is green on the reviewed head.** `gh pr checks <n>`, or without GraphQL `gh api 'repos/{owner}/{repo}/commits/<sha>/check-runs?per_page=100'`. CI runs fmt, clippy with `-D warnings`, the workspace tests, MSRV, `cargo deny check`, the Compose checks and, once `web/` exists, the web tests, contrast check and build. A check the author couldn't run locally is named in the PR body.
 - **The PR targets the right base.** Stacked on the branch of the task it depends on, or `main`; its body says `Stacked on #<n>` when the base isn't `main`. Merges are merge commits. `.claude/hooks/guard.py` refuses squash, rebase, `--auto` and `--admin` merges, a merge no review covers, and deleting a branch that open PRs still use as their base.
 - **Commits carry the right identity.** Author email is a GitHub noreply address, and every commit has a `Co-Authored-By:` trailer naming the model that wrote it: `git log --format='%ae %(trailers:key=Co-Authored-By,valueonly)' origin/<base>..<head>`.
 - **Migrations are append-only.** A migration file that has reached `main` is released: it is never edited, renamed or deleted, and a schema change is a new numbered file in `crates/katwork/migrations/`. `git diff --name-status origin/main...<head> -- crates/katwork/migrations` lists only `A` lines.
@@ -21,7 +21,7 @@ The plans' **Global Constraints** (`docs/plans/2026-10-22-sp1-core-runtime.md`, 
 
 The checklist reviewer (Sonnet) answers every item, in this order, as **pass** or a finding with its file and line. An item that does not apply is marked so, with the reason.
 
-1. CI is green on the reviewed head (`gh pr checks <n>`).
+1. CI is green on the reviewed head (`gh pr checks <n>`, or its REST form in the rule above).
 2. The base, the commit identity and the trailers pass the Mechanical rules above; the author model matches the task's Builder line.
 3. Every file the task's **Files** list names is created or modified, and the diff touches no file outside that list without a line in the PR body saying why.
 4. Every name, signature and type in the task's **Interfaces** block exists in the diff exactly as written, and every value the task pins (limits, codes, copy, defaults) is the one the plan gives.

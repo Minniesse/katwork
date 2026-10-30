@@ -4,11 +4,11 @@ Issues and specs for this repo live as GitHub issues. Use the `gh` CLI for all o
 
 ## Conventions
 
-Every `gh issue` and `gh pr` command uses GraphQL, which a cloud session doesn't have (it fails with HTTP 403). There, use the REST form given after each command.
+Most `gh issue` and `gh pr` commands use GraphQL, which a cloud session doesn't have: there they fail with HTTP 403 (`gh pr diff` may still work). Use the REST form given after each command instead.
 
 - **Create an issue**: `gh issue create --title "..." --body "..."`. Use a heredoc for multi-line bodies. REST: `gh api repos/{owner}/{repo}/issues -f title="..." -F body=@<file>`.
 - **Read an issue**: `gh issue view <number> --json number,title,body,labels,comments`. REST: `gh api repos/{owner}/{repo}/issues/<number>`, and `.../issues/<number>/comments`.
-- **List issues**: `gh issue list --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters. REST: `gh api --paginate 'repos/{owner}/{repo}/issues?state=open&labels=<label>' --jq '.[] | select(.pull_request | not) | {number, title, labels: [.labels[].name]}'` (this endpoint lists PRs too).
+- **List issues**: `gh issue list --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters. REST: `gh api --paginate 'repos/{owner}/{repo}/issues?state=open&labels=<label>' --jq '.[] | select(.pull_request | not) | {number, title, body, labels: [.labels[].name]}'` (this endpoint lists PRs too, and leaves out comments: read them per issue with `.../issues/<number>/comments`).
 - **Make an issue a sub-issue of a parent**: `gh issue create --parent <parent> ...`, or `gh issue edit <parent> --add-sub-issue <child>` afterwards (`gh` 2.94+). Older `gh`: `gh api --method POST repos/<owner>/<repo>/issues/<parent>/sub_issues -F sub_issue_id=<child-db-id>` (database id, as in **Blocking** below). Without sub-issues, put `Part of #<parent>` at the top of the child body.
 - **Comment on an issue**: `gh issue comment <number> --body "..."`. REST: `gh api repos/{owner}/{repo}/issues/<number>/comments -F body=@<file>`.
 - **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`. REST: `gh api repos/{owner}/{repo}/issues/<number>/labels -f "labels[]=..."` / `gh api -X DELETE repos/{owner}/{repo}/issues/<number>/labels/<label>`.
