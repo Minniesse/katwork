@@ -781,7 +781,9 @@ def check_command(cmd, cwd, depth, feeds_shell, shell_vars, stdin=([], True)):
         check_git(args, cwd, opaque, depth, env)
         return cwd
     if head == "gh":
-        check_gh(args, cwd, opaque, depth, stdin)
+        # typed: `gh` is the first word of a command on the line itself, as prefix rules (Codex's) see it
+        typed = depth == 0 and len(argv) == len(cmd.words) and prog.text == "gh"
+        check_gh(args, cwd, opaque, depth, stdin, typed)
         return cwd
     if head in ("curl", "wget", "http", "https", "xh"):
         check_http_client(args)
@@ -1168,7 +1170,7 @@ MERGE_WAYS = (f"Merge with `gh pr merge <n> --merge`, or where GraphQL is unavai
               "owner, repo, PR number and full head SHA written out; push branches with `git push`. Those are checked.")
 
 
-def check_gh(args, cwd, opaque, depth, stdin=([], True)):
+def check_gh(args, cwd, opaque, depth, stdin=([], True), typed=False):
     texts = [w.text for w in args]
     positionals, flags = [], []  # flags: (name, value or None)
     i = 0
@@ -1195,7 +1197,7 @@ def check_gh(args, cwd, opaque, depth, stdin=([], True)):
         else:
             positionals.append(args[i])
             if len(positionals) == 1 and a == "api":
-                check_gh_api(args[i + 1 :], cwd, stdin, opaque, texts[:i])
+                check_gh_api(args[i + 1 :], cwd, stdin, opaque, texts[:i], typed)
                 return
             if len(positionals) == 1 and a not in GH_COMMANDS:
                 check_gh_alias(a, texts[i + 1 :], cwd, depth)
@@ -1314,8 +1316,9 @@ def json_strings(text):
 STDIN_PATHS = {"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"}
 
 
-def check_gh_api(args, cwd, stdin=([], True), opaque=False, leading=()):
-    """args follow `api`; leading are the words between `gh` and `api`."""
+def check_gh_api(args, cwd, stdin=([], True), opaque=False, leading=(), typed=False):
+    """args follow `api`; leading are the words between `gh` and `api`; typed
+    says `gh` starts a command on the line itself (see check_command)."""
     method, endpoint, writes, unreadable = None, None, False, False
     bodies = []  # (text, dynamic) pieces of the request body
     stdin_texts, stdin_complete = stdin
@@ -1380,30 +1383,34 @@ def check_gh_api(args, cwd, stdin=([], True), opaque=False, leading=()):
                           f"`gh pr merge --auto`. Merge once a review covers the head, with `{REST_MERGE}`.")
         if not MERGE_PATH.search(path):
             raise Blocked(f"`gh api` writes that merge PRs or move, delete or write branches are blocked. {MERGE_WAYS}")
-        slug, number, sha = rest_merge_request(args, leading, opaque)
+        slug, number, sha = rest_merge_request(args, leading, opaque, typed)
         reason = rest_review_check(slug, number, sha, cwd)
         if reason:
             raise Blocked(f"PR can't merge yet: {reason}")
 
 
-def rest_merge_request(args, leading, opaque):
+def rest_merge_request(args, leading, opaque, typed):
     """The one `gh api` merge the guard lets through, for sessions without
-    GraphQL: REST_MERGE and nothing else. The method comes right after `api`
-    (`-X PUT`, `-XPUT`, `-X=PUT`, `--method PUT`, `--method=PUT`), so a prefix
-    rule such as Codex's can ask a person first, as it does for `gh pr merge`; the
-    endpoint and -f/-F/--raw-field/--field follow in any order and spelling.
-    Every word must be written out, and each field given once (gh applies -F
-    after -f, whatever their order). Returns (owner/repo, number, sha), or
-    raises Blocked naming what differs."""
+    GraphQL: REST_MERGE and nothing else. It is a command of its own that
+    starts `gh api` and then the method (`-X PUT`, `-XPUT`, `-X=PUT`, `--method
+    PUT`, `--method=PUT`), so a prefix rule such as Codex's, which sees the
+    command as typed and unwraps nothing, can ask a person first, as it does
+    for `gh pr merge`. The endpoint and -f/-F/--raw-field/--field follow in
+    any order and spelling. Every word must be written out, and each field
+    given once (gh applies -F after -f, whatever their order). Returns
+    (owner/repo, number, sha), or raises Blocked naming what differs."""
 
     def refuse(why):
         raise Blocked(f"this REST merge isn't the one form the guard checks: {why}. Write `{REST_MERGE}`, "
                       "with the owner, repo, PR number and full head SHA written out.")
 
-    if leading:
-        refuse(f"`gh {' '.join(leading)}` before `api` isn't part of it")
     if opaque:
         refuse("more arguments arrive at run time (xargs, find -exec)")
+    if leading:
+        refuse(f"`gh {' '.join(leading)}` before `api` isn't part of it")
+    if not typed:
+        refuse("it must be a command of its own that starts `gh api`, not one under a wrapper (`timeout`, `env`), "
+               "after `VAR=`, through an alias, or inside `bash -c`, `eval` or `$(...)`")
     methods, fields, positionals = [], [], []
     i = 0
     while i < len(args):
@@ -1997,7 +2004,7 @@ def real_merge_cases():
     ]
 
 
-REST_CASES = 89
+REST_CASES = 107
 
 
 def rest_self_test():
@@ -2044,7 +2051,8 @@ def rest_self_test():
     def answers(graphql):
         """What `gh` prints, by the words after `gh`. Any other call fails, as
         every GraphQL call does in a cloud session."""
-        table = {f"api repos/o/r/compare/{b}...main --jq .behind_by": "0"}
+        table = {f"api repos/o/r/compare/{b}...main --jq .behind_by": "0",
+                 "alias list": "mrg: 'api -X PUT repos/o/r/pulls/$1/merge -f merge_method=merge -f sha=$2'"}
         for n, (head, reviews, commits) in prs.items():
             url = f"https://github.com/o/r/pull/{n}"
             posted = [{"commit": c, "state": s, "submittedAt": None if s == "PENDING" else "1"} for c, s in reviews]
@@ -2070,7 +2078,9 @@ def rest_self_test():
         (f"gh api --method PUT repos/o/r/pulls/21/merge -F merge_method=merge -F sha={a}", True, False),
         (f"gh api --method=PUT repos/o/r/pulls/21/merge --field sha={a} --raw-field merge_method=merge", True, False),
         (f"gh api -XPUT /repos/o/r/pulls/21/merge -fmerge_method=merge -f=sha={a}", True, False),
-        (f"timeout 60 {put.format(n=22, sha=m)} && echo merged", True, False),
+        (f"timeout 60 {put.format(n=22, sha=m)} && echo merged", False, False),  # a wrapper hides it from Codex
+        (f"true && {put.format(n=22, sha=m)} && echo merged", True, False),
+        (f"gh api -X=PUT repos/o/r/pulls/21/merge -f merge_method=merge -f sha={a}", True, False),
         # no review covers the head: none, one on an older plain commit, one still pending
         (put.format(n=24, sha=a), False, False),
         (put.format(n=23, sha=d), False, False),
@@ -2151,6 +2161,16 @@ def rest_self_test():
         ("curl -X PUT https://api.github.com/repos/o/r/pulls/24/ccr/auto_merge", False, False),
         ("gh api repos/o/r/pulls/21/ccr/review_threads", True, False),
         ("gh api -X POST repos/o/r/pulls/21/ccr/ready_for_review", True, False),
+        # only as typed, where a prefix rule (Codex's) sees `gh api -X PUT`; no wrapper, VAR=, alias or nesting
+        *((form.format(put.format(n=21, sha=a)), False, False) for form in (
+            "env {}", "GH_X=1 {}", "nice {}", "{{ {}; }}", "bash -c '{}'", "eval '{}'", "x=$({})")),
+        (put.format(n=21, sha=a).replace("gh api", "/usr/bin/gh api"), False, False),
+        (f"gh mrg 21 {a}", False, False),
+        # options and run-time words the review found no failing case for (review round 1)
+        *((put.format(n=21, sha=a) + extra, False, False) for extra in (
+            " --input=body.json", " --hostname=example.com", " --verbose", " --silent", " -i")),
+        (put.format(n=21, sha=a).replace("-f merge_method=merge", "-fmerge_method=$'\\merge'"), False, False),
+        (put.format(n=21, sha=a).replace("-f merge_method=merge", "-f merge_method=$'\\merge'"), False, False),
         # gh pr merge reads the PR with gh pr view; without GraphQL it is refused, even on a covered head
         ("gh pr merge 22 --merge", True, True),
         ("gh pr merge 24 --merge", False, True),

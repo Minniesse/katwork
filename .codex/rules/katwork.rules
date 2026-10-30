@@ -56,21 +56,28 @@ prefix_rule(
     justification = "The maintainer merges after cross-review (see the katwork-review skill).",
 )
 
-# The REST merge (gh api -X PUT repos/<owner>/<repo>/pulls/<n>/merge ...) too. The guard allows it only
-# with the method right after `api`, so these prefixes cover it; they ask before any other PUT as well.
+# The REST merge (gh api -X PUT repos/<owner>/<repo>/pulls/<n>/merge ...) too. The guard allows it only as a
+# command of its own that starts `gh api` and the method, so these prefixes cover it; they ask before any other
+# PUT as well. gh upper-cases the method, so every letter case is listed for when hooks are off. A prefix rule
+# can't see a merge under a wrapper (`timeout`, `env`) or with the method after the endpoint; the guard refuses those.
 prefix_rule(
-    pattern = ["gh", "api", ["-X", "--method"], "PUT"],
+    pattern = ["gh", "api", ["-X", "--method"], ["PUT", "PUt", "PuT", "Put", "pUT", "pUt", "puT", "put"]],
     decision = "prompt",
     justification = "The maintainer merges after cross-review (see the katwork-review skill).",
-    match = ["gh api -X PUT repos/o/r/pulls/1/merge -f merge_method=merge -f sha=abc", "gh api --method PUT repos/o/r/pulls/1/merge"],
+    match = ["gh api -X PUT repos/o/r/pulls/1/merge -f merge_method=merge -f sha=abc", "gh api --method PUT repos/o/r/pulls/1/merge",
+             "gh api -X put repos/o/r/pulls/1/merge"],
     not_match = ["gh api repos/o/r/pulls/1", "gh api -X GET repos/o/r/pulls/1/merge"],
 )
 
 prefix_rule(
-    pattern = ["gh", "api", ["-XPUT", "-X=PUT", "--method=PUT"]],
+    pattern = ["gh", "api", [
+        "-XPUT", "-XPUt", "-XPuT", "-XPut", "-XpUT", "-XpUt", "-XpuT", "-Xput",
+        "-X=PUT", "-X=PUt", "-X=PuT", "-X=Put", "-X=pUT", "-X=pUt", "-X=puT", "-X=put",
+        "--method=PUT", "--method=PUt", "--method=PuT", "--method=Put", "--method=pUT", "--method=pUt", "--method=puT", "--method=put",
+    ]],
     decision = "prompt",
     justification = "The maintainer merges after cross-review (see the katwork-review skill).",
-    match = ["gh api -XPUT repos/o/r/pulls/1/merge", "gh api --method=PUT repos/o/r/pulls/1/merge"],
+    match = ["gh api -XPUT repos/o/r/pulls/1/merge", "gh api --method=PUT repos/o/r/pulls/1/merge", "gh api -Xput repos/o/r/pulls/1/merge"],
     not_match = ["gh api -XGET repos/o/r/pulls/1/merge"],
 )
 
