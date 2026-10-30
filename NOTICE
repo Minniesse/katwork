@@ -15,3 +15,15 @@ crates/katwork-thai/src/normalize.rs ports the reordering rules of pythainlp/uti
 and crates/katwork-thai/src/numbers.rs the grammar of pythainlp/util/wordtonum.py, whose first
 version was adapted from a notebook by Korakot Chaovavanich. PyThaiNLP itself runs only in
 scripts/fixtures/pythainlp_oracle.py, an offline fixture generator for developers and CI.
+
+pdf-extract, the fork Minniesse/pdf-extract of jrmuizel/pdf-extract: the PDF text walker
+https://github.com/Minniesse/pdf-extract (upstream https://github.com/jrmuizel/pdf-extract)
+MIT License, as its Cargo.toml declares (the upstream repository ships no licence file);
+authors Jeff Muizelaar and contributors. KatWork's changes are on the fork's `katwork` branch.
+
+Sarabun and Noto Sans Thai: the bundled fonts, crates/katwork/assets/fonts
+SIL Open Font License, Version 1.1. Copyright 2018 The Sarabun Project Authors
+(https://github.com/cadsondemak/Sarabun); Copyright 2022 The Noto Project Authors
+(https://github.com/notofonts/thai). Licence text: crates/katwork/assets/fonts/OFL.txt;
+each file's source, commit and SHA-256: crates/katwork/assets/fonts/FONTS.md.
+

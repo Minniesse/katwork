@@ -15,3 +15,10 @@ allow = ["0BSD"]
 [[licenses.exceptions]]
 name = "borrow-or-share"
 allow = ["MIT-0"]
+
+# The only git source is the pdf-extract fork, at a pinned revision (the SP2a plan, Task 5).
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+required-git-spec = "rev"
+allow-git = ["https://github.com/Minniesse/pdf-extract"]

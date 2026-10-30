@@ -34,6 +34,7 @@ async fn main() -> ExitCode {
         .with(tracing_subscriber::filter::filter_fn(
             dependency_log_allowed,
         ))
+        .with(DocumentLibraryLogs)
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
     match run().await {
@@ -87,6 +88,28 @@ fn error_report(error: &KatError, config: Option<&Config>, database_url: Option<
 fn dependency_log_allowed(metadata: &tracing::Metadata<'_>) -> bool {
     // SQLx logs secret options and Rig logs provider messages, even at WARN.
     !metadata.target().starts_with("sqlx") && !metadata.target().starts_with("rig")
+}
+
+/// Drops what the PDF libraries log through the `log` crate. lopdf logs a line for every
+/// malformed object, so a hostile file could flood the log, and a line may quote the file.
+/// Their events reach tracing through the `log` bridge with the target "log", so this reads
+/// each event's original target; a `filter_fn` sees only the bridge's.
+struct DocumentLibraryLogs;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for DocumentLibraryLogs {
+    fn event_enabled(
+        &self,
+        event: &tracing::Event<'_>,
+        _: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        use tracing_log::NormalizeEvent;
+        let Some(metadata) = event.normalized_metadata() else {
+            return true;
+        };
+        !["lopdf", "pdf_extract", "cff_parser"]
+            .iter()
+            .any(|library| metadata.target().starts_with(library))
+    }
 }
 
 const USAGE: &str = "\
@@ -436,6 +459,39 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn lopdf_and_pdf_extract_logs_do_not_reach_the_server_log() {
+        use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+        // The bridge from `log` is process-wide; another test may have installed it first.
+        let _ = tracing_log::LogTracer::init();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("trace"))
+            .with(tracing_subscriber::filter::filter_fn(
+                super::dependency_log_allowed,
+            ))
+            .with(super::DocumentLibraryLogs)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .without_time()
+                    .with_ansi(false)
+                    .with_writer({
+                        let output = output.clone();
+                        move || Capture(output.clone())
+                    }),
+            );
+        let _guard = subscriber.set_default();
+        log::error!(target: "lopdf::reader", "Object load error: lopdf_probe_secret");
+        log::warn!(target: "pdf_extract", "pdf_extract_probe_secret");
+        log::warn!(target: "cff_parser::cff", "cff_probe_secret");
+        log::warn!(target: "katwork::probe", "bridged_probe_kept");
+        tracing::warn!(target: "katwork", "tracing_probe_kept");
+        let logged = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(!logged.contains("probe_secret"), "{logged}");
+        assert!(logged.contains("bridged_probe_kept"), "{logged}");
+        assert!(logged.contains("tracing_probe_kept"), "{logged}");
+    }
 
     struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
     impl std::io::Write for Capture {

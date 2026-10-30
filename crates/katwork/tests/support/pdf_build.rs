@@ -267,9 +267,14 @@ impl Doc {
         self.add_stream(&format!("/Type /XObject /Subtype /Form {bbox} {resources} {dict}"), content.as_bytes())
     }
 
-    /// `/Resources` with both fonts and `extra` entries.
+    /// `/Resources` with both fonts and `extra` entries; fonts `extra` names join them.
     pub fn resources(&self, extra: &str) -> String {
-        format!("/Resources << /Font << /F1 {} 0 R /U {} 0 R >> {extra} >>", self.helvetica, self.unicode)
+        let fonts = format!("/F1 {} 0 R /U {} 0 R", self.helvetica, self.unicode);
+        if extra.contains("/Font << ") {
+            format!("/Resources << {} >>", extra.replacen("/Font << ", &format!("/Font << {fonts} "), 1))
+        } else {
+            format!("/Resources << /Font << {fonts} >> {extra} >>")
+        }
     }
 
     pub fn catalog(&mut self, extra: &str) {

@@ -6,6 +6,7 @@ mod pdf_build;
 use katwork::docs::{
     self, Block, DocError, DocLimits, ExtractWarning, Extracted, HiddenWhy, Locator, MediaKind, TextLayer,
 };
+use lopdf::dictionary;
 use pdf_build::*;
 
 fn limits() -> DocLimits {
@@ -633,4 +634,778 @@ fn pdf_form_xobjects_inherit_the_invoking_state() {
     let shown = extracted.blocks.iter().find(|block| block.locator == Locator::PdfPage { page: 6 }).unwrap();
     let rect = shown.lines[0].rect;
     assert_eq!((rect[0], rect[1], rect[3]), (20.0, 180.0 - 0.2 * 48.0, 180.0 + 0.8 * 48.0));
+}
+
+/// Limits scaled down so a bomb proves its cap in milliseconds: 1 MiB per stream.
+fn small_limits() -> DocLimits {
+    DocLimits {
+        max_stream_bytes: 1 << 20,
+        ..DocLimits::default()
+    }
+}
+
+/// 65 KiB of zlib data that inflates to 64 MiB of zeros, built once per test binary.
+fn bomb() -> &'static [u8] {
+    static BOMB: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    BOMB.get_or_init(|| zeros(64 << 20))
+}
+
+/// `read_with` on this thread, with the bytes the capped decoder produced and the walks run.
+fn read_counted(bytes: &[u8], limits: &DocLimits) -> (Result<Extracted, DocError>, u64, u64) {
+    let (decoded, walks) = (docs::pdf_guard::decoded_bytes(), docs::pdf::output_doc_calls());
+    let result = read_with(bytes, limits);
+    (
+        result,
+        docs::pdf_guard::decoded_bytes() - decoded,
+        docs::pdf::output_doc_calls() - walks,
+    )
+}
+
+#[test]
+fn pdf_flate_bomb_fails_bounded() {
+    let mut doc = Doc::new();
+    let contents = doc.add(stream("/Filter /FlateDecode", bomb()));
+    let (raw, catalog) = {
+        doc.page("", "");
+        let (mut raw, catalog) = doc.into_raw();
+        let page = (1..raw.size()).find(|id| raw_has(&raw, *id, "/Type /Page ")).unwrap();
+        let body = raw_body(&raw, page).replace(&format!("/Contents {} 0 R", page - 1), &format!("/Contents {contents} 0 R"));
+        raw.set(page, body);
+        (raw, catalog)
+    };
+    let limits = small_limits();
+    let (result, decoded, walks) = read_counted(&raw.build(catalog, ""), &limits);
+    assert_eq!(result.unwrap_err(), DocError::TooComplex("stream_bytes"));
+    assert!(decoded <= limits.max_stream_bytes, "{decoded}");
+    assert_eq!(walks, 0);
+    // Twice compressed, 244 bytes inflate past the cap the same way.
+    let mut doc = Doc::new();
+    doc.add(stream("/Filter [/FlateDecode /FlateDecode]", &flate(bomb())));
+    doc.page("", "");
+    assert_eq!(read_counted(&doc.build(), &limits).0.unwrap_err(), DocError::TooComplex("stream_bytes"));
+}
+
+fn raw_has(raw: &Raw, id: u32, needle: &str) -> bool {
+    raw_body(raw, id).contains(needle)
+}
+
+fn raw_body(raw: &Raw, id: u32) -> String {
+    let file = raw.build(1, "");
+    let header = format!("\n{id} 0 obj\n");
+    let at = file.windows(header.len()).position(|window| window == header.as_bytes()).unwrap() + header.len();
+    let end = at + file[at..].windows(7).position(|window| window == b"\nendobj").unwrap();
+    String::from_utf8_lossy(&file[at..end]).into_owned()
+}
+
+#[tokio::test]
+async fn pdf_font_and_cmap_bombs_fail_bounded() {
+    let limits = small_limits();
+    let font_bomb = {
+        let mut doc = Doc::new();
+        let file = doc.add(stream("/Filter /FlateDecode", bomb()));
+        let descriptor = doc.add(format!("<< /Type /FontDescriptor /FontName /B /Flags 32 /FontFile2 {file} 0 R >>"));
+        let font = doc.add(format!("<< /Type /Font /Subtype /TrueType /BaseFont /B /FontDescriptor {descriptor} 0 R >>"));
+        doc.page("BT /B 10 Tf 10 10 Td (x) Tj ET", &format!("/Font << /B {font} 0 R >>"));
+        doc.build()
+    };
+    let cmap_bomb = {
+        let mut doc = Doc::new();
+        let cmap = doc.add(stream("/Filter /FlateDecode", bomb()));
+        let font = doc.add(format!("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode {cmap} 0 R >>"));
+        doc.page("BT /B 10 Tf 10 10 Td (x) Tj ET", &format!("/Font << /B {font} 0 R >>"));
+        doc.build()
+    };
+    let pool = docs::DocPool::new(1, limits.clone()).unwrap();
+    let workspace = katwork::ids::WorkspaceId::new();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    for bomb in [font_bomb, cmap_bomb] {
+        let outcome = pool
+            .run(workspace, &cancel, None, move |limits| {
+                let before = docs::pdf_guard::decoded_bytes();
+                let result = docs::extract(MediaKind::Pdf, &bomb, limits);
+                Ok((result, docs::pdf_guard::decoded_bytes() - before))
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.0.unwrap_err(), DocError::TooComplex("stream_bytes"));
+        assert!(outcome.1 <= limits.max_stream_bytes);
+        // The next job on that thread reads a file.
+        let mut doc = Doc::new();
+        doc.page(&text(10.0, 10.0, 100.0, "after the bomb"), "");
+        let next = doc.build();
+        let read = pool
+            .run(workspace, &cancel, None, move |limits| docs::extract(MediaKind::Pdf, &next, limits))
+            .await
+            .unwrap();
+        assert_eq!(visible(&read), vec!["after the bomb"]);
+    }
+}
+
+/// `count` objects; each `/Type /ObjStm` holds one member, `inflate` makes one inflate past
+/// `max_objstm_bytes`.
+fn object_streams(count: usize, inflate: bool) -> Vec<u8> {
+    let mut doc = Doc::new();
+    for at in 0..count {
+        doc.add(stream("/Type /ObjStm /N 1 /First 6", format!("9{at:04} 0 << >>").as_bytes()));
+    }
+    if inflate {
+        doc.add(stream("/Type /ObjStm /N 1 /First 4 /Filter /FlateDecode", &zeros(3 << 20)));
+    }
+    doc.page(&text(10.0, 10.0, 100.0, "x"), "");
+    doc.build()
+}
+
+#[test]
+fn pdf_object_stream_budget_is_enforced_during_load() {
+    let limits = limits();
+    let (result, _, walks) = read_counted(&object_streams(65, false), &limits);
+    assert_eq!(result.unwrap_err(), DocError::TooComplex("object_streams"));
+    assert_eq!(walks, 0);
+    assert!(read_with(&object_streams(64, false), &limits).is_ok());
+    let (result, decoded, walks) = read_counted(&object_streams(0, true), &limits);
+    assert_eq!(result.unwrap_err(), DocError::TooComplex("objstm_bytes"));
+    assert!(decoded <= limits.max_objstm_bytes);
+    assert_eq!(walks, 0);
+    // Objects: 1,001 of them past a cap of 1,000.
+    let small = DocLimits {
+        max_pdf_objects: 1_000,
+        ..DocLimits::default()
+    };
+    let mut doc = Doc::new();
+    while doc.raw.size() <= 1_001 {
+        doc.add("<< >>");
+    }
+    doc.page("", "");
+    let (result, _, walks) = read_counted(&doc.build(), &small);
+    assert_eq!(result.unwrap_err(), DocError::TooComplex("objects"));
+    assert_eq!(walks, 0);
+    // A container that does not decode is malformed, never a page missing its objects.
+    let mut doc = Doc::new();
+    doc.add(stream("/Type /ObjStm /N 1 /First 4 /Filter /FlateDecode", b"\x78\x9c\xff\xff\xff"));
+    doc.page("", "");
+    assert_eq!(read_counted(&doc.build(), &limits).0.unwrap_err(), DocError::Malformed("object_stream"));
+}
+
+#[test]
+fn pdf_objects_inside_object_streams_survive_the_filter() {
+    let mut doc = Doc::new();
+    doc.page(&text(10.0, 10.0, 100.0, "packed font"), "");
+    let (raw, catalog) = doc.into_raw();
+    // Helvetica (3), the page tree (2) and the catalog (1) live in an object stream.
+    let extracted = read(&raw.build_packed(catalog, &[1, 2, 3]));
+    assert_eq!(visible(&extracted), vec!["packed font"]);
+}
+
+#[test]
+fn pdf_streams_with_image_filters_outside_images_are_malformed() {
+    let mut doc = Doc::new();
+    let file = doc.add(stream("/Filter /DCTDecode", b"\xFF\xD8\xFF"));
+    let descriptor = doc.add(format!("<< /Type /FontDescriptor /FontName /B /FontFile2 {file} 0 R >>"));
+    let font = doc.add(format!("<< /Type /Font /Subtype /TrueType /BaseFont /B /FontDescriptor {descriptor} 0 R >>"));
+    doc.page("", &format!("/Font << /B {font} 0 R >>"));
+    assert_eq!(error(&doc.build()), DocError::Malformed("stream_filter"));
+    let mut doc = Doc::new();
+    doc.add(stream("/Filter /NoSuchFilter", b"BT ET"));
+    doc.page("", "");
+    assert_eq!(error(&doc.build()), DocError::Malformed("stream_filter"));
+    // An image keeps its codec and is never decoded.
+    let mut doc = Doc::new();
+    let image = doc.add(stream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray /Filter /DCTDecode", b"\xFF\xD8"));
+    doc.page(&format!("q 10 0 0 10 0 0 cm /Im Do Q {}", text(10.0, 50.0, 50.0, "beside")), &format!("/XObject << /Im {image} 0 R >>"));
+    assert_eq!(visible(&read(&doc.build())), vec!["beside"]);
+}
+
+#[test]
+fn pdf_page_tree_cycle_fails_bounded() {
+    let mut doc = Doc::new();
+    doc.page(&text(10.0, 10.0, 100.0, "x"), "");
+    let (mut raw, catalog) = doc.into_raw();
+    let pages = 2;
+    raw.set(pages, format!("<< /Type /Pages /Kids [{pages} 0 R] /Count 1 >>"));
+    assert_eq!(error(&raw.build(catalog, "")), DocError::Malformed("page_tree_cycle"));
+    // A page whose /Parent is itself, and no media box or resources of its own.
+    let mut raw = Raw::new();
+    let catalog = raw.reserve();
+    let pages = raw.reserve();
+    let page = raw.reserve();
+    let contents = raw.add(stream("", b"BT /F1 10 Tf (x) Tj ET"));
+    raw.set(page, format!("<< /Type /Page /Parent {page} 0 R /Contents {contents} 0 R >>"));
+    raw.set(pages, format!("<< /Type /Pages /Kids [{page} 0 R] /Count 1 >>"));
+    raw.set(catalog, format!("<< /Type /Catalog /Pages {pages} 0 R >>"));
+    let extracted = read(&raw.build(catalog, ""));
+    assert_eq!(extracted.pages.len(), 1);
+    // A kid that does not exist is skipped.
+    let mut doc = Doc::new();
+    doc.page(&text(10.0, 10.0, 100.0, "kept"), "");
+    let (mut raw, catalog) = doc.into_raw();
+    let body = raw_body(&raw, 2).replace("/Kids [", "/Kids [999 0 R ");
+    raw.set(2, body);
+    assert_eq!(visible(&read(&raw.build(catalog, ""))), vec!["kept"]);
+}
+
+#[test]
+fn pdf_deep_xobject_nesting_fails_bounded() {
+    let mut doc = Doc::new();
+    let mut inner = doc.form("", "BT /F1 10 Tf 10 10 Td (deep) Tj ET");
+    for _ in 1..100 {
+        inner = doc.form(&doc.resources(&format!("/XObject << /N {inner} 0 R >>")), "/N Do");
+    }
+    doc.page("/N Do", &format!("/XObject << /N {inner} 0 R >>"));
+    let (result, _, walks) = read_counted(&doc.build(), &limits());
+    assert_eq!(result.unwrap_err(), DocError::TooComplex("xobject_depth"));
+    assert_eq!(walks, 0);
+    let mut doc = Doc::new();
+    let id = doc.raw.reserve();
+    doc.raw.set(id, stream(&format!("/Type /XObject /Subtype /Form /BBox [0 0 1 1] /Resources << /XObject << /S {id} 0 R >> >>"), b"/S Do"));
+    doc.page("/S Do", &format!("/XObject << /S {id} 0 R >>"));
+    assert_eq!(error(&doc.build()), DocError::Malformed("xobject_cycle"));
+    // Eight levels read.
+    let mut doc = Doc::new();
+    let mut inner = doc.form("", "BT /F1 10 Tf 10 10 Td (eight) Tj ET");
+    for _ in 1..8 {
+        inner = doc.form(&doc.resources(&format!("/XObject << /N {inner} 0 R >>")), "/N Do");
+    }
+    doc.page("/N Do", &format!("/XObject << /N {inner} 0 R >>"));
+    assert_eq!(visible(&read(&doc.build())), vec!["eight"]);
+}
+
+#[test]
+fn pdf_form_fanout_fails_bounded() {
+    // Four levels, each drawing the next 100 times: 10^8 Form runs from a few objects.
+    let mut doc = Doc::new();
+    let mut inner = doc.form("", "q Q");
+    for _ in 0..4 {
+        let calls = "/N Do ".repeat(100);
+        inner = doc.form(&doc.resources(&format!("/XObject << /N {inner} 0 R >>")), &calls);
+    }
+    doc.page("/N Do", &format!("/XObject << /N {inner} 0 R >>"));
+    assert_eq!(error(&doc.build()), DocError::TooComplex("content_ops"));
+}
+
+#[test]
+fn pdf_over_max_pages_is_too_complex() {
+    let mut doc = Doc::new();
+    for _ in 0..501 {
+        doc.page("", "");
+    }
+    let (result, _, walks) = read_counted(&doc.build(), &limits());
+    assert_eq!(result.unwrap_err(), DocError::TooComplex("pages"));
+    assert_eq!(walks, 0);
+    let mut doc = Doc::new();
+    for _ in 0..500 {
+        doc.page("", "");
+    }
+    assert_eq!(read(&doc.build()).pages.len(), 500);
+}
+
+#[test]
+fn pdf_encrypted_is_encrypted() {
+    let mut doc = Doc::new();
+    let content = doc.add(stream("/Filter /FlateDecode", &flate(b"BT /F1 10 Tf (x) Tj ET")));
+    doc.page("", "");
+    let (raw, catalog) = doc.into_raw();
+    let encrypt = "/Encrypt << /Filter /Standard /V 1 /R 2 /O <00> /U <00> /P -4 >>";
+    let escaped = "/Encr#79pt << /Filter /Standard /V 1 /R 2 /O <00> /U <00> /P -4 >>";
+    let _ = content;
+    for trailer in [encrypt, escaped] {
+        let (result, decoded, walks) = read_counted(&raw.build(catalog, trailer), &limits());
+        assert_eq!(result.unwrap_err(), DocError::Encrypted, "{trailer}");
+        assert_eq!((decoded, walks), (0, 0), "nothing is decoded: {trailer}");
+    }
+}
+
+#[test]
+fn pdf_encrypted_variants_are_refused_before_any_decode() {
+    // A file lopdf itself encrypts (RC4, an empty user password lopdf would open).
+    let mut doc = lopdf::Document::with_version("1.7");
+    let pages = doc.new_object_id();
+    let font = doc.add_object(dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" });
+    let contents = doc.add_object(lopdf::Stream::new(dictionary! {}, b"BT /F1 10 Tf 10 10 Td (secret) Tj ET".to_vec()));
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page", "Parent" => pages, "Contents" => contents,
+        "MediaBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
+        "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+    });
+    doc.objects.insert(pages, lopdf::Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }));
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+    doc.trailer.set("Root", catalog);
+    doc.trailer.set("ID", lopdf::Object::Array(vec![lopdf::Object::string_literal("0123456789abcdef"), lopdf::Object::string_literal("0123456789abcdef")]));
+    let version = lopdf::EncryptionVersion::V2 {
+        document: &doc,
+        owner_password: "owner",
+        user_password: "",
+        key_length: 128,
+        permissions: lopdf::Permissions::all(),
+    };
+    let state = lopdf::EncryptionState::try_from(version).unwrap();
+    doc.encrypt(&state).unwrap();
+    let mut encrypted = Vec::new();
+    doc.save_to(&mut encrypted).unwrap();
+    let (result, decoded, walks) = read_counted(&encrypted, &limits());
+    assert_eq!(result.unwrap_err(), DocError::Encrypted);
+    assert_eq!((decoded, walks), (0, 0));
+}
+
+#[test]
+fn pdf_one_lopdf_in_the_lock_file_without_rayon() {
+    let output = std::process::Command::new(env!("CARGO"))
+        .args(["metadata", "--format-version", "1", "--locked", "--offline", "--manifest-path"])
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let lopdf: Vec<&serde_json::Value> = metadata["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|package| package["name"] == "lopdf")
+        .collect();
+    assert_eq!(lopdf.len(), 1, "exactly one lopdf");
+    assert_eq!(lopdf[0]["version"], "0.46.0");
+    let id = lopdf[0]["id"].as_str().unwrap();
+    let node = metadata["resolve"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["id"] == id)
+        .unwrap();
+    let features: Vec<&str> = node["features"].as_array().unwrap().iter().map(|feature| feature.as_str().unwrap()).collect();
+    assert!(!features.contains(&"rayon"), "{features:?}");
+    assert!(metadata["packages"].as_array().unwrap().iter().all(|package| package["name"] != "rayon"));
+}
+
+#[test]
+fn pdf_javascript_and_attachments_are_ignored() {
+    let mut doc = Doc::new();
+    let data = doc.add(stream("/Type /EmbeddedFile", b"attached"));
+    let spec = doc.add(format!("<< /Type /Filespec /F (a.txt) /EF << /F {data} 0 R >> >>"));
+    doc.catalog(&format!(
+        "/OpenAction << /S /JavaScript /JS (app.alert(1)) >> /Names << /EmbeddedFiles << /Names [(a.txt) {spec} 0 R] >> >>"
+    ));
+    doc.page(&text(10.0, 10.0, 100.0, "page text"), "");
+    let extracted = read(&doc.build());
+    assert_eq!(visible(&extracted), vec!["page text"]);
+    assert_eq!(
+        extracted.warnings,
+        vec![
+            ExtractWarning::ActiveContentIgnored { what: "pdf_script" },
+            ExtractWarning::EmbeddedContentIgnored { what: "pdf_attachment" },
+        ]
+    );
+    // The same anywhere: a link annotation's action, a field's /AA, an XFA form. A plain link
+    // and a destination are not active content.
+    let mut doc = Doc::new();
+    doc.add("<< /Type /Annot /Subtype /Link /A << /S /Launch /F (calc.exe) >> >>");
+    doc.add("<< /FT /Tx /AA << /K << /S /JavaScript /JS (x) >> >> >>");
+    doc.catalog("/AcroForm << /Fields [] /XFA [(x) 0 0 R] >> /OpenAction [3 0 R /Fit]");
+    doc.page(&text(10.0, 10.0, 100.0, "page text"), "");
+    let warnings = read(&doc.build()).warnings;
+    assert_eq!(
+        warnings,
+        vec![
+            ExtractWarning::ActiveContentIgnored { what: "pdf_script" },
+            ExtractWarning::ActiveContentIgnored { what: "pdf_xfa" },
+        ]
+    );
+    let mut doc = Doc::new();
+    doc.add("<< /Type /Annot /Subtype /Link /A << /S /URI /URI (https://example.com) >> >>");
+    doc.catalog("/OpenAction << /S /GoTo /D [3 0 R /Fit] >>");
+    doc.page(&text(10.0, 10.0, 100.0, "page text"), "");
+    assert_eq!(read(&doc.build()).warnings, vec![]);
+}
+
+#[test]
+fn pdf_text_layer_suspect_cases() {
+    let mut doc = Doc::new();
+    // A Type 0 font with no ToUnicode map: its codes have no text.
+    let descendant = doc.add("<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> >>");
+    let bare = doc.add(format!("<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H /DescendantFonts [{descendant} 0 R] >>"));
+    doc.page("BT /X 10 Tf 10 100 Td <00410042> Tj ET", &format!("/Font << /X {bare} 0 R >>"));
+    // A simple font with no ToUnicode whose text is not ASCII (Latin-1 codes for Thai).
+    doc.page("BT /F1 10 Tf 10 100 Td (\\341\\342\\343) Tj ET", "");
+    // Replacement characters.
+    doc.page(&utext(10.0, 10.0, 100.0, "ab\u{FFFD}\u{FFFD}"), "");
+    // An image and nothing else.
+    let image = doc.add_stream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray", &[0]);
+    doc.page("q 200 0 0 200 0 0 cm /Im Do Q", &format!("/XObject << /Im {image} 0 R >>"));
+    // A Thai mark with no base.
+    doc.page(&utext(10.0, 10.0, 100.0, "\u{E48}กา"), "");
+    doc.page(&utext(10.0, 10.0, 100.0, "กำไร น้ำ"), "");
+    let extracted = read(&doc.build());
+    let layers: Vec<TextLayer> = extracted.pages.iter().map(|page| page.text_layer).collect();
+    assert_eq!(
+        layers,
+        vec![
+            TextLayer::Suspect("tounicode"),
+            TextLayer::Suspect("tounicode"),
+            TextLayer::Suspect("fffd"),
+            TextLayer::Absent,
+            TextLayer::Suspect("marks"),
+            TextLayer::Ok,
+        ]
+    );
+    assert!(extracted.warnings.contains(&ExtractWarning::SuspectTextLayer { page: 1, why: "tounicode" }));
+    assert!(extracted.warnings.contains(&ExtractWarning::NoTextLayer { page: 4 }));
+}
+
+#[test]
+fn pdf_searchable_scan_is_absent() {
+    let scan = |mode: u32| {
+        let mut doc = Doc::new();
+        let image = doc.add_stream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray", &[255]);
+        doc.page(
+            &format!("q 300 0 0 300 0 0 cm /Im Do Q BT {mode} Tr /F1 10 Tf 20 100 Td (scanned words) Tj ET"),
+            &format!("/XObject << /Im {image} 0 R >>"),
+        );
+        read(&doc.build())
+    };
+    let invisible = scan(3);
+    assert_eq!(invisible.pages[0].text_layer, TextLayer::Absent);
+    assert_eq!(hidden(&invisible), vec![("scanned words", HiddenWhy::InvisibleMode)]);
+    assert!(visible(&invisible).is_empty());
+    let shown = scan(0);
+    assert_eq!(shown.pages[0].text_layer, TextLayer::Ok);
+    assert_eq!(block(&shown, "scanned words").suspect, Some("unknown_background"));
+}
+
+/// A document of every kind the walker reads: Flate content, a Form, an embedded Type 1 font
+/// with a ToUnicode map, an ICC profile, an Indexed table, a sampled tint transform, images.
+fn every_stream_kind() -> Vec<u8> {
+    let mut doc = Doc::new();
+    let program = doc.add(stream("/Filter /FlateDecode /Length1 40", &flate(b"/Encoding StandardEncoding def eexec")));
+    let to_unicode = doc.add(stream("/Filter /FlateDecode", &flate(b"1 beginbfchar <41> <0E01> endbfchar")));
+    let descriptor = doc.add(format!("<< /Type /FontDescriptor /FontName /E /FontFile {program} 0 R >>"));
+    let font = doc.add(format!("<< /Type /Font /Subtype /Type1 /BaseFont /E /FontDescriptor {descriptor} 0 R /ToUnicode {to_unicode} 0 R >>"));
+    let icc = doc.add(stream("/N 3 /Filter /FlateDecode", &flate(b"profile")));
+    let lookup = doc.add(stream("/Filter /ASCIIHexDecode", b"000000 FFFFFF>"));
+    let samples = doc.add(stream("/FunctionType 0 /Domain [0 1] /Range [0 1] /Size [2] /BitsPerSample 8 /Filter /FlateDecode", &flate(&[255, 0])));
+    let form = doc.add(stream(
+        &format!("/Type /XObject /Subtype /Form /BBox [0 0 200 200] /Filter /FlateDecode {}", doc.resources("")),
+        &flate(b"BT /F1 10 Tf 10 30 Td (in a form) Tj ET"),
+    ));
+    let image = doc.add(stream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray /Filter /FlateDecode", &flate(&[0])));
+    let content = doc.add(stream(
+        "/Filter /FlateDecode",
+        &flate(b"BT /E 10 Tf 10 150 Td (A) Tj ET /C cs 0 0 0 sc BT /F1 10 Tf 10 120 Td (icc) Tj ET /I cs 0 sc BT /F1 10 Tf 10 100 Td (indexed) Tj ET /S cs 1 sc BT /F1 10 Tf 10 80 Td (sampled) Tj ET /Fm Do q 10 0 0 10 150 150 cm /Im Do Q"),
+    ));
+    let page = doc.page("", &format!(
+        "/Font << /E {font} 0 R >> /ColorSpace << /C [/ICCBased {icc} 0 R] /I [/Indexed /DeviceRGB 1 {lookup} 0 R] /S [/Separation /Spot /DeviceGray {samples} 0 R] >> /XObject << /Fm {form} 0 R /Im {image} 0 R >>"
+    ));
+    let (mut raw, catalog) = doc.into_raw();
+    let body = raw_body(&raw, page).replace(&format!("/Contents {} 0 R", page - 1), &format!("/Contents {content} 0 R"));
+    raw.set(page, body);
+    raw.build(catalog, "")
+}
+
+#[test]
+fn pdf_streams_reach_pdf_extract_decoded() {
+    pdf_extract::test_hooks::reset();
+    let extracted = read(&every_stream_kind());
+    assert_eq!(visible(&extracted).concat(), "กiccindexedsampledin a form");
+    // pdf-extract read the content, the Form, the font program, the CMap, the lookup table and
+    // the samples, and none of them had a /Filter.
+    assert!(pdf_extract::test_hooks::streams_read() >= 6, "{}", pdf_extract::test_hooks::streams_read());
+    assert_eq!(pdf_extract::test_hooks::filtered_get_contents(), 0);
+}
+
+#[test]
+fn pdf_extract_never_decompresses() {
+    pdf_extract::test_hooks::reset();
+    let mut files: Vec<Vec<u8>> = vec![every_stream_kind(), object_streams(3, false)];
+    for name in ["thai.pdf", "white.pdf", "gradient.pdf"] {
+        files.push(std::fs::read(format!("{FIXTURES}/{name}")).unwrap());
+    }
+    for file in &files {
+        read(file);
+    }
+    for hostile in [object_streams(65, false), object_streams(0, true)] {
+        let _ = read_with(&hostile, &limits());
+    }
+    assert!(pdf_extract::test_hooks::streams_read() > 0);
+    assert_eq!(pdf_extract::test_hooks::filtered_get_contents(), 0);
+}
+
+const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/pdf");
+
+fn fixture(name: &str) -> Vec<u8> {
+    std::fs::read(format!("{FIXTURES}/{name}")).unwrap()
+}
+
+/// The text a Typst source sets: every line but `#set` rules, and the body of `#text(..)[..]`.
+fn typst_text(source: &str) -> String {
+    source
+        .lines()
+        .filter(|line| !line.starts_with("#set"))
+        .map(|line| match line.strip_prefix("#text(") {
+            Some(rest) => rest.split_once(")[").map_or("", |(_, body)| body.trim_end_matches(']')),
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Thai text as matching compares it: `normalize_th` (which composes SARA AM), without white
+/// space, since Typst breaks Thai lines where the source has none.
+fn comparable(text: &str) -> String {
+    katwork_thai::normalize_th(text).text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+#[test]
+fn pdf_thai_fixture_text_matches_its_source() {
+    let source = std::fs::read_to_string(format!("{FIXTURES}/thai.typ")).unwrap();
+    let extracted = read(&fixture("thai.pdf"));
+    assert!(hidden(&extracted).is_empty());
+    let text = visible(&extracted).join("\n");
+    assert_eq!(comparable(&text), comparable(&typst_text(&source)));
+    // SARA AM stays one character, and a tone mark over an above vowel keeps its order.
+    assert!(text.contains("กำไร") && text.contains("น\u{E49}ำ") && text.contains("ที\u{E48}") && text.contains("1,250"));
+    // The marks gate passes a Typst page: every Thai mark has its consonant.
+    assert!(extracted.pages.iter().all(|page| page.text_layer == TextLayer::Ok));
+    // A paragraph Typst wrapped over four lines is one block with one line box per line.
+    let paragraph = extracted.blocks.iter().find(|block| block.text.contains("1,250")).unwrap();
+    assert_eq!(paragraph.lines.len(), 4);
+    assert_eq!(paragraph.text.matches('\n').count(), 3);
+}
+
+#[test]
+fn typst_white_text_is_low_contrast() {
+    let extracted = read(&fixture("white.pdf"));
+    assert_eq!(visible(&extracted), vec!["ข\u{E49}อความท\u{E35}\u{E48}มองเห\u{E47}น visible text"]);
+    assert_eq!(
+        hidden(&extracted),
+        vec![
+            ("ซ\u{E48}อนส\u{E35}ขาว hidden white", HiddenWhy::LowContrast),
+            ("เก\u{E37}อบขาว near white", HiddenWhy::LowContrast),
+        ]
+    );
+}
+
+#[test]
+fn typst_gradient_text_is_hidden() {
+    let extracted = read(&fixture("gradient.pdf"));
+    assert_eq!(hidden(&extracted), vec![("9,999", HiddenWhy::UnknownPaint)]);
+    assert!(visible(&extracted).iter().all(|text| !text.contains("9,999")));
+    assert_eq!(visible(&extracted), vec!["Total revenue"]);
+}
+
+const PDF_MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/pdf/MANIFEST.md");
+
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// `MANIFEST.md`'s rows: the first cell (a path in backticks) and the second (its SHA-256).
+fn manifest_rows() -> std::collections::BTreeMap<String, String> {
+    std::fs::read_to_string(PDF_MANIFEST)
+        .unwrap()
+        .lines()
+        .filter(|line| line.starts_with("| `"))
+        .map(|line| {
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            (cells[1].trim_matches('`').to_owned(), cells[2].trim_matches('`').to_owned())
+        })
+        .collect()
+}
+
+#[test]
+fn pdf_fixtures_match_the_manifest() {
+    let rows = manifest_rows();
+    let mut committed = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(FIXTURES).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name != "MANIFEST.md" {
+            committed.insert(format!("fixtures/pdf/{name}"), sha256(&std::fs::read(entry.path()).unwrap()));
+        }
+    }
+    let corpus = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fuzz/corpus/pdf");
+    for entry in std::fs::read_dir(corpus).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        committed.insert(format!("fuzz/corpus/pdf/{name}"), sha256(&std::fs::read(entry.path()).unwrap()));
+    }
+    let fonts = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts");
+    for name in ["Sarabun-Regular.ttf", "NotoSansThai-Regular.ttf"] {
+        committed.insert(format!("assets/fonts/{name}"), sha256(&std::fs::read(format!("{fonts}/{name}")).unwrap()));
+    }
+    assert_eq!(committed, rows);
+}
+
+/// The `pdf` fuzz target's seeds: ordinary files and the hostile shapes of PdfCraft's and
+/// craft-libs' patch notes and of this task's tests, each rebuilt here.
+fn seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
+    let simple = {
+        let mut doc = Doc::new();
+        doc.page(&[text(10.0, 20.0, 170.0, "First line"), text(10.0, 20.0, 158.0, "second line")].concat(), "");
+        doc.page(&utext(12.0, 20.0, 100.0, "กำไร 1,250 บาท"), "");
+        doc.build()
+    };
+    let cycle = {
+        let mut doc = Doc::new();
+        doc.page(&text(10.0, 10.0, 100.0, "x"), "");
+        let (mut raw, catalog) = doc.into_raw();
+        raw.set(2, "<< /Type /Pages /Kids [2 0 R] /Count 1 >>");
+        raw.build(catalog, "")
+    };
+    let wide = {
+        let mut doc = Doc::new();
+        let cid = doc.add("<< /Type /Font /Subtype /CIDFontType2 /BaseFont /W /W [0 4294967295 500] >>");
+        let font = doc.add(format!("<< /Type /Font /Subtype /Type0 /BaseFont /W /Encoding /Identity-H /DescendantFonts [{cid} 0 R] >>"));
+        doc.page("BT /W 10 Tf 10 10 Td <00010002> Tj ET", &format!("/Font << /W {font} 0 R >>"));
+        doc.build()
+    };
+    let columns = {
+        let mut doc = Doc::new();
+        let contents = doc.add(stream("/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 4294967295 >>", &flate(b"\x00BT ET")));
+        let page = doc.page("", "");
+        let (mut raw, catalog) = doc.into_raw();
+        let body = raw_body(&raw, page).replace(&format!("/Contents {} 0 R", page - 1), &format!("/Contents {contents} 0 R"));
+        raw.set(page, body);
+        raw.build(catalog, "")
+    };
+    let bomb_in = |key: &str| {
+        let mut doc = Doc::new();
+        let data = doc.add(stream("/Filter /FlateDecode", bomb()));
+        let (font, descriptor) = match key {
+            "ToUnicode" => (format!("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode {data} 0 R >>"), None),
+            _ => (String::new(), Some(doc.add(format!("<< /Type /FontDescriptor /FontName /B /{key} {data} 0 R >>")))),
+        };
+        let font = match descriptor {
+            Some(descriptor) => doc.add(format!("<< /Type /Font /Subtype /TrueType /BaseFont /B /FontDescriptor {descriptor} 0 R >>")),
+            None => doc.add(font),
+        };
+        doc.page("BT /B 10 Tf (x) Tj ET", &format!("/Font << /B {font} 0 R >>"));
+        doc.build()
+    };
+    let content_bomb = {
+        let mut doc = Doc::new();
+        doc.add(stream("/Filter /FlateDecode", bomb()));
+        doc.page("", "");
+        doc.build()
+    };
+    let range = {
+        let mut doc = Doc::new();
+        let cmap = doc.add(stream("", b"1 beginbfrange <00000000> <FFFFFFFF> <0041> endbfrange"));
+        let font = doc.add(format!("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode {cmap} 0 R >>"));
+        doc.page("BT /R 10 Tf 10 10 Td (abc) Tj ET", &format!("/Font << /R {font} 0 R >>"));
+        doc.build()
+    };
+    let nesting = {
+        let mut doc = Doc::new();
+        let cmap = doc.add(stream("", &[b'['; 20_000]));
+        let program = doc.add(stream("", &[b"/Encoding ".as_slice(), &[b'{'; 20_000]].concat()));
+        let descriptor = doc.add(format!("<< /Type /FontDescriptor /FontName /N /FontFile {program} 0 R >>"));
+        let font = doc.add(format!("<< /Type /Font /Subtype /Type1 /BaseFont /N /FontDescriptor {descriptor} 0 R /ToUnicode {cmap} 0 R >>"));
+        doc.page("BT /N 10 Tf 10 10 Td (abc) Tj ET", &format!("/Font << /N {font} 0 R >>"));
+        doc.build()
+    };
+    let deep = {
+        let mut doc = Doc::new();
+        let mut inner = doc.form("", "BT /F1 10 Tf 10 10 Td (deep) Tj ET");
+        for _ in 1..100 {
+            inner = doc.form(&doc.resources(&format!("/XObject << /N {inner} 0 R >>")), "/N Do");
+        }
+        doc.page("/N Do", &format!("/XObject << /N {inner} 0 R >>"));
+        doc.build()
+    };
+    let fanout = {
+        let mut doc = Doc::new();
+        let mut inner = doc.form("", "q Q");
+        for _ in 0..4 {
+            inner = doc.form(&doc.resources(&format!("/XObject << /N {inner} 0 R >>")), &"/N Do ".repeat(100));
+        }
+        doc.page("/N Do", &format!("/XObject << /N {inner} 0 R >>"));
+        doc.build()
+    };
+    let encrypted = {
+        let mut doc = Doc::new();
+        doc.page(&text(10.0, 10.0, 100.0, "x"), "");
+        let (raw, catalog) = doc.into_raw();
+        raw.build(catalog, "/Encr#79pt << /Filter /Standard /V 1 /R 2 /O <00> /U <00> /P -4 >>")
+    };
+    let packed = {
+        let mut doc = Doc::new();
+        doc.page(&text(10.0, 10.0, 100.0, "packed"), "");
+        let (raw, catalog) = doc.into_raw();
+        raw.build_packed(catalog, &[1, 2, 3])
+    };
+    let groups = {
+        let mut doc = Doc::new();
+        let state = doc.add("<< /Type /ExtGState /ca 0.5 /BM [/Bogus /Multiply] /SMask /None >>");
+        let group = doc.form("/Group << /S /Transparency /K true >>", "0 g BT /F1 10 Tf 10 50 Td (in group) Tj ET 1 g 5 46 100 16 re f*");
+        let off = doc.add("<< /Type /OCG /Name (off) >>");
+        doc.catalog(&format!("/OCProperties << /OCGs [{off} 0 R] /D << /OFF [{off} 0 R] >> >>"));
+        doc.page(
+            &format!(
+                "q /G gs /X Do Q /OC /Off BDC {} EMC q 0 0 50 50 re W n {} Q q 20 0 0 20 0 0 cm BI /W 1 /H 1 /BPC 8 /CS /G ID \x00 EI Q",
+                text(10.0, 10.0, 150.0, "off"),
+                text(10.0, 10.0, 100.0, "clipped")
+            ),
+            &format!("/ExtGState << /G {state} 0 R >> /XObject << /X {group} 0 R >> /Properties << /Off {off} 0 R >>"),
+        );
+        doc.build()
+    };
+    vec![
+        ("simple.pdf", "two pages of text, Helvetica and an identity-mapped Type 0 font", simple),
+        ("thai-typst.pdf", "the Typst Thai fixture (tests/fixtures/pdf/thai.pdf)", fixture("thai.pdf")),
+        ("page-tree-cycle.pdf", "a Pages node that is its own kid", cycle),
+        ("cid-width-range.pdf", "a /W entry 0 4294967295 500", wide),
+        ("predictor-columns.pdf", "a PNG predictor with /Columns 4294967295", columns),
+        ("content-bomb.pdf", "a Flate stream inflating to 64 MiB", content_bomb),
+        ("font-bomb.pdf", "a /FontFile2 inflating to 64 MiB", bomb_in("FontFile2")),
+        ("cmap-bomb.pdf", "a /ToUnicode CMap inflating to 64 MiB", bomb_in("ToUnicode")),
+        ("cmap-range.pdf", "a bfrange from 00000000 to FFFFFFFF", range),
+        ("cmap-nesting.pdf", "20,000 nested brackets in a CMap and a Type 1 program", nesting),
+        ("object-streams.pdf", "65 object streams", object_streams(65, false)),
+        ("objstm-bomb.pdf", "an object stream inflating past max_objstm_bytes", object_streams(0, true)),
+        ("forms-deep.pdf", "100 nested Form XObjects", deep),
+        ("forms-fanout.pdf", "four levels of 100 Form calls each", fanout),
+        ("encrypted.pdf", "an /Encrypt entry spelled /Encr#79pt", encrypted),
+        ("xref-stream.pdf", "an object stream and an xref stream", packed),
+        ("groups-and-clips.pdf", "a knockout group, blend arrays, optional content, a clip and an inline image", groups),
+        ("every-stream.pdf", "Flate content, a Form, a Type 1 program, a CMap, an ICC profile, an Indexed table and a sampled function", every_stream_kind()),
+    ]
+}
+
+const CORPUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fuzz/corpus/pdf");
+
+#[test]
+#[ignore = "rewrites fuzz/corpus/pdf and the seed table of tests/fixtures/pdf/MANIFEST.md"]
+fn regenerate_pdf_fuzz_seeds() {
+    if std::path::Path::new(CORPUS).exists() {
+        std::fs::remove_dir_all(CORPUS).unwrap();
+    }
+    std::fs::create_dir_all(CORPUS).unwrap();
+    let mut rows = String::new();
+    for (file, what, bytes) in seeds() {
+        std::fs::write(format!("{CORPUS}/{file}"), &bytes).unwrap();
+        rows.push_str(&format!("| `fuzz/corpus/pdf/{file}` | `{}` | {what} |\n", sha256(&bytes)));
+    }
+    let manifest = std::fs::read_to_string(PDF_MANIFEST).unwrap();
+    let marker = "## Fuzz seeds (`fuzz/corpus/pdf/`)";
+    let (head, tail) = manifest.split_once(marker).expect("the manifest's seed section");
+    let (intro, _) = tail.split_once("|---|---|---|\n").expect("the seed table");
+    std::fs::write(PDF_MANIFEST, format!("{head}{marker}{intro}|---|---|---|\n{rows}")).unwrap();
+}
+
+#[test]
+fn every_pdf_fuzz_seed_reads_or_fails_bounded() {
+    let small = DocLimits {
+        max_input_bytes: 1 << 20,
+        max_stream_bytes: 1 << 20,
+        max_decoded_bytes: 8 << 20,
+        max_objstm_bytes: 1 << 20,
+        max_pdf_objects: 10_000,
+        max_pages: 16,
+        max_content_ops: 100_000,
+        ..DocLimits::default()
+    };
+    for (file, _, bytes) in seeds() {
+        match read_with(&bytes, &small) {
+            Ok(_) | Err(DocError::TooComplex(_) | DocError::Malformed(_) | DocError::Encrypted) => {}
+            Err(other) => panic!("{file}: {other:?}"),
+        }
+    }
 }

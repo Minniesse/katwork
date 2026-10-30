@@ -8,6 +8,9 @@ use super::TextLayer;
 pub struct PageText {
     /// The visible text of each line, in reading order.
     pub lines: Vec<String>,
+    /// Visible glyphs that a person sees as a mark: any but known spaces, so a glyph whose
+    /// code has no text still counts.
+    pub visible_glyphs: usize,
     /// A visible glyph came from a font with no `/ToUnicode` map: a composite font (whose codes
     /// then have no text at all), or a simple font whose text is not ASCII.
     pub unmapped_font: bool,
@@ -47,8 +50,7 @@ fn stray_mark(line: &str) -> bool {
 /// Thai mark with no base consonant, `Suspect("tounicode")` for a font with no ToUnicode map;
 /// else `Ok`.
 pub fn check_page(page: &PageText) -> TextLayer {
-    let visible = page.lines.iter().any(|line| line.chars().any(|c| !c.is_whitespace()));
-    if !visible {
+    if page.visible_glyphs == 0 {
         return if page.images > 0 { TextLayer::Absent } else { TextLayer::Ok };
     }
     let total: usize = page.lines.iter().map(|line| line.chars().count()).sum();
@@ -57,7 +59,7 @@ pub fn check_page(page: &PageText) -> TextLayer {
         .iter()
         .map(|line| line.chars().filter(|c| *c == '\u{FFFD}' || is_private(*c)).count())
         .sum();
-    if bad * 100 > total {
+    if total > 0 && bad * 100 > total {
         return TextLayer::Suspect("fffd");
     }
     if page.lines.iter().any(|line| stray_mark(line)) {
@@ -76,6 +78,7 @@ mod tests {
     fn page(lines: &[&str]) -> PageText {
         PageText {
             lines: lines.iter().map(|line| line.to_string()).collect(),
+            visible_glyphs: lines.iter().map(|line| line.chars().filter(|c| !c.is_whitespace()).count()).sum(),
             ..PageText::default()
         }
     }
@@ -99,5 +102,13 @@ mod tests {
     fn nothing_visible() {
         assert_eq!(check_page(&PageText { images: 1, ..page(&[" "]) }), TextLayer::Absent);
         assert_eq!(check_page(&page(&[])), TextLayer::Ok);
+        // Glyphs with no text are still marks on the page.
+        let unmapped = PageText {
+            visible_glyphs: 3,
+            unmapped_font: true,
+            images: 1,
+            ..page(&[])
+        };
+        assert_eq!(check_page(&unmapped), TextLayer::Suspect("tounicode"));
     }
 }

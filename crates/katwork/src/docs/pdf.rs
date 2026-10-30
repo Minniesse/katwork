@@ -16,6 +16,10 @@
 //! - A marked-content `/ActualText` replaces the text of the glyphs it encloses (Typst writes
 //!   one around every Thai cluster its ToUnicode map cannot express); the span is hidden when
 //!   any of its glyphs is, and suspect when any is suspect.
+//! - A glyph whose text repeats that of a glyph or span not hidden earlier on its line, with its
+//!   box centre inside that one's box (within 5% of the font size), adds no text: it draws over a character already read
+//!   (Typst draws a cluster's positioned mark again with the cluster's text; some producers
+//!   overprint text to embolden it).
 //! - Ordinals count emitted blocks from 1 across the file, hidden blocks included.
 use std::{cell::Cell, collections::HashMap, rc::Rc};
 
@@ -53,6 +57,9 @@ struct Char {
     text: String,
     actual: Option<(u32, Rc<str>)>,
     paint: CharPaint,
+    /// The box its text covers: its own, or for an `/ActualText` span's first glyph the
+    /// union of the span's glyphs.
+    text_box: [f32; 4],
     /// The baseline origin and its end after the advance, in user space.
     origin: (f64, f64),
     end: (f64, f64),
@@ -205,6 +212,7 @@ impl OutputDev for Collector<'_> {
                 matrix: [a, b, c, d, matrix.m31, matrix.m32].map(|value| value as f32),
                 groups,
             },
+            text_box: rect(bbox),
             origin,
             end,
             direction: (glyph.trm.m11 / along, glyph.trm.m12 / along),
@@ -322,6 +330,13 @@ fn apply_actual_text(chars: &mut [Char], verdicts: &mut [Visibility]) {
             _ => None,
         });
         let verdict = hidden.or(suspect).unwrap_or(Visibility::Visible);
+        let span_box = members
+            .iter()
+            .map(|at| chars[*at].paint.bbox)
+            .reduce(|a, b| union(Some(a), b));
+        if let (Some(first), Some(span_box)) = (members.first(), span_box) {
+            chars[*first].text_box = span_box;
+        }
         for (index, at) in members.iter().enumerate() {
             let text = match (&chars[*at].actual, index) {
                 (Some((_, text)), 0) => text.to_string(),
@@ -333,10 +348,21 @@ fn apply_actual_text(chars: &mut [Char], verdicts: &mut [Visibility]) {
     }
 }
 
+/// Whether `inner`'s centre lies in `outer`, within 5% of `outer`'s height (its font size): a
+/// mark drawn again at the end of its cluster sits on the cluster's edge, while the next
+/// character's centre is half a character beyond it.
+fn holds(outer: [f32; 4], inner: [f32; 4]) -> bool {
+    let (x, y) = ((inner[0] + inner[2]) / 2.0, (inner[1] + inner[3]) / 2.0);
+    let slack = (outer[3] - outer[1]).abs() * 0.05;
+    outer[0] - slack <= x && x <= outer[2] + slack && outer[1] - slack <= y && y <= outer[3] + slack
+}
+
 /// The page's glyphs as lines, in painting order.
 fn lines(chars: &[Char], verdicts: &[Visibility]) -> Vec<Line> {
     let mut lines: Vec<Line> = Vec::new();
     let mut previous: Option<&Char> = None;
+    // The texts read on the current line, with their boxes, for overprinted repeats.
+    let mut read: Vec<(&str, [f32; 4])> = Vec::new();
     for (char, verdict) in chars.iter().zip(verdicts) {
         let (hidden, suspect) = match verdict {
             Visibility::Visible => (None, None),
@@ -366,6 +392,12 @@ fn lines(chars: &[Char], verdicts: &[Visibility]) -> Vec<Line> {
                 items: Vec::new(),
                 rect: None,
             });
+            read.clear();
+        }
+        let repeat = !char.text.is_empty()
+            && read.iter().any(|(text, text_box)| *text == char.text && holds(*text_box, char.text_box));
+        if !repeat && hidden.is_none() && !char.text.is_empty() {
+            read.push((&char.text, char.text_box));
         }
         let Some(line) = lines.last_mut() else { continue };
         if space {
@@ -378,7 +410,7 @@ fn lines(chars: &[Char], verdicts: &[Visibility]) -> Vec<Line> {
         }
         line.rect = Some(union(line.rect, char.paint.bbox));
         line.items.push(Item {
-            text: char.text.clone(),
+            text: if repeat { String::new() } else { char.text.clone() },
             hidden,
             suspect,
             bbox: Some(char.paint.bbox),
@@ -665,11 +697,14 @@ pub(crate) fn read(bytes: &[u8], limits: &DocLimits) -> Result<Extracted, DocErr
         let mut verdicts = pdf_visibility::try_classify(&paints, &scene.areas, &page, limits)?;
         drop(paints);
         apply_actual_text(&mut scene.chars, &mut verdicts);
-        let unmapped_font = scene
+        let shown = |verdict: &Visibility| !matches!(verdict, Visibility::Hidden(_));
+        let unmapped_font = scene.chars.iter().zip(&verdicts).any(|(char, verdict)| char.unmapped_font && shown(verdict));
+        let visible_glyphs = scene
             .chars
             .iter()
             .zip(&verdicts)
-            .any(|(char, verdict)| char.unmapped_font && !matches!(verdict, Visibility::Hidden(_)));
+            .filter(|(char, verdict)| shown(verdict) && (char.text.is_empty() || !char.text.chars().all(char::is_whitespace)))
+            .count();
         let mut lines = lines(&scene.chars, &verdicts);
         let starts = block_starts(&lines);
         let mut visible_lines = Vec::new();
@@ -686,6 +721,7 @@ pub(crate) fn read(bytes: &[u8], limits: &DocLimits) -> Result<Extracted, DocErr
         }
         page.text_layer = pdf_layer::check_page(&PageText {
             lines: visible_lines,
+            visible_glyphs,
             unmapped_font,
             images: scene.images,
         });
