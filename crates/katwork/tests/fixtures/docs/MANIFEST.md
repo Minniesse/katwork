@@ -34,6 +34,7 @@ checks that the committed seeds are exactly the files listed, with these hashes.
 | `docx/shapes.docx` | `f488a5abeec539213baf2f11c2fbdae80f39883658cb268d8b975ad12a6590ed` | text boxes with fills, a hidden shape, a VML shapetype and a nested table |
 | `docx/fields.docx` | `fe2620fa01c0fb8c35f965e2adff3bda78d6a56a1e381bde5f92aac94894f1e8` | fields Word recomputes, a hyperlink, a data-bound control and symbols |
 | `docx/uncertain.docx` | `4b68fc8faab395ba7533212e1f91be3f9c70451090ca6aea9fd56416dc44cc04` | a choice the reader does not understand, undecided properties and tracked table changes |
+| `docx/unread.docx` | `7e5a7cb58782852d7f59f0e0286e63539eb69eda76b589ffc13876f70a417fbd` | equations and an unknown element with an attribute between runs, in a run and between paragraphs, text Word would not read there, a shapetype's text box and an offset in pieces |
 | `docx/entities.docx` | `a5309df9e78c6fea173572a491a2a02e9814895e564c34c90e36ab03506a0413` | entity and character references |
 | `docx/notes.docx` | `5541c4c15c536ac3c6fbb4ef69888a8e80c4317fea47a2a7f369aa1a4970c1b3` | a header, a footer, footnotes and endnotes |
 | `docx/strict.docx` | `8a23951a689ec0c902730a14a06f21274225f872f243ea4585154697b941c643` | a Strict OOXML main part |
