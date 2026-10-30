@@ -1360,10 +1360,13 @@ def check_gh_api(args, cwd, stdin=([], True), opaque=False, leading=()):
 
 def rest_merge_request(args, leading, opaque):
     """The one `gh api` merge the guard lets through, for sessions without
-    GraphQL: REST_MERGE and nothing else. -X/--method and -f/-F/--raw-field/
-    --field may take any spelling and order; every word must be written out,
-    and each field given once (gh applies -F after -f, whatever their order).
-    Returns (owner/repo, number, sha), or raises Blocked naming what differs."""
+    GraphQL: REST_MERGE and nothing else. The method comes right after `api`
+    (`-X PUT`, `-XPUT`, `-X=PUT`, `--method PUT`, `--method=PUT`), so a prefix
+    rule such as Codex's can ask a person first, as it does for `gh pr merge`; the
+    endpoint and -f/-F/--raw-field/--field follow in any order and spelling.
+    Every word must be written out, and each field given once (gh applies -F
+    after -f, whatever their order). Returns (owner/repo, number, sha), or
+    raises Blocked naming what differs."""
 
     def refuse(why):
         raise Blocked(f"this REST merge isn't the one form the guard checks: {why}. Write `{REST_MERGE}`, "
@@ -1376,7 +1379,7 @@ def rest_merge_request(args, leading, opaque):
     methods, fields, positionals = [], [], []
     i = 0
     while i < len(args):
-        w = args[i]
+        w, start = args[i], i
         if w.dynamic:
             refuse(f"'{w.text}' is computed at run time")
         a = w.text
@@ -1394,6 +1397,8 @@ def rest_merge_request(args, leading, opaque):
                 "-F": fields, "--field": fields}.get(name)
         if into is None:
             refuse(f"`{a}` isn't part of it")
+        if into is methods and start != 0:
+            refuse("the method goes right after `api`: `gh api -X PUT repos/...`")
         if value is None:
             if i + 1 >= len(args):
                 refuse(f"`{a}` has no value")
@@ -1403,8 +1408,8 @@ def rest_merge_request(args, leading, opaque):
             i += 1
         into.append(value)
         i += 1
-    if len(methods) != 1 or methods[0].upper() != "PUT":
-        refuse("it takes exactly one method, PUT")
+    if len(methods) != 1 or methods[0] != "PUT":
+        refuse("it takes exactly one method, PUT, right after `api`")
     m = REST_MERGE_ENDPOINT.fullmatch(positionals[0]) if len(positionals) == 1 else None
     if not m:
         refuse(f"the endpoint must be repos/<owner>/<repo>/pulls/<n>/merge, not '{' '.join(positionals)}'")
@@ -1981,7 +1986,7 @@ def real_merge_cases():
     ]
 
 
-REST_CASES = 55
+REST_CASES = 57
 
 
 def rest_self_test():
@@ -2052,7 +2057,7 @@ def rest_self_test():
         (put.format(n=21, sha=a), True, False),
         (put.format(n=22, sha=m), True, False),
         (f"gh api --method PUT repos/o/r/pulls/21/merge -F merge_method=merge -F sha={a}", True, False),
-        (f"gh api repos/o/r/pulls/21/merge --field sha={a} --method=PUT --raw-field merge_method=merge", True, False),
+        (f"gh api --method=PUT repos/o/r/pulls/21/merge --field sha={a} --raw-field merge_method=merge", True, False),
         (f"gh api -XPUT /repos/o/r/pulls/21/merge -fmerge_method=merge -f=sha={a}", True, False),
         (f"timeout 60 {put.format(n=22, sha=m)} && echo merged", True, False),
         # no review covers the head: none, one on an older plain commit, one still pending
@@ -2087,6 +2092,8 @@ def rest_self_test():
         (put.format(n=21, sha=a).replace("PUT", "POST"), False, False),
         (put.format(n=21, sha=a).replace("-X PUT ", ""), False, False),
         (put.format(n=21, sha=a).replace("-X PUT", "-X POST -X PUT"), False, False),
+        (f"gh api repos/o/r/pulls/21/merge -X PUT -f merge_method=merge -f sha={a}", False, False),  # Codex asks only for `gh api -X PUT`
+        (put.format(n=21, sha=a).replace("PUT", "put"), False, False),
         # extra fields, options and arguments that change the request
         (put.format(n=21, sha=a) + " -f commit_title=x", False, False),
         (put.format(n=21, sha=a) + " --input body.json", False, False),

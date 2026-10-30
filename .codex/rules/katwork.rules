@@ -56,6 +56,24 @@ prefix_rule(
     justification = "The maintainer merges after cross-review (see the katwork-review skill).",
 )
 
+# The REST merge (gh api -X PUT repos/<owner>/<repo>/pulls/<n>/merge ...) too. The guard allows it only
+# with the method right after `api`, so these prefixes cover it; they ask before any other PUT as well.
+prefix_rule(
+    pattern = ["gh", "api", ["-X", "--method"], "PUT"],
+    decision = "prompt",
+    justification = "The maintainer merges after cross-review (see the katwork-review skill).",
+    match = ["gh api -X PUT repos/o/r/pulls/1/merge -f merge_method=merge -f sha=abc", "gh api --method PUT repos/o/r/pulls/1/merge"],
+    not_match = ["gh api repos/o/r/pulls/1", "gh api -X GET repos/o/r/pulls/1/merge"],
+)
+
+prefix_rule(
+    pattern = ["gh", "api", ["-XPUT", "-X=PUT", "--method=PUT"]],
+    decision = "prompt",
+    justification = "The maintainer merges after cross-review (see the katwork-review skill).",
+    match = ["gh api -XPUT repos/o/r/pulls/1/merge", "gh api --method=PUT repos/o/r/pulls/1/merge"],
+    not_match = ["gh api -XGET repos/o/r/pulls/1/merge"],
+)
+
 # --- allowed outside the sandbox without a prompt ----------------------------
 
 # Postgres can't create shared memory inside the macOS sandbox, so the private

@@ -60,7 +60,7 @@ Without GraphQL (a cloud session, where every GraphQL call, so every `gh pr` com
 - view it and its head: `gh api repos/{owner}/{repo}/pulls/<n>`; its diff: the same with `-H 'Accept: application/vnd.github.diff'`, or `git diff` of the fetched refs
 - its checks: `gh api repos/{owner}/{repo}/commits/<sha>/check-runs`
 - review it: `gh api repos/{owner}/{repo}/pulls/<n>/reviews -f commit_id=<sha> -f event=COMMENT -F body=@<file>` (without `event` the review stays pending)
-- merge it: `gh api -X PUT repos/<owner>/<repo>/pulls/<n>/merge -f merge_method=merge -f sha=<head sha>`, the one REST merge the guard allows, under the same review rule. The owner, repo, PR number and full head SHA are written out (no `{owner}/{repo}`, no variables), nothing else is on the command, and the SHA is the PR's current head, so GitHub refuses the merge if the head moves after the check.
+- merge it: `gh api -X PUT repos/<owner>/<repo>/pulls/<n>/merge -f merge_method=merge -f sha=<head sha>`, the one REST merge the guard allows, under the same review rule. The method comes right after `api` (`-X PUT` or `--method PUT`, so Codex asks a person first, as it does for `gh pr merge`), the owner, repo, PR number and full head SHA are written out (no `{owner}/{repo}`, no variables), nothing else is on the command, and the SHA is the PR's current head, so GitHub refuses the merge if the head moves after the check.
 
 `gh pr merge` also reads the PR over REST when `gh pr view` fails.
 
