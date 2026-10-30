@@ -771,13 +771,136 @@ async fn input_artifact_never_gets_second_version(pool: PgPool) {
     )
     .await;
     assert!(matches!(result, Err(KatError::ArtifactImmutable)));
-    let versions: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM artifact_versions WHERE artifact_id = $1")
-            .bind(input.id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(versions, 1);
+    assert_eq!(versions_of(&pool, input.id).await, 1);
+}
+
+async fn versions_of(pool: &PgPool, artifact: ArtifactId) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM artifact_versions WHERE artifact_id = $1")
+        .bind(artifact)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Another Space of the fixture's workspace.
+async fn another_space(pool: &PgPool, f: &Fixture) -> SpaceId {
+    let space = SpaceId::new();
+    sqlx::query(
+        "INSERT INTO spaces (id, workspace_id, name, allow_external) VALUES ($1, $2, 'Other', false)",
+    )
+    .bind(space)
+    .bind(f.workspace)
+    .execute(pool)
+    .await
+    .unwrap();
+    space
+}
+
+/// A second job on the fixture's thread, so in the fixture's Space.
+async fn another_job(pool: &PgPool, f: &Fixture) -> JobId {
+    let message = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO messages (id, workspace_id, thread_id, author_kind, author_user_id, body) VALUES ($1, $2, $3, 'user', $4, 'Again')",
+    )
+    .bind(message)
+    .bind(f.workspace)
+    .bind(f.thread)
+    .bind(f.user)
+    .execute(pool)
+    .await
+    .unwrap();
+    let job = JobId::new();
+    sqlx::query(
+        "INSERT INTO jobs (id, workspace_id, thread_id, request_message_id, requested_by) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(job)
+    .bind(f.workspace)
+    .bind(f.thread)
+    .bind(message)
+    .bind(f.user)
+    .execute(pool)
+    .await
+    .unwrap();
+    job
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn new_output_version_of_another_jobs_or_spaces_file_is_not_found(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let tenant = tenant(&pool, &f).await;
+    let dir = TestDir::new();
+    let blobs = dir.store();
+    let writer = ctx(&f, &tenant);
+    let other_space = another_space(&pool, &f).await;
+    // Another job's output, in the writer's Space.
+    let other_job = OutputCtx {
+        job_id: another_job(&pool, &f).await,
+        ..ctx(&f, &tenant)
+    };
+    let theirs = output(
+        &pool,
+        &blobs,
+        &other_job,
+        "theirs.docx",
+        b"theirs",
+        "theirs-1",
+    )
+    .await
+    .unwrap();
+    // The writer's own job's output in another Space: only the Space check refuses it.
+    let elsewhere = OutputCtx {
+        space_id: other_space,
+        ..ctx(&f, &tenant)
+    };
+    let away = output(&pool, &blobs, &elsewhere, "away.docx", b"away", "away-1")
+        .await
+        .unwrap();
+    // An input of another Space: not_found, never artifact_immutable, which would confirm it.
+    let foreign_input = upload(&pool, &blobs, &tenant, other_space, "in.txt", b"in").await;
+    for (artifact, key) in [
+        (theirs.artifact_id, "theirs-2"),
+        (away.artifact_id, "away-2"),
+        (foreign_input.id, "foreign-input-2"),
+    ] {
+        let result = new_version(&pool, &blobs, &writer, artifact, b"v2", key, None).await;
+        assert!(
+            matches!(result, Err(KatError::NotFound)),
+            "{key}: {result:?}"
+        );
+        assert_eq!(versions_of(&pool, artifact).await, 1, "{key}");
+    }
+    // In the writer's own Space an input stays artifact_immutable, whatever its job, and the
+    // writer's own output takes version 2.
+    let own_input = upload(&pool, &blobs, &tenant, SpaceId(f.space), "in.txt", b"own").await;
+    let result = new_version(
+        &pool,
+        &blobs,
+        &writer,
+        own_input.id,
+        b"v2",
+        "own-in-2",
+        None,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(KatError::ArtifactImmutable)),
+        "{result:?}"
+    );
+    let mine = output(&pool, &blobs, &writer, "mine.docx", b"mine", "mine-1")
+        .await
+        .unwrap();
+    let second = new_version(
+        &pool,
+        &blobs,
+        &writer,
+        mine.artifact_id,
+        b"v2",
+        "mine-2",
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!((second.artifact_id, second.version), (mine.artifact_id, 2));
 }
 
 #[sqlx::test(migrations = "./migrations")]

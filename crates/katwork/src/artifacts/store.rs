@@ -262,9 +262,10 @@ pub async fn create_output_on(
 }
 
 /// The next version of this job's output, inside the caller's transaction, which has locked the
-/// artifact row with `lock_artifacts_on` (this takes no lock). An input is `ArtifactImmutable`;
-/// a missing, deleted, foreign or other job's or Space's artifact is `NotFound`. A stored
-/// `idempotency_key` returns its version unchanged.
+/// artifact row with `lock_artifacts_on` (this takes no lock). A missing, deleted or foreign
+/// artifact, or one of another Space whatever its role, is `NotFound`; then an input is
+/// `ArtifactImmutable` and another job's output `NotFound`. A stored `idempotency_key` returns
+/// its version unchanged.
 pub async fn new_output_version_on(
     conn: &mut PgConnection,
     ctx: &OutputCtx,
@@ -290,16 +291,18 @@ pub async fn new_output_version_on(
     .bind(artifact_id)
     .fetch_optional(&mut *conn)
     .await?;
+    // Another Space's file is not_found whatever its role, so a writer learns nothing about it;
+    // in the writer's own Space an input is immutable and another job's output not_found.
     let Some(row) = row else {
         return Err(KatError::NotFound);
     };
-    if row.deleted_at.is_some() {
+    if row.deleted_at.is_some() || row.space_id != ctx.space_id {
         return Err(KatError::NotFound);
     }
     if row.role == ArtifactRole::Input {
         return Err(KatError::ArtifactImmutable);
     }
-    if row.job_id != Some(ctx.job_id) || row.space_id != ctx.space_id {
+    if row.job_id != Some(ctx.job_id) {
         return Err(KatError::NotFound);
     }
     Ok(sqlx::query_as(
