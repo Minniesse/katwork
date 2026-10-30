@@ -117,7 +117,11 @@ impl Raw {
         let start = out.len();
         out.extend_from_slice(Raw::table(self.size(), &offsets).as_bytes());
         out.extend_from_slice(
-            format!("trailer\n<< /Size {} /Root {root} 0 R {trailer} >>\nstartxref\n{start}\n%%EOF\n", self.size()).as_bytes(),
+            format!(
+                "trailer\n<< /Size {} /Root {root} 0 R {trailer} >>\nstartxref\n{start}\n%%EOF\n",
+                self.size()
+            )
+            .as_bytes(),
         );
         out
     }
@@ -129,7 +133,12 @@ impl Raw {
         let mut index = String::new();
         let mut data = Vec::new();
         for id in packed {
-            let body = &self.objects.iter().find(|(number, _)| number == id).unwrap().1;
+            let body = &self
+                .objects
+                .iter()
+                .find(|(number, _)| number == id)
+                .unwrap()
+                .1;
             index.push_str(&format!("{id} {} ", data.len()));
             data.extend_from_slice(body);
             data.push(b'\n');
@@ -141,24 +150,55 @@ impl Raw {
         content.extend_from_slice(&data);
         plain.set(
             container,
-            stream(&format!("/Type /ObjStm /N {} /First {first} /Filter /FlateDecode", packed.len()), &flate(&content)),
+            stream(
+                &format!(
+                    "/Type /ObjStm /N {} /First {first} /Filter /FlateDecode",
+                    packed.len()
+                ),
+                &flate(&content),
+            ),
         );
         let (mut out, offsets) = plain.body();
         let xref_id = plain.size();
         let size = xref_id + 1;
         let mut rows = Vec::new();
         for number in 0..size {
-            let row: [u8; 7] = if let Some((_, offset)) = offsets.iter().find(|(id, _)| *id == number) {
-                let offset = *offset as u32;
-                [1, (offset >> 24) as u8, (offset >> 16) as u8, (offset >> 8) as u8, offset as u8, 0, 0]
-            } else if let Some(position) = packed.iter().position(|id| *id == number) {
-                [2, (container >> 24) as u8, (container >> 16) as u8, (container >> 8) as u8, container as u8, 0, position as u8]
-            } else if number == xref_id {
-                let offset = out.len() as u32;
-                [1, (offset >> 24) as u8, (offset >> 16) as u8, (offset >> 8) as u8, offset as u8, 0, 0]
-            } else {
-                [0, 0, 0, 0, 0, 0xFF, 0xFF]
-            };
+            let row: [u8; 7] =
+                if let Some((_, offset)) = offsets.iter().find(|(id, _)| *id == number) {
+                    let offset = *offset as u32;
+                    [
+                        1,
+                        (offset >> 24) as u8,
+                        (offset >> 16) as u8,
+                        (offset >> 8) as u8,
+                        offset as u8,
+                        0,
+                        0,
+                    ]
+                } else if let Some(position) = packed.iter().position(|id| *id == number) {
+                    [
+                        2,
+                        (container >> 24) as u8,
+                        (container >> 16) as u8,
+                        (container >> 8) as u8,
+                        container as u8,
+                        0,
+                        position as u8,
+                    ]
+                } else if number == xref_id {
+                    let offset = out.len() as u32;
+                    [
+                        1,
+                        (offset >> 24) as u8,
+                        (offset >> 16) as u8,
+                        (offset >> 8) as u8,
+                        offset as u8,
+                        0,
+                        0,
+                    ]
+                } else {
+                    [0, 0, 0, 0, 0, 0xFF, 0xFF]
+                };
             rows.extend_from_slice(&row);
         }
         let start = out.len();
@@ -181,7 +221,12 @@ impl Raw {
         let mut index = String::new();
         let mut data = Vec::new();
         for id in packed {
-            let body = &self.objects.iter().find(|(number, _)| number == id).unwrap().1;
+            let body = &self
+                .objects
+                .iter()
+                .find(|(number, _)| number == id)
+                .unwrap()
+                .1;
             index.push_str(&format!("{id} {} ", data.len()));
             data.extend_from_slice(body);
             data.push(b'\n');
@@ -193,7 +238,13 @@ impl Raw {
         content.extend_from_slice(&data);
         plain.set(
             container,
-            stream(&format!("/Type /ObjStm /N {} /First {first} /Filter /FlateDecode", packed.len()), &flate(&content)),
+            stream(
+                &format!(
+                    "/Type /ObjStm /N {} /First {first} /Filter /FlateDecode",
+                    packed.len()
+                ),
+                &flate(&content),
+            ),
         );
         let (mut out, offsets) = plain.body();
         let size = plain.size() + 1;
@@ -201,12 +252,22 @@ impl Raw {
         let mut subsections = String::new();
         for (position, id) in packed.iter().enumerate() {
             subsections.push_str(&format!("{id} 1 "));
-            rows.extend_from_slice(&[2, (container >> 24) as u8, (container >> 16) as u8, (container >> 8) as u8, container as u8, 0, position as u8]);
+            rows.extend_from_slice(&[
+                2,
+                (container >> 24) as u8,
+                (container >> 16) as u8,
+                (container >> 8) as u8,
+                container as u8,
+                0,
+                position as u8,
+            ]);
         }
         let stream_at = out.len();
         out.extend_from_slice(format!("{} 0 obj\n", plain.size()).as_bytes());
         out.extend_from_slice(&stream(
-            &format!("/Type /XRef /Size {size} /W [1 4 2] /Index [{subsections}] /Filter /FlateDecode"),
+            &format!(
+                "/Type /XRef /Size {size} /W [1 4 2] /Index [{subsections}] /Filter /FlateDecode"
+            ),
             &flate(&rows),
         ));
         out.extend_from_slice(b"\nendobj\n");
@@ -228,7 +289,14 @@ impl Raw {
 
 /// An incremental update appended to `base`: new or changed `objects`, a table marking `freed`
 /// numbers free, and a trailer whose `/Prev` points at `prev`.
-pub fn append_update(base: &[u8], objects: &[(u32, Vec<u8>)], freed: &[u32], size: u32, root: u32, prev: usize) -> Vec<u8> {
+pub fn append_update(
+    base: &[u8],
+    objects: &[(u32, Vec<u8>)],
+    freed: &[u32],
+    size: u32,
+    root: u32,
+    prev: usize,
+) -> Vec<u8> {
     let mut out = base.to_vec();
     let mut entries: Vec<(u32, String)> = Vec::new();
     for (id, body) in objects {
@@ -248,14 +316,20 @@ pub fn append_update(base: &[u8], objects: &[(u32, Vec<u8>)], freed: &[u32], siz
     }
     out.extend_from_slice(table.as_bytes());
     out.extend_from_slice(
-        format!("trailer\n<< /Size {size} /Root {root} 0 R /Prev {prev} >>\nstartxref\n{start}\n%%EOF\n").as_bytes(),
+        format!(
+            "trailer\n<< /Size {size} /Root {root} 0 R /Prev {prev} >>\nstartxref\n{start}\n%%EOF\n"
+        )
+        .as_bytes(),
     );
     out
 }
 
 /// The offset `startxref` names.
 pub fn startxref(file: &[u8]) -> usize {
-    let at = file.windows(9).rposition(|window| window == b"startxref").unwrap();
+    let at = file
+        .windows(9)
+        .rposition(|window| window == b"startxref")
+        .unwrap();
     let rest = std::str::from_utf8(&file[at + 9..]).unwrap();
     rest.split_whitespace().next().unwrap().parse().unwrap()
 }
@@ -289,9 +363,14 @@ impl Doc {
         let mut raw = Raw::new();
         let catalog = raw.reserve();
         let pages = raw.reserve();
-        let helvetica = raw.add("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>");
+        let helvetica = raw.add(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        );
         let to_unicode = raw.add(stream("", b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n1 beginbfrange <0000> <FFFF> <0000> endbfrange"));
-        let widths: Vec<String> = (0x0E31u16..=0x0E4E).filter(|unit| zero_width(*unit)).map(|unit| format!("{unit} {unit} 0")).collect();
+        let widths: Vec<String> = (0x0E31u16..=0x0E4E)
+            .filter(|unit| zero_width(*unit))
+            .map(|unit| format!("{unit} {unit} 0"))
+            .collect();
         let descendant = raw.add(format!(
             "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Uni /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /DW 500 /W [{}] >>",
             widths.join(" ")
@@ -321,16 +400,30 @@ impl Doc {
 
     /// A Form XObject whose box clips nothing unless `dict` sets one.
     pub fn form(&mut self, dict: &str, content: &str) -> u32 {
-        let bbox = if dict.contains("/BBox") { "" } else { "/BBox [-10000 -10000 10000 10000]" };
-        let resources = if dict.contains("/Resources") { String::new() } else { self.resources("") };
-        self.add_stream(&format!("/Type /XObject /Subtype /Form {bbox} {resources} {dict}"), content.as_bytes())
+        let bbox = if dict.contains("/BBox") {
+            ""
+        } else {
+            "/BBox [-10000 -10000 10000 10000]"
+        };
+        let resources = if dict.contains("/Resources") {
+            String::new()
+        } else {
+            self.resources("")
+        };
+        self.add_stream(
+            &format!("/Type /XObject /Subtype /Form {bbox} {resources} {dict}"),
+            content.as_bytes(),
+        )
     }
 
     /// `/Resources` with both fonts and `extra` entries; fonts `extra` names join them.
     pub fn resources(&self, extra: &str) -> String {
         let fonts = format!("/F1 {} 0 R /U {} 0 R", self.helvetica, self.unicode);
         if extra.contains("/Font << ") {
-            format!("/Resources << {} >>", extra.replacen("/Font << ", &format!("/Font << {fonts} "), 1))
+            format!(
+                "/Resources << {} >>",
+                extra.replacen("/Font << ", &format!("/Font << {fonts} "), 1)
+            )
         } else {
             format!("/Resources << /Font << {fonts} >> {extra} >>")
         }
@@ -345,9 +438,16 @@ impl Doc {
     /// page-dictionary entries.
     pub fn page_with(&mut self, page: &str, content: &str, resources: &str) -> u32 {
         let contents = self.add_stream("", content.as_bytes());
-        let media = if page.contains("/MediaBox") { String::new() } else { format!("/MediaBox [0 0 {} {}]", self.size.0, self.size.1) };
+        let media = if page.contains("/MediaBox") {
+            String::new()
+        } else {
+            format!("/MediaBox [0 0 {} {}]", self.size.0, self.size.1)
+        };
         let resources = self.resources(resources);
-        let id = self.add(format!("<< /Type /Page /Parent {} 0 R {media} {resources} /Contents {contents} 0 R {page} >>", self.pages));
+        let id = self.add(format!(
+            "<< /Type /Page /Parent {} 0 R {media} {resources} /Contents {contents} 0 R {page} >>",
+            self.pages
+        ));
         self.kids.push(id);
         id
     }
@@ -358,8 +458,21 @@ impl Doc {
 
     fn finish(&mut self) {
         let kids: Vec<String> = self.kids.iter().map(|kid| format!("{kid} 0 R")).collect();
-        self.raw.set(self.pages, format!("<< /Type /Pages /Kids [{}] /Count {} >>", kids.join(" "), self.kids.len()));
-        self.raw.set(self.catalog, format!("<< /Type /Catalog /Pages {} 0 R {} >>", self.pages, self.catalog_extra));
+        self.raw.set(
+            self.pages,
+            format!(
+                "<< /Type /Pages /Kids [{}] /Count {} >>",
+                kids.join(" "),
+                self.kids.len()
+            ),
+        );
+        self.raw.set(
+            self.catalog,
+            format!(
+                "<< /Type /Catalog /Pages {} 0 R {} >>",
+                self.pages, self.catalog_extra
+            ),
+        );
     }
 
     pub fn build(mut self) -> Vec<u8> {

@@ -25,11 +25,13 @@
 use std::{cell::Cell, collections::HashMap, rc::Rc};
 
 use lopdf::Document;
-use pdf_extract::{Area, AreaKind as WalkedArea, Glyph, MediaBox, Optional, OutputDev, OutputError, Transform};
+use pdf_extract::{
+    Area, AreaKind as WalkedArea, Glyph, MediaBox, Optional, OutputDev, OutputError, Transform,
+};
 
 use super::{
-    Block, DocError, DocLimits, ExtractWarning, Extracted, ExtractorId, HiddenWhy, LineBox, Locator, PageInfo,
-    TextLayer, deadline,
+    Block, DocError, DocLimits, ExtractWarning, Extracted, ExtractorId, HiddenWhy, LineBox,
+    Locator, PageInfo, TextLayer, deadline,
     pdf_guard::{self, PrescanReport},
     pdf_layer::{self, PageText},
     pdf_visibility::{self, AreaKind, AreaPaint, CharPaint, GroupPaint, Paint, Visibility},
@@ -98,7 +100,14 @@ impl Collector<'_> {
     }
 
     fn groups(&mut self, groups: &[pdf_extract::Group]) -> Rc<[GroupPaint]> {
-        if self.groups.0.len() != groups.len() || self.groups.0.iter().zip(groups).any(|(id, group)| *id != group.id) {
+        if self.groups.0.len() != groups.len()
+            || self
+                .groups
+                .0
+                .iter()
+                .zip(groups)
+                .any(|(id, group)| *id != group.id)
+        {
             let chain: Vec<GroupPaint> = groups
                 .iter()
                 .map(|group| GroupPaint {
@@ -123,12 +132,21 @@ impl Collector<'_> {
 fn paint(colour: &pdf_extract::Colour) -> Paint {
     Paint {
         space: colour.space.clone(),
-        operands: colour.components.iter().map(|value| *value as f32).collect(),
+        operands: colour
+            .components
+            .iter()
+            .map(|value| *value as f32)
+            .collect(),
     }
 }
 
 fn rect(rect: pdf_extract::Rect) -> [f32; 4] {
-    [rect.x0 as f32, rect.y0 as f32, rect.x1 as f32, rect.y1 as f32]
+    [
+        rect.x0 as f32,
+        rect.y0 as f32,
+        rect.x1 as f32,
+        rect.y1 as f32,
+    ]
 }
 
 fn apply(m: &Transform, x: f64, y: f64) -> (f64, f64) {
@@ -136,7 +154,12 @@ fn apply(m: &Transform, x: f64, y: f64) -> (f64, f64) {
 }
 
 impl OutputDev for Collector<'_> {
-    fn begin_page(&mut self, _: u32, _: &MediaBox, _: Option<(f64, f64, f64, f64)>) -> Result<(), OutputError> {
+    fn begin_page(
+        &mut self,
+        _: u32,
+        _: &MediaBox,
+        _: Option<(f64, f64, f64, f64)>,
+    ) -> Result<(), OutputError> {
         self.scene = Scene::default();
         Ok(())
     }
@@ -146,7 +169,14 @@ impl OutputDev for Collector<'_> {
         Ok(())
     }
 
-    fn output_character(&mut self, _: &Transform, _: f64, _: f64, _: f64, _: &str) -> Result<(), OutputError> {
+    fn output_character(
+        &mut self,
+        _: &Transform,
+        _: f64,
+        _: f64,
+        _: f64,
+        _: &str,
+    ) -> Result<(), OutputError> {
         Ok(())
     }
 
@@ -187,11 +217,19 @@ impl OutputDev for Collector<'_> {
         let order = self.next_order();
         let groups = self.groups(glyph.groups);
         let origin = apply(&glyph.trm, 0.0, 0.0);
-        let end = apply(&glyph.trm, glyph.width * glyph.font_size + glyph.spacing, 0.0);
+        let end = apply(
+            &glyph.trm,
+            glyph.width * glyph.font_size + glyph.spacing,
+            0.0,
+        );
         let along = (glyph.trm.m11.hypot(glyph.trm.m12)).max(f64::MIN_POSITIVE);
         let (a, b, c, d) = (matrix.m11, matrix.m12, matrix.m21, matrix.m22);
         let scale = a.hypot(b);
-        let size = if scale > 0.0 { glyph.font_size.abs() * (a * d - b * c).abs() / scale } else { 0.0 };
+        let size = if scale > 0.0 {
+            glyph.font_size.abs() * (a * d - b * c).abs() / scale
+        } else {
+            0.0
+        };
         let font = glyph.font;
         self.scene.chars.push(Char {
             text: glyph.text.to_owned(),
@@ -255,7 +293,11 @@ impl OutputDev for Collector<'_> {
 }
 
 /// Runs pdf-extract's walker over the pre-scanned pages.
-fn walk(doc: &Document, report: &PrescanReport, limits: &DocLimits) -> Result<Vec<Scene>, DocError> {
+fn walk(
+    doc: &Document,
+    report: &PrescanReport,
+    limits: &DocLimits,
+) -> Result<Vec<Scene>, DocError> {
     let mut collector = Collector {
         limits,
         pages: Vec::new(),
@@ -303,13 +345,21 @@ struct Line {
 fn union(a: Option<[f32; 4]>, b: [f32; 4]) -> [f32; 4] {
     match a {
         None => b,
-        Some(a) => [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])],
+        Some(a) => [
+            a[0].min(b[0]),
+            a[1].min(b[1]),
+            a[2].max(b[2]),
+            a[3].max(b[3]),
+        ],
     }
 }
 
 fn is_mark(c: char) -> bool {
     use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
-    matches!(c.general_category(), GeneralCategory::NonspacingMark | GeneralCategory::EnclosingMark)
+    matches!(
+        c.general_category(),
+        GeneralCategory::NonspacingMark | GeneralCategory::EnclosingMark
+    )
 }
 
 /// Replaces each `/ActualText` span's glyph texts with its text, on its first glyph, and gives
@@ -378,12 +428,22 @@ fn lines(chars: &[Char], verdicts: &[Visibility]) -> Vec<Line> {
                 let delta = (char.origin.0 - before.end.0, char.origin.1 - before.end.1);
                 let along = delta.0 * before.direction.0 + delta.1 * before.direction.1;
                 let across = -delta.0 * before.direction.1 + delta.1 * before.direction.0;
-                let turned = before.direction.0 * char.direction.0 + before.direction.1 * char.direction.1 < 0.95;
-                let zero_advance = (char.end.0 - char.origin.0).hypot(char.end.1 - char.origin.1) < 1e-6;
+                let turned = before.direction.0 * char.direction.0
+                    + before.direction.1 * char.direction.1
+                    < 0.95;
+                let zero_advance =
+                    (char.end.0 - char.origin.0).hypot(char.end.1 - char.origin.1) < 1e-6;
                 let mark = char.text.chars().next().is_some_and(is_mark);
-                let off_line = if zero_advance || mark { across.abs() > size } else { across.abs() > size / 2.0 };
+                let off_line = if zero_advance || mark {
+                    across.abs() > size
+                } else {
+                    across.abs() > size / 2.0
+                };
                 let broke = turned || off_line || along < -size / 2.0;
-                space = !broke && along > size / 4.0 && !mark && !char.text.starts_with(char::is_whitespace)
+                space = !broke
+                    && along > size / 4.0
+                    && !mark
+                    && !char.text.starts_with(char::is_whitespace)
                     && !before.text.ends_with(char::is_whitespace);
                 broke
             }
@@ -396,11 +456,15 @@ fn lines(chars: &[Char], verdicts: &[Visibility]) -> Vec<Line> {
             read.clear();
         }
         let repeat = !char.text.is_empty()
-            && read.iter().any(|(text, text_box)| *text == char.text && holds(*text_box, char.text_box));
+            && read
+                .iter()
+                .any(|(text, text_box)| *text == char.text && holds(*text_box, char.text_box));
         if !repeat && hidden.is_none() && !char.text.is_empty() {
             read.push((&char.text, char.text_box));
         }
-        let Some(line) = lines.last_mut() else { continue };
+        let Some(line) = lines.last_mut() else {
+            continue;
+        };
         if space {
             line.items.push(Item {
                 text: " ".to_owned(),
@@ -411,7 +475,11 @@ fn lines(chars: &[Char], verdicts: &[Visibility]) -> Vec<Line> {
         }
         line.rect = Some(union(line.rect, char.paint.bbox));
         line.items.push(Item {
-            text: if repeat { String::new() } else { char.text.clone() },
+            text: if repeat {
+                String::new()
+            } else {
+                char.text.clone()
+            },
             hidden,
             suspect,
             bbox: Some(char.paint.bbox),
@@ -425,7 +493,13 @@ fn lines(chars: &[Char], verdicts: &[Visibility]) -> Vec<Line> {
 fn settle_spaces(items: &mut [Item]) {
     let hidden: Vec<Option<bool>> = items
         .iter()
-        .map(|item| if item.is_space() || item.text.is_empty() { None } else { Some(item.hidden.is_some()) })
+        .map(|item| {
+            if item.is_space() || item.text.is_empty() {
+                None
+            } else {
+                Some(item.hidden.is_some())
+            }
+        })
         .collect();
     for at in 0..items.len() {
         if hidden[at].is_some() || !items[at].is_space() {
@@ -529,7 +603,8 @@ fn assemble_block(block: &mut [Line]) -> Assembled {
                             if out.visible.ends_with_space() {
                                 continue;
                             }
-                        } else if !out.visible.ends_with_space() && !item.text.starts_with(is_mark) {
+                        } else if !out.visible.ends_with_space() && !item.text.starts_with(is_mark)
+                        {
                             // A combining mark stays on its base: a space would split its cluster.
                             out.visible.push(" ", None, Some(line_at));
                         }
@@ -551,7 +626,10 @@ fn assemble_block(block: &mut [Line]) -> Assembled {
         let skip = line_text.chars().count() - trimmed.chars().count();
         if skip > 0 {
             let chars_before = out.visible.text[..content_start].chars().count();
-            out.visible.text.replace_range(content_start..content_start + (line_text.len() - trimmed.len()), "");
+            out.visible.text.replace_range(
+                content_start..content_start + (line_text.len() - trimmed.len()),
+                "",
+            );
             out.visible.boxes.drain(chars_before..chars_before + skip);
             out.visible.lines.drain(chars_before..chars_before + skip);
         }
@@ -562,7 +640,8 @@ fn assemble_block(block: &mut [Line]) -> Assembled {
             out.visible.boxes.truncate(chars_before);
             out.visible.lines.truncate(chars_before);
         } else {
-            out.visible_lines.push(out.visible.text[content_start..].to_owned());
+            out.visible_lines
+                .push(out.visible.text[content_start..].to_owned());
         }
     }
     out
@@ -593,7 +672,13 @@ struct Output<'l> {
 }
 
 impl Output<'_> {
-    fn emit(&mut self, page: u32, text: &Text, hidden: Option<HiddenWhy>, suspect: Option<&'static str>) -> Result<(), DocError> {
+    fn emit(
+        &mut self,
+        page: u32,
+        text: &Text,
+        hidden: Option<HiddenWhy>,
+        suspect: Option<&'static str>,
+    ) -> Result<(), DocError> {
         self.ordinal += 1;
         let mut chars_before = 0usize;
         for (piece, range) in split_pieces(&text.text)?.into_iter().enumerate() {
@@ -617,19 +702,34 @@ impl Output<'_> {
                     }
                     (_, Some(line)) => {
                         if let Some((_, start, end, Some(rect))) = current.take() {
-                            lines.push(LineBox { start, end, page, rect });
+                            lines.push(LineBox {
+                                start,
+                                end,
+                                page,
+                                rect,
+                            });
                         }
                         current = Some((line, offset as u32, offset as u32 + 1, bbox));
                     }
                     (_, None) => {
                         if let Some((_, start, end, Some(rect))) = current.take() {
-                            lines.push(LineBox { start, end, page, rect });
+                            lines.push(LineBox {
+                                start,
+                                end,
+                                page,
+                                rect,
+                            });
                         }
                     }
                 }
             }
             if let Some((_, start, end, Some(rect))) = current.take() {
-                lines.push(LineBox { start, end, page, rect });
+                lines.push(LineBox {
+                    start,
+                    end,
+                    page,
+                    rect,
+                });
             }
             self.blocks.push(Block {
                 ordinal: self.ordinal,
@@ -700,12 +800,19 @@ pub(crate) fn read(bytes: &[u8], limits: &DocLimits) -> Result<Extracted, DocErr
         drop(paints);
         apply_actual_text(&mut scene.chars, &mut verdicts);
         let shown = |verdict: &Visibility| !matches!(verdict, Visibility::Hidden(_));
-        let unmapped_font = scene.chars.iter().zip(&verdicts).any(|(char, verdict)| char.unmapped_font && shown(verdict));
+        let unmapped_font = scene
+            .chars
+            .iter()
+            .zip(&verdicts)
+            .any(|(char, verdict)| char.unmapped_font && shown(verdict));
         let visible_glyphs = scene
             .chars
             .iter()
             .zip(&verdicts)
-            .filter(|(char, verdict)| shown(verdict) && (char.text.is_empty() || !char.text.chars().all(char::is_whitespace)))
+            .filter(|(char, verdict)| {
+                shown(verdict)
+                    && (char.text.is_empty() || !char.text.chars().all(char::is_whitespace))
+            })
             .count();
         let mut lines = lines(&scene.chars, &verdicts);
         let starts = block_starts(&lines);
@@ -717,7 +824,12 @@ pub(crate) fn read(bytes: &[u8], limits: &DocLimits) -> Result<Extracted, DocErr
                 output.emit(page.page, &block.visible, None, block.suspect)?;
             }
             if !block.hidden.text.is_empty() {
-                output.emit(page.page, &block.hidden, Some(most_common(&block.reasons)), None)?;
+                output.emit(
+                    page.page,
+                    &block.hidden,
+                    Some(most_common(&block.reasons)),
+                    None,
+                )?;
             }
             visible_lines.extend(block.visible_lines);
         }
@@ -732,8 +844,13 @@ pub(crate) fn read(bytes: &[u8], limits: &DocLimits) -> Result<Extracted, DocErr
         }
         match page.text_layer {
             TextLayer::Ok => {}
-            TextLayer::Suspect(why) => output.warnings.push(ExtractWarning::SuspectTextLayer { page: page.page, why }),
-            TextLayer::Absent => output.warnings.push(ExtractWarning::NoTextLayer { page: page.page }),
+            TextLayer::Suspect(why) => output.warnings.push(ExtractWarning::SuspectTextLayer {
+                page: page.page,
+                why,
+            }),
+            TextLayer::Absent => output
+                .warnings
+                .push(ExtractWarning::NoTextLayer { page: page.page }),
         }
         pages.push(page);
     }

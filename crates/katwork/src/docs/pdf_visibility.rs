@@ -194,14 +194,28 @@ fn resolve_depth(space: &ColourSpace, values: &[f64], depth: usize) -> Option<Rg
         return None;
     }
     match (space, values) {
-        (ColourSpace::DeviceGray | ColourSpace::CalGray | ColourSpace::IccBased { n: 1 }, [g]) => Some(gray(*g)),
-        (ColourSpace::DeviceRGB | ColourSpace::CalRGB | ColourSpace::IccBased { n: 3 }, [r, g, b]) => Some(Rgb {
+        (ColourSpace::DeviceGray | ColourSpace::CalGray | ColourSpace::IccBased { n: 1 }, [g]) => {
+            Some(gray(*g))
+        }
+        (
+            ColourSpace::DeviceRGB | ColourSpace::CalRGB | ColourSpace::IccBased { n: 3 },
+            [r, g, b],
+        ) => Some(Rgb {
             r: byte(*r),
             g: byte(*g),
             b: byte(*b),
         }),
-        (ColourSpace::DeviceCMYK | ColourSpace::IccBased { n: 4 }, [c, m, y, k]) => Some(cmyk(*c, *m, *y, *k)),
-        (ColourSpace::Indexed { base, hival, lookup }, [index]) => {
+        (ColourSpace::DeviceCMYK | ColourSpace::IccBased { n: 4 }, [c, m, y, k]) => {
+            Some(cmyk(*c, *m, *y, *k))
+        }
+        (
+            ColourSpace::Indexed {
+                base,
+                hival,
+                lookup,
+            },
+            [index],
+        ) => {
             let width = base.components();
             let entries = usize::try_from(*hival).ok()?.checked_add(1)?;
             if *hival > 255 || width == 0 || lookup.len() < width.checked_mul(entries)? {
@@ -212,15 +226,27 @@ fn resolve_depth(space: &ColourSpace, values: &[f64], depth: usize) -> Option<Rg
             let components: Vec<f64> = entry.iter().map(|byte| f64::from(*byte) / 255.0).collect();
             resolve_depth(base, &components, depth + 1)
         }
-        (ColourSpace::Separation { colorant, alternate, tint }, [value]) => {
+        (
+            ColourSpace::Separation {
+                colorant,
+                alternate,
+                tint,
+            },
+            [value],
+        ) => {
             if colorant == b"None" {
                 return None;
             }
             resolve_depth(alternate, &evaluate(tint, *value)?, depth + 1)
         }
-        (ColourSpace::DeviceN { colorants, alternate, tint }, [value]) if colorants.len() == 1 => {
-            resolve_depth(alternate, &evaluate(tint, *value)?, depth + 1)
-        }
+        (
+            ColourSpace::DeviceN {
+                colorants,
+                alternate,
+                tint,
+            },
+            [value],
+        ) if colorants.len() == 1 => resolve_depth(alternate, &evaluate(tint, *value)?, depth + 1),
         _ => None,
     }
 }
@@ -228,30 +254,59 @@ fn resolve_depth(space: &ColourSpace, values: &[f64], depth: usize) -> Option<Rg
 /// A one-input tint transform: Type 2, or Type 0 with one input and linear interpolation.
 fn evaluate(function: &Function, x: f64) -> Option<Vec<f64>> {
     match function {
-        Function::Exponential { domain, c0, c1, n, range } => {
+        Function::Exponential {
+            domain,
+            c0,
+            c1,
+            n,
+            range,
+        } => {
             if c0.len() != c1.len() || c0.is_empty() {
                 return None;
             }
             let x = x.clamp(domain[0].min(domain[1]), domain[0].max(domain[1]));
             let power = x.powf(*n);
-            let mut out: Vec<f64> = c0.iter().zip(c1).map(|(a, b)| a + power * (b - a)).collect();
+            let mut out: Vec<f64> = c0
+                .iter()
+                .zip(c1)
+                .map(|(a, b)| a + power * (b - a))
+                .collect();
             if let Some(range) = range {
                 clip_to(&mut out, range)?;
             }
             out.iter().all(|value| value.is_finite()).then_some(out)
         }
-        Function::Sampled { domain, range, size, bits_per_sample, order, encode, decode, samples } => {
-            let ([d0, d1], [size], [e0, e1]) = (domain.as_slice(), size.as_slice(), encode.get(..2)?) else {
+        Function::Sampled {
+            domain,
+            range,
+            size,
+            bits_per_sample,
+            order,
+            encode,
+            decode,
+            samples,
+        } => {
+            let ([d0, d1], [size], [e0, e1]) =
+                (domain.as_slice(), size.as_slice(), encode.get(..2)?)
+            else {
                 return None;
             };
             let outputs = range.len() / 2;
             let bits = *bits_per_sample;
-            if *order != 1 || outputs == 0 || decode.len() < outputs * 2 || ![1, 2, 4, 8, 12, 16, 24, 32].contains(&bits) {
+            if *order != 1
+                || outputs == 0
+                || decode.len() < outputs * 2
+                || ![1, 2, 4, 8, 12, 16, 24, 32].contains(&bits)
+            {
                 return None;
             }
             let last = f64::from(size.checked_sub(1)?);
             let x = x.clamp(d0.min(*d1), d0.max(*d1));
-            let e = if d1 == d0 { *e0 } else { e0 + (x - d0) * (e1 - e0) / (d1 - d0) };
+            let e = if d1 == d0 {
+                *e0
+            } else {
+                e0 + (x - d0) * (e1 - e0) / (d1 - d0)
+            };
             let e = e.clamp(0.0, last);
             let (low, high) = (e.floor() as u64, e.ceil() as u64);
             let max = (1u64 << bits) - 1;
@@ -296,7 +351,11 @@ fn over(top: [f64; 3], under: [f64; 3], alpha: f64) -> [f64; 3] {
 }
 
 fn channels(colour: Rgb) -> [f64; 3] {
-    [f64::from(colour.r), f64::from(colour.g), f64::from(colour.b)]
+    [
+        f64::from(colour.r),
+        f64::from(colour.g),
+        f64::from(colour.b),
+    ]
 }
 
 fn rounded(channels: [f64; 3]) -> Rgb {
@@ -407,7 +466,12 @@ impl Index {
 /// `UnknownPaint`, `Tiny`, `LowContrast`, `Covered`, then `Suspect("unknown_background")`.
 /// A page that cannot be classified within its budget or deadline hides every character
 /// rather than guess; the reader calls `try_classify` and fails the read instead.
-pub fn classify(chars: &[CharPaint], paints: &[AreaPaint], page: &PageInfo, limits: &DocLimits) -> Vec<Visibility> {
+pub fn classify(
+    chars: &[CharPaint],
+    paints: &[AreaPaint],
+    page: &PageInfo,
+    limits: &DocLimits,
+) -> Vec<Visibility> {
     try_classify(chars, paints, page, limits)
         .unwrap_or_else(|_| vec![Visibility::Hidden(HiddenWhy::UnknownPaint); chars.len()])
 }
@@ -424,7 +488,9 @@ pub(crate) fn try_classify(
     let mut comparisons = 0u64;
     let mut verdicts = Vec::with_capacity(chars.len());
     // Characters inside a knockout group, for the knockout rule.
-    let knocked: Vec<usize> = (0..chars.len()).filter(|at| chars[*at].groups.iter().any(|group| group.knockout)).collect();
+    let knocked: Vec<usize> = (0..chars.len())
+        .filter(|at| chars[*at].groups.iter().any(|group| group.knockout))
+        .collect();
     for (at, char) in chars.iter().enumerate() {
         if at.is_multiple_of(256) {
             deadline::check()?;
@@ -433,7 +499,9 @@ pub(crate) fn try_classify(
         // The budget counts the areas looked at, before any is.
         let (cell, wide) = index.lists(point);
         let in_knockout = char.groups.iter().any(|group| group.knockout);
-        comparisons += (cell.len() + wide.len()) as u64 + 1 + if in_knockout { knocked.len() as u64 } else { 0 };
+        comparisons += (cell.len() + wide.len()) as u64
+            + 1
+            + if in_knockout { knocked.len() as u64 } else { 0 };
         if comparisons > MAX_COMPARISONS {
             return Err(DocError::TooComplex("areas"));
         }
@@ -443,14 +511,23 @@ pub(crate) fn try_classify(
             .map(|area| &paints[area])
             .filter(|area| contains_point(area.bbox, point))
             .collect();
-        let before = near.iter().rev().find(|area| area.order < char.order).copied();
-        let after: Vec<&AreaPaint> = near.into_iter().filter(|area| area.order > char.order).collect();
+        let before = near
+            .iter()
+            .rev()
+            .find(|area| area.order < char.order)
+            .copied();
+        let after: Vec<&AreaPaint> = near
+            .into_iter()
+            .filter(|area| area.order > char.order)
+            .collect();
         let knocked_later = in_knockout
             && knocked.iter().any(|other| {
                 let other = &chars[*other];
                 other.order > char.order
                     && contains_point(other.bbox, point)
-                    && shared(&char.groups, &other.groups).iter().any(|group| group.knockout)
+                    && shared(&char.groups, &other.groups)
+                        .iter()
+                        .any(|group| group.knockout)
             });
         verdicts.push(verdict(char, before, &after, knocked_later, page, limits));
     }
@@ -462,7 +539,10 @@ fn painted(char: &CharPaint) -> Vec<(&Paint, f32)> {
     match char.render_mode % 4 {
         0 => vec![(&char.fill, char.fill_alpha)],
         1 => vec![(&char.stroke, char.stroke_alpha)],
-        _ => vec![(&char.fill, char.fill_alpha), (&char.stroke, char.stroke_alpha)],
+        _ => vec![
+            (&char.fill, char.fill_alpha),
+            (&char.stroke, char.stroke_alpha),
+        ],
     }
 }
 
@@ -470,7 +550,11 @@ fn effective_size(char: &CharPaint) -> (f64, f64) {
     let [a, b, c, d, _, _] = char.matrix.map(f64::from);
     let size = f64::from(char.font_size).abs();
     let along = (a * a + b * b).sqrt();
-    let height = if along > 0.0 { size * (a * d - b * c).abs() / along } else { 0.0 };
+    let height = if along > 0.0 {
+        size * (a * d - b * c).abs() / along
+    } else {
+        0.0
+    };
     let width = size * f64::from(char.horizontal_scaling).abs() * along;
     (height, width)
 }
@@ -498,10 +582,16 @@ fn verdict(
     if char.clip.is_some_and(|clip| !contains_point(clip, point)) {
         return Visibility::Hidden(Clipped);
     }
-    if paints.iter().all(|(_, alpha)| *alpha < limits.min_text_alpha) {
+    if paints
+        .iter()
+        .all(|(_, alpha)| *alpha < limits.min_text_alpha)
+    {
         return Visibility::Hidden(Transparent);
     }
-    let colours: Option<Vec<(Rgb, f32)>> = paints.iter().map(|(paint, alpha)| paint.resolve().map(|rgb| (rgb, *alpha))).collect();
+    let colours: Option<Vec<(Rgb, f32)>> = paints
+        .iter()
+        .map(|(paint, alpha)| paint.resolve().map(|rgb| (rgb, *alpha)))
+        .collect();
     let unknown_after = after.iter().any(|area| {
         let groups = shared(&char.groups, &area.groups);
         area.soft_mask
@@ -511,7 +601,12 @@ fn verdict(
             || groups.iter().any(GroupPaint::changes_its_content)
             || groups.iter().any(|group| group.knockout)
     });
-    if colours.is_none() || char.soft_mask || !char.blend.is_normal() || unknown_after || knocked_later {
+    if colours.is_none()
+        || char.soft_mask
+        || !char.blend.is_normal()
+        || unknown_after
+        || knocked_later
+    {
         return Visibility::Hidden(UnknownPaint);
     }
     let (height, width) = effective_size(char);
@@ -540,7 +635,10 @@ fn verdict(
             return Visibility::Hidden(LowContrast);
         }
     }
-    if after.iter().any(|area| area.opaque() && contains_rect(area.bbox, char.bbox)) {
+    if after
+        .iter()
+        .any(|area| area.opaque() && contains_rect(area.bbox, char.bbox))
+    {
         return Visibility::Hidden(Covered);
     }
     if background.is_none() {

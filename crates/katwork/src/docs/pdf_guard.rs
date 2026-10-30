@@ -137,16 +137,20 @@ pub fn load_filter(id: ObjectId, object: &mut Object) -> Option<(ObjectId, Objec
         if open.budget.object_streams > open.limits.max_object_streams {
             return Err(DocError::TooComplex("object_streams"));
         }
-        open.budget.decoded = open.budget.decoded.saturating_add(open.limits.max_objstm_bytes);
+        open.budget.decoded = open
+            .budget
+            .decoded
+            .saturating_add(open.limits.max_objstm_bytes);
         if open.budget.decoded > open.limits.max_decoded_bytes {
             return Err(DocError::TooComplex("decoded_bytes"));
         }
-        let decoded = decode(None, stream, open.limits.max_objstm_bytes).map_err(|error| match error {
-            DocError::TooComplex(_) => DocError::TooComplex("objstm_bytes"),
-            DocError::Malformed("stream_filter") => DocError::Malformed("stream_filter"),
-            DocError::Malformed(_) => DocError::Malformed("object_stream"),
-            other => other,
-        })?;
+        let decoded =
+            decode(None, stream, open.limits.max_objstm_bytes).map_err(|error| match error {
+                DocError::TooComplex(_) => DocError::TooComplex("objstm_bytes"),
+                DocError::Malformed("stream_filter") => DocError::Malformed("stream_filter"),
+                DocError::Malformed(_) => DocError::Malformed("object_stream"),
+                other => other,
+            })?;
         stream.set_plain_content(decoded);
         Ok(())
     });
@@ -290,7 +294,11 @@ impl Cursor<'_> {
             if self.bytes.get(self.at) != Some(&b'%') {
                 return;
             }
-            while self.bytes.get(self.at).is_some_and(|byte| !b"\r\n".contains(byte)) {
+            while self
+                .bytes
+                .get(self.at)
+                .is_some_and(|byte| !b"\r\n".contains(byte))
+            {
                 self.at += 1;
             }
         }
@@ -301,7 +309,9 @@ impl Cursor<'_> {
         let start = self.at;
         let mut value = 0u64;
         while let Some(digit) = self.bytes.get(self.at).filter(|byte| byte.is_ascii_digit()) {
-            value = value.checked_mul(10)?.checked_add(u64::from(digit - b'0'))?;
+            value = value
+                .checked_mul(10)?
+                .checked_add(u64::from(digit - b'0'))?;
             self.at += 1;
         }
         (self.at > start).then_some(value)
@@ -373,7 +383,10 @@ impl Cursor<'_> {
             b'(' => {
                 let start = self.at;
                 self.skip_string()?;
-                Some(Object::String(self.bytes[start + 1..self.at - 1].to_vec(), StringFormat::Literal))
+                Some(Object::String(
+                    self.bytes[start + 1..self.at - 1].to_vec(),
+                    StringFormat::Literal,
+                ))
             }
             b'<' => {
                 let end = self.rest().iter().position(|byte| *byte == b'>')?;
@@ -383,7 +396,11 @@ impl Cursor<'_> {
             }
             b'+' | b'-' | b'.' | b'0'..=b'9' => {
                 let start = self.at;
-                while self.bytes.get(self.at).is_some_and(|byte| matches!(byte, b'+' | b'-' | b'.' | b'0'..=b'9')) {
+                while self
+                    .bytes
+                    .get(self.at)
+                    .is_some_and(|byte| matches!(byte, b'+' | b'-' | b'.' | b'0'..=b'9'))
+                {
                     self.at += 1;
                 }
                 let text = std::str::from_utf8(&self.bytes[start..self.at]).ok()?;
@@ -394,9 +411,16 @@ impl Cursor<'_> {
                 let after = self.at;
                 if let (Some(generation), Ok(number)) = (self.unsigned(), u32::try_from(value)) {
                     self.skip();
-                    if self.rest().first() == Some(&b'R') && self.bytes.get(self.at + 1).is_none_or(|byte| is_white(*byte) || is_delimiter(*byte)) {
+                    if self.rest().first() == Some(&b'R')
+                        && self
+                            .bytes
+                            .get(self.at + 1)
+                            .is_none_or(|byte| is_white(*byte) || is_delimiter(*byte))
+                    {
                         self.at += 1;
-                        return u16::try_from(generation).ok().map(|generation| Object::Reference((number, generation)));
+                        return u16::try_from(generation)
+                            .ok()
+                            .map(|generation| Object::Reference((number, generation)));
                     }
                 }
                 self.at = after;
@@ -404,7 +428,11 @@ impl Cursor<'_> {
             }
             _ => {
                 let start = self.at;
-                while self.bytes.get(self.at).is_some_and(|byte| !(is_white(*byte) || is_delimiter(*byte))) {
+                while self
+                    .bytes
+                    .get(self.at)
+                    .is_some_and(|byte| !(is_white(*byte) || is_delimiter(*byte)))
+                {
                     self.at += 1;
                 }
                 match &self.bytes[start..self.at] {
@@ -430,17 +458,28 @@ impl Cursor<'_> {
         while self.bytes.get(self.at).is_some_and(u8::is_ascii_digit) {
             self.at += 1;
         }
-        if self.at == digits || self.bytes.get(self.at).is_some_and(|byte| *byte == b'.' || !(is_white(*byte) || is_delimiter(*byte))) {
+        if self.at == digits
+            || self
+                .bytes
+                .get(self.at)
+                .is_some_and(|byte| *byte == b'.' || !(is_white(*byte) || is_delimiter(*byte)))
+        {
             self.at = start;
             return None;
         }
-        let value = std::str::from_utf8(&self.bytes[start..self.at]).ok()?.parse::<i64>().ok()?;
+        let value = std::str::from_utf8(&self.bytes[start..self.at])
+            .ok()?
+            .parse::<i64>()
+            .ok()?;
         // `n g R` is a reference, which lopdf does not read as an offset.
         let after = self.at;
         let reference = self.unsigned().is_some() && {
             self.skip();
             self.rest().first() == Some(&b'R')
-                && self.bytes.get(self.at + 1).is_none_or(|byte| is_white(*byte) || is_delimiter(*byte))
+                && self
+                    .bytes
+                    .get(self.at + 1)
+                    .is_none_or(|byte| is_white(*byte) || is_delimiter(*byte))
         };
         self.at = after;
         (!reference).then_some(value)
@@ -501,7 +540,11 @@ fn trailer_offsets(bytes: &[u8], at: usize) -> Option<(Option<i64>, Option<i64>)
             }
             _ => {
                 let start = cursor.at;
-                while cursor.bytes.get(cursor.at).is_some_and(|byte| !(is_white(*byte) || is_delimiter(*byte))) {
+                while cursor
+                    .bytes
+                    .get(cursor.at)
+                    .is_some_and(|byte| !(is_white(*byte) || is_delimiter(*byte)))
+                {
                     cursor.at += 1;
                 }
                 if cursor.at == start {
@@ -516,7 +559,10 @@ fn trailer_offsets(bytes: &[u8], at: usize) -> Option<(Option<i64>, Option<i64>)
 /// The classic table at `offset` (which starts with `xref`). lopdf reads every entry that
 /// follows a subsection header, whatever its count says.
 fn table_section(bytes: &[u8], offset: usize) -> Result<Option<Section>, DocError> {
-    let mut cursor = Cursor { bytes, at: offset + 4 };
+    let mut cursor = Cursor {
+        bytes,
+        at: offset + 4,
+    };
     let mut section = Section {
         used: Vec::new(),
         free: Vec::new(),
@@ -551,11 +597,16 @@ fn table_section(bytes: &[u8], offset: usize) -> Result<Option<Section>, DocErro
                 deadline::check()?;
             }
             // lopdf skips a number past u32.
-            let Some(number) = start.checked_add(index).and_then(|number| u32::try_from(number).ok()) else {
+            let Some(number) = start
+                .checked_add(index)
+                .and_then(|number| u32::try_from(number).ok())
+            else {
                 continue;
             };
             match (kind, u32::try_from(position), u16::try_from(generation)) {
-                (Some(b'n'), Ok(offset), Ok(generation)) => section.used.push((number, XrefEntry::Normal { offset, generation })),
+                (Some(b'n'), Ok(offset), Ok(generation)) => section
+                    .used
+                    .push((number, XrefEntry::Normal { offset, generation })),
                 // An offset past u32 is one lopdf could not have read.
                 (Some(b'n'), Err(_), _) => return Ok(None),
                 // lopdf drops an in-use entry whose generation is out of range, as a free one.
@@ -573,7 +624,12 @@ fn table_section(bytes: &[u8], offset: usize) -> Result<Option<Section>, DocErro
 
 /// The cross-reference stream at `offset`, read from the file's bytes (a hybrid file's
 /// `/XRefStm` stream is often listed in no section, so lopdf never loads it as an object).
-fn stream_section(bytes: &[u8], doc: &Document, offset: usize, limits: &DocLimits) -> Result<Option<Section>, DocError> {
+fn stream_section(
+    bytes: &[u8],
+    doc: &Document,
+    offset: usize,
+    limits: &DocLimits,
+) -> Result<Option<Section>, DocError> {
     let mut cursor = Cursor { bytes, at: offset };
     let (Some(_), Some(_)) = (cursor.unsigned(), cursor.unsigned()) else {
         return Ok(None);
@@ -593,7 +649,11 @@ fn stream_section(bytes: &[u8], doc: &Document, offset: usize, limits: &DocLimit
     cursor.at += 6;
     if cursor.rest().starts_with(b"\r\n") {
         cursor.at += 2;
-    } else if cursor.rest().first().is_some_and(|byte| b"\r\n".contains(byte)) {
+    } else if cursor
+        .rest()
+        .first()
+        .is_some_and(|byte| b"\r\n".contains(byte))
+    {
         cursor.at += 1;
     }
     let start = cursor.at;
@@ -602,9 +662,15 @@ fn stream_section(bytes: &[u8], doc: &Document, offset: usize, limits: &DocLimit
         Some(other) => other.as_i64().ok(),
         None => None,
     };
-    let end = match length.and_then(|length| usize::try_from(length).ok()).and_then(|length| start.checked_add(length)) {
+    let end = match length
+        .and_then(|length| usize::try_from(length).ok())
+        .and_then(|length| start.checked_add(length))
+    {
         Some(end) if end <= bytes.len() => end,
-        _ => match bytes[start..].windows(9).position(|window| window == b"endstream") {
+        _ => match bytes[start..]
+            .windows(9)
+            .position(|window| window == b"endstream")
+        {
             Some(at) => start + at,
             None => return Ok(None),
         },
@@ -619,10 +685,17 @@ fn stream_section(bytes: &[u8], doc: &Document, offset: usize, limits: &DocLimit
             _ => None,
         }
     };
-    let (Some(size), Some(widths)) = (dict.get(b"Size").ok().and_then(|size| size.as_i64().ok()), integers(b"W")) else {
+    let (Some(size), Some(widths)) = (
+        dict.get(b"Size").ok().and_then(|size| size.as_i64().ok()),
+        integers(b"W"),
+    ) else {
         return Ok(None);
     };
-    let widths: Vec<usize> = widths.iter().take(3).filter_map(|width| usize::try_from(*width).ok().filter(|width| *width <= 8)).collect();
+    let widths: Vec<usize> = widths
+        .iter()
+        .take(3)
+        .filter_map(|width| usize::try_from(*width).ok().filter(|width| *width <= 8))
+        .collect();
     let [first, second, third] = widths[..] else {
         return Ok(None);
     };
@@ -636,7 +709,10 @@ fn stream_section(bytes: &[u8], doc: &Document, offset: usize, limits: &DocLimit
         used: Vec::new(),
         free: Vec::new(),
         prev: dict.get(b"Prev").ok().and_then(|prev| prev.as_i64().ok()),
-        stream: dict.get(b"XRefStm").ok().and_then(|stream| stream.as_i64().ok()),
+        stream: dict
+            .get(b"XRefStm")
+            .ok()
+            .and_then(|stream| stream.as_i64().ok()),
     };
     for pair in index.chunks_exact(2) {
         for at in 0..pair[1].max(0) {
@@ -644,15 +720,34 @@ fn stream_section(bytes: &[u8], doc: &Document, offset: usize, limits: &DocLimit
                 return Ok(None);
             };
             // Big-endian fields, kept to 32 bits as lopdf keeps them.
-            let field = |from: usize, len: usize| row[from..from + len].iter().fold(0u32, |value, byte| (value << 8) | u32::from(*byte));
+            let field = |from: usize, len: usize| {
+                row[from..from + len]
+                    .iter()
+                    .fold(0u32, |value, byte| (value << 8) | u32::from(*byte))
+            };
             let kind = if first == 0 { 1 } else { field(0, first) };
             let (middle, last) = (field(first, second), field(first + second, third));
-            let Some(number) = pair[0].checked_add(at).and_then(|number| u32::try_from(number).ok()) else {
+            let Some(number) = pair[0]
+                .checked_add(at)
+                .and_then(|number| u32::try_from(number).ok())
+            else {
                 continue;
             };
             match kind {
-                1 => section.used.push((number, XrefEntry::Normal { offset: middle, generation: last as u16 })),
-                2 => section.used.push((number, XrefEntry::Compressed { container: middle, index: last as u16 })),
+                1 => section.used.push((
+                    number,
+                    XrefEntry::Normal {
+                        offset: middle,
+                        generation: last as u16,
+                    },
+                )),
+                2 => section.used.push((
+                    number,
+                    XrefEntry::Compressed {
+                        container: middle,
+                        index: last as u16,
+                    },
+                )),
                 _ => section.free.push(number),
             }
         }
@@ -662,12 +757,20 @@ fn stream_section(bytes: &[u8], doc: &Document, offset: usize, limits: &DocLimit
 
 fn same_entry(a: &XrefEntry, b: &XrefEntry) -> bool {
     match (a, b) {
-        (XrefEntry::Normal { offset, generation }, XrefEntry::Normal { offset: other, generation: other_generation }) => {
-            offset == other && generation == other_generation
-        }
-        (XrefEntry::Compressed { container, index }, XrefEntry::Compressed { container: other, index: other_index }) => {
-            container == other && index == other_index
-        }
+        (
+            XrefEntry::Normal { offset, generation },
+            XrefEntry::Normal {
+                offset: other,
+                generation: other_generation,
+            },
+        ) => offset == other && generation == other_generation,
+        (
+            XrefEntry::Compressed { container, index },
+            XrefEntry::Compressed {
+                container: other,
+                index: other_index,
+            },
+        ) => container == other && index == other_index,
         _ => false,
     }
 }
@@ -677,13 +780,23 @@ fn same_entry(a: &XrefEntry, b: &XrefEntry) -> bool {
 /// section's in-use entry for the same number survives its merge and brings back an object
 /// every viewer treats as deleted. `None` when the sections cannot be read here exactly as
 /// lopdf read them: lopdf's merged table must come out the same.
-fn freed_numbers(bytes: &[u8], doc: &Document, limits: &DocLimits) -> Result<Option<HashSet<u32>>, DocError> {
+fn freed_numbers(
+    bytes: &[u8],
+    doc: &Document,
+    limits: &DocLimits,
+) -> Result<Option<HashSet<u32>>, DocError> {
     // lopdf reads from the header on, and its offsets count from there.
-    let base = bytes.windows(5).position(|five| five == b"%PDF-").unwrap_or(0);
+    let base = bytes
+        .windows(5)
+        .position(|five| five == b"%PDF-")
+        .unwrap_or(0);
     let bytes = &bytes[base..];
     let read = |offset: i64| -> Result<Option<Section>, DocError> {
         deadline::check()?;
-        let Some(offset) = usize::try_from(offset).ok().filter(|offset| *offset < bytes.len()) else {
+        let Some(offset) = usize::try_from(offset)
+            .ok()
+            .filter(|offset| *offset < bytes.len())
+        else {
             return Ok(None);
         };
         if bytes[offset..].starts_with(b"xref") {
@@ -745,11 +858,21 @@ fn freed_numbers(bytes: &[u8], doc: &Document, limits: &DocLimits) -> Result<Opt
     }
     let table = &doc.reference_table.entries;
     let agrees = merged.len() == table.len()
-        && table.iter().all(|(number, entry)| merged.get(number).is_some_and(|mine| same_entry(mine, entry)));
+        && table.iter().all(|(number, entry)| {
+            merged
+                .get(number)
+                .is_some_and(|mine| same_entry(mine, entry))
+        });
     if !agrees {
         return Ok(None);
     }
-    Ok(Some(newest.into_iter().filter(|(number, used)| *number != 0 && !used).map(|(number, _)| number).collect()))
+    Ok(Some(
+        newest
+            .into_iter()
+            .filter(|(number, used)| *number != 0 && !used)
+            .map(|(number, _)| number)
+            .collect(),
+    ))
 }
 
 /// Loads `bytes` with lopdf under the open budget (`BudgetScope`), then refuses an encrypted
@@ -782,12 +905,19 @@ pub(crate) fn load(bytes: &[u8], limits: &DocLimits) -> Result<Document, DocErro
         return Err(DocError::Encrypted);
     }
     let rebuilt = matches!(doc.xref_recovery, Some(XrefRecovery::Reconstructed));
-    let freed = if rebuilt { None } else { freed_numbers(bytes, &doc, limits)? };
+    let freed = if rebuilt {
+        None
+    } else {
+        freed_numbers(bytes, &doc, limits)?
+    };
     let is_freed = |number: u32| freed.as_ref().is_some_and(|freed| freed.contains(&number));
     // An object stream lopdf could not parse is dropped with its members; never read a file
     // with objects silently missing.
     for (number, entry) in &doc.reference_table.entries {
-        if matches!(entry, XrefEntry::Compressed { .. }) && !is_freed(*number) && !doc.objects.contains_key(&(*number, 0)) {
+        if matches!(entry, XrefEntry::Compressed { .. })
+            && !is_freed(*number)
+            && !doc.objects.contains_key(&(*number, 0))
+        {
             return Err(DocError::Malformed("object_stream"));
         }
     }
@@ -853,7 +983,9 @@ impl Capped {
         let mut chunk = vec![0u8; CHUNK];
         loop {
             deadline::check()?;
-            let want = usize::try_from(self.room()).unwrap_or(usize::MAX).min(CHUNK);
+            let want = usize::try_from(self.room())
+                .unwrap_or(usize::MAX)
+                .min(CHUNK);
             if want == 0 {
                 // At the cap: one more byte of output is too many.
                 let mut probe = [0u8; 1];
@@ -875,7 +1007,10 @@ impl Capped {
 }
 
 /// `/Filter` and `/DecodeParms` resolved: each filter name with its parameters.
-fn filters(doc: Option<&Document>, dict: &Dictionary) -> Result<Vec<(Vec<u8>, Option<Dictionary>)>, DocError> {
+fn filters(
+    doc: Option<&Document>,
+    dict: &Dictionary,
+) -> Result<Vec<(Vec<u8>, Option<Dictionary>)>, DocError> {
     let malformed = DocError::Malformed("stream_filter");
     let resolve = |object: &Object| -> Result<Object, DocError> {
         match object {
@@ -948,7 +1083,9 @@ fn decode(doc: Option<&Document>, stream: &Stream, cap: u64) -> Result<Vec<u8>, 
 /// not; corrupt deflate data is `Malformed`.
 fn inflate(input: &[u8], out: &mut Capped) -> Result<(), DocError> {
     let raw = match input {
-        [cmf, flg, rest @ ..] if cmf & 0x0F == 8 && ((u16::from(*cmf) << 8) | u16::from(*flg)) % 31 == 0 => {
+        [cmf, flg, rest @ ..]
+            if cmf & 0x0F == 8 && ((u16::from(*cmf) << 8) | u16::from(*flg)) % 31 == 0 =>
+        {
             if flg & 0x20 != 0 {
                 // A preset dictionary: never in a PDF.
                 return Err(DocError::Malformed("stream_decode"));
@@ -1011,7 +1148,9 @@ fn ascii_hex(input: &[u8], out: &mut Capped) -> Result<(), DocError> {
         if is_white(byte) {
             continue;
         }
-        let nibble = (byte as char).to_digit(16).ok_or(DocError::Malformed("stream_decode"))? as u8;
+        let nibble = (byte as char)
+            .to_digit(16)
+            .ok_or(DocError::Malformed("stream_decode"))? as u8;
         match high.take() {
             Some(high) => out.push(high << 4 | nibble)?,
             None => high = Some(nibble),
@@ -1029,8 +1168,12 @@ fn ascii85(input: &[u8], out: &mut Capped) -> Result<(), DocError> {
     let flush = |group: &[u32], out: &mut Capped| -> Result<(), DocError> {
         let mut padded = [84u32; 5];
         padded[..group.len()].copy_from_slice(group);
-        let value = padded.iter().try_fold(0u64, |value, digit| Some(value * 85 + u64::from(*digit)));
-        let value = value.and_then(|value| u32::try_from(value).ok()).ok_or(malformed)?;
+        let value = padded
+            .iter()
+            .try_fold(0u64, |value, digit| Some(value * 85 + u64::from(*digit)));
+        let value = value
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or(malformed)?;
         out.extend(&value.to_be_bytes()[..group.len() - 1])
     };
     let mut bytes = input.iter().copied().peekable();
@@ -1098,11 +1241,16 @@ fn predict(input: Capped, params: Option<&Dictionary>, cap: u64) -> Result<Cappe
     let colors = number(b"Colors", 1)?;
     let bits = number(b"BitsPerComponent", 8)?;
     let columns = number(b"Columns", 1)?;
-    if !(1..=MAX_COLORS).contains(&colors) || !(1..=MAX_COLUMNS).contains(&columns) || ![1, 2, 4, 8, 16].contains(&bits) {
+    if !(1..=MAX_COLORS).contains(&colors)
+        || !(1..=MAX_COLUMNS).contains(&columns)
+        || ![1, 2, 4, 8, 16].contains(&bits)
+    {
         return Err(DocError::Malformed("stream_predictor"));
     }
-    let row = usize::try_from((colors * bits * columns).div_ceil(8)).map_err(|_| DocError::Malformed("stream_predictor"))?;
-    let pixel = usize::try_from((colors * bits).div_ceil(8)).map_err(|_| DocError::Malformed("stream_predictor"))?;
+    let row = usize::try_from((colors * bits * columns).div_ceil(8))
+        .map_err(|_| DocError::Malformed("stream_predictor"))?;
+    let pixel = usize::try_from((colors * bits).div_ceil(8))
+        .map_err(|_| DocError::Malformed("stream_predictor"))?;
     let data = input.data;
     let mut out = Capped::new(cap);
     match predictor {
@@ -1118,12 +1266,22 @@ fn predict(input: Capped, params: Option<&Dictionary>, cap: u64) -> Result<Cappe
             let mut previous = vec![0u8; row];
             for line in data.chunks(row + 1) {
                 deadline::check()?;
-                let (&kind, encoded) = line.split_first().ok_or(DocError::Malformed("stream_predictor"))?;
+                let (&kind, encoded) = line
+                    .split_first()
+                    .ok_or(DocError::Malformed("stream_predictor"))?;
                 let mut current = vec![0u8; encoded.len()];
                 for index in 0..encoded.len() {
-                    let left = if index >= pixel { current[index - pixel] } else { 0 };
+                    let left = if index >= pixel {
+                        current[index - pixel]
+                    } else {
+                        0
+                    };
                     let up = previous[index];
-                    let up_left = if index >= pixel { previous[index - pixel] } else { 0 };
+                    let up_left = if index >= pixel {
+                        previous[index - pixel]
+                    } else {
+                        0
+                    };
                     let value = encoded[index];
                     current[index] = match kind {
                         0 => value,
@@ -1159,7 +1317,11 @@ fn paeth(left: u8, up: u8, up_left: u8) -> u8 {
 /// TIFF predictor 2 on one row: each sample adds the one `colors` samples before it.
 fn tiff_row(row: &mut [u8], colors: usize, bits: usize) {
     let samples = row.len() * 8 / bits;
-    let mask = if bits == 16 { 0xFFFF } else { (1u32 << bits) - 1 };
+    let mask = if bits == 16 {
+        0xFFFF
+    } else {
+        (1u32 << bits) - 1
+    };
     let get = |row: &[u8], index: usize| -> u32 {
         match bits {
             16 => u32::from(u16::from_be_bytes([row[index * 2], row[index * 2 + 1]])),
@@ -1210,7 +1372,10 @@ pub struct PrescanReport {
 }
 
 fn rect_of(doc: &Document, object: Option<&Object>) -> Option<[f32; 4]> {
-    let Some(Object::Array(items)) = object.and_then(|object| doc.dereference(object).ok()).map(|(_, object)| object) else {
+    let Some(Object::Array(items)) = object
+        .and_then(|object| doc.dereference(object).ok())
+        .map(|(_, object)| object)
+    else {
         return None;
     };
     let values: Option<Vec<f32>> = items
@@ -1246,12 +1411,18 @@ fn dict_of<'a>(doc: &'a Document, object: &'a Object) -> Option<&'a Dictionary> 
 /// before any page is read. Media and crop boxes inherit down the tree.
 fn page_tree(doc: &Document, limits: &DocLimits) -> Result<Vec<PrescanPage>, DocError> {
     let no_pages = DocError::Malformed("no_pages");
-    let root = doc.trailer.get(b"Root").ok().and_then(|root| dict_of(doc, root)).ok_or(no_pages)?;
+    let root = doc
+        .trailer
+        .get(b"Root")
+        .ok()
+        .and_then(|root| dict_of(doc, root))
+        .ok_or(no_pages)?;
     let top = root.get(b"Pages").ok().ok_or(no_pages)?;
     let mut seen: HashSet<ObjectId> = HashSet::new();
     let mut pages = Vec::new();
     // (node, depth, inherited media box, inherited crop box)
-    let mut stack: Vec<(&Object, u32, Option<[f32; 4]>, Option<[f32; 4]>)> = vec![(top, 1, None, None)];
+    let mut stack: Vec<(&Object, u32, Option<[f32; 4]>, Option<[f32; 4]>)> =
+        vec![(top, 1, None, None)];
     let mut visits = 0u64;
     while let Some((node, depth, media, crop)) = stack.pop() {
         visits += 1;
@@ -1291,7 +1462,12 @@ fn page_tree(doc: &Document, limits: &DocLimits) -> Result<Vec<PrescanPage>, Doc
                 // US Letter when no media box is named, as the walker reads it.
                 let media = media.unwrap_or([0.0, 0.0, 612.0, 792.0]);
                 let crop = crop.map_or(media, |crop| {
-                    [crop[0].max(media[0]), crop[1].max(media[1]), crop[2].min(media[2]), crop[3].min(media[3])]
+                    [
+                        crop[0].max(media[0]),
+                        crop[1].max(media[1]),
+                        crop[2].min(media[2]),
+                        crop[3].min(media[3]),
+                    ]
                 });
                 pages.push(PrescanPage {
                     number: pages.len() as u32 + 1,
@@ -1323,7 +1499,12 @@ fn decode_all(doc: &mut Document, limits: &DocLimits) -> Result<(), DocError> {
         let Some(Object::Stream(stream)) = doc.objects.get(&id) else {
             continue;
         };
-        let image = stream.dict.get(b"Subtype").ok().and_then(|subtype| resolve(doc, subtype)).is_some_and(|(_, subtype)| subtype.as_name().ok() == Some(b"Image"));
+        let image = stream
+            .dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(|subtype| resolve(doc, subtype))
+            .is_some_and(|(_, subtype)| subtype.as_name().ok() == Some(b"Image"));
         let decoded = if image || stream.dict.has(b"F") {
             Vec::new()
         } else if !stream.dict.has(b"Filter") {
@@ -1346,10 +1527,14 @@ fn contents(doc: &Document, page: &Dictionary) -> Result<Vec<ObjectId>, DocError
     match page.get(b"Contents").ok() {
         Some(Object::Reference(id)) => match doc.get_object(*id) {
             Ok(Object::Stream(_)) => streams.push(*id),
-            Ok(Object::Array(items)) => streams.extend(items.iter().filter_map(|item| item.as_reference().ok())),
+            Ok(Object::Array(items)) => {
+                streams.extend(items.iter().filter_map(|item| item.as_reference().ok()))
+            }
             _ => {}
         },
-        Some(Object::Array(items)) => streams.extend(items.iter().filter_map(|item| item.as_reference().ok())),
+        Some(Object::Array(items)) => {
+            streams.extend(items.iter().filter_map(|item| item.as_reference().ok()))
+        }
         _ => {}
     }
     if streams.len() > MAX_CONTENTS {
@@ -1359,7 +1544,12 @@ fn contents(doc: &Document, page: &Dictionary) -> Result<Vec<ObjectId>, DocError
 }
 
 /// A page attribute inherited through `/Parent`, as pdf-extract reads it.
-fn inherited<'a>(doc: &'a Document, page: &'a Dictionary, key: &[u8], limits: &DocLimits) -> Option<&'a Object> {
+fn inherited<'a>(
+    doc: &'a Document,
+    page: &'a Dictionary,
+    key: &[u8],
+    limits: &DocLimits,
+) -> Option<&'a Object> {
     let mut dict = page;
     let mut seen = HashSet::new();
     for _ in 0..=limits.max_page_tree_depth {
@@ -1388,7 +1578,12 @@ struct FormWalk<'a> {
 impl<'a> FormWalk<'a> {
     /// Counts `content`'s operators and walks the Forms it draws; returns the height of the
     /// deepest Form chain below it (0 for none). `depth` is the content's own nesting depth.
-    fn content(&mut self, content: &[u8], resources: Option<&'a Dictionary>, depth: u32) -> Result<u32, DocError> {
+    fn content(
+        &mut self,
+        content: &[u8],
+        resources: Option<&'a Dictionary>,
+        depth: u32,
+    ) -> Result<u32, DocError> {
         let doc = self.doc;
         let mut height = 0;
         for operation in Content::decode_iter(content) {
@@ -1414,7 +1609,13 @@ impl<'a> FormWalk<'a> {
             let Some((Some(id), Object::Stream(form))) = target else {
                 continue;
             };
-            if form.dict.get(b"Subtype").ok().and_then(|subtype| subtype.as_name().ok()) != Some(b"Form") {
+            if form
+                .dict
+                .get(b"Subtype")
+                .ok()
+                .and_then(|subtype| subtype.as_name().ok())
+                != Some(b"Form")
+            {
                 continue;
             }
             height = height.max(self.form(id, form, resources, depth + 1)?);
@@ -1422,15 +1623,29 @@ impl<'a> FormWalk<'a> {
         Ok(height)
     }
 
-    fn form(&mut self, id: ObjectId, form: &'a Stream, outer: Option<&'a Dictionary>, depth: u32) -> Result<u32, DocError> {
+    fn form(
+        &mut self,
+        id: ObjectId,
+        form: &'a Stream,
+        outer: Option<&'a Dictionary>,
+        depth: u32,
+    ) -> Result<u32, DocError> {
         if self.path.contains(&id) {
             return Err(DocError::Malformed("xobject_cycle"));
         }
         if depth > self.limits.max_xobject_depth {
             return Err(DocError::TooComplex("xobject_depth"));
         }
-        let resources = form.dict.get(b"Resources").ok().and_then(|resources| dict_of(self.doc, resources)).or(outer);
-        let key = (id, resources.map_or(0, |resources| resources as *const Dictionary as usize));
+        let resources = form
+            .dict
+            .get(b"Resources")
+            .ok()
+            .and_then(|resources| dict_of(self.doc, resources))
+            .or(outer);
+        let key = (
+            id,
+            resources.map_or(0, |resources| resources as *const Dictionary as usize),
+        );
         if let Some(height) = self.heights.get(&key) {
             if depth + height - 1 > self.limits.max_xobject_depth {
                 return Err(DocError::TooComplex("xobject_depth"));
@@ -1486,13 +1701,19 @@ fn active_content(doc: &Document) -> Result<Vec<ExtractWarning>, DocError> {
                     let goes_to = match resolve(doc, value) {
                         Some((_, Object::Array(_))) => true,
                         Some((_, Object::Dictionary(action))) => {
-                            action.get(b"S").ok().and_then(|kind| kind.as_name().ok()) == Some(b"GoTo")
+                            action.get(b"S").ok().and_then(|kind| kind.as_name().ok())
+                                == Some(b"GoTo")
                         }
                         _ => true,
                     };
                     script |= !goes_to;
                 }
-                b"S" if value.as_name().is_ok_and(|kind| ACTIVE_ACTIONS.contains(&kind)) => script = true,
+                b"S" if value
+                    .as_name()
+                    .is_ok_and(|kind| ACTIVE_ACTIONS.contains(&kind)) =>
+                {
+                    script = true
+                }
                 b"XFA" => xfa = true,
                 b"EmbeddedFiles" => attachment = true,
                 b"Type" if value.as_name().ok() == Some(b"EmbeddedFile") => attachment = true,
@@ -1537,10 +1758,11 @@ pub fn prescan(doc: &mut Document, limits: &DocLimits) -> Result<PrescanReport, 
         let Ok(dict) = doc.get_dictionary(page.id) else {
             continue;
         };
-        let resources = inherited(doc, dict, b"Resources", limits).and_then(|resources| match resources {
-            Object::Dictionary(dict) => Some(dict),
-            _ => None,
-        });
+        let resources =
+            inherited(doc, dict, b"Resources", limits).and_then(|resources| match resources {
+                Object::Dictionary(dict) => Some(dict),
+                _ => None,
+            });
         let mut content = Vec::new();
         for id in contents(doc, dict)? {
             let Ok(Object::Stream(stream)) = doc.get_object(id) else {

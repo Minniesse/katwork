@@ -51,13 +51,21 @@ fn stray_mark(line: &str) -> bool {
 /// else `Ok`.
 pub fn check_page(page: &PageText) -> TextLayer {
     if page.visible_glyphs == 0 {
-        return if page.images > 0 { TextLayer::Absent } else { TextLayer::Ok };
+        return if page.images > 0 {
+            TextLayer::Absent
+        } else {
+            TextLayer::Ok
+        };
     }
     let total: usize = page.lines.iter().map(|line| line.chars().count()).sum();
     let bad: usize = page
         .lines
         .iter()
-        .map(|line| line.chars().filter(|c| *c == '\u{FFFD}' || is_private(*c)).count())
+        .map(|line| {
+            line.chars()
+                .filter(|c| *c == '\u{FFFD}' || is_private(*c))
+                .count()
+        })
         .sum();
     if total > 0 && bad * 100 > total {
         return TextLayer::Suspect("fffd");
@@ -78,7 +86,10 @@ mod tests {
     fn page(lines: &[&str]) -> PageText {
         PageText {
             lines: lines.iter().map(|line| line.to_string()).collect(),
-            visible_glyphs: lines.iter().map(|line| line.chars().filter(|c| !c.is_whitespace()).count()).sum(),
+            visible_glyphs: lines
+                .iter()
+                .map(|line| line.chars().filter(|c| !c.is_whitespace()).count())
+                .sum(),
             ..PageText::default()
         }
     }
@@ -86,21 +97,42 @@ mod tests {
     #[test]
     fn marks_need_a_consonant() {
         assert_eq!(check_page(&page(&["น้ำ กำไร ไม่"])), TextLayer::Ok);
-        assert_eq!(check_page(&page(&["น\u{E49}\u{E4D}\u{E32}"])), TextLayer::Ok);
-        assert_eq!(check_page(&page(&["\u{E48}ก"])), TextLayer::Suspect("marks"));
-        assert_eq!(check_page(&page(&["a\u{E49}"])), TextLayer::Suspect("marks"));
+        assert_eq!(
+            check_page(&page(&["น\u{E49}\u{E4D}\u{E32}"])),
+            TextLayer::Ok
+        );
+        assert_eq!(
+            check_page(&page(&["\u{E48}ก"])),
+            TextLayer::Suspect("marks")
+        );
+        assert_eq!(
+            check_page(&page(&["a\u{E49}"])),
+            TextLayer::Suspect("marks")
+        );
     }
 
     #[test]
     fn replacement_characters_past_one_percent() {
         let clean = "x".repeat(200);
-        assert_eq!(check_page(&page(&[&format!("{clean}\u{FFFD}")])), TextLayer::Ok);
-        assert_eq!(check_page(&page(&[&format!("{clean}\u{FFFD}\u{E000}\u{FFFD}")])), TextLayer::Suspect("fffd"));
+        assert_eq!(
+            check_page(&page(&[&format!("{clean}\u{FFFD}")])),
+            TextLayer::Ok
+        );
+        assert_eq!(
+            check_page(&page(&[&format!("{clean}\u{FFFD}\u{E000}\u{FFFD}")])),
+            TextLayer::Suspect("fffd")
+        );
     }
 
     #[test]
     fn nothing_visible() {
-        assert_eq!(check_page(&PageText { images: 1, ..page(&[" "]) }), TextLayer::Absent);
+        assert_eq!(
+            check_page(&PageText {
+                images: 1,
+                ..page(&[" "])
+            }),
+            TextLayer::Absent
+        );
         assert_eq!(check_page(&page(&[])), TextLayer::Ok);
         // Glyphs with no text are still marks on the page.
         let unmapped = PageText {

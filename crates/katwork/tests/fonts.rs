@@ -40,9 +40,11 @@ fn manifest() -> BTreeMap<String, String> {
 
 fn is_font(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    [".ttf", ".otf", ".ttc", ".otc", ".woff", ".woff2", ".pfb", ".pfa"]
-        .iter()
-        .any(|extension| lower.ends_with(extension))
+    [
+        ".ttf", ".otf", ".ttc", ".otc", ".woff", ".woff2", ".pfb", ".pfa",
+    ]
+    .iter()
+    .any(|extension| lower.ends_with(extension))
 }
 
 #[test]
@@ -57,7 +59,10 @@ fn font_bundle_hashes_match_manifest() {
     for entry in std::fs::read_dir(FONTS).unwrap() {
         let entry = entry.unwrap();
         let name = entry.file_name().to_string_lossy().into_owned();
-        assert!(entry.file_type().unwrap().is_file(), "{name} is a plain file");
+        assert!(
+            entry.file_type().unwrap().is_file(),
+            "{name} is a plain file"
+        );
         match name.as_str() {
             "FONTS.md" | "OFL.txt" => {}
             _ => {
