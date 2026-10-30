@@ -13,9 +13,8 @@ it and the reason on stderr goes back to the agent. Blocks:
 - commits and merges when the author or committer email isn't a GitHub
   noreply address
 - `gh pr merge` with --admin, --auto, --squash or --rebase; without a review
-  that covers the PR (see merge_verdict; the PR is read with `gh pr view`, or
-  over REST when that fails); or with --delete-branch while open PRs use the
-  head branch as their base
+  that covers the PR (see merge_verdict); or with --delete-branch while open
+  PRs use the head branch as their base
 - `gh api` writes that merge, move or delete refs or write contents, in any
   flag spelling and any endpoint spelling GitHub routes there (see api_path),
   and GraphQL merge or ref mutations, including bodies read
@@ -1532,11 +1531,13 @@ def have_commits(shas, slug, cwd):
 
 
 def review_check(target, repo, cwd):
-    """The review rule for `gh pr merge`: the PR from `gh pr view`, or over
-    REST when that fails (a session without GraphQL)."""
+    """The review rule for `gh pr merge`, on the PR `gh pr view` reads."""
     view = ["gh", "pr", "view"] + ([target] if target else []) + repo
     out = run(view + ["--json", "number,url,headRefOid,baseRefName,reviews"], cwd)
-    pr, reason = pr_from_view(out) if out is not None else pr_by_rest(target, repo, cwd)
+    if out is None:  # without GraphQL, `gh pr merge` can't merge either
+        return ("couldn't read the PR with `gh pr view`, so the merge can't be checked. Where GraphQL is "
+                f"unavailable, merge with `{REST_MERGE}`.")
+    pr, reason = pr_from_view(out)
     return reason or pr_verdict(pr, cwd)
 
 
@@ -1554,28 +1555,9 @@ def pr_from_view(out):
             "base": pr.get("baseRefName", ""), "reviews": reviews}, None
 
 
-def pr_by_rest(target, repo, cwd):
-    """`gh pr merge`'s PR over REST, when `gh pr view` fails: a PR URL, or a
-    number in --repo's repository or else the clone's, which gh fills in for
-    {owner}/{repo} the way a non-interactive `gh pr` picks it."""
-    m = re.fullmatch(r"https://github\.com/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/pull/([1-9][0-9]*)(?:[/?#].*)?", target or "")
-    if m:
-        return pr_over_rest(m.group(1), m.group(2), cwd)
-    if not re.fullmatch(r"#?[1-9][0-9]*", target or ""):
-        return None, ("couldn't read the PR with `gh pr view`, and over REST the guard finds a PR only by number "
-                      f"or URL. Name it, or where GraphQL is unavailable merge with `{REST_MERGE}`.")
-    slug = "{owner}/{repo}"
-    if repo:
-        m = re.fullmatch(r"(?:github\.com/)?([A-Za-z0-9-]+/[A-Za-z0-9._-]+)", repo[1])
-        if not m:
-            return None, f"couldn't read the PR with `gh pr view`, and --repo '{repo[1]}' isn't an owner/repo on github.com."
-        slug = m.group(1)
-    return pr_over_rest(slug, target.lstrip("#"), cwd)
-
-
 def pr_over_rest(slug, number, cwd):
-    """pr_from_view's result, read over REST: the PR, then its reviews by
-    each one's commit_id."""
+    """pr_from_view's result for the REST merge, read over REST: the PR, then
+    its reviews by each one's commit_id."""
     endpoint = f"repos/{slug}/pulls/{number}"
     out = run(["gh", "api", endpoint, "--jq", "{number, url: .html_url, head: .head.sha, base: .base.ref}"], cwd)
     try:
@@ -2019,9 +2001,9 @@ REST_CASES = 89
 
 
 def rest_self_test():
-    """The REST merge, and `gh pr merge` reading the PR over REST when `gh pr
-    view` fails, end to end through decide() with every `gh` call answered by
-    a fake. A scratch repo holds real commits: P on main, A (the reviewed
+    """The REST merge, and `gh pr merge` with and without GraphQL, end to end
+    through decide() with every `gh` call answered by a fake. A scratch repo
+    holds real commits: P on main, A (the reviewed
     commit) on the PR branch, B on main, M (git's clean merge of B into A) and
     D (a plain commit on A). The fake serves repo o/r: PR 21 (head A, reviewed
     on A), 22 (head M, reviewed on A), 23 (head D, reviewed on A), 24 (head A,
@@ -2066,7 +2048,7 @@ def rest_self_test():
         for n, (head, reviews, commits) in prs.items():
             url = f"https://github.com/o/r/pull/{n}"
             posted = [{"commit": c, "state": s, "submittedAt": None if s == "PENDING" else "1"} for c, s in reviews]
-            for slug in ("o/r", "{owner}/{repo}"):  # gh fills {owner}/{repo} in from the clone
+            for slug in ("o/r", "{owner}/{repo}"):  # gh fills {owner}/{repo} in, so a guard reading it would pass
                 table[f"api repos/{slug}/pulls/{n} --jq {{number, url: .html_url, head: .head.sha, base: .base.ref}}"] = \
                     json.dumps({"number": n, "url": url, "head": head, "base": "main"})
             table[f"api --paginate repos/o/r/pulls/{n}/reviews --jq .[] | "
@@ -2169,13 +2151,13 @@ def rest_self_test():
         ("curl -X PUT https://api.github.com/repos/o/r/pulls/24/ccr/auto_merge", False, False),
         ("gh api repos/o/r/pulls/21/ccr/review_threads", True, False),
         ("gh api -X POST repos/o/r/pulls/21/ccr/ready_for_review", True, False),
-        # gh pr merge reads the PR with gh pr view where GraphQL works, and over REST where it doesn't
+        # gh pr merge reads the PR with gh pr view; without GraphQL it is refused, even on a covered head
         ("gh pr merge 22 --merge", True, True),
         ("gh pr merge 24 --merge", False, True),
         ("gh pr merge 25 --merge", False, True),
-        ("gh pr merge 22 --merge", True, False),
-        ("gh pr merge https://github.com/o/r/pull/21 --merge", True, False),
-        ("gh pr merge 21 --merge --repo o/r", True, False),
+        ("gh pr merge 22 --merge", False, False),
+        ("gh pr merge https://github.com/o/r/pull/21 --merge", False, False),
+        ("gh pr merge 21 --merge --repo o/r", False, False),
         ("gh pr merge 23 --merge", False, False),
         ("gh pr merge 25 --merge", False, False),
         ("gh pr merge --merge", False, False),
