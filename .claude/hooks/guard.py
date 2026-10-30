@@ -13,11 +13,15 @@ it and the reason on stderr goes back to the agent. Blocks:
 - commits and merges when the author or committer email isn't a GitHub
   noreply address
 - `gh pr merge` with --admin, --auto, --squash or --rebase; without a review
-  that covers the PR (see merge_verdict); or with --delete-branch while open
-  PRs use the head branch as their base
+  that covers the PR (see merge_verdict; the PR is read with `gh pr view`, or
+  over REST when that fails); or with --delete-branch while open PRs use the
+  head branch as their base
 - `gh api` writes that merge, move or delete refs or write contents, in any
   flag spelling, and GraphQL merge or ref mutations, including bodies read
-  from stdin or files (an unreadable GraphQL body is refused)
+  from stdin or files (an unreadable GraphQL body is refused). One REST merge
+  passes, for sessions without GraphQL, when every part is written out and a
+  review covers the head it names (see rest_merge_request):
+  `gh api -X PUT repos/<owner>/<repo>/pulls/<n>/merge -f merge_method=merge -f sha=<head sha>`
 
 Commands are parsed with a quote-aware shell lexer. It follows `;`, `&&`, `|`
 chains, subshells, `$(...)` and backticks, `sh -c`, `eval`, heredocs and
@@ -1115,10 +1119,9 @@ def check_http_client(args):
     for url in urls:
         path = re.sub(r"^.*api\.github\.com", "", url).split("?", 1)[0].rstrip("/")
         if path.endswith("/graphql") and GRAPHQL_WRITES.search(joined):
-            raise Blocked("GraphQL mutations that merge PRs or move refs are blocked.")
+            raise Blocked(f"GraphQL mutations that merge PRs or move refs are blocked. {MERGE_WAYS}")
         if write and API_WRITE_PATHS.search(path):
-            raise Blocked("GitHub API writes that merge PRs or move, delete or write branches are blocked. "
-                          "Use `gh pr merge --merge` or `git push`, which are checked.")
+            raise Blocked(f"GitHub API writes that merge PRs or move, delete or write branches are blocked. {MERGE_WAYS}")
 
 
 # ---------------------------------------------------------------- gh
@@ -1133,6 +1136,11 @@ GH_FLAGS_WITH_VALUE = {"-R", "--repo", "-b", "--body", "-F", "--body-file", "-t"
 GRAPHQL_WRITES = re.compile(r"\b(mergePullRequest|enablePullRequestAutoMerge|updateRefs?|deleteRef|createRef|"
                             r"createCommitOnBranch|mergeBranch|updatePullRequestBranch)\b")
 API_WRITE_PATHS = re.compile(r"(^|/)(pulls/[^/]+/merge|merges|git/refs(/.*)?|contents/.*|branches/[^/]+/rename)$")
+MERGE_PATH = re.compile(r"(^|/)pulls/[^/]+/merge$")
+REST_MERGE = "gh api -X PUT repos/<owner>/<repo>/pulls/<n>/merge -f merge_method=merge -f sha=<head sha>"
+REST_MERGE_ENDPOINT = re.compile(r"/?repos/([A-Za-z0-9][A-Za-z0-9-]*/(?!\.+/)[A-Za-z0-9._-]+)/pulls/([1-9][0-9]*)/merge")
+MERGE_WAYS = (f"Merge with `gh pr merge <n> --merge`, or where GraphQL is unavailable `{REST_MERGE}` with the "
+              "owner, repo, PR number and full head SHA written out; push branches with `git push`. Those are checked.")
 
 
 def check_gh(args, cwd, opaque, depth, stdin=([], True)):
@@ -1162,7 +1170,7 @@ def check_gh(args, cwd, opaque, depth, stdin=([], True)):
         else:
             positionals.append(args[i])
             if len(positionals) == 1 and a == "api":
-                check_gh_api(args[i + 1 :], cwd, stdin)
+                check_gh_api(args[i + 1 :], cwd, stdin, opaque, texts[:i])
                 return
             if len(positionals) == 1 and a not in GH_COMMANDS:
                 check_gh_alias(a, texts[i + 1 :], cwd, depth)
@@ -1281,7 +1289,8 @@ def json_strings(text):
 STDIN_PATHS = {"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"}
 
 
-def check_gh_api(args, cwd, stdin=([], True)):
+def check_gh_api(args, cwd, stdin=([], True), opaque=False, leading=()):
+    """args follow `api`; leading are the words between `gh` and `api`."""
     method, endpoint, writes, unreadable = None, None, False, False
     bodies = []  # (text, dynamic) pieces of the request body
     stdin_texts, stdin_complete = stdin
@@ -1333,7 +1342,7 @@ def check_gh_api(args, cwd, stdin=([], True)):
             texts, unreadable = texts + t, unreadable or not c
         text = " ".join(texts + [json_strings(b) for b in texts])
         if GRAPHQL_WRITES.search(text):
-            raise Blocked("GraphQL mutations that merge PRs or move refs are blocked. Use `gh pr merge --merge`.")
+            raise Blocked(f"GraphQL mutations that merge PRs or move refs are blocked. {MERGE_WAYS}")
         if unreadable:
             raise Blocked("can't read this GraphQL request's body, so it can't be checked for merges or ref writes. "
                           "Pass the query inline with -f query=..., or from a file in the repo.")
@@ -1341,8 +1350,91 @@ def check_gh_api(args, cwd, stdin=([], True)):
     write = (method or ("POST" if writes else "GET")) not in ("GET", "HEAD")
     path = endpoint.text.split("?", 1)[0].rstrip("/")
     if write and (endpoint.dynamic or API_WRITE_PATHS.search(path)):
-        raise Blocked("`gh api` writes that merge PRs or move, delete or write branches are blocked. "
-                      "Use `gh pr merge --merge` or `git push`, which are checked.")
+        if not MERGE_PATH.search(path):
+            raise Blocked(f"`gh api` writes that merge PRs or move, delete or write branches are blocked. {MERGE_WAYS}")
+        slug, number, sha = rest_merge_request(args, leading, opaque)
+        reason = rest_review_check(slug, number, sha, cwd)
+        if reason:
+            raise Blocked(f"PR can't merge yet: {reason}")
+
+
+def rest_merge_request(args, leading, opaque):
+    """The one `gh api` merge the guard lets through, for sessions without
+    GraphQL: REST_MERGE and nothing else. -X/--method and -f/-F/--raw-field/
+    --field may take any spelling and order; every word must be written out,
+    and each field given once (gh applies -F after -f, whatever their order).
+    Returns (owner/repo, number, sha), or raises Blocked naming what differs."""
+
+    def refuse(why):
+        raise Blocked(f"this REST merge isn't the one form the guard checks: {why}. Write `{REST_MERGE}`, "
+                      "with the owner, repo, PR number and full head SHA written out.")
+
+    if leading:
+        refuse(f"`gh {' '.join(leading)}` before `api` isn't part of it")
+    if opaque:
+        refuse("more arguments arrive at run time (xargs, find -exec)")
+    methods, fields, positionals = [], [], []
+    i = 0
+    while i < len(args):
+        w = args[i]
+        if w.dynamic:
+            refuse(f"'{w.text}' is computed at run time")
+        a = w.text
+        if a.startswith("--"):
+            name, eq, value = a.partition("=")
+            value = value if eq else None
+        elif a.startswith("-") and len(a) > 1:
+            name, value = a[:2], a[2:]
+            value = value[1:] if value.startswith("=") else (value or None)  # -XPUT, -X=PUT; -X alone takes the next word
+        else:
+            positionals.append(a)
+            i += 1
+            continue
+        into = {"-X": methods, "--method": methods, "-f": fields, "--raw-field": fields,
+                "-F": fields, "--field": fields}.get(name)
+        if into is None:
+            refuse(f"`{a}` isn't part of it")
+        if value is None:
+            if i + 1 >= len(args):
+                refuse(f"`{a}` has no value")
+            if args[i + 1].dynamic:
+                refuse(f"'{args[i + 1].text}' is computed at run time")
+            value = args[i + 1].text
+            i += 1
+        into.append(value)
+        i += 1
+    if len(methods) != 1 or methods[0].upper() != "PUT":
+        refuse("it takes exactly one method, PUT")
+    m = REST_MERGE_ENDPOINT.fullmatch(positionals[0]) if len(positionals) == 1 else None
+    if not m:
+        refuse(f"the endpoint must be repos/<owner>/<repo>/pulls/<n>/merge, not '{' '.join(positionals)}'")
+    given = {}
+    for field in fields:
+        key, eq, value = field.partition("=")
+        if not eq or key not in ("merge_method", "sha"):
+            refuse(f"field '{field}' isn't part of it")
+        if key in given:
+            refuse(f"`{key}` is given twice")
+        given[key] = value
+    if given.get("merge_method") != "merge":
+        refuse("it needs `merge_method=merge`: merge commits keep stacked PRs' history")
+    sha = given.get("sha", "")
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        refuse("it needs `sha=<the PR's head>`, all 40 lowercase hex digits, so GitHub refuses the merge "
+               "if the head moves after this check")
+    return m.group(1), m.group(2), sha
+
+
+def rest_review_check(slug, number, sha, cwd):
+    """The review rule for the REST merge: sha must be the PR's current head,
+    and a review must cover it, all read over REST."""
+    pr, reason = pr_over_rest(slug, number, cwd)
+    if reason:
+        return reason
+    if pr["head"] != sha:
+        return (f"sha {sha[:7]} isn't the PR's head, which is {pr['head'] or 'unknown'}. "
+                "Merge the head a review covers.")
+    return pr_verdict(pr, cwd)
 
 
 # ---------------------------------------------------------------- merge review rule
@@ -1406,17 +1498,79 @@ def have_commits(shas, slug, cwd):
 
 
 def review_check(target, repo, cwd):
+    """The review rule for `gh pr merge`: the PR from `gh pr view`, or over
+    REST when that fails (a session without GraphQL)."""
     view = ["gh", "pr", "view"] + ([target] if target else []) + repo
     out = run(view + ["--json", "number,url,headRefOid,baseRefName,reviews"], cwd)
-    if out is None:
-        return "couldn't read the PR with `gh pr view`, so the merge can't be checked."
+    pr, reason = pr_from_view(out) if out is not None else pr_by_rest(target, repo, cwd)
+    return reason or pr_verdict(pr, cwd)
+
+
+def pr_from_view(out):
+    """(pr, None) from `gh pr view --json` output, or (None, reason). pr holds
+    slug, number, head, base and reviews ({"commit", "submittedAt"}). A
+    pending review hasn't been posted, so it never counts."""
     pr = json.loads(out)
     m = re.search(r"github\.com/([^/]+/[^/]+)/pull/(\d+)", pr.get("url", ""))
     if not m:
-        return "couldn't tell which repository the PR is in."
-    slug, number, base = m.group(1), m.group(2), pr.get("baseRefName", "")
+        return None, "couldn't tell which repository the PR is in."
     reviews = [{"commit": (r.get("commit") or {}).get("oid"), "submittedAt": r.get("submittedAt")}
-               for r in pr.get("reviews", [])]
+               for r in pr.get("reviews", []) if r.get("state") != "PENDING"]
+    return {"slug": m.group(1), "number": m.group(2), "head": pr.get("headRefOid", ""),
+            "base": pr.get("baseRefName", ""), "reviews": reviews}, None
+
+
+def pr_by_rest(target, repo, cwd):
+    """`gh pr merge`'s PR over REST, when `gh pr view` fails: a PR URL, or a
+    number in --repo's repository or else the clone's, which gh fills in for
+    {owner}/{repo} the way a non-interactive `gh pr` picks it."""
+    m = re.fullmatch(r"https://github\.com/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/pull/([1-9][0-9]*)(?:[/?#].*)?", target or "")
+    if m:
+        return pr_over_rest(m.group(1), m.group(2), cwd)
+    if not re.fullmatch(r"#?[1-9][0-9]*", target or ""):
+        return None, ("couldn't read the PR with `gh pr view`, and over REST the guard finds a PR only by number "
+                      f"or URL. Name it, or where GraphQL is unavailable merge with `{REST_MERGE}`.")
+    slug = "{owner}/{repo}"
+    if repo:
+        m = re.fullmatch(r"(?:github\.com/)?([A-Za-z0-9-]+/[A-Za-z0-9._-]+)", repo[1])
+        if not m:
+            return None, f"couldn't read the PR with `gh pr view`, and --repo '{repo[1]}' isn't an owner/repo on github.com."
+        slug = m.group(1)
+    return pr_over_rest(slug, target.lstrip("#"), cwd)
+
+
+def pr_over_rest(slug, number, cwd):
+    """pr_from_view's result, read over REST: the PR, then its reviews by
+    each one's commit_id."""
+    endpoint = f"repos/{slug}/pulls/{number}"
+    out = run(["gh", "api", endpoint, "--jq", "{number, url: .html_url, head: .head.sha, base: .base.ref}"], cwd)
+    try:
+        pr = json.loads(out) if out is not None else None
+    except ValueError:
+        pr = None
+    if not isinstance(pr, dict):
+        return None, f"couldn't read the PR with `gh api {endpoint}`, so the merge can't be checked."
+    m = re.fullmatch(r"https://github\.com/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/pull/([0-9]+)", str(pr.get("url")))
+    if not m or m.group(2) != number:
+        return None, "couldn't tell which repository the PR is in."
+    slug = m.group(1)
+    lines = run(["gh", "api", "--paginate", f"repos/{slug}/pulls/{number}/reviews",
+                 "--jq", ".[] | {commit: .commit_id, state, submittedAt: .submitted_at}"], cwd)
+    try:
+        found = [json.loads(line) for line in lines.splitlines() if line.strip()] if lines is not None else None
+        reviews = [{"commit": r.get("commit"), "submittedAt": r.get("submittedAt")}
+                   for r in found if r.get("state") != "PENDING"] if found is not None else None
+    except (ValueError, AttributeError):
+        reviews = None
+    if reviews is None:
+        return None, "couldn't list the PR's reviews over REST, so the merge can't be checked."
+    return {"slug": slug, "number": number, "head": pr.get("head") or "", "base": pr.get("base") or "",
+            "reviews": reviews}, None
+
+
+def pr_verdict(pr, cwd):
+    """merge_verdict for a PR read by pr_from_view or pr_over_rest."""
+    slug, number, base, reviews = pr["slug"], pr["number"], pr["base"], pr["reviews"]
     lines = run(["gh", "api", "--paginate", f"repos/{slug}/pulls/{number}/commits",
                  "--jq", ".[] | {sha, parents: [.parents[].sha]}"], cwd)
     if lines is None:
@@ -1434,7 +1588,7 @@ def review_check(target, repo, cwd):
     def merge_clean(merge, first, second):
         return have_commits([merge, first, second], slug, cwd) and merge_is_clean(merge, first, second, cwd)
 
-    return merge_verdict(pr.get("headRefOid", ""), reviews, parents, base_ancestor, merge_clean)
+    return merge_verdict(pr["head"], reviews, parents, base_ancestor, merge_clean)
 
 
 # ================================================================ entry
@@ -1681,6 +1835,13 @@ def self_test():
         "git push --no-dry-run --dry-run origin main", "git push --dry origin main", "git clean -f --no-dry-run -n", "git clean -f --d",
         "for f in a b; do echo $f; done", "x=1; echo $x", "cd /tmp && ls",
         "PG=/opt/pg/bin; $PG/initdb -D $SP/pg", "$PG/pg_ctl -D \"$S/pg\" -l $S/pg/log start", "$EDITOR notes.md", "curl -s https://api.github.com/repos/o/r/pulls/12", "git subtree push --prefix=docs origin docs-branch",
+        # the REST forms the docs give for sessions without GraphQL
+        "gh api repos/{owner}/{repo}/pulls -f title='SP2a Task 4: x' -f head=sp2a/task-4-x -f base=main -F body=@body.md",
+        "gh api repos/{owner}/{repo}/pulls/12 --jq .head.sha", "gh api repos/{owner}/{repo}/pulls/12/reviews --paginate",
+        "gh api repos/{owner}/{repo}/pulls/12 -H 'Accept: application/vnd.github.diff'",
+        "gh api 'repos/{owner}/{repo}/commits/abc/check-runs?per_page=100' --jq '.check_runs[] | .name'",
+        "gh api repos/{owner}/{repo}/pulls/12/reviews -f commit_id=abc -f event=COMMENT -F body=@review.md",
+        "gh api -X PATCH repos/{owner}/{repo}/pulls/12 -f base=main", "gh api repos/{owner}/{repo}/issues/12/comments -F body=@c.md",
     ]
     failures = 0
     for cmd in blocked:
@@ -1715,7 +1876,8 @@ def self_test():
                 print(f"FAIL (generated, should allow): {cmd!r}: {reason}")
                 failures += 1
     failures += merge_self_test()
-    total = len(blocked) + len(allowed) + generated + MERGE_CASES
+    failures += rest_self_test()
+    total = len(blocked) + len(allowed) + generated + MERGE_CASES + REST_CASES
     print(f"guard self-test: {total - failures}/{total} passed")
     return 1 if failures else 0
 
@@ -1817,6 +1979,161 @@ def real_merge_cases():
         ("real merge that moves the reviewed edit", verdict(moved), False),
         ("real merge that resolves a conflict", verdict(resolved), False),
     ]
+
+
+REST_CASES = 55
+
+
+def rest_self_test():
+    """The REST merge, and `gh pr merge` reading the PR over REST when `gh pr
+    view` fails, end to end through decide() with every `gh` call answered by
+    a fake. A scratch repo holds real commits: P on main, A (the reviewed
+    commit) on the PR branch, B on main, M (git's clean merge of B into A) and
+    D (a plain commit on A). The fake serves repo o/r: PR 21 (head A, reviewed
+    on A), 22 (head M, reviewed on A), 23 (head D, reviewed on A), 24 (head A,
+    no review) and 25 (head A, only a pending review on A). Without GraphQL,
+    as in a cloud session, `gh pr view` fails."""
+    global run
+    import tempfile
+
+    repo = tempfile.mkdtemp()
+
+    def git(*a):
+        out = subprocess.run(["git", *a], cwd=repo, check=True, capture_output=True, text=True)
+        return out.stdout.strip()
+
+    def commit(name, text, message):
+        with open(os.path.join(repo, name), "w") as f:
+            f.write(text)
+        git("add", name)
+        git("commit", "-q", "-m", message)
+        return git("rev-parse", "HEAD")
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "1+bot" + NOREPLY)
+    git("config", "user.name", "bot")
+    p = commit("app.py", "x = 0\n", "P")
+    git("switch", "-q", "-c", "pr")
+    a = commit("app.py", "x = 1\n", "A")
+    git("switch", "-q", "main")
+    b = commit("README.md", "base\n", "B")
+    git("switch", "-q", "pr")
+    git("merge", "-q", "--no-edit", "main")
+    m = git("rev-parse", "HEAD")
+    git("switch", "-q", "-c", "later", a)
+    d = commit("app.py", "x = 2\n", "D")
+    prs = {21: (a, [(a, "COMMENTED")], {a: [p]}), 22: (m, [(a, "COMMENTED")], {a: [p], m: [a, b]}),
+           23: (d, [(a, "COMMENTED")], {a: [p], d: [a]}), 24: (a, [], {a: [p]}), 25: (a, [(a, "PENDING")], {a: [p]})}
+
+    def answers(graphql):
+        """What `gh` prints, by the words after `gh`. Any other call fails, as
+        every GraphQL call does in a cloud session."""
+        table = {f"api repos/o/r/compare/{b}...main --jq .behind_by": "0"}
+        for n, (head, reviews, commits) in prs.items():
+            url = f"https://github.com/o/r/pull/{n}"
+            posted = [{"commit": c, "state": s, "submittedAt": None if s == "PENDING" else "1"} for c, s in reviews]
+            for slug in ("o/r", "{owner}/{repo}"):  # gh fills {owner}/{repo} in from the clone
+                table[f"api repos/{slug}/pulls/{n} --jq {{number, url: .html_url, head: .head.sha, base: .base.ref}}"] = \
+                    json.dumps({"number": n, "url": url, "head": head, "base": "main"})
+            table[f"api --paginate repos/o/r/pulls/{n}/reviews --jq .[] | "
+                  "{commit: .commit_id, state, submittedAt: .submitted_at}"] = "\n".join(json.dumps(r) for r in posted)
+            table[f"api --paginate repos/o/r/pulls/{n}/commits --jq .[] | {{sha, parents: [.parents[].sha]}}"] = \
+                "\n".join(json.dumps({"sha": c, "parents": ps}) for c, ps in commits.items())
+            if graphql:
+                table[f"pr view {n} --json number,url,headRefOid,baseRefName,reviews"] = json.dumps(
+                    {"number": n, "url": url, "headRefOid": head, "baseRefName": "main",
+                     "reviews": [{"commit": {"oid": r["commit"]}, "state": r["state"], "submittedAt": r["submittedAt"]}
+                                 for r in posted]})
+        return table
+
+    put = "gh api -X PUT repos/o/r/pulls/{n}/merge -f merge_method=merge -f sha={sha}"
+    cases = [  # (command, allowed, GraphQL served)
+        # the REST merge: a review on the head, or on an earlier commit followed only by clean base merges
+        (put.format(n=21, sha=a), True, False),
+        (put.format(n=22, sha=m), True, False),
+        (f"gh api --method PUT repos/o/r/pulls/21/merge -F merge_method=merge -F sha={a}", True, False),
+        (f"gh api repos/o/r/pulls/21/merge --field sha={a} --method=PUT --raw-field merge_method=merge", True, False),
+        (f"gh api -XPUT /repos/o/r/pulls/21/merge -fmerge_method=merge -f=sha={a}", True, False),
+        (f"timeout 60 {put.format(n=22, sha=m)} && echo merged", True, False),
+        # no review covers the head: none, one on an older plain commit, one still pending
+        (put.format(n=24, sha=a), False, False),
+        (put.format(n=23, sha=d), False, False),
+        (put.format(n=25, sha=a), False, False),
+        # sha isn't the head: the reviewed commit the head has moved past, or another commit
+        (put.format(n=22, sha=a), False, False),
+        (put.format(n=21, sha=b), False, False),
+        # merge_method squash, rebase, missing, given twice (gh applies -F last), from a file or a variable
+        (f"gh api -X PUT repos/o/r/pulls/21/merge -f merge_method=squash -f sha={a}", False, False),
+        (f"gh api -X PUT repos/o/r/pulls/21/merge -f merge_method=rebase -f sha={a}", False, False),
+        (f"gh api -X PUT repos/o/r/pulls/21/merge -f sha={a}", False, False),
+        (f"gh api -X PUT repos/o/r/pulls/21/merge -f merge_method=merge -f merge_method=squash -f sha={a}", False, False),
+        (f"gh api -X PUT repos/o/r/pulls/21/merge -F merge_method=squash -f merge_method=merge -f sha={a}", False, False),
+        (f"gh api -X PUT repos/o/r/pulls/21/merge -F merge_method=@method.txt -f sha={a}", False, False),
+        (f"gh api -X PUT repos/o/r/pulls/21/merge -f merge_method=$M -f sha={a}", False, False),
+        # sha missing, short, upper case, computed at run time, given twice, or from a file
+        ("gh api -X PUT repos/o/r/pulls/21/merge -f merge_method=merge", False, False),
+        (put.format(n=21, sha=a[:7]), False, False),
+        (put.format(n=21, sha=a.upper()), False, False),
+        (put.format(n=21, sha="$SHA"), False, False),
+        (put.format(n=21, sha="\"$(git rev-parse HEAD)\""), False, False),
+        (put.format(n=21, sha=a) + f" -f sha={b}", False, False),
+        ("gh api -X PUT repos/o/r/pulls/21/merge -f merge_method=merge -F sha=@sha.txt", False, False),
+        # the PR number computed at run time, or another endpoint or method
+        (put.format(n="$N", sha=a), False, False),
+        (put.format(n="\"$(cat pr.txt)\"", sha=a), False, False),
+        (put.format(n=21, sha=a).replace("o/r", "{owner}/{repo}"), False, False),
+        (f"gh api -X PUT 'repos/o/r/pulls/21/merge?merge_method=squash' -f merge_method=merge -f sha={a}", False, False),
+        (put.format(n=21, sha=a).replace("repos/", "https://api.github.com/repos/"), False, False),
+        (put.format(n=21, sha=a).replace("PUT", "POST"), False, False),
+        (put.format(n=21, sha=a).replace("-X PUT ", ""), False, False),
+        (put.format(n=21, sha=a).replace("-X PUT", "-X POST -X PUT"), False, False),
+        # extra fields, options and arguments that change the request
+        (put.format(n=21, sha=a) + " -f commit_title=x", False, False),
+        (put.format(n=21, sha=a) + " --input body.json", False, False),
+        (put.format(n=21, sha=a) + " -H 'X-HTTP-Method-Override: PATCH'", False, False),
+        (put.format(n=21, sha=a) + " --hostname example.com", False, False),
+        (put.format(n=21, sha=a) + " extra", False, False),
+        (put.format(n=21, sha=a).replace("gh api", "gh --hostname example.com api"), False, False),
+        ("echo x | xargs " + put.format(n=21, sha=a), False, False),
+        # every other merge, ref and contents write stays blocked
+        (f"gh api -X PUT repos/o/r/contents/a.txt -f merge_method=merge -f sha={a}", False, False),
+        (f"gh api -X PATCH repos/o/r/git/refs/heads/main -f sha={a}", False, False),
+        (f"gh api repos/o/r/merges -f merge_method=merge -f sha={a}", False, False),
+        ("gh api -X POST repos/o/r/branches/main/rename -f new_name=x", False, False),
+        (f"curl -X PUT https://api.github.com/repos/o/r/pulls/21/merge -d '{{\"merge_method\":\"merge\",\"sha\":\"{a}\"}}'",
+         False, False),
+        ("gh api graphql -f query='mutation { mergePullRequest(input: {pullRequestId: \"x\"}) { clientMutationId } }'",
+         False, False),
+        # gh pr merge reads the PR with gh pr view where GraphQL works, and over REST where it doesn't
+        ("gh pr merge 22 --merge", True, True),
+        ("gh pr merge 24 --merge", False, True),
+        ("gh pr merge 25 --merge", False, True),
+        ("gh pr merge 22 --merge", True, False),
+        ("gh pr merge https://github.com/o/r/pull/21 --merge", True, False),
+        ("gh pr merge 21 --merge --repo o/r", True, False),
+        ("gh pr merge 23 --merge", False, False),
+        ("gh pr merge 25 --merge", False, False),
+        ("gh pr merge --merge", False, False),
+    ]
+    assert len(cases) == REST_CASES
+    real_run, failures = run, 0
+
+    def faking(table):
+        def answer(args, cwd, timeout=20):
+            return table.get(" ".join(args[1:])) if args[:1] == ["gh"] else real_run(args, cwd, timeout)
+        return answer
+
+    try:
+        for cmd, ok, graphql in cases:
+            run = faking(answers(graphql))
+            reason = decide({"tool_input": {"command": cmd}, "cwd": repo})
+            if (reason is None) != ok:
+                where = "with" if graphql else "without"
+                print(f"FAIL (merge {where} GraphQL, should {'allow' if ok else 'block'}): {cmd!r}: {reason}")
+                failures += 1
+    finally:
+        run = real_run
+    return failures
 
 
 if __name__ == "__main__":
