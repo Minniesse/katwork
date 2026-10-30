@@ -166,13 +166,13 @@ jobs:
         run: command -v cargo-fuzz || cargo install cargo-fuzz --locked --version 0.13.2
       - name: Every target has committed seeds
         if: steps.changed.outputs.run == 'true'
-        run: for target in package docx text; do test -n "$(ls "fuzz/corpus/$target")"; done
+        run: for target in package docx text pdf; do test -n "$(ls "fuzz/corpus/$target")"; done
       - name: Fuzz each target for 60 s
         if: steps.changed.outputs.run == 'true'
         working-directory: fuzz
         # New inputs go to a scratch corpus; the committed seeds are read only.
         run: |
-          for target in package docx text; do
+          for target in package docx text pdf; do
             mkdir -p "$RUNNER_TEMP/corpus/$target"
             cargo fuzz run "$target" "$RUNNER_TEMP/corpus/$target" "corpus/$target" -a -- \
               -max_total_time=60 -timeout=10 -rss_limit_mb=1024

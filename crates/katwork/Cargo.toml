@@ -47,8 +47,12 @@ regex-syntax.workspace = true
 zip.workspace = true
 quick-xml.workspace = true
 crc32fast.workspace = true
+flate2.workspace = true
+lopdf.workspace = true
+pdf-extract.workspace = true
+weezl.workspace = true
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util", "io-util"] }
-flate2.workspace = true
+katwork-thai = { path = "../katwork-thai" }

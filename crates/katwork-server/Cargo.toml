@@ -11,6 +11,8 @@ smoke-fixtures = ["katwork/smoke-fixtures"]
 [dependencies]
 tracing-subscriber.workspace = true
 tracing.workspace = true
+# Reads the original target of events the `log` bridge forwards (the PDF libraries log there).
+tracing-log = "0.2"
 axum.workspace = true
 hyper-util.workspace = true
 url.workspace = true
@@ -30,6 +32,7 @@ socket2.workspace = true
 
 [dev-dependencies]
 katwork = { path = "../katwork", features = ["test-support"] }
+log = "0.4"
 reqwest.workspace = true
 eventsource-stream.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
