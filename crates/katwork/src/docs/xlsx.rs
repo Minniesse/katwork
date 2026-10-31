@@ -18,7 +18,7 @@ use std::{
 use quick_xml::{
     NsReader,
     events::{BytesStart, Event},
-    name::ResolveResult,
+    name::{QName, ResolveResult},
 };
 
 use super::{
@@ -895,8 +895,30 @@ enum Node<'x> {
     },
     End(Open),
     Text(Cow<'x, str>),
+    /// Where the walk stands, markup compatibility left content the reader cannot read as Excel
+    /// may (see `Walk::mc_from`): `held` names the SpreadsheetML elements in it (`""` for one the
+    /// part's reader does not know), and `any` is whether it held anything at all.
+    Undecided {
+        held: Vec<&'static str>,
+        any: bool,
+    },
     Eof,
 }
+
+/// An open element of the walk: one reported (on the path), or markup compatibility's.
+enum Frame {
+    Reported,
+    /// `mc:AlternateContent`: whether a branch was taken, and whether its `mc:Fallback` was
+    /// seen.
+    Alternate {
+        taken: bool,
+        fallback: bool,
+    },
+    /// The branch taken, whose content stands in the alternate's place.
+    Branch,
+}
+
+const MC: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
 
 /// A walk over a part `xml_guard::scan` has passed, element by element, with the path of open
 /// elements from the root.
@@ -904,9 +926,18 @@ struct Walk<'x> {
     reader: NsReader<&'x [u8]>,
     names: &'static [&'static str],
     stack: Vec<Open>,
+    frames: Vec<Frame>,
     events: u64,
     /// The element just reported was empty: its end comes next.
     close_next: bool,
+    /// From this depth of the path down, markup compatibility applies as Excel applies it: of an
+    /// `mc:AlternateContent` the first `mc:Choice` whose `Requires` names only namespaces the
+    /// reader understands is read in its place, else the `mc:Fallback`. A choice the reader
+    /// cannot take, read before the branch taken, may be Excel's: it is skipped and reported
+    /// `Undecided`. So is an element of another namespace that holds SpreadsheetML elements,
+    /// which `mc:ProcessContent` can tell Excel to read. Above this depth, those are elements
+    /// like any other.
+    mc_from: Option<usize>,
 }
 
 impl<'x> Walk<'x> {
@@ -915,48 +946,59 @@ impl<'x> Walk<'x> {
             reader: xml_guard::reader(xml),
             names,
             stack: Vec::new(),
+            frames: Vec::new(),
             events: 0,
             close_next: false,
+            mc_from: None,
         }
     }
 
     fn next(&mut self) -> Result<Node<'x>, DocError> {
         if self.close_next {
             self.close_next = false;
-            let open = self
-                .stack
-                .pop()
-                .ok_or(DocError::Malformed("xml_structure"))?;
-            return Ok(Node::End(open));
+            return self.close();
         }
         loop {
-            self.events += 1;
-            if self.events.is_multiple_of(1024) {
-                deadline::check()?;
-            }
-            let (resolved, event) = self
-                .reader
-                .read_resolved_event()
-                .map_err(xml_guard::map_error)?;
-            let (sml, strict) = match &resolved {
-                ResolveResult::Bound(ns) => (ns.0 == SML, ns.0.starts_with(STRICT)),
-                _ => (false, false),
+            let (resolved, event) = self.event()?;
+            let (sml, strict, mc) = match &resolved {
+                ResolveResult::Bound(ns) => (ns.0 == SML, ns.0.starts_with(STRICT), ns.0 == MC),
+                _ => (false, false, false),
             };
+            let compatible = self.mc_from.is_some_and(|depth| self.stack.len() >= depth);
+            let empty = matches!(event, Event::Empty(_));
             match event {
-                Event::Start(start) => return Ok(self.open(start, sml, strict, false)),
-                Event::Empty(start) => return Ok(self.open(start, sml, strict, true)),
-                Event::End(_) => {
-                    let open = self
-                        .stack
-                        .pop()
-                        .ok_or(DocError::Malformed("xml_structure"))?;
-                    return Ok(Node::End(open));
+                Event::Start(start) | Event::Empty(start) => {
+                    if compatible && let Some(node) = self.compatibility(&start, mc, sml, empty)? {
+                        match node {
+                            Some(node) => return Ok(node),
+                            None => continue,
+                        }
+                    }
+                    return Ok(self.open(start, sml, strict, empty));
                 }
-                Event::Text(text) => return Ok(Node::Text(text.xml10_content())),
-                Event::CData(data) => return Ok(Node::Text(data.xml10_content())),
+                Event::End(_) => match self.frames.last() {
+                    Some(Frame::Reported) => return self.close(),
+                    Some(_) => {
+                        self.frames.pop();
+                    }
+                    None => return Err(DocError::Malformed("xml_structure")),
+                },
+                // Character data directly inside `mc:AlternateContent` is not content.
+                Event::Text(text) => {
+                    if !matches!(self.frames.last(), Some(Frame::Alternate { .. })) {
+                        return Ok(Node::Text(text.xml10_content()));
+                    }
+                }
+                Event::CData(data) => {
+                    if !matches!(self.frames.last(), Some(Frame::Alternate { .. })) {
+                        return Ok(Node::Text(data.xml10_content()));
+                    }
+                }
                 Event::GeneralRef(reference) => {
                     let c = xml_guard::resolve_ref(&reference)?;
-                    return Ok(Node::Text(Cow::Owned(c.to_string())));
+                    if !matches!(self.frames.last(), Some(Frame::Alternate { .. })) {
+                        return Ok(Node::Text(Cow::Owned(c.to_string())));
+                    }
                 }
                 Event::Eof => return Ok(Node::Eof),
                 Event::Decl(_) | Event::PI(_) | Event::Comment(_) | Event::DocType(_) => {}
@@ -964,25 +1006,192 @@ impl<'x> Walk<'x> {
         }
     }
 
+    /// The next event, with a deadline check every 1,024.
+    fn event(&mut self) -> Result<(ResolveResult<'_>, Event<'x>), DocError> {
+        self.events += 1;
+        if self.events.is_multiple_of(1024) {
+            deadline::check()?;
+        }
+        self.reader
+            .read_resolved_event()
+            .map_err(xml_guard::map_error)
+    }
+
+    /// Markup compatibility at an element that starts where it applies: `None` when the element
+    /// is an ordinary one to report; else what to report instead, if anything.
+    #[allow(clippy::option_option)]
+    fn compatibility(
+        &mut self,
+        start: &BytesStart,
+        mc: bool,
+        sml: bool,
+        empty: bool,
+    ) -> Result<Option<Option<Node<'x>>>, DocError> {
+        let in_alternate = matches!(self.frames.last(), Some(Frame::Alternate { .. }));
+        if mc {
+            let local = start.local_name();
+            match (local.as_ref(), in_alternate) {
+                ("AlternateContent", false) => {
+                    if !empty {
+                        self.frames.push(Frame::Alternate {
+                            taken: false,
+                            fallback: false,
+                        });
+                    }
+                    return Ok(Some(None));
+                }
+                ("Choice", true) => {
+                    let understood = self.requires_understood(start)?;
+                    let Some(Frame::Alternate { taken, fallback }) = self.frames.last_mut() else {
+                        return Err(DocError::Malformed("xml_structure"));
+                    };
+                    if *fallback {
+                        return Err(DocError::Malformed("xlsx_structure"));
+                    }
+                    if *taken {
+                        self.skip(empty)?;
+                        return Ok(Some(None));
+                    }
+                    if understood {
+                        *taken = true;
+                        if !empty {
+                            self.frames.push(Frame::Branch);
+                        }
+                        return Ok(Some(None));
+                    }
+                    // Excel may take this choice: what it holds is undecided.
+                    let (held, any) = self.skip(empty)?;
+                    return Ok(Some(any.then_some(Node::Undecided { held, any })));
+                }
+                ("Fallback", true) => {
+                    let Some(Frame::Alternate { taken, fallback }) = self.frames.last_mut() else {
+                        return Err(DocError::Malformed("xml_structure"));
+                    };
+                    if *fallback {
+                        return Err(DocError::Malformed("xlsx_structure"));
+                    }
+                    *fallback = true;
+                    if *taken {
+                        self.skip(empty)?;
+                    } else {
+                        *taken = true;
+                        if !empty {
+                            self.frames.push(Frame::Branch);
+                        }
+                    }
+                    return Ok(Some(None));
+                }
+                _ => {}
+            }
+        }
+        if mc || !sml || in_alternate {
+            // Markup Excel does not read here, or an element of another namespace: what it holds
+            // is undecided when it holds SpreadsheetML's markup.
+            let own = sml.then(|| self.known(start.local_name().as_ref()));
+            let (mut held, _) = self.skip(empty)?;
+            if let Some(own) = own
+                && !held.contains(&own)
+            {
+                held.push(own);
+            }
+            let node = (!held.is_empty()).then_some(Node::Undecided { held, any: true });
+            return Ok(Some(node));
+        }
+        Ok(None)
+    }
+
+    /// Whether every prefix a `mc:Choice`'s `Requires` names is bound to a namespace the reader
+    /// understands: SpreadsheetML's, or markup compatibility's own.
+    fn requires_understood(&self, start: &BytesStart) -> Result<bool, DocError> {
+        let [requires] = attributes(&self.reader, start, [(None, "Requires")], None)?;
+        let Some(requires) = requires else {
+            return Ok(false);
+        };
+        let mut prefixes = requires.split_ascii_whitespace().peekable();
+        if prefixes.peek().is_none() {
+            return Ok(false);
+        }
+        Ok(prefixes.all(|prefix| {
+            let name = format!("{prefix}:x");
+            !prefix.contains(':')
+                && matches!(
+                    self.reader.resolver().resolve_element(QName(&name)).0,
+                    ResolveResult::Bound(ns) if ns.0 == SML || ns.0 == MC
+                )
+        }))
+    }
+
+    /// Reads past the element that just started, unless it was empty: the names of the
+    /// SpreadsheetML elements in it, and whether it held any element or text.
+    fn skip(&mut self, empty: bool) -> Result<(Vec<&'static str>, bool), DocError> {
+        let (mut held, mut any) = (Vec::new(), false);
+        if empty {
+            return Ok((held, any));
+        }
+        let mut depth = 1u32;
+        while depth > 0 {
+            let (resolved, event) = self.event()?;
+            let sml = matches!(&resolved, ResolveResult::Bound(ns) if ns.0 == SML);
+            let opens = matches!(event, Event::Start(_));
+            match event {
+                Event::Start(start) | Event::Empty(start) => {
+                    any = true;
+                    if sml {
+                        let name = self.known(start.local_name().as_ref());
+                        if !held.contains(&name) {
+                            held.push(name);
+                        }
+                    }
+                    if opens {
+                        depth += 1;
+                    }
+                }
+                Event::End(_) => depth -= 1,
+                Event::Text(text) => {
+                    any |= !text.xml10_content().trim().is_empty();
+                }
+                Event::CData(_) | Event::GeneralRef(_) => any = true,
+                Event::Eof => return Err(DocError::Malformed("xml_structure")),
+                Event::Decl(_) | Event::PI(_) | Event::Comment(_) | Event::DocType(_) => {}
+            }
+        }
+        Ok((held, any))
+    }
+
+    /// A SpreadsheetML element's local name, when the part's reader knows it (else `""`).
+    fn known(&self, local: &str) -> &'static str {
+        self.names
+            .iter()
+            .copied()
+            .find(|name| *name == local)
+            .unwrap_or("")
+    }
+
     fn open(&mut self, start: BytesStart<'x>, sml: bool, strict: bool, empty: bool) -> Node<'x> {
         let name = if sml {
-            let local = start.local_name();
-            self.names
-                .iter()
-                .copied()
-                .find(|name| *name == local.as_ref())
-                .unwrap_or("")
+            self.known(start.local_name().as_ref())
         } else {
             ""
         };
         let open = Open { sml, name };
         self.stack.push(open);
+        self.frames.push(Frame::Reported);
         self.close_next = empty;
         Node::Start {
             start,
             open,
             strict,
         }
+    }
+
+    /// Ends the innermost reported element.
+    fn close(&mut self) -> Result<Node<'x>, DocError> {
+        self.frames.pop();
+        let open = self
+            .stack
+            .pop()
+            .ok_or(DocError::Malformed("xml_structure"))?;
+        Ok(Node::End(open))
     }
 
     /// Whether the open elements, from the root, are SpreadsheetML's `path`.
@@ -1140,7 +1349,7 @@ impl Workbook {
                     strict,
                 } => (start, open, strict),
                 Node::Eof => break,
-                Node::End(_) | Node::Text(_) => continue,
+                Node::End(_) | Node::Text(_) | Node::Undecided { .. } => continue,
             };
             if walk.stack.len() == 1 {
                 if strict {
@@ -1322,6 +1531,8 @@ impl Size {
 struct Font {
     size: Option<Size>,
     colours: Vec<ColourSpec>,
+    /// Markup compatibility left what Excel reads for it undecided.
+    undecided: bool,
 }
 
 impl Font {
@@ -1341,6 +1552,7 @@ struct PatternFill {
 struct Fill {
     patterns: Vec<PatternFill>,
     gradients: Vec<Vec<ColourSpec>>,
+    undecided: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1348,6 +1560,7 @@ struct Xf {
     num_fmt: u32,
     font: u32,
     fill: u32,
+    undecided: bool,
 }
 
 #[derive(Default)]
@@ -1359,6 +1572,14 @@ struct Styles {
     /// `colors/indexedColors`, which replaces the standard palette; an entry that does not
     /// parse is `None`.
     palette: Option<Vec<Option<Rgb>>>,
+    /// Markup compatibility left Excel's records undecided: every number format (a choice may
+    /// define any id); the fonts, fills and cell formats from these indexes on (Excel's indexes
+    /// may differ from the reader's from there); the palette.
+    formats_undecided: bool,
+    fonts_from: Option<usize>,
+    fills_from: Option<usize>,
+    xfs_from: Option<usize>,
+    palette_undecided: bool,
 }
 
 const STYLE_NAMES: &[&str] = &[
@@ -1390,6 +1611,7 @@ impl Styles {
     fn read(xml: &[u8]) -> Result<Styles, DocError> {
         const ROOT: &str = "styleSheet";
         let mut walk = Walk::new(xml, STYLE_NAMES);
+        walk.mc_from = Some(1);
         let mut styles = Styles::default();
         let mut seen = HashSet::new();
         let bad = DocError::Malformed("xlsx_styles");
@@ -1400,6 +1622,11 @@ impl Styles {
                     open,
                     strict,
                 } => (start, open, strict),
+                Node::Undecided { held, .. } => {
+                    let path: Vec<&str> = walk.stack.iter().map(|open| open.name).collect();
+                    styles.undecided(&path, &held);
+                    continue;
+                }
                 Node::Eof => break,
                 Node::End(_) | Node::Text(_) => continue,
             };
@@ -1497,6 +1724,7 @@ impl Styles {
                     num_fmt: index(num_fmt)?,
                     font: index(font)?,
                     fill: index(fill)?,
+                    undecided: false,
                 });
             } else if walk.at(&[ROOT, "colors", "indexedColors"]) {
                 if styles.palette.is_some() {
@@ -1511,6 +1739,51 @@ impl Styles {
             }
         }
         Ok(styles)
+    }
+
+    /// Content markup compatibility left undecided, at `path` (the open elements' names), held
+    /// these SpreadsheetML elements: the records it may have changed are undecided.
+    fn undecided(&mut self, path: &[&str], held: &[&str]) {
+        let holds = |name: &str| held.contains(&name);
+        match path {
+            ["styleSheet"] => {
+                self.formats_undecided |= holds("numFmts");
+                if holds("fonts") {
+                    self.fonts_from = Some(0);
+                }
+                if holds("fills") {
+                    self.fills_from = Some(0);
+                }
+                if holds("cellXfs") {
+                    self.xfs_from = Some(0);
+                }
+                self.palette_undecided |= holds("colors");
+            }
+            ["styleSheet", "numFmts", ..] => self.formats_undecided |= !held.is_empty(),
+            ["styleSheet", "fonts"] if holds("font") => {
+                self.fonts_from.get_or_insert(self.fonts.len());
+            }
+            ["styleSheet", "fonts", "font", ..] if !held.is_empty() => {
+                if let Some(font) = self.fonts.last_mut() {
+                    font.undecided = true;
+                }
+            }
+            ["styleSheet", "fills"] if holds("fill") => {
+                self.fills_from.get_or_insert(self.fills.len());
+            }
+            ["styleSheet", "fills", "fill", ..] if !held.is_empty() => {
+                if let Some(fill) = self.fills.last_mut() {
+                    fill.undecided = true;
+                }
+            }
+            ["styleSheet", "cellXfs"] if holds("xf") => {
+                self.xfs_from.get_or_insert(self.xfs.len());
+            }
+            ["styleSheet", "colors", ..] => {
+                self.palette_undecided |= holds("indexedColors") || holds("rgbColor");
+            }
+            _ => {}
+        }
     }
 
     /// The size of a font that states none: the default font's (font 0), else Excel's 11 pt.
@@ -1534,6 +1807,8 @@ struct Rst {
     runs: Vec<Run>,
     /// It holds phonetic text (`rPh`), which Excel shows only as a hint, if at all.
     phonetic: bool,
+    /// Markup compatibility left its text undecided: Excel may show other text.
+    undecided: bool,
 }
 
 impl Rst {
@@ -1548,6 +1823,8 @@ struct Run {
     /// The run's own properties; `None` for plain text or a run with no `rPr`, which takes the
     /// cell's font.
     props: Option<Font>,
+    /// Markup compatibility left its text or properties undecided.
+    undecided: bool,
 }
 
 /// Builds one `si` or `is` from the walk's events below it.
@@ -1555,12 +1832,21 @@ struct Run {
 struct RstBuilder {
     rst: Rst,
     chars: usize,
-    /// The run being read: its properties, whether they and its text were seen.
-    run: Option<(Option<Font>, bool)>,
+    /// The run being read.
+    run: Option<RunState>,
     /// The `t` being read and its raw text.
     text: Option<String>,
     plain_seen: bool,
     in_phonetic: bool,
+}
+
+/// A run being read: its properties, whether its text was seen, and whether markup
+/// compatibility left it undecided.
+#[derive(Default)]
+struct RunState {
+    props: Option<Font>,
+    seen: bool,
+    undecided: bool,
 }
 
 impl RstBuilder {
@@ -1579,25 +1865,36 @@ impl RstBuilder {
                 self.plain_seen = true;
                 self.text = Some(String::new());
             }
-            ["r"] => self.run = Some((None, false)),
+            ["r"] => self.run = Some(RunState::default()),
             ["r", "rPr"] => match &mut self.run {
-                Some((props @ None, _)) => *props = Some(Font::default()),
+                Some(RunState {
+                    props: props @ None,
+                    ..
+                }) => *props = Some(Font::default()),
                 _ => return Err(structure),
             },
             ["r", "rPr", "sz"] => {
                 let [value] = walk.attrs(start, ["val"])?;
-                if let Some((Some(props), _)) = &mut self.run {
+                if let Some(RunState {
+                    props: Some(props), ..
+                }) = &mut self.run
+                {
                     props.add_size(Size::read(value));
                 }
             }
             ["r", "rPr", "color"] => {
                 let spec = ColourSpec::read(walk, start)?;
-                if let Some((Some(props), _)) = &mut self.run {
+                if let Some(RunState {
+                    props: Some(props), ..
+                }) = &mut self.run
+                {
                     props.colours.push(spec);
                 }
             }
             ["r", "t"] => match &mut self.run {
-                Some((_, seen @ false)) => {
+                Some(RunState {
+                    seen: seen @ false, ..
+                }) => {
                     *seen = true;
                     self.text = Some(String::new());
                 }
@@ -1633,11 +1930,15 @@ impl RstBuilder {
                 if self.chars > MAX_CELL_CHARS {
                     return Err(DocError::TooComplex("cell_text"));
                 }
-                let props = match names.as_slice() {
-                    ["t"] => None,
-                    _ => self.run.as_ref().and_then(|(props, _)| props.clone()),
+                let (props, undecided) = match (names.as_slice(), &self.run) {
+                    (["r", "t"], Some(run)) => (run.props.clone(), run.undecided),
+                    _ => (None, false),
                 };
-                self.rst.runs.push(Run { text, props });
+                self.rst.runs.push(Run {
+                    text,
+                    props,
+                    undecided,
+                });
             }
             ["r"] => self.run = None,
             ["rPh", "t"] => {
@@ -1648,6 +1949,32 @@ impl RstBuilder {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Markup compatibility left content undecided at `rel`, the path below the `si` or `is`:
+    /// in a run, the run is undecided; in a phonetic hint, nothing that is read; anywhere else,
+    /// the string's text.
+    fn undecided(&mut self, rel: &[Open]) {
+        let names: Vec<&str> = rel
+            .iter()
+            .map(|open| if open.sml { open.name } else { "" })
+            .collect();
+        match names.as_slice() {
+            ["rPh", ..] => {}
+            ["r"] | ["r", "rPr", ..] => {
+                if let Some(run) = &mut self.run {
+                    run.undecided = true;
+                    // Its text may already be in.
+                    if run.seen
+                        && self.text.is_none()
+                        && let Some(last) = self.rst.runs.last_mut()
+                    {
+                        last.undecided = true;
+                    }
+                }
+            }
+            _ => self.rst.undecided = true,
+        }
     }
 }
 
@@ -1666,10 +1993,23 @@ const RST_STRUCTURE: &[&str] = &["t", "r", "rPr", "rPh"];
 
 fn read_shared_strings(xml: &[u8]) -> Result<Vec<Rst>, DocError> {
     let mut walk = Walk::new(xml, SST_NAMES);
-    let mut strings = Vec::new();
+    walk.mc_from = Some(1);
+    let mut strings: Vec<Rst> = Vec::new();
     let mut current: Option<RstBuilder> = None;
+    // Markup compatibility left Excel's strings undecided from this index on.
+    let mut undecided_from: Option<usize> = None;
     loop {
         match walk.next()? {
+            Node::Undecided { any, .. } => {
+                if walk.at(&["sst"]) && any {
+                    undecided_from.get_or_insert(strings.len());
+                } else if walk.stack.len() >= 2
+                    && walk.at_prefix(&["sst", "si"])
+                    && let Some(builder) = &mut current
+                {
+                    builder.undecided(&walk.stack[2..]);
+                }
+            }
             Node::Start {
                 start,
                 open,
@@ -1730,7 +2070,14 @@ fn read_shared_strings(xml: &[u8]) -> Result<Vec<Rst>, DocError> {
                     builder.close(&rel)?;
                 }
             }
-            Node::Eof => return Ok(strings),
+            Node::Eof => {
+                if let Some(from) = undecided_from {
+                    for string in strings.iter_mut().skip(from) {
+                        string.undecided = true;
+                    }
+                }
+                return Ok(strings);
+            }
         }
     }
 }
@@ -2017,6 +2364,7 @@ fn read_sheet(xml: &[u8], strings: &[Rst]) -> Result<SheetData, DocError> {
                             return Err(structure);
                         }
                         open_cell.inline = Some(RstBuilder::default());
+                        walk.mc_from = Some(walk.stack.len());
                     }
                     "col" => {
                         let [min, max, hidden, width, style] =
@@ -2103,7 +2451,7 @@ fn read_sheet(xml: &[u8], strings: &[Rst]) -> Result<SheetData, DocError> {
                         let open_cell = cell.as_mut().ok_or(structure)?;
                         open_cell.value = raw.take();
                     }
-                    ("is", 4) => {}
+                    ("is", 4) => walk.mc_from = None,
                     ("c", 3) => {
                         let open_cell = cell.take().ok_or(structure)?;
                         let hidden = row.is_some_and(|(_, hidden, _, _)| hidden);
@@ -2119,6 +2467,13 @@ fn read_sheet(xml: &[u8], strings: &[Rst]) -> Result<SheetData, DocError> {
                         }
                     }
                     _ => {}
+                }
+            }
+            Node::Undecided { .. } => {
+                if walk.stack.len() >= 5
+                    && let Some(builder) = cell.as_mut().and_then(|cell| cell.inline.as_mut())
+                {
+                    builder.undecided(&walk.stack[5..]);
                 }
             }
             Node::Eof => return Ok(data),
@@ -2184,9 +2539,13 @@ fn finish_cell(
         }
         (_, Some(text), _) => Some(Value::Date(string(&text)?)),
     };
+    // A string markup compatibility left undecided is not known to be empty: it keeps a block.
     let value = value.filter(|value| match value {
-        Value::Shared(index) => !strings[*index as usize].is_empty(),
-        Value::Inline(rst) => !rst.is_empty(),
+        Value::Shared(index) => {
+            let rst = &strings[*index as usize];
+            rst.undecided || !rst.is_empty()
+        }
+        Value::Inline(rst) => rst.undecided || !rst.is_empty(),
         Value::Str(text) | Value::Date(text) => !text.is_empty(),
         _ => true,
     });
@@ -2379,6 +2738,16 @@ fn hex(value: u32) -> Rgb {
 
 impl Judge<'_> {
     fn xf(&self, index: u32) -> Result<Xf, DocError> {
+        if self
+            .styles
+            .xfs_from
+            .is_some_and(|from| index as usize >= from)
+        {
+            return Ok(Xf {
+                undecided: true,
+                ..Xf::default()
+            });
+        }
         match self.styles.xfs.get(index as usize) {
             Some(xf) => Ok(*xf),
             None if index == 0 && self.styles.xfs.is_empty() => Ok(Xf::default()),
@@ -2386,12 +2755,30 @@ impl Judge<'_> {
         }
     }
 
+    /// A font whose record markup compatibility left undecided: its colour cannot be known.
+    fn undecided_look(&self) -> Look {
+        Look {
+            pt: self.default_pt,
+            paint: Paint::Bad,
+        }
+    }
+
     fn font(&self, index: u32) -> Result<Look, DocError> {
+        if self
+            .styles
+            .fonts_from
+            .is_some_and(|from| index as usize >= from)
+        {
+            return Ok(self.undecided_look());
+        }
         let font = match self.styles.fonts.get(index as usize) {
             Some(font) => font.clone(),
             None if index == 0 && self.styles.fonts.is_empty() => Font::default(),
             None => return Err(DocError::Malformed("xlsx_style_index")),
         };
+        if font.undecided {
+            return Ok(self.undecided_look());
+        }
         Ok(Look {
             pt: match font.size {
                 Some(Size::Points(points)) => points,
@@ -2497,6 +2884,7 @@ impl Judge<'_> {
         match index {
             SYSTEM_FOREGROUND => Some(Rgb::BLACK),
             SYSTEM_BACKGROUND => Some(Rgb::WHITE),
+            _ if self.styles.palette_undecided => None,
             index => match &self.styles.palette {
                 Some(palette) => palette.get(index as usize).copied().flatten(),
                 None => PALETTE.get(index as usize).map(|&value| hex(value)),
@@ -2513,11 +2901,21 @@ impl Judge<'_> {
             1 => return Ok(Paint::Colours(vec![Rgb::WHITE, gray125])),
             _ => {}
         }
+        if self
+            .styles
+            .fills_from
+            .is_some_and(|from| index as usize >= from)
+        {
+            return Ok(Paint::Bad);
+        }
         let fill = self
             .styles
             .fills
             .get(index as usize)
             .ok_or(DocError::Malformed("xlsx_style_index"))?;
+        if fill.undecided {
+            return Ok(Paint::Bad);
+        }
         let mut paint: Option<Paint> = None;
         let mut add = |more: Paint| {
             paint = Some(match paint.take() {
@@ -2776,10 +3174,21 @@ impl Output<'_> {
         let mut styles = Vec::with_capacity(formats.len());
         for &format in formats {
             let xf = judge.xf(format)?;
-            styles.push(Drawn {
-                font: judge.font(xf.font)?,
-                fill: judge.fill(xf.fill)?,
-                format: judge.format(xf.num_fmt),
+            // A cell format markup compatibility left undecided draws in a look not known.
+            styles.push(if xf.undecided {
+                Drawn {
+                    font: judge.undecided_look(),
+                    fill: Paint::Bad,
+                    format: None,
+                    format_undecided: false,
+                }
+            } else {
+                Drawn {
+                    font: judge.font(xf.font)?,
+                    fill: judge.fill(xf.fill)?,
+                    format: judge.format(xf.num_fmt),
+                    format_undecided: judge.styles.formats_undecided,
+                }
             });
         }
         let number_format = styles.first().and_then(|style| style.format);
@@ -2829,7 +3238,7 @@ impl Output<'_> {
             .or_else(|| covered.then_some(HiddenWhy::Covered))
             .or_else(|| {
                 styles.iter().find_map(|style| {
-                    if empty(style.format) {
+                    if style.format_undecided || empty(style.format) {
                         Some(HiddenWhy::EmptyFormat)
                     } else if runs.is_none() {
                         judge.judge(&base, &style.font, &style.fill)
@@ -2839,7 +3248,9 @@ impl Output<'_> {
                 })
             })
             .or_else(|| match &runs {
-                Some((_, first, true)) => first.or(Some(HiddenWhy::LowContrast)),
+                Some((_, first, true)) => {
+                    first.map(|(why, _)| why).or(Some(HiddenWhy::LowContrast))
+                }
                 _ => None,
             });
         let displayed = match (&cached, number_format) {
@@ -2859,7 +3270,7 @@ impl Output<'_> {
         let run_why = runs
             .as_ref()
             .and_then(|(_, first, all)| first.filter(|_| !all))
-            .map(why_text);
+            .map(|(_, why)| why);
         Ok(Made {
             text,
             facts: CellFacts {
@@ -2882,13 +3293,15 @@ impl Output<'_> {
     }
 
     /// A string's runs judged against the cell's font and fill in each format it may be drawn
-    /// in: a run shows only if it shows in all of them.
+    /// in: a run shows only if it shows in all of them, and never when markup compatibility
+    /// left it or its string undecided. The first hidden run's reason comes with the `why` of
+    /// its warning.
     fn runs(
         &self,
         judge: &Judge,
         rst: &Rst,
         styles: &[Drawn],
-    ) -> Result<(String, Option<HiddenWhy>, bool), DocError> {
+    ) -> Result<(String, Option<(HiddenWhy, &'static str)>, bool), DocError> {
         let plain = CellLook {
             sheet_hidden: false,
             row_hidden: false,
@@ -2903,13 +3316,20 @@ impl Output<'_> {
             if at % 1024 == 1023 {
                 deadline::check()?;
             }
-            let why = styles.iter().find_map(|style| {
-                judge.judge(
-                    &plain,
-                    &judge.run(run.props.as_ref(), &style.font),
-                    &style.fill,
-                )
-            });
+            let why = if rst.undecided || run.undecided {
+                Some((HiddenWhy::LowContrast, UNKNOWN_NAMESPACE))
+            } else {
+                styles
+                    .iter()
+                    .find_map(|style| {
+                        judge.judge(
+                            &plain,
+                            &judge.run(run.props.as_ref(), &style.font),
+                            &style.fill,
+                        )
+                    })
+                    .map(|why| (why, why_text(why)))
+            };
             match why {
                 Some(why) => first = first.or(Some(why)),
                 None => {
@@ -2922,12 +3342,17 @@ impl Output<'_> {
     }
 }
 
-/// One format a cell may be drawn in: its font, its fill and its number format.
+/// One format a cell may be drawn in: its font, its fill and its number format, and whether
+/// markup compatibility left its number format undecided.
 struct Drawn<'s> {
     font: Look,
     fill: Paint,
     format: Option<&'s str>,
+    format_undecided: bool,
 }
+
+/// The `why` of a run's `HiddenContent` warning when markup compatibility left it undecided.
+const UNKNOWN_NAMESPACE: &str = "unknown_namespace";
 
 /// A sheet's `col` entries sorted by column, refusing two that share a column: Excel writes
 /// each column once, and which of two entries it would take is not known.

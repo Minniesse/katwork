@@ -1353,6 +1353,324 @@ fn xlsx_foreign_namespace_cell_is_not_a_cell() {
     );
 }
 
+/// `mc:AlternateContent` whose choice requires a namespace the reader does not understand (Excel
+/// may take it), whose choice requires only SpreadsheetML (Excel and the reader take it), and
+/// with only a fallback.
+fn uncertain(choice: &str, fallback: &str) -> String {
+    format!(
+        r#"<mc:AlternateContent xmlns:mc="{MC}" xmlns:x14="{X14}"><mc:Choice Requires="x14">{choice}</mc:Choice><mc:Fallback>{fallback}</mc:Fallback></mc:AlternateContent>"#
+    )
+}
+
+fn understood(choice: &str, fallback: &str) -> String {
+    format!(
+        r#"<mc:AlternateContent xmlns:mc="{MC}" xmlns:x="{SML}"><mc:Choice Requires="x">{choice}</mc:Choice><mc:Fallback>{fallback}</mc:Fallback></mc:AlternateContent>"#
+    )
+}
+
+fn fallback_only(fallback: &str) -> String {
+    format!(
+        r#"<mc:AlternateContent xmlns:mc="{MC}"><mc:Fallback>{fallback}</mc:Fallback></mc:AlternateContent>"#
+    )
+}
+
+/// A styles part with `num_fmts`, `fonts`, `fills` after Excel's two, `xfs` and `colors` as
+/// written.
+fn styles_part(num_fmts: &str, fonts: &str, fills: &str, xfs: &str, colors: &str) -> String {
+    format!(
+        r#"<?xml version="1.0"?><styleSheet xmlns="{SML}"><numFmts>{num_fmts}</numFmts><fonts>{fonts}</fonts><fills><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>{fills}</fills><cellXfs>{xfs}</cellXfs>{colors}</styleSheet>"#
+    )
+}
+
+#[test]
+fn xlsx_markup_compatibility_in_styles_is_read_as_excel_reads_it() {
+    let black = r#"<font><sz val="11"/><color rgb="FF000000"/></font>"#;
+    let white = r#"<font><sz val="11"/><color rgb="FFFFFFFF"/></font>"#;
+    let three_xfs = r#"<xf numFmtId="0" fontId="0" fillId="0"/><xf numFmtId="164" fontId="1" fillId="0"/><xf numFmtId="0" fontId="2" fillId="0"/>"#;
+    let cells = row(
+        1,
+        &[num("A1", 0, "5"), num("B1", 1, "5"), num("C1", 2, "5")].concat(),
+    );
+    let judged = |styles: &str| {
+        first_row(&read(
+            &Xlsx::new().styles(styles).sheet("Sheet1", &data(&cells)),
+        ))
+    };
+    use HiddenWhy::{EmptyFormat as E, LowContrast as L};
+    let fonts = format!("{black}{black}{black}");
+    let format = |code: &str| format!(r#"<numFmt numFmtId="164" formatCode="{code}"/>"#);
+    // Number formats: a choice the reader cannot take leaves every format undecided (it may
+    // define any id, 0 included); a choice it takes, or a lone fallback, is read in place.
+    for (num_fmts, expected) in [
+        (
+            uncertain(&format(";;;"), &format(";;;")),
+            [Some(E), Some(E), Some(E)],
+        ),
+        (
+            uncertain(&format("0"), &format("0")),
+            [Some(E), Some(E), Some(E)],
+        ),
+        (understood(&format("0"), &format(";;;")), [None, None, None]),
+        (
+            understood(&format(";;;"), &format("0")),
+            [None, Some(E), None],
+        ),
+        (fallback_only(&format(";;;")), [None, Some(E), None]),
+        (fallback_only(&format("0")), [None, None, None]),
+    ] {
+        let styles = styles_part(&num_fmts, &fonts, "", three_xfs, "");
+        assert_eq!(judged(&styles), expected, "{num_fmts}");
+    }
+    // Fonts: a font in a choice the reader cannot take leaves it and every later font
+    // undecided, since Excel's indexes may differ from the reader's from there on.
+    let plain = format("0");
+    for (fonts, expected) in [
+        (
+            format!("{black}{}{black}", uncertain(white, white)),
+            [None, Some(L), Some(L)],
+        ),
+        (
+            format!("{black}{}{black}", uncertain(black, black)),
+            [None, Some(L), Some(L)],
+        ),
+        (
+            format!("{black}{}{black}", understood(white, black)),
+            [None, Some(L), None],
+        ),
+        (
+            format!("{black}{}{black}", understood(black, white)),
+            [None, None, None],
+        ),
+        // Inside one font, only that font is undecided.
+        (
+            format!(
+                r#"{black}<font><sz val="11"/>{}</font>{black}"#,
+                uncertain(r#"<color rgb="FF000000"/>"#, r#"<color rgb="FF000000"/>"#)
+            ),
+            [None, Some(L), None],
+        ),
+        (
+            format!(
+                r#"{black}<font><sz val="11"/>{}</font>{black}"#,
+                understood(r#"<color rgb="FFFFFFFF"/>"#, r#"<color rgb="FF000000"/>"#)
+            ),
+            [None, Some(L), None],
+        ),
+        // A font inside an element of another namespace, which markup compatibility can tell
+        // Excel to read.
+        (
+            format!(r#"{black}<o:wrap xmlns:o="urn:example:other">{white}</o:wrap>{black}"#),
+            [None, Some(L), Some(L)],
+        ),
+    ] {
+        let styles = styles_part(&plain, &fonts, "", three_xfs, "");
+        assert_eq!(judged(&styles), expected, "{fonts}");
+    }
+    // Fills and cell formats likewise.
+    let solid =
+        r#"<fill><patternFill patternType="solid"><fgColor rgb="FFFFFFFF"/></patternFill></fill>"#;
+    let on_fills = r#"<xf numFmtId="0" fontId="0" fillId="0"/><xf numFmtId="0" fontId="0" fillId="2"/><xf numFmtId="0" fontId="0" fillId="3"/>"#;
+    let styles = styles_part(
+        "",
+        &fonts,
+        &format!("{}{solid}", uncertain(solid, solid)),
+        on_fills,
+        "",
+    );
+    assert_eq!(judged(&styles), [None, Some(L), Some(L)]);
+    let xfs = format!(
+        r#"<xf numFmtId="0" fontId="0" fillId="0"/>{}<xf numFmtId="0" fontId="0" fillId="0"/>"#,
+        uncertain(
+            r#"<xf numFmtId="0" fontId="0" fillId="0"/>"#,
+            r#"<xf numFmtId="0" fontId="0" fillId="0"/>"#
+        )
+    );
+    let styles = styles_part("", &fonts, "", &xfs, "");
+    assert_eq!(judged(&styles), [None, Some(L), Some(L)]);
+    // A palette in a choice the reader cannot take leaves every palette colour undecided.
+    let palette = |eight: &str| {
+        format!(
+            "<indexedColors>{}<rgbColor rgb=\"{eight}\"/></indexedColors>",
+            r#"<rgbColor rgb="FF000000"/>"#.repeat(8)
+        )
+    };
+    let indexed = format!(r#"{black}<font><sz val="11"/><color indexed="8"/></font>{black}"#);
+    for (colors, expected) in [
+        (
+            format!(
+                "<colors>{}</colors>",
+                uncertain(&palette("FF000000"), &palette("FF000000"))
+            ),
+            [None, Some(L), None],
+        ),
+        (
+            format!(
+                "<colors>{}</colors>",
+                understood(&palette("FFFFFFFF"), &palette("FF000000"))
+            ),
+            [None, Some(L), None],
+        ),
+        (
+            format!(
+                "<colors>{}</colors>",
+                understood(&palette("FF000000"), &palette("FFFFFFFF"))
+            ),
+            [None, None, None],
+        ),
+    ] {
+        let styles = styles_part(&plain, &indexed, "", three_xfs, &colors);
+        assert_eq!(judged(&styles), expected, "{colors}");
+    }
+    // Markup compatibility outside the records cells use changes nothing: an extension's
+    // records of another namespace, a choice about something else.
+    let honest = format!(
+        r#"<?xml version="1.0"?><styleSheet xmlns="{SML}" xmlns:mc="{MC}" xmlns:x14ac="http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac" mc:Ignorable="x14ac"><fonts count="1" x14ac:knownFonts="1">{black}</fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0"><extLst><ext uri="{{C7286773-470A-42A8-94C5-96B5CB345126}}" xmlns:xfpb="http://schemas.microsoft.com/office/spreadsheetml/2022/featurepropertybag"><xfpb:xfComplement i="0"/></ext></extLst></xf></cellXfs>{}<extLst><ext uri="{{EB79DEF2-80B8-43e5-95BD-54CBDDF9020C}}" xmlns:x14="{X14}"><x14:dxfs count="1"><dxf><font><color rgb="FFFFFFFF"/></font></dxf></x14:dxfs></ext></extLst></styleSheet>"#,
+        uncertain("<dxfs/>", "<dxfs/>")
+    );
+    let extracted = read(
+        &Xlsx::new()
+            .styles(&honest)
+            .sheet("Sheet1", &data(&row(1, &num("A1", 0, "5")))),
+    );
+    assert_eq!(hidden(&extracted, "Sheet1", "A1"), None);
+    // A choice after the fallback is refused, as Excel refuses it.
+    let misordered = styles_part(
+        &format!(
+            r#"<mc:AlternateContent xmlns:mc="{MC}" xmlns:x="{SML}"><mc:Fallback/><mc:Choice Requires="x"/></mc:AlternateContent>"#
+        ),
+        black,
+        "",
+        r#"<xf numFmtId="0" fontId="0" fillId="0"/>"#,
+        "",
+    );
+    assert_eq!(
+        extract(
+            &Xlsx::new()
+                .styles(&misordered)
+                .sheet("Sheet1", &data(&row(1, &num("A1", 0, "5"))))
+        ),
+        Err(DocError::Malformed("xlsx_structure"))
+    );
+}
+
+#[test]
+fn xlsx_markup_compatibility_in_strings_is_read_as_excel_reads_it() {
+    let white = r#"<color rgb="FFFFFFFF"/>"#;
+    let black = r#"<color rgb="FF000000"/>"#;
+    let probe = "PROBE-HIDDEN-RUN";
+    // A run whose properties hold a choice the reader cannot take is hidden: which colour Excel
+    // draws it in is not known. In a shared string and an inline one alike.
+    let runs = |props: &str| {
+        format!(
+            r#"<r><t xml:space="preserve">visible </t></r><r><rPr>{props}</rPr><t>{probe}</t></r>"#
+        )
+    };
+    for props in [
+        uncertain(white, white),
+        uncertain(black, black),
+        understood(white, black),
+    ] {
+        let inline_cell = format!(r#"<c r="A1" t="inlineStr"><is>{}</is></c>"#, runs(&props));
+        let both = Xlsx::new().shared_strings(&[&runs(&props)]).sheet(
+            "S",
+            &data(&row(1, &format!("{inline_cell}{}", shared("B1", 0, 0)))),
+        );
+        let extracted = read(&both);
+        for at in ["A1", "B1"] {
+            assert_eq!(block(&extracted, "S", at).text, "visible ", "{props} {at}");
+            assert_eq!(hidden(&extracted, "S", at), None, "{props} {at}");
+        }
+        assert!(
+            !format!("{:?}", extracted.blocks).contains(probe),
+            "{props}"
+        );
+        assert_eq!(hidden_content(&extracted).len(), 2, "{props}");
+    }
+    // A choice the reader takes that makes the run black shows it.
+    let shown = read(&Xlsx::new().sheet(
+        "S",
+        &data(&row(
+            1,
+            &format!(
+                r#"<c r="A1" t="inlineStr"><is>{}</is></c>"#,
+                runs(&understood(black, white))
+            ),
+        )),
+    ));
+    assert_eq!(block(&shown, "S", "A1").text, format!("visible {probe}"));
+    // A choice the reader cannot take around runs or text leaves the whole string undecided: the
+    // cell is a hidden block holding no text. One the reader takes is read in place.
+    for (string, text, why) in [
+        (
+            format!(
+                r#"<r><t>a</t></r>{}"#,
+                uncertain("<r><t>b</t></r>", "<r><t>c</t></r>")
+            ),
+            "",
+            Some(HiddenWhy::LowContrast),
+        ),
+        (
+            uncertain("<t>b</t>", "<t>c</t>"),
+            "",
+            Some(HiddenWhy::LowContrast),
+        ),
+        (
+            format!(
+                r#"<r><t>a</t></r>{}"#,
+                understood("<r><t>b</t></r>", "<r><t>c</t></r>")
+            ),
+            "ab",
+            None,
+        ),
+        (fallback_only("<t>c</t>"), "c", None),
+        (
+            r#"<o:wrap xmlns:o="urn:example:other"><t>b</t></o:wrap>"#.to_owned(),
+            "",
+            Some(HiddenWhy::LowContrast),
+        ),
+    ] {
+        let extracted = read(&Xlsx::new().sheet(
+            "S",
+            &data(&row(
+                1,
+                &format!(r#"<c r="A1" t="inlineStr"><is>{string}</is></c>"#),
+            )),
+        ));
+        assert_eq!(block(&extracted, "S", "A1").text, text, "{string}");
+        assert_eq!(hidden(&extracted, "S", "A1"), why, "{string}");
+        let shared_part =
+            format!(r#"<?xml version="1.0"?><sst xmlns="{SML}"><si>{string}</si></sst>"#);
+        let extracted = read(
+            &Xlsx::new()
+                .shared_strings_xml(&shared_part)
+                .sheet("S", &data(&row(1, &shared("A1", 0, 0)))),
+        );
+        assert_eq!(block(&extracted, "S", "A1").text, text, "{string}");
+        assert_eq!(hidden(&extracted, "S", "A1"), why, "{string}");
+    }
+    // Between strings, a choice the reader cannot take leaves every later index undecided.
+    let table = format!(
+        r#"<?xml version="1.0"?><sst xmlns="{SML}"><si><t>first</t></si>{}<si><t>last</t></si></sst>"#,
+        uncertain("<si><t>x</t></si>", "<si><t>y</t></si>")
+    );
+    let extracted = read(&Xlsx::new().shared_strings_xml(&table).sheet(
+        "S",
+        &data(&row(
+            1,
+            &[shared("A1", 0, 0), shared("B1", 0, 1), shared("C1", 0, 2)].concat(),
+        )),
+    ));
+    assert_eq!(block(&extracted, "S", "A1").text, "first");
+    for at in ["B1", "C1"] {
+        assert_eq!(block(&extracted, "S", at).text, "", "{at}");
+        assert_eq!(
+            hidden(&extracted, "S", at),
+            Some(HiddenWhy::LowContrast),
+            "{at}"
+        );
+    }
+}
+
 #[test]
 fn xlsx_strict_and_bad_main_parts_are_refused() {
     let body = data(&row(1, &num("A1", 0, "1")));
