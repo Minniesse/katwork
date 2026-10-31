@@ -3906,8 +3906,10 @@ fn stops_at_its_check(site: &'static str, xlsx: &Xlsx) {
             low = mid + 1;
         }
     }
+    // Stopped there: no check of the reader's after it, and that check the last stage.
     let (result, stages) = within(Some(low));
     assert_eq!(result, Err(DocError::Timeout), "{site}");
+    assert_eq!(reader_checks(&stages), first + 1, "{site}");
     assert_eq!(stages.last(), Some(&Stage::Check(site)), "{site}");
 }
 
@@ -3934,7 +3936,9 @@ fn xlsx_each_reader_loop_stops_at_its_own_deadline_check() {
             data(&rows(1))
         )),
     );
-    let runs = "<r><t>x</t></r>".repeat(1_100);
+    // White runs: the cell's text is empty, so nothing after the runs checks the deadline but
+    // the reader's own next loop.
+    let runs = r#"<r><rPr><color rgb="FFFFFFFF"/></rPr><t>x</t></r>"#.repeat(1_100);
     stops_at_its_check(
         "runs",
         &sheet(&data(&row(
