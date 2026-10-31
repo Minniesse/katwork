@@ -42,9 +42,12 @@ blob() {
     printf '%s' "$2" > "$tmp/artifacts/$relative"
     printf '%s\n' "$relative"
 }
+nl='
+'
 backups() { find "$KATWORK_BACKUP_DIR" -mindepth 1 -maxdepth 1 -name "*$1" | sort; }
 w1=01900000-0000-7000-8000-000000000001
 w2=01900000-0000-7000-8000-000000000002
+w3=01900000-0000-7000-8000-000000000003
 first=$(blob "$w1" 'first file')
 second=$(blob "$w2" 'second file')
 # Not files the app stores: a staging file, a stray file and a file whose name is not its hash.
@@ -53,10 +56,28 @@ printf 'half' > "$tmp/artifacts/$w1/tmp/upload"
 printf 'stray' > "$tmp/artifacts/$w1/notes"
 damaged=$(blob "$w1" 'damaged file')
 printf 'changed' > "$tmp/artifacts/$damaged"
+# Nor names the backup must not trust: a stored-looking file in the wrong folder, a folder that
+# is not a workspace, a folder name that holds a newline, a link (to a file whose bytes match
+# its name), and a sparse file larger than any stored file.
+misplaced=$(stored_path "$w1" 'misplaced file')
+mkdir -p "$tmp/artifacts/$w1/sha256/00/00"
+printf 'misplaced file' > "$tmp/artifacts/$w1/sha256/00/00/${misplaced##*/}"
+odd=$(blob 'not-a-workspace' 'odd workspace')
+split=$(blob "$w1$nl$w3" 'split by a newline')
+printf 'outside the volume' > "$tmp/outside"
+linked=$(stored_path "$w1" 'outside the volume')
+mkdir -p "$tmp/artifacts/${linked%/*}"
+ln -s "$tmp/outside" "$tmp/artifacts/$linked"
+# Its first 64 MiB, all zeros, match its name, so a copy that read it would be kept.
+zeros=$(head -c 67108864 /dev/zero | digest)
+oversized="$w1/sha256/$(printf '%s' "$zeros" | cut -c1-2)/$(printf '%s' "$zeros" | cut -c3-4)/$zeros"
+mkdir -p "$tmp/artifacts/${oversized%/*}"
+dd if=/dev/zero of="$tmp/artifacts/$oversized" bs=1 count=1 seek=67108864 2> /dev/null
 
 # The first backup: the dump and a .files folder of the same name, with the stored files only.
 "$root/scripts/compose-backup.sh" 2> "$tmp/err"
 grep -qF "${damaged##*/}" "$tmp/err" || fail 'a damaged file is reported'
+grep -F "${oversized##*/}" "$tmp/err" | grep -q 'larger than any stored file' || fail 'an oversized file is reported'
 [ "$(backups .dump | wc -l | tr -d ' ')" = 1 ] || fail 'one dump'
 [ "$(backups .files | wc -l | tr -d ' ')" = 1 ] || fail 'one files folder'
 dump=$(backups .dump)
@@ -65,6 +86,11 @@ one="${dump%.dump}.files"
 [ "$(cat "$one/$first")" = 'first file' ] || fail 'first file copied'
 [ "$(cat "$one/$second")" = 'second file' ] || fail 'second file copied'
 [ "$(find "$one" -type f | wc -l | tr -d ' ')" = 2 ] || fail 'only stored, undamaged files'
+[ -z "$(find "$one" -path '*/sha256/00/00/*')" ] || fail 'a file in the wrong folder is not copied'
+[ ! -e "$one/not-a-workspace" ] || fail 'a folder that is not a workspace is not copied'
+[ ! -e "$one/$w3" ] && [ ! -e "$one/$split" ] || fail 'a name with a newline is never split'
+[ ! -e "$one/$linked" ] || fail 'a link is never followed'
+[ ! -e "$one/$oversized" ] || fail 'a file larger than any stored file is never read'
 [ "$(mode "$one")" = 700 ] && [ "$(mode "${one}/$w1")" = 700 ] || fail 'private folders'
 [ "$(mode "$one/$first")" = 600 ] || fail 'private files'
 [ -z "$(find "$KATWORK_BACKUP_DIR" -name '*.partial')" ] || fail 'no partial left'
@@ -72,7 +98,7 @@ one="${dump%.dump}.files"
 # The second backup links the files it already holds and copies only the new one.
 third=$(blob "$w1" 'third file')
 rm "$tmp/artifacts/$damaged"
-"$root/scripts/compose-backup.sh"
+"$root/scripts/compose-backup.sh" 2> /dev/null
 [ "$(backups .dump | wc -l | tr -d ' ')" = 2 ] || fail 'two dumps'
 two=$(backups .files | grep -vxF "$one")
 [ "$(inode "$two/$first")" = "$(inode "$one/$first")" ] || fail 'an unchanged file is a hard link'
@@ -82,7 +108,7 @@ two=$(backups .files | grep -vxF "$one")
 
 # A file gone from the volume is gone from the next backup; older backups keep it.
 rm "$tmp/artifacts/$second"
-"$root/scripts/compose-backup.sh"
+"$root/scripts/compose-backup.sh" 2> /dev/null
 three=$(backups .files | grep -vxF -e "$one" -e "$two")
 [ ! -e "$three/$second" ] || fail 'a removed file leaves the next backup'
 [ -f "$two/$second" ] || fail 'an older backup keeps it'
@@ -120,8 +146,10 @@ grep -qF "${two##*/}" "$tmp/out" || fail 'the restore names its backup'
 restore "${two##*/}" > /dev/null
 restore "${three##*/}" > /dev/null
 [ "$(find "$tmp/restored" -type f | wc -l | tr -d ' ')" = 3 ] || fail 'restores merge'
-# Names outside the backup folder, missing backups and a damaged file are refused.
-for name in '' "../${two##*/}" "${two##*/}/.." 'katwork-x.dump' 'katwork-missing.files'; do
+# Names outside the backup folder, missing backups and a damaged file are refused, also a
+# path through another folder that would resolve to a real backup.
+mkdir "$KATWORK_BACKUP_DIR/katwork-x"
+for name in '' "../${two##*/}" "${two##*/}/.." "katwork-x/../${two##*/}" 'katwork-x.dump' 'katwork-missing.files'; do
     if restore "$name" 2> /dev/null; then fail "restore of '$name' is refused"; fi
 done
 printf 'tampered' > "$two/$third"

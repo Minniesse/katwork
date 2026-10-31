@@ -2,6 +2,52 @@
 set -eu
 umask 077
 export LC_ALL=C
+# The largest file the app stores is a Kat's 50 MiB output (an upload is at most 25 MiB). The
+# files backup skips a larger file unread, and copies at most this much of any file.
+max_file_bytes=67108864
+digest() {
+    if command -v sha256sum > /dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -c1-64
+}
+# Copies the stored files named on the command line into $files, linking each one the earlier
+# backup $previous holds. Run through xargs over the NUL-separated listing below, so no name in
+# the volume can split into two, with files_root, files and previous exported.
+copy_files() {
+    h='[0-9a-f]'
+    uuid="$h$h$h$h$h$h$h$h-$h$h$h$h-$h$h$h$h-$h$h$h$h-$h$h$h$h$h$h$h$h$h$h$h$h"
+    for source do
+        relative=${source#"$files_root"/}
+        workspace=${relative%%/*}
+        name=${source##*/}
+        rest=${name#??}
+        # Only the app's own path, <workspace id>/sha256/<aa>/<bb>/<64 hex digits>.
+        case "$workspace" in $uuid) ;; *) continue ;; esac
+        case "$name" in *[!0-9a-f]*) continue ;; esac
+        [ "${#name}" -eq 64 ] || continue
+        [ "$relative" = "$workspace/sha256/${name%"$rest"}/${rest%"${rest#??}"}/$name" ] || continue
+        # Never through a link, even one made since the listing.
+        [ ! -L "$source" ] || continue
+        target="$files/$relative"
+        [ -d "${target%/*}" ] || mkdir -p "${target%/*}"
+        # Each stored file is named by its SHA-256 and never changed, so a name the earlier
+        # backup holds is linked from it, costing no space; a new one is copied and checked.
+        if [ -n "$previous" ] && [ -f "$previous/$relative" ] && ln "$previous/$relative" "$target" 2> /dev/null; then
+            continue
+        fi
+        if ! head -c "$max_file_bytes" < "$source" > "$target"; then
+            printf 'Cannot copy %s.\n' "$relative" >&2
+            exit 1
+        fi
+        if [ "$(digest < "$target")" != "$name" ]; then
+            rm -f "$target"
+            printf 'Skipped a damaged file: %s does not match its SHA-256 name.\n' "$relative" >&2
+        fi
+    done
+}
+if [ "${1:-}" = --copy-files ]; then
+    shift
+    copy_files "$@"
+    exit 0
+fi
 invalid_url() {
     printf '%s\n' 'Unsupported DATABASE_URL: use postgres://USER:PASSWORD@HOST:PORT/DATABASE with plain URL-safe fields, no options.' >&2
     exit 1
@@ -58,34 +104,16 @@ list=''
 trap 'rm -rf "$base" "$dump" "$files"; [ -z "$list" ] || rm -f "$list"' EXIT HUP INT TERM
 mv "$base" "$dump"
 pg_dump --format=custom --file "$dump"
-# The files, copied after the dump so the copy holds every file the dump names. Each stored
-# file is named by its SHA-256 and never changed, so a name the newest earlier backup holds is
-# linked from it, costing no space; a new one is copied and checked against its name.
-digest() {
-    if command -v sha256sum > /dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -c1-64
-}
+# The files, copied after the dump so the copy holds every file the dump names: the regular
+# files at a stored file's depth (never a link), listed NUL-separated.
 previous=$(ls -1dt "$directory"/katwork-*.files 2> /dev/null | head -n 1)
 list=$(mktemp)
-find "$files_root" -type f -path "$files_root/*/sha256/*" > "$list"
+find "$files_root" -mindepth 5 -maxdepth 5 -type f -path "$files_root/*/sha256/*/*/*" \
+    -size -"$((max_file_bytes + 1))"c -print0 > "$list"
+find "$files_root" -mindepth 5 -maxdepth 5 -type f -path "$files_root/*/sha256/*/*/*" \
+    -size +"$max_file_bytes"c -exec printf 'Skipped a file larger than any stored file, unread: %s\n' {} + >&2
 mkdir "$files"
-while IFS= read -r source; do
-    relative=${source#"$files_root"/}
-    name=${source##*/}
-    rest=${name#??}
-    case "$name" in *[!0-9a-f]*) continue ;; esac
-    # Only <workspace>/sha256/<aa>/<bb>/<64 hex digits>, as the app stores a file.
-    [ "${#name}" -eq 64 ] || continue
-    [ "$relative" = "${relative%%/*}/sha256/${name%"$rest"}/${rest%"${rest#??}"}/$name" ] || continue
-    target="$files/$relative"
-    [ -d "${target%/*}" ] || mkdir -p "${target%/*}"
-    if [ -n "$previous" ] && [ -f "$previous/$relative" ] && ln "$previous/$relative" "$target" 2> /dev/null; then
-        continue
-    fi
-    cp "$source" "$target"
-    if [ "$(digest < "$target")" != "$name" ]; then
-        rm -f "$target"
-        printf 'Skipped a damaged file: %s does not match its SHA-256 name.\n' "$relative" >&2
-    fi
-done < "$list"
+export files_root files previous
+xargs -0 sh "$0" --copy-files < "$list"
 mv "$files" "$base.files"
 mv "$dump" "$base.dump"
