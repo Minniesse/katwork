@@ -2351,6 +2351,15 @@ fn xlsx_text_and_formula_caps_are_excels() {
         one(&format!(r#"<c r="A1"><f>{formula}3</f><v>1</v></c>"#)),
         Err(DocError::TooComplex("formula"))
     );
+    // A stored number is text too: at most 32,767 characters (Excel writes 17 significant
+    // digits and an exponent).
+    let digits = format!("0.{}1", "0".repeat(32_764));
+    assert_eq!(digits.len(), 32_767);
+    assert!(one(&num("A1", 0, &digits)).is_ok());
+    assert_eq!(
+        one(&num("A1", 0, &format!("{digits}1"))),
+        Err(DocError::TooComplex("cell_text"))
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2454,22 +2463,48 @@ fn xlsx_row_and_column_formats_count_for_cells_that_write_none() {
 }
 
 #[test]
-fn xlsx_zero_height_rows_and_zero_width_columns_are_hidden() {
+fn xlsx_rows_and_columns_too_small_to_show_text_are_hidden() {
+    // A row lower than `min_visible_pt` (4 pt) clips any text to less than tiny text; a column
+    // narrower than one character (`width` counts characters of the widest digit, padding
+    // included) cannot show a digit. Both hide their cells; at the limits they show.
     let body = format!(
-        r#"<cols><col min="2" max="2" width="0" customWidth="1"/><col min="3" max="3" width="12"/></cols>{}"#,
+        r#"<cols><col min="2" max="2" width="0" customWidth="1"/><col min="3" max="3" width="12"/><col min="4" max="4" width="0.01" customWidth="1"/><col min="5" max="5" width="0.99" customWidth="1"/><col min="6" max="6" width="1" customWidth="1"/></cols>{}"#,
         data(
             &[
                 r#"<row r="1" ht="0" customHeight="1"><c r="A1"><v>1</v></c></row>"#,
-                r#"<row r="2" ht="15"><c r="A2"><v>2</v></c><c r="B2"><v>3</v></c><c r="C2"><v>4</v></c></row>"#,
+                r#"<row r="2" ht="15"><c r="A2"><v>2</v></c><c r="B2"><v>3</v></c><c r="C2"><v>4</v></c><c r="D2"><v>5</v></c><c r="E2"><v>6</v></c><c r="F2"><v>7</v></c></row>"#,
+                r#"<row r="3" ht="0.1" customHeight="1"><c r="A3"><v>8</v></c></row>"#,
+                r#"<row r="4" ht="1" customHeight="1"><c r="A4"><v>9</v></c></row>"#,
+                r#"<row r="5" ht="3.99"><c r="A5"><v>10</v></c></row>"#,
+                r#"<row r="6" ht="4"><c r="A6"><v>11</v></c></row>"#,
             ]
             .concat()
         )
     );
     let extracted = read(&Xlsx::new().sheet("S", &body));
-    assert_eq!(hidden(&extracted, "S", "A1"), Some(HiddenWhy::HiddenRow));
-    assert_eq!(hidden(&extracted, "S", "A2"), None);
-    assert_eq!(hidden(&extracted, "S", "B2"), Some(HiddenWhy::HiddenColumn));
-    assert_eq!(hidden(&extracted, "S", "C2"), None);
+    for (at, why) in [
+        ("A1", Some(HiddenWhy::HiddenRow)),
+        ("A2", None),
+        ("B2", Some(HiddenWhy::HiddenColumn)),
+        ("C2", None),
+        ("D2", Some(HiddenWhy::HiddenColumn)),
+        ("E2", Some(HiddenWhy::HiddenColumn)),
+        ("F2", None),
+        ("A3", Some(HiddenWhy::HiddenRow)),
+        ("A4", Some(HiddenWhy::HiddenRow)),
+        ("A5", Some(HiddenWhy::HiddenRow)),
+        ("A6", None),
+    ] {
+        assert_eq!(hidden(&extracted, "S", at), why, "{at}");
+    }
+    // The row's limit is the read's `min_visible_pt`.
+    let lower = DocLimits {
+        min_visible_pt: 0.5,
+        ..limits()
+    };
+    let extracted = extract_with(&Xlsx::new().sheet("S", &body), &lower).unwrap();
+    assert_eq!(hidden(&extracted, "S", "A4"), None);
+    assert_eq!(hidden(&extracted, "S", "A3"), Some(HiddenWhy::HiddenRow));
 }
 
 #[test]
@@ -2701,6 +2736,19 @@ fn xlsx_colour_attribute_priority_and_palettes() {
         &row(1, &[num("A1", eight, "1"), num("B1", twenty, "2")].concat()),
     ));
     assert_eq!(first_row(&extracted), [Some(L), Some(L)]);
+    // Indexes from 66 up are not colours, however long the file's palette.
+    let mut styles = StyleSet::new();
+    let seventy = styles.with_font(r#"<sz val="11"/><color indexed="70"/>"#);
+    let ten = styles.with_font(r#"<sz val="11"/><color indexed="10"/>"#);
+    styles.extra(&format!(
+        "<colors><indexedColors>{}</indexedColors></colors>",
+        r#"<rgbColor rgb="FF000000"/>"#.repeat(80)
+    ));
+    let extracted = read(&book(
+        &styles,
+        &row(1, &[num("A1", seventy, "1"), num("B1", ten, "2")].concat()),
+    ));
+    assert_eq!(first_row(&extracted), [Some(L), None]);
 }
 
 #[test]

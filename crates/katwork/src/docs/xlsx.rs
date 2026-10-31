@@ -48,6 +48,8 @@ const MAX_CELL_CHARS: usize = 32_767;
 const MAX_FORMULA_CHARS: usize = 8_192;
 const MAX_FORMAT_CHARS: usize = 255;
 const MAX_SHEET_NAME_CHARS: usize = 31;
+/// The narrowest column (in characters of `width`) that shows its cells.
+const MIN_COLUMN_WIDTH: f64 = 1.0;
 /// `_xHHHH_` is seven characters for one: text this many times a cap, in bytes, cannot fit it.
 const ESCAPED_BYTES: usize = 7 * 4;
 /// A column header stands in one of a sheet's first rows.
@@ -410,7 +412,7 @@ pub(super) fn read(bytes: &[u8], limits: &DocLimits) -> Result<Extracted, DocErr
         };
         let xml = package.part(part).unwrap_or_default();
         record_read(part, xml);
-        let data = read_sheet(xml, &strings)?;
+        let data = read_sheet(xml, &strings, limits)?;
         let start = out.blocks.len();
         out.sheet(&judge, sheet, &data)?;
         fill_headers(&mut out.blocks[start..]);
@@ -2198,7 +2200,7 @@ struct OpenCell {
     seen_value: bool,
 }
 
-fn read_sheet(xml: &[u8], strings: &[Rst]) -> Result<SheetData, DocError> {
+fn read_sheet(xml: &[u8], strings: &[Rst], limits: &DocLimits) -> Result<SheetData, DocError> {
     let mut walk = Walk::new(xml, SHEET_NAMES);
     let mut data = SheetData {
         cells: Vec::new(),
@@ -2275,10 +2277,13 @@ fn read_sheet(xml: &[u8], strings: &[Rst]) -> Result<SheetData, DocError> {
                             return Err(reference);
                         }
                         last_row = number;
-                        // A hidden flag that does not parse, and a row of no height, hide it.
+                        // A hidden flag that does not parse hides it, and so does a height (in
+                        // points) under `min_visible_pt`: the row clips any text to less than
+                        // tiny text.
+                        let min_pt = f64::from(limits.min_visible_pt);
                         let hidden = hidden.is_some_and(|hidden| boolean(&hidden) != Some(false))
                             || height.is_some_and(|height| {
-                                numfmt::number(&height).is_none_or(|height| height <= 0.0)
+                                numfmt::number(&height).is_none_or(|height| height < min_pt)
                             });
                         // A row's format counts for its cells that write none when it has
                         // `customFormat` (a value that does not parse counts as set).
@@ -2376,10 +2381,13 @@ fn read_sheet(xml: &[u8], strings: &[Rst]) -> Result<SheetData, DocError> {
                         if min == 0 || min > max || max > MAX_COLUMN {
                             return Err(bad);
                         }
-                        // A hidden flag that does not parse, and a column of no width, hide it.
+                        // A hidden flag that does not parse hides it, and so does a width under
+                        // one character: `width` counts characters of the widest digit with
+                        // their padding (ECMA-376 Part 1 §18.3.1.13), so such a column shows no
+                        // digit (Excel draws a number there as `#`).
                         let hidden = hidden.is_some_and(|hidden| boolean(&hidden) != Some(false))
                             || width.is_some_and(|width| {
-                                numfmt::number(&width).is_none_or(|width| width <= 0.0)
+                                numfmt::number(&width).is_none_or(|width| width < MIN_COLUMN_WIDTH)
                             });
                         let style = match style {
                             Some(style) => Some(
@@ -2521,6 +2529,9 @@ fn finish_cell(
         ("inlineStr", _, None) => None,
         (_, None, _) => None,
         ("n", Some(text), _) => {
+            if text.chars().count() > MAX_CELL_CHARS {
+                return Err(DocError::TooComplex("cell_text"));
+            }
             numfmt::number(&text).ok_or(DocError::Malformed("xlsx_number"))?;
             Some(Value::Number(
                 text.trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'))
@@ -2940,6 +2951,8 @@ impl Judge<'_> {
         match index {
             SYSTEM_FOREGROUND => Some(Rgb::BLACK),
             SYSTEM_BACKGROUND => Some(Rgb::WHITE),
+            // Past the system colours an index names no colour, however long the palette.
+            index if index > SYSTEM_BACKGROUND => None,
             _ if self.styles.palette_undecided => None,
             index => match &self.styles.palette {
                 Some(palette) => palette.get(index as usize).copied().flatten(),
