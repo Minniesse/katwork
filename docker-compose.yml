@@ -18,6 +18,13 @@ x-katwork-environment: &katwork-environment
   KATWORK_DOC_WORKERS: ${KATWORK_DOC_WORKERS:-}
   KATWORK_DOC_MAX_XML_ELEMENTS: ${KATWORK_DOC_MAX_XML_ELEMENTS:-}
   KATWORK_DOC_MAX_READ_BYTES: ${KATWORK_DOC_MAX_READ_BYTES:-}
+  # Uploaded and written files: pinned to the artifacts volume's mount point, so .env cannot
+  # move them off the volume.
+  KATWORK_ARTIFACT_DIR: /var/lib/katwork/artifacts
+  KATWORK_UPLOAD_MAX_BYTES: ${KATWORK_UPLOAD_MAX_BYTES:-}
+  KATWORK_WORKSPACE_STORAGE_BYTES: ${KATWORK_WORKSPACE_STORAGE_BYTES:-}
+  KATWORK_UPLOAD_MIN_BYTES_PER_SEC: ${KATWORK_UPLOAD_MIN_BYTES_PER_SEC:-}
+  KATWORK_UPLOAD_RATE_WINDOW_MS: ${KATWORK_UPLOAD_RATE_WINDOW_MS:-}
   KATWORK_IDLE_TIMEOUT_SECONDS: ${KATWORK_IDLE_TIMEOUT_SECONDS:-}
   KATWORK_MAX_CONNECTIONS: ${KATWORK_MAX_CONNECTIONS:-}
   KATWORK_MAX_CONNECTIONS_PER_IP: ${KATWORK_MAX_CONNECTIONS_PER_IP:-}
@@ -59,10 +66,14 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
 
+  # Before every start: the database, then the files of the artifacts volume (README, Backups
+  # and upgrades).
   backup:
     image: postgres:17
     restart: "no"
     cap_drop: [ALL]
+    # Reads the app's private files (owner 65532, mode 0600) to copy them; writes nothing there.
+    cap_add: [DAC_READ_SEARCH]
     security_opt: ["no-new-privileges:true"]
     networks: [backend]
     environment:
@@ -71,9 +82,27 @@ services:
     volumes:
       - ./scripts/compose-backup.sh:/scripts/compose-backup.sh:ro
       - ./backups:/backups
+      - artifacts:/var/lib/katwork/artifacts:ro
     depends_on:
       postgres:
         condition: service_healthy
+
+  # Run by hand to copy a files backup back into the artifacts volume (README, Backups and
+  # upgrades); never started by `up`.
+  restore-files:
+    image: postgres:17
+    profiles: [restore]
+    restart: "no"
+    network_mode: none
+    cap_drop: [ALL]
+    # Writes into the app's private folders and gives the files back to its user, 65532.
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt: ["no-new-privileges:true"]
+    entrypoint: ["sh", "/scripts/compose-restore-files.sh"]
+    volumes:
+      - ./scripts/compose-restore-files.sh:/scripts/compose-restore-files.sh:ro
+      - ./backups:/backups:ro
+      - artifacts:/var/lib/katwork/artifacts
 
   migrate:
     <<: *katwork-image
@@ -98,6 +127,10 @@ services:
     networks: [backend, default]
     extra_hosts: ["host.docker.internal:host-gateway"]
     environment: *katwork-environment
+    # The image creates the mount point owned by its non-root user, and a new volume copies
+    # that owner. The backup service copies it after each database backup.
+    volumes:
+      - artifacts:/var/lib/katwork/artifacts
     healthcheck:
       test: ["CMD", "/app/katwork-server", "healthcheck"]
       interval: 5s
@@ -118,3 +151,4 @@ networks:
 volumes:
   postgres_data:
   qdrant_data:
+  artifacts:

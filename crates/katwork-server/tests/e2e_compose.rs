@@ -60,7 +60,7 @@ impl Stack {
         } else {
             "  katwork:\n    ports: !override [\"127.0.0.1::3000\"]\n"
         };
-        fs::write(dir.join("test.yml"), format!("services:\n{ports}  backup:\n    volumes:\n      - {}:/backups\n  restore:\n    image: postgres:17\n    networks: [backend]\n    environment:\n      POSTGRES_PASSWORD: ${{POSTGRES_PASSWORD}}\n    volumes:\n      - {}:/backups:ro\n", dir.join("backups").display(), dir.join("backups").display())).unwrap();
+        fs::write(dir.join("test.yml"), format!("services:\n{ports}  backup:\n    volumes:\n      - {}:/backups\n  restore-files:\n    volumes:\n      - {}:/backups:ro\n  restore:\n    image: postgres:17\n    networks: [backend]\n    environment:\n      POSTGRES_PASSWORD: ${{POSTGRES_PASSWORD}}\n    volumes:\n      - {}:/backups:ro\n", dir.join("backups").display(), dir.join("backups").display(), dir.join("backups").display())).unwrap();
         let mut files = format!("{ROOT}/docker-compose.yml:{ROOT}/docker-compose.smoke.yml");
         if https {
             files.push_str(&format!(":{ROOT}/docker-compose.https.yml"));
@@ -424,7 +424,7 @@ fn first_run_and_profile_configuration() {
                 .env("COMPOSE_FILE", files)
                 .env("CARGO_FEATURES", "smoke-fixtures")
                 .env("KATWORK_HTTPS_HOST", "smoke.example")
-                .args(["config", "--format", "json"]),
+                .args(["--profile", "restore", "config", "--format", "json"]),
         ))
         .unwrap();
         let app = &config["services"]["katwork"];
@@ -468,6 +468,50 @@ fn first_run_and_profile_configuration() {
                 .to_str()
                 .unwrap()
         );
+        // Uploaded and written files live on the artifacts volume in every profile, and .env
+        // cannot move them off it.
+        assert!(
+            app["volumes"].as_array().unwrap().iter().any(|v| {
+                v["type"] == "volume"
+                    && v["source"] == "artifacts"
+                    && v["target"] == "/var/lib/katwork/artifacts"
+            }),
+            "katwork must mount the artifacts volume: {overrides:?}"
+        );
+        assert!(config["volumes"]["artifacts"].is_object());
+        assert_eq!(
+            app["environment"]["KATWORK_ARTIFACT_DIR"],
+            "/var/lib/katwork/artifacts"
+        );
+        // Every backup copies the files too, reading the volume and nothing more.
+        let backup = &config["services"]["backup"];
+        assert!(
+            backup_volumes.iter().any(|v| v["source"] == "artifacts"
+                && v["target"] == "/var/lib/katwork/artifacts"
+                && v["read_only"] == true),
+            "the backup reads the artifacts volume: {overrides:?}"
+        );
+        assert_eq!(backup["cap_drop"], json!(["ALL"]));
+        assert_eq!(backup["cap_add"], json!(["DAC_READ_SEARCH"]));
+        // The restore service runs only by hand, offline, from the same backup folder.
+        let restore = &config["services"]["restore-files"];
+        assert_eq!(restore["profiles"], json!(["restore"]));
+        assert_eq!(restore["network_mode"], "none");
+        assert_eq!(restore["cap_drop"], json!(["ALL"]));
+        assert_eq!(
+            restore["cap_add"],
+            json!(["CHOWN", "DAC_OVERRIDE", "FOWNER"])
+        );
+        let restore_volumes = restore["volumes"].as_array().unwrap();
+        assert!(restore_volumes.iter().any(|v| v["source"] == "artifacts"
+            && v["target"] == "/var/lib/katwork/artifacts"
+            && v["read_only"] != true));
+        let restore_archive = restore_volumes
+            .iter()
+            .find(|v| v["target"] == "/backups")
+            .unwrap();
+        assert_eq!(restore_archive["source"], archive_mount["source"]);
+        assert_eq!(restore_archive["read_only"], true);
         assert_eq!(config["networks"]["backend"]["internal"], true);
         assert_eq!(
             config["services"]["postgres"]["networks"]
@@ -653,7 +697,17 @@ async fn offline_demo_uses_synthetic_provider_with_host_keys_cleared() {
     for archive in archives {
         let archive = archive.to_str().unwrap();
         assert!(archive.starts_with("katwork-katwork-"));
-        assert!(archive.ends_with(".dump"));
+        let Some(stem) = archive.strip_suffix(".dump") else {
+            assert!(archive.ends_with(".files"), "{archive}");
+            continue;
+        };
+        assert!(
+            stack
+                .dir
+                .join("backups-demo")
+                .join(format!("{stem}.files"))
+                .is_dir()
+        );
     }
 }
 
@@ -778,12 +832,20 @@ async fn backup_archive_restores_seeded_data() {
     stack.start().await;
     let archives: Vec<_> = fs::read_dir(stack.dir.join("backups"))
         .unwrap()
-        .map(|e| e.unwrap().file_name())
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with(".dump"))
         .collect();
     assert_eq!(archives.len(), 1);
-    let archive = archives[0].to_str().unwrap();
+    let archive = archives[0].as_str();
     assert!(archive.starts_with("katwork-seeded-"));
-    assert!(archive.ends_with(".dump"));
+    // The files are backed up with the database, under the same name.
+    assert!(
+        stack
+            .dir
+            .join("backups")
+            .join(archive.replace(".dump", ".files"))
+            .is_dir()
+    );
     stack.run(&["up", "-d", "restore"]);
     poll(|| {
         output(
@@ -882,6 +944,91 @@ async fn backup_archive_restores_seeded_data() {
         stack.sql("SELECT count(*) FROM users WHERE email='demo@katwork.local'"),
         "1"
     );
+}
+
+/// The `.files` folders in `backups/`, oldest first.
+fn files_backups(stack: &Stack) -> Vec<String> {
+    let mut names: Vec<_> = fs::read_dir(stack.dir.join("backups"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with(".files"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// A root-owned backup file, read the way an operator does.
+fn sudo(args: &[&str]) -> Vec<u8> {
+    let result = output(Command::new("sudo").arg("-n").args(args));
+    assert!(
+        result.status.success(),
+        "sudo {args:?}: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    result.stdout
+}
+
+#[tokio::test]
+#[ignore = "Docker daemon; run scripts/smoke.sh"]
+async fn files_are_backed_up_with_the_database_and_restored() {
+    let mut stack = Stack::new(false);
+    stack.start().await;
+    stack.seed_login().await;
+    let workspace = stack.sql("SELECT id FROM workspaces WHERE name='เดโม'");
+    let space = stack.sql(&format!(
+        "SELECT id FROM spaces WHERE workspace_id='{workspace}' LIMIT 1"
+    ));
+    let bytes = b"Backed up with the database.\n";
+    let response = stack
+        .request(
+            "POST",
+            &format!("/api/workspaces/{workspace}/spaces/{space}/files?name=backup.txt"),
+        )
+        .header("Content-Type", "application/octet-stream")
+        .body(bytes.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    let file: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    let sha = file["latest"]["sha256"].as_str().unwrap().to_owned();
+    let stored = format!("{workspace}/sha256/{}/{}/{sha}", &sha[..2], &sha[2..4]);
+    let content = format!(
+        "/api/workspaces/{workspace}/files/{}/versions/1/content",
+        file["id"].as_str().unwrap()
+    );
+    // A start backs up the database, then the files, as a pair of the same name.
+    stack.run(&["stop", "katwork"]);
+    stack.start().await;
+    let first = files_backups(&stack);
+    assert_eq!(first.len(), 1);
+    let backups = stack.dir.join("backups");
+    assert!(backups.join(first[0].replace(".files", ".dump")).is_file());
+    let copy = backups.join(&first[0]).join(&stored);
+    assert_eq!(sudo(&["cat", copy.to_str().unwrap()]), bytes);
+    // The next backup links the unchanged file rather than copying it again.
+    stack.run(&["stop", "katwork"]);
+    stack.start().await;
+    let both = files_backups(&stack);
+    assert_eq!(both.len(), 2);
+    let inode = |backup: &str| {
+        sudo(&[
+            "stat",
+            "-c",
+            "%i",
+            backups.join(backup).join(&stored).to_str().unwrap(),
+        ])
+    };
+    assert_eq!(inode(&both[0]), inode(&both[1]));
+    // The files volume is lost; the files backup taken with the database brings it back.
+    stack.run(&["down"]);
+    checked(Command::new("docker").args(["volume", "rm", &format!("{}_artifacts", stack.project)]));
+    let restored = stack.run(&["run", "--rm", "-T", "restore-files", &first[0]]);
+    assert!(restored.contains(&first[0]), "{restored}");
+    stack.start().await;
+    let response = stack.request("GET", &content).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.bytes().await.unwrap().as_ref(), bytes);
 }
 
 #[tokio::test]

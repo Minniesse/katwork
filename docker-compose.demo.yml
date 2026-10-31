@@ -20,6 +20,9 @@ services:
   backup:
     volumes:
       - ./backups-demo:/backups
+  restore-files:
+    volumes:
+      - ./backups-demo:/backups:ro
   demo-proxy:
     image: caddy:2.11.7-alpine
     restart: unless-stopped

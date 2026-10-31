@@ -7,7 +7,7 @@ use axum::{
 use katwork::runtime::Core;
 
 use crate::{
-    routes::{auth, events, health, jobs, kats, members, teams, threads, workspaces},
+    routes::{auth, events, files, health, jobs, kats, members, teams, threads, workspaces},
     static_files,
 };
 
@@ -118,6 +118,8 @@ fn router(state: AppState, web_dir: &Path, reset_work: ResetWork) -> Router {
             "/api/workspaces/{workspace_id}/jobs/{job_id}/cancel",
             post(jobs::cancel),
         )
+        .route(files::UPLOAD_ROUTE, get(files::list))
+        .route(files::CONTENT_ROUTE, get(files::download))
         .fallback_service(static_files::service(web_dir.to_owned()))
         .layer(Extension(auth::LoginLimiter::default()))
         .layer(Extension(auth::ResetLimiter::default()))
@@ -129,6 +131,14 @@ fn router(state: AppState, web_dir: &Path, reset_work: ResetWork) -> Router {
             get(events::subscribe),
         )
         .layer(axum::middleware::from_fn(crate::guards::read_body))
+        .with_state(state.clone());
+    // An upload streams its body to disk: outside `bounded`, which reads a whole body into
+    // memory under a 1 MiB limit and a 30 s timeout. The upload handler bounds itself.
+    let uploads = Router::new()
+        .route(files::UPLOAD_ROUTE, post(files::upload))
         .with_state(state);
-    crate::guards::secure(crate::guards::bounded(router).merge(streams), &config)
+    crate::guards::secure(
+        crate::guards::bounded(router).merge(streams).merge(uploads),
+        &config,
+    )
 }

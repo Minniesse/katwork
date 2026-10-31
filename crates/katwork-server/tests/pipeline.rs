@@ -213,7 +213,7 @@ impl Fixture {
         while let Some(r) = workers.join_next().await {
             r.unwrap();
         }
-        safety::assert_pool_clean(&self.core.pool).await;
+        support::assert_pool_clean(&self.core.pool).await;
     }
     async fn pause(&self, kat: KatId) {
         sqlx::query("UPDATE kats SET status='paused',policy_version=policy_version+1 WHERE id=$1")
