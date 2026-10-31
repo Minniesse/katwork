@@ -3772,6 +3772,123 @@ fn xlsx_macros_and_embedded_objects_are_warned_once() {
 }
 
 #[test]
+fn xlsx_data_connections_and_embedded_packages_are_warned() {
+    let one = data(&row(1, &num("A1", 0, "1")));
+    // A data connection, which can refresh cells from outside the file, is an external link.
+    let connected = Xlsx::new().sheet("S", &one).related(
+        "connections",
+        "connections.xml",
+        Some(format!(r#"<?xml version="1.0"?><connections xmlns="{SML}"/>"#).as_bytes()),
+    );
+    assert_eq!(
+        read(&connected).warnings,
+        [ExtractWarning::EmbeddedContentIgnored {
+            what: "external_link"
+        }]
+    );
+    // A package embedded in a sheet (a document inside the workbook) is an embedded object.
+    let mut packaged = Xlsx::new().sheet("S", &one);
+    packaged.last_sheet().rels.push((
+        "package".to_owned(),
+        "../embeddings/doc.docx".to_owned(),
+        None,
+    ));
+    assert_eq!(
+        read(&packaged).warnings,
+        [ExtractWarning::EmbeddedContentIgnored { what: "ole_object" }]
+    );
+}
+
+#[test]
+fn xlsx_macro_chart_and_dialog_sheets_hold_no_cells_the_reader_reads() {
+    let one = data(&row(1, &num("A1", 0, "1")));
+    let secret = r#"<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>secret</t></is></c></row></sheetData>"#;
+    for (kind, target, root, warnings) in [
+        (
+            format!("{MS_REL}xlIntlMacrosheet"),
+            "macrosheets/intl1.xml",
+            "xm:macrosheet",
+            vec![ExtractWarning::ActiveContentIgnored {
+                what: "macro_sheet",
+            }],
+        ),
+        (
+            "chartsheet".to_owned(),
+            "chartsheets/sheet1.xml",
+            "chartsheet",
+            Vec::new(),
+        ),
+        (
+            "dialogsheet".to_owned(),
+            "dialogsheets/sheet1.xml",
+            "dialogsheet",
+            Vec::new(),
+        ),
+    ] {
+        // Listed in the workbook like a sheet; its cells are never read.
+        let xml = format!(
+            r#"<?xml version="1.0"?><{root} xmlns="{SML}" xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main">{secret}</{root}>"#
+        );
+        let base = Xlsx::new().sheet("S", &one);
+        let workbook = base.workbook_part().replace(
+            "</sheets>",
+            r#"<sheet name="Other" sheetId="9" r:id="rIdW0"/></sheets>"#,
+        );
+        let extracted = read(
+            &base
+                .related(&kind, target, Some(xml.as_bytes()))
+                .workbook_xml(&workbook),
+        );
+        assert_eq!(extracted.blocks.len(), 1, "{kind}");
+        assert!(
+            !format!("{:?}", extracted.blocks).contains("secret"),
+            "{kind}"
+        );
+        assert_eq!(extracted.warnings, warnings, "{kind}");
+    }
+}
+
+#[test]
+fn xlsx_a_part_given_a_role_is_scanned_whatever_its_name() {
+    // A worksheet stored under a name that is not `.xml` is scanned as its relationship's role
+    // says, before the model: a doctype refused, its cells counted.
+    let cells = |count: u32| {
+        data(
+            &(1..=count)
+                .map(|r| row(r, &num(&format!("A{r}"), 0, "1")))
+                .collect::<String>(),
+        )
+    };
+    let stored = |body: &str| {
+        let mut xlsx = Xlsx::new().sheet("S", body);
+        xlsx.last_sheet().target = "worksheets/sheet1.bin".into();
+        xlsx
+    };
+    let mut doctype = stored(&cells(1));
+    let xml = doctype
+        .last_sheet()
+        .xml
+        .replacen("?>", "?><!DOCTYPE worksheet>", 1);
+    doctype.last_sheet().xml = xml;
+    assert_eq!(extract(&doctype), Err(DocError::Malformed("doctype")));
+    let small = DocLimits {
+        max_cells: 1_000,
+        ..limits()
+    };
+    assert_eq!(
+        extract_with(&stored(&cells(1_001)), &small),
+        Err(DocError::TooComplex("cells"))
+    );
+    assert_eq!(
+        extract_with(&stored(&cells(1_000)), &small)
+            .unwrap()
+            .blocks
+            .len(),
+        1_000
+    );
+}
+
+#[test]
 fn xlsx_activex_controls_are_warned_once() {
     // An ActiveX control is an embedded object: never read, and one warning however many there
     // are, found by a sheet's `control` relationship, by a part under `xl/activeX/` or by a
