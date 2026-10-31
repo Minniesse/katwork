@@ -2,31 +2,35 @@
 """PreToolUse guard for Bash calls, shared by Claude Code and Codex.
 
 Reads the hook event JSON on stdin. Exit 0 lets the command run; exit 2 blocks
-it and the reason on stderr goes back to the agent. Blocks:
+it and the reason on stderr goes back to the agent.
 
-- `git push` that updates or deletes main/master: explicit refspecs, HEAD or @
-  on main, --all/--mirror, `:` (matching), config-driven pushes
-  (remote.<name>.push, push.default upstream/matching), and refspecs built at
-  run time; also deleting a remote branch while open PRs use it as their base
-- `git reset --hard`, and `git clean` that would delete (force, or
-  clean.requireForce=false) unless it is a dry run
-- commits and merges when the author or committer email isn't a GitHub
-  noreply address
-- `gh pr merge` with --admin, --auto, --squash or --rebase; without a review
-  that covers the PR (see merge_verdict); or with --delete-branch while open
-  PRs use the head branch as their base
-- `gh api` writes that merge, move or delete refs or write contents, in any
-  flag spelling and any endpoint spelling GitHub routes there (see api_path),
-  and GraphQL merge or ref mutations, including bodies read
-  from stdin or files (an unreadable GraphQL body is refused). One REST merge
-  passes, for sessions without GraphQL, when every part is written out and a
-  review covers the head it names (see rest_merge_request):
-  `gh api -X PUT repos/<owner>/<repo>/pulls/<n>/merge -f merge_method=merge -f sha=<head sha>`
+It decides in three steps, so it never allows what main's guard refused,
+apart from one command line:
 
-Commands are parsed with a quote-aware shell lexer. It follows `;`, `&&`, `|`
-chains, subshells, `$(...)` and backticks, `sh -c`, `eval`, heredocs and
-here-strings fed to a shell, shell scripts run by path, git and gh aliases, and
-wrappers such as env, command, sudo, timeout, xargs and find -exec.
+1. main's guard decides. guard_main.py beside this file is main's guard.py at
+   a536fa5, byte for byte, run unchanged. Its docstring lists what it blocks:
+   pushes that update or delete main, `git reset --hard`, a deleting
+   `git clean`, commits whose identity isn't a GitHub noreply address,
+   `gh pr merge` with --admin, --auto, --squash or --rebase or without a review
+   that covers the head, and `gh api`, curl and GraphQL writes that merge PRs
+   or move refs.
+2. Where it refuses, one command line may still pass: exactly
+   `gh api -X PUT repos/<owner>/<repo>/pulls/<n>/merge -f merge_method=merge -f sha=<head sha>`
+   (or `--method PUT`, or `-F` for a field) and nothing else on the line,
+   when sha is the PR's head and a review covers it, both read over REST
+   (canonical_rest_merge, rest_review_check). It is the merge for sessions
+   without GraphQL.
+3. Where it allows, the checks here may still refuse (extra_reason):
+   - a write to a merge, ref, merges, contents or rename endpoint in any
+     spelling GitHub routes there (api_path), and a write whose path hides a
+     delimiter behind percent-encoding (hides_delimiter);
+   - the cloud auto-merge route (`pulls/<n>/ccr/auto_merge`) and
+     `pulls/<n>/update-branch`;
+   - GraphQL mutations sent to `/graphql` or a full URL;
+   - for curl, httpie and xh: the method inside a short-option cluster
+     (`-sX PUT`), a method word (`http PUT`), request items (`key=value`),
+     a URL glob (`{merge}`), and an upper-case host;
+   - `gh pr merge` when the only review covering the head is pending.
 
 It stops agents' accidents, not deliberate evasion: the server-side ruleset on
 main is the boundary. docs/agents/environment.md ("Guard scope") lists the
@@ -41,1124 +45,145 @@ import re
 import shlex
 import subprocess
 import sys
+import types
 import urllib.parse
 
-PROTECTED = {"main", "master"}
-NOREPLY = "@users.noreply.github.com"
-SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "mksh", "fish"}
-INTERPRETERS = {"python", "python3", "node", "perl", "ruby", "php", "osascript", "deno", "bun", "lua", "tclsh"}
-MAX_DEPTH = 6
-MAX_SCRIPT_BYTES = 256 * 1024
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-class Blocked(Exception):
-    pass
+def load_main_guard():
+    """guard_main.py, main's guard as it was, loaded as a module of its own."""
+    path = os.path.join(HERE, "guard_main.py")
+    module = types.ModuleType("guard_main")
+    module.__file__ = path
+    with open(path) as f:
+        exec(compile(f.read(), path, "exec"), module.__dict__)
+    return module
 
 
-class ParseError(Exception):
-    pass
+try:
+    base = load_main_guard()
+except Exception as e:  # without main's guard nothing can be checked, so main() refuses everything
+    base, LOAD_ERROR = None, f"{type(e).__name__}: {e}"
+if base is not None:
+    Blocked, NOREPLY, GRAPHQL_WRITES = base.Blocked, base.NOREPLY, base.GRAPHQL_WRITES
+    command_text, merge_verdict, merge_is_clean, run = base.command_text, base.merge_verdict, base.merge_is_clean, base.run
+    MAIN = {name: getattr(base, name) for name in ("check_gh_api", "check_http_client", "review_check")}
 
 
-def run(args, cwd, timeout=20):
-    try:
-        out = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired):
+def use_run(fn):
+    """Send every `gh` and git call, here and in main's guard, to fn."""
+    global run
+    run = base.run = fn
+
+
+# ================================================================ step 2: the one REST merge
+
+REST_MERGE = "gh api -X PUT repos/<owner>/<repo>/pulls/<n>/merge -f merge_method=merge -f sha=<head sha>"
+MERGE_WAYS = (f"Merge with `gh pr merge <n> --merge`, or where GraphQL is unavailable with the whole command line "
+              f"`{REST_MERGE}`, every part written out; push branches with `git push`. Those are checked.")
+CANONICAL_MERGE = re.compile(
+    r"\s*gh[ \t]+api[ \t]+(?:-X|--method)[ \t]+PUT[ \t]+repos/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pulls/([1-9][0-9]*)/merge"
+    r"[ \t]+-[fF][ \t]+merge_method=merge[ \t]+-[fF][ \t]+sha=([0-9a-f]{40})\s*")
+
+
+def canonical_rest_merge(text):
+    """(owner/repo, number, sha) when the whole command line is the REST merge,
+    word for word, with no quotes, variables or other words; else None. The
+    owner and repo are plain names (no `..`, not only dots), so the path the
+    line names is the path GitHub routes."""
+    m = CANONICAL_MERGE.fullmatch(text)
+    if not m or any(".." in name or not name.strip(".") for name in m.group(1, 2)):
         return None
-    return out.stdout.strip() if out.returncode == 0 else None
+    return f"{m.group(1)}/{m.group(2)}", m.group(3), m.group(4)
 
 
-# ================================================================ shell lexer
+def rest_review_check(slug, number, sha, cwd):
+    """The review rule for the REST merge: sha must be the PR's current head,
+    and a review must cover it, all read over REST."""
+    pr, reason = pr_over_rest(slug, number, cwd)
+    if reason:
+        return reason
+    if pr["head"] != sha:
+        return (f"sha {sha[:7]} isn't the PR's head, which is {pr['head'] or 'unknown'}. "
+                "Merge the head a review covers.")
+    return pr_verdict(pr, cwd)
 
 
-class Word:
-    """One shell word: its value after quote removal, and whether that value
-    depends on run-time expansion ($var, $(...), globs, braces)."""
-
-    __slots__ = ("text", "dynamic")
-
-    def __init__(self, text, dynamic=False):
-        self.text = text
-        self.dynamic = dynamic
-
-    def __repr__(self):
-        return f"Word({self.text!r}{', dynamic' if self.dynamic else ''})"
-
-
-class Command:
-    """A simple command: its words, plus what it reads on stdin from heredocs
-    and here-strings."""
-
-    __slots__ = ("words", "stdin", "stdin_dynamic", "stdin_files")
-
-    def __init__(self):
-        self.words = []
-        self.stdin = []
-        self.stdin_dynamic = []  # per stdin text: True if the shell expands it ($(...), $VAR)
-        self.stdin_files = []  # targets of < redirections
+def pr_from_view(out):
+    """(pr, None) from `gh pr view --json` output, or (None, reason). pr holds
+    slug, number, head, base and reviews ({"commit", "submittedAt"}). A
+    pending review hasn't been posted, so it never counts."""
+    pr = json.loads(out)
+    m = re.search(r"github\.com/([^/]+/[^/]+)/pull/(\d+)", pr.get("url", ""))
+    if not m:
+        return None, "couldn't tell which repository the PR is in."
+    reviews = [{"commit": (r.get("commit") or {}).get("oid"), "submittedAt": r.get("submittedAt")}
+               for r in pr.get("reviews", []) if r.get("state") != "PENDING"]
+    return {"slug": m.group(1), "number": m.group(2), "head": pr.get("headRefOid", ""),
+            "base": pr.get("baseRefName", ""), "reviews": reviews}, None
 
 
-class Parsed:
-    def __init__(self):
-        self.pipelines = []  # list of lists of Command
-        self.subs = []  # bodies of $(...), `...`, <(...), >(...)
-
-
-ANSI_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", "'": "'", '"': '"', "a": "\a", "b": "\b",
-                "e": "\x1b", "E": "\x1b", "f": "\f", "v": "\v", "?": "?"}
-
-
-def read_balanced(s, i, open_ch="(", close_ch=")"):
-    """s[i] is just past an opening paren; return (content, index past the
-    matching close), skipping quoted text."""
-    depth, j = 1, i
-    while j < len(s):
-        c = s[j]
-        if c == "\\":
-            j += 2
-            continue
-        if c == "'":
-            k = s.find("'", j + 1)
-            if k < 0:
-                raise ParseError("unterminated quote")
-            j = k + 1
-            continue
-        if c == '"':
-            j = skip_double(s, j + 1)
-            continue
-        if c == "`":
-            k = find_backtick(s, j + 1)
-            j = k + 1
-            continue
-        if c == open_ch:
-            depth += 1
-        elif c == close_ch:
-            depth -= 1
-            if depth == 0:
-                return s[i:j], j + 1
-        j += 1
-    raise ParseError("unbalanced parentheses")
-
-
-def skip_double(s, j):
-    while j < len(s):
-        c = s[j]
-        if c == "\\":
-            j += 2
-            continue
-        if c == '"':
-            return j + 1
-        if c == "$" and s[j + 1 : j + 2] == "(":
-            _, j = read_balanced(s, j + 2)
-            continue
-        if c == "`":
-            j = find_backtick(s, j + 1) + 1
-            continue
-        j += 1
-    raise ParseError("unterminated double quote")
-
-
-def find_backtick(s, j):
-    while j < len(s):
-        if s[j] == "\\":
-            j += 2
-            continue
-        if s[j] == "`":
-            return j
-        j += 1
-    raise ParseError("unterminated backtick")
-
-
-OPERATORS = ["&&", "||", ";;", "|&", ";", "|", "&", "(", ")", "\n"]
-REDIRECTS = ["<<<", "<<-", "<<", "&>>", "&>", ">>", ">|", "<>", ">&", "<&", ">", "<"]
-
-
-def parse(s):
-    """Parse a shell string into pipelines of simple commands."""
-    out = Parsed()
-    pipeline, cmd = [], Command()
-    word, has_word, dynamic, word_quoted = [], False, False, False
-    redirect = None  # pending redirection operator awaiting its target word
-    heredocs = []  # (delimiter, strip_tabs, quoted, command) awaiting a body
-    i, n = 0, len(s)
-
-    def end_word():
-        nonlocal word, has_word, dynamic, redirect, word_quoted
-        if not has_word:
-            return
-        text = "".join(word)
-        if redirect is None:
-            cmd.words.append(Word(text, dynamic))
-        elif redirect in ("<<", "<<-"):
-            heredocs.append((text, redirect == "<<-", word_quoted, cmd))
-        elif redirect == "<":
-            cmd.stdin_files.append(text)
-        elif redirect == "<<<":
-            cmd.stdin.append(text)
-            cmd.stdin_dynamic.append(dynamic)
-        redirect = None
-        word, has_word, dynamic, word_quoted = [], False, False, False
-
-    def end_command():
-        nonlocal cmd
-        end_word()
-        if cmd.words or cmd.stdin:
-            pipeline.append(cmd)
-        cmd = Command()
-
-    def end_pipeline():
-        nonlocal pipeline
-        end_command()
-        if pipeline:
-            out.pipelines.append(pipeline)
-        pipeline = []
-
-    while i < n:
-        c = s[i]
-        if c in " \t":
-            end_word()
-            i += 1
-            continue
-        if c == "\\":
-            if s[i + 1 : i + 2] == "\n":
-                i += 2
-                continue
-            word.append(s[i + 1 : i + 2])
-            has_word, word_quoted = True, True
-            i += 2
-            continue
-        if c == "#" and not has_word:
-            k = s.find("\n", i)
-            i = n if k < 0 else k
-            continue
-        if c == "'":
-            k = s.find("'", i + 1)
-            if k < 0:
-                raise ParseError("unterminated quote")
-            word.append(s[i + 1 : k])
-            has_word, word_quoted = True, True
-            i = k + 1
-            continue
-        if c == "$" and s[i + 1 : i + 2] == "'":
-            j, buf = i + 2, []
-            while j < n and s[j] != "'":
-                if s[j] == "\\" and j + 1 < n:
-                    e = s[j + 1]
-                    if e in ANSI_ESCAPES:
-                        buf.append(ANSI_ESCAPES[e])
-                        j += 2
-                    elif e == "x":
-                        m = re.match(r"[0-9A-Fa-f]{1,2}", s[j + 2 :])
-                        buf.append(chr(int(m.group(0), 16)) if m else "x")
-                        j += 2 + (len(m.group(0)) if m else 0)
-                    elif e in "01234567":
-                        m = re.match(r"[0-7]{1,3}", s[j + 1 :])
-                        buf.append(chr(int(m.group(0), 8)))
-                        j += 1 + len(m.group(0))
-                    else:
-                        buf.append(e)
-                        dynamic = True
-                        j += 2
-                else:
-                    buf.append(s[j])
-                    j += 1
-            if j >= n:
-                raise ParseError("unterminated $'")
-            word.append("".join(buf))
-            has_word, word_quoted = True, True
-            i = j + 1
-            continue
-        if c == '"':
-            j = i + 1
-            buf = []
-            while True:
-                if j >= n:
-                    raise ParseError("unterminated double quote")
-                d = s[j]
-                if d == '"':
-                    j += 1
-                    break
-                if d == "\\" and j + 1 < n:
-                    if s[j + 1] in '$`"\\\n':
-                        if s[j + 1] != "\n":
-                            buf.append(s[j + 1])
-                        j += 2
-                        continue
-                    buf.append(d)
-                    j += 1
-                    continue
-                if d == "$" and s[j + 1 : j + 2] == "(":
-                    inner, k = read_balanced(s, j + 2)
-                    out.subs.append(inner)
-                    buf.append(s[j:k])
-                    dynamic = True
-                    j = k
-                    continue
-                if d == "`":
-                    k = find_backtick(s, j + 1)
-                    out.subs.append(s[j + 1 : k])
-                    buf.append(s[j : k + 1])
-                    dynamic = True
-                    j = k + 1
-                    continue
-                if d == "$" and j + 1 < n and (s[j + 1].isalnum() or s[j + 1] in "_{@*#?$!-"):
-                    dynamic = True
-                buf.append(d)
-                j += 1
-            word.append("".join(buf))
-            has_word, word_quoted = True, True
-            i = j
-            continue
-        if c == "$" and s[i + 1 : i + 2] == "(":
-            if s[i + 2 : i + 3] == "(":
-                inner, k = read_balanced(s, i + 3)
-                k += 1  # arithmetic: the second closing paren
-            else:
-                inner, k = read_balanced(s, i + 2)
-                out.subs.append(inner)
-            word.append(s[i:k])
-            has_word, dynamic = True, True
-            i = k
-            continue
-        if c == "`":
-            k = find_backtick(s, i + 1)
-            out.subs.append(s[i + 1 : k])
-            word.append(s[i : k + 1])
-            has_word, dynamic = True, True
-            i = k + 1
-            continue
-        if c in "<>" and s[i + 1 : i + 2] == "(":
-            inner, k = read_balanced(s, i + 2)
-            out.subs.append(inner)
-            word.append(s[i:k])
-            has_word, dynamic = True, True
-            i = k
-            continue
-        if c == "$" and i + 1 < n and (s[i + 1].isalnum() or s[i + 1] in "_{@*#?$!-"):
-            if s[i + 1] == "{":
-                _, k = read_balanced(s, i + 2, "{", "}")
-            else:
-                m = re.match(r"[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-]", s[i + 1 :])
-                k = i + 1 + len(m.group(0))
-            word.append(s[i:k])
-            has_word, dynamic = True, True
-            i = k
-            continue
-        # redirections, with an optional fd number already collected as a word
-        op = next((r for r in REDIRECTS if s.startswith(r, i)), None)
-        if op:
-            if has_word and re.fullmatch(r"[0-9]+", "".join(word)) and not word_quoted:
-                word, has_word = [], False
-            else:
-                end_word()
-            redirect = op
-            i += len(op)
-            if op in (">&", "<&"):
-                m = re.match(r"\s*([0-9]+|-)", s[i:])
-                if m:
-                    i += len(m.group(0))
-                    redirect = None
-            continue
-        op = next((o for o in OPERATORS if s.startswith(o, i)), None)
-        if op:
-            if op in ("|", "|&"):
-                if not cmd.words and not cmd.stdin and not pipeline:
-                    cmd.words.append(Word("(subshell)", True))  # `( ... ) |`: output unknown
-                end_command()
-            else:
-                end_pipeline()
-            i += len(op)
-            if op == "\n" and heredocs:
-                i = read_heredoc_bodies(s, i, heredocs, out)
-            continue
-        if c in "*?[" or (c == "{" and re.match(r"\{[^{}\s]*(,|\.\.)[^{}\s]*\}", s[i:])):
-            dynamic = True
-        if c == "~" and not has_word:
-            dynamic = True
-        word.append(c)
-        has_word = True
-        i += 1
-    end_pipeline()
-    if heredocs:  # bodies never terminated: treat everything after as the body
-        for delim, _, quoted, owner in heredocs:
-            owner.stdin.append("")
-            owner.stdin_dynamic.append(False)
-    return out
-
-
-def read_heredoc_bodies(s, i, heredocs, out):
-    for delim, strip_tabs, quoted, owner in heredocs:
-        lines = []
-        while i <= len(s):
-            k = s.find("\n", i)
-            line = s[i:] if k < 0 else s[i:k]
-            i = len(s) + 1 if k < 0 else k + 1
-            check = line.lstrip("\t") if strip_tabs else line
-            if check == delim:
-                break
-            lines.append(check)
-        body = "\n".join(lines)
-        owner.stdin.append(body)
-        owner.stdin_dynamic.append(not quoted and ("$" in body or "`" in body))
-        if not quoted:  # an unquoted delimiter expands $(...) and backticks in the body
-            try:
-                out.subs.extend(parse_substitutions(body))
-            except ParseError:
-                out.subs.append(body)
-    heredocs.clear()
-    return min(i, len(s))
-
-
-def parse_substitutions(text):
-    """Command substitutions inside text that the shell expands (a heredoc
-    with an unquoted delimiter)."""
-    subs, i = [], 0
-    while i < len(text):
-        if text[i] == "\\":
-            i += 2
-            continue
-        if text.startswith("$(", i) and not text.startswith("$((", i):
-            inner, i = read_balanced(text, i + 2)
-            subs.append(inner)
-            continue
-        if text[i] == "`":
-            k = find_backtick(text, i + 1)
-            subs.append(text[i + 1 : k])
-            i = k + 1
-            continue
-        i += 1
-    return subs
-
-
-# ================================================================ unwrapping
-
-RESERVED = {"!", "{", "}", "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "esac", "coproc"}
-NOT_COMMANDS = {"for", "select", "case", "function", "[[", "]]", "in"}
-
-# wrapper -> options that take a separate value
-WRAPPERS = {
-    "command": set(), "builtin": set(), "noglob": set(), "nohup": set(), "chronic": set(), "unbuffer": set(),
-    "exec": {"-a"},
-    "time": {"-f", "-o", "--format", "--output"},
-    "sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "-T", "--user", "--group", "--chdir",
-             "--host", "--prompt", "--role", "--type", "--other-user", "--command-timeout", "--close-from"},
-    "doas": {"-u", "-C"},
-    "nice": {"-n", "--adjustment"},
-    "ionice": {"-c", "-n", "-p", "-P", "-u", "--class", "--classdata"},
-    "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
-    "caffeinate": {"-t", "-w"},
-    "timeout": {"-s", "-k", "--signal", "--kill-after"},
-    "flock": {"-w", "-E", "--timeout", "--conflict-exit-code"},
-}
-WRAPPER_POSITIONALS = {"timeout": 1, "flock": 1}
-
-
-def unwrap(words, depth):
-    """Strip assignments, reserved words and wrappers. Returns
-    (argv, assignments, opaque, scripts): opaque means more arguments arrive
-    at run time (xargs, find -exec {}); scripts are strings the wrapper runs
-    as shell code."""
-    env, opaque, scripts = {}, False, []
-    while words:
-        w = words[0]
-        head = os.path.basename(w.text)
-        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", w.text, re.S)
-        if m and not w.text.startswith("="):
-            env[m.group(1)] = m.group(2)
-            words = words[1:]
-        elif w.text in RESERVED:
-            words = words[1:]
-        elif w.text in NOT_COMMANDS:
-            return [], env, opaque, scripts
-        elif head == "env":
-            words = words[1:]
-            while words:
-                a = words[0].text
-                if a in ("-S", "--split-string") and len(words) > 1:
-                    scripts.append(" ".join(x.text for x in words[1:]))
-                    return [], env, opaque, scripts
-                if a.startswith("--split-string=") or (a.startswith("-S") and len(a) > 2):
-                    rest = a.split("=", 1)[1] if a.startswith("--") else a[2:]
-                    scripts.append(" ".join([rest] + [x.text for x in words[1:]]))
-                    return [], env, opaque, scripts
-                if a in ("-u", "--unset", "-C", "--chdir", "-P"):
-                    words = words[2:]
-                elif a == "--":
-                    words = words[1:]
-                    break
-                elif a.startswith("-"):
-                    words = words[1:]
-                elif "=" in a:
-                    k, _, v = a.partition("=")
-                    env[k] = v
-                    words = words[1:]
-                else:
-                    break
-        elif head in WRAPPERS:
-            if head == "command" and len(words) > 1 and words[1].text in ("-v", "-V"):
-                return [], env, opaque, scripts  # a lookup, not a run
-            if head == "flock" and any(x.text in ("-c", "--command") for x in words[1:]):
-                k = next(idx for idx, x in enumerate(words) if x.text in ("-c", "--command"))
-                if k + 1 < len(words):
-                    scripts.append(words[k + 1].text)
-                return [], env, opaque, scripts
-            values = WRAPPERS[head]
-            words = words[1:]
-            while words and words[0].text.startswith("-") and words[0].text != "-":
-                a = words[0].text
-                if a == "--":
-                    words = words[1:]
-                    break
-                words = words[2:] if a in values else words[1:]
-            words = words[WRAPPER_POSITIONALS.get(head, 0) :]
-        elif head == "watch":
-            words = words[1:]
-            while words and words[0].text.startswith("-"):
-                words = words[2:] if words[0].text in ("-n", "--interval", "-d") and len(words) > 1 else words[1:]
-            scripts.append(" ".join(x.text for x in words))
-            return [], env, opaque, scripts
-        elif head == "xargs":
-            words = words[1:]
-            with_value = {"-I", "-L", "-n", "-P", "-s", "-d", "-E", "-a", "--max-args", "--max-procs",
-                          "--delimiter", "--arg-file", "--replace", "--max-lines"}
-            while words and words[0].text.startswith("-"):
-                a = words[0].text
-                words = words[2:] if a in with_value else words[1:]
-            opaque = True
-        elif head == "find":
-            k = next((idx for idx, x in enumerate(words) if x.text in ("-exec", "-execdir", "-ok", "-okdir")), None)
-            if k is None:
-                return [], env, opaque, scripts
-            words = [x for x in words[k + 1 :] if x.text not in ("+", ";")]
-            if any(x.text == "{}" for x in words):
-                opaque = True
-        elif head == "eval":
-            scripts.append(" ".join(x.text for x in words[1:]))
-            return [], env, opaque, scripts
-        else:
-            return words, env, opaque, scripts
-    return [], env, opaque, scripts
-
-
-def shell_invocation(argv):
-    """For a shell interpreter: (inline script or None, script file or None,
-    reads_stdin)."""
-    i, script_mode = 1, False
-    while i < len(argv):
-        a = argv[i].text
-        if a == "--" or a == "-":
-            i += 1
-            break
-        if a in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
-            i += 2
-            continue
-        if a.startswith("--"):
-            if a == "--command":
-                script_mode = True
-            i += 1
-            continue
-        if a.startswith(("-", "+")) and len(a) > 1:
-            if "c" in a[1:]:
-                script_mode = True
-            if "s" in a[1:]:
-                return None, None, True
-            i += 1
-            continue
-        break
-    rest = argv[i:]
-    if script_mode:
-        return (rest[0].text if rest else ""), None, False
-    if rest:
-        return None, rest[0].text, False
-    return None, None, True
-
-
-def program_name(text):
-    """The command a word runs: its basename, with zsh's =cmd path expansion undone."""
-    if text.startswith("=") and len(text) > 1:
-        text = text[1:]
-    return os.path.basename(text)
-
-
-def is_stdin_shell(cmd, depth):
-    argv, _, _, _ = unwrap(cmd.words, depth)
-    if not argv:
-        return False
-    head = program_name(argv[0].text)
-    if head in SHELLS:
-        _, _, reads_stdin = shell_invocation(argv)
-        return reads_stdin
-    if head in ("source", ".") and len(argv) > 1 and argv[1].text in ("/dev/stdin", "-"):
-        return True
-    return head in INTERPRETERS and (len(argv) == 1 or argv[1].text == "-")
-
-
-# ================================================================ checking
-
-COARSE = [
-    (r"\bgit\b[^\n;|&]*\bpush\b[^\n;|&]*(?:^|[\s:+/'\"])(?:main|master)(?=$|[\s'\";|&)])", "a `git push` to main"),
-    (r"\bgit\b[^\n;|&]*\breset\b[^\n;|&]*--hard", "`git reset --hard`"),
-    (r"\bgit\b[^\n;|&]*\bclean\b[^\n;|&]*(\s-[a-zA-Z]*f|--force)", "a forced `git clean`"),
-    (r"\bgh\b[^\n;|&]*\bpr\b[^\n;|&]*\bmerge\b", "`gh pr merge`"),
-    (r"\bgh\b[^\n;|&]*\bapi\b[^\n;|&]*(/merges?\b|git/refs)", "a `gh api` merge or ref write"),
-]
-
-
-def coarse_check(text, where):
-    for pattern, what in COARSE:
-        if re.search(pattern, text):
-            raise Blocked(f"{where} contains {what}, and code there can't be checked. Run the command directly.")
-
-
-def check_script(text, cwd, depth=0):
-    if depth > MAX_DEPTH:
-        raise Blocked("commands nested this deeply can't be checked. Run them directly.")
+def pr_over_rest(slug, number, cwd):
+    """pr_from_view's result for the REST merge, read over REST: the PR, then
+    its reviews by each one's commit_id."""
+    endpoint = f"repos/{slug}/pulls/{number}"
+    out = run(["gh", "api", endpoint, "--jq", "{number, url: .html_url, head: .head.sha, base: .base.ref}"], cwd)
     try:
-        parsed = parse(text)
-    except ParseError:
-        coarse_check(text, "this command (which doesn't parse)")
-        return cwd
-    for sub in parsed.subs:
-        check_script(sub, cwd, depth + 1)
-    shell_vars = {}  # NAME=value assignments seen so far, to resolve $NAME as a program
-    plain = depth == 0 and plain_words(text)
-    for pipeline in parsed.pipelines:
-        for k, cmd in enumerate(pipeline):
-            feeds_shell = any(is_stdin_shell(later, depth) for later in pipeline[k + 1 :])
-            stdin = stdin_of(pipeline, k, cwd, depth)
-            cwd = check_command(cmd, cwd, depth, feeds_shell, shell_vars, stdin, plain)
-    return cwd
-
-
-PLAIN_WORD = r"[A-Za-z0-9_@%+=:,./-]+"
-PLAIN_COMMAND = re.compile(rf"{PLAIN_WORD}(?:[ \t]+{PLAIN_WORD})*")
-
-
-def plain_words(text):
-    """True when the command line is commands of plain words joined by `&&`,
-    `||`, `;` or `|`: no quotes, escapes, `$`, globs, braces, comments,
-    redirections, a lone `&`, parentheses or newlines. Codex splits only such
-    a line into commands before its prefix rules match; anything else it
-    matches as one `bash -lc ...` command, which no `gh` rule sees."""
-    parts = re.split(r"[ \t]*(?:&&|\|\||;|\|)[ \t]*", text.strip(" \t"))
-    return all(PLAIN_COMMAND.fullmatch(part) for part in parts)
-
-
-def stdin_of(pipeline, k, cwd, depth):
-    """What pipeline[k] reads on stdin, as (texts, complete). complete is False
-    when some of it can't be seen: a file that can't be read, or output from a
-    program the guard can't predict."""
-    cmd = pipeline[k]
-    texts, complete = [], True
-    for n, text in enumerate(cmd.stdin):
-        dyn = cmd.stdin_dynamic[n] if n < len(cmd.stdin_dynamic) else False
-        t, c = resolve_text(text, dyn, cwd, depth)
-        texts, complete = texts + t, complete and c
-    for path in cmd.stdin_files:
-        t, c = redirect_input(path, cwd, depth)
-        texts, complete = texts + t, complete and c
-    if k > 0:
-        t, c = output_of(pipeline, k - 1, cwd, depth)
-        texts, complete = texts + t, complete and c
-    return texts, complete
-
-
-def output_of(pipeline, k, cwd, depth):
-    """What pipeline[k] prints, for the commands whose output is predictable:
-    echo, printf, and cat or tee passing on files and their own stdin."""
-    argv, _, _, _ = unwrap(pipeline[k].words, depth)
-    producer = program_name(argv[0].text) if argv else ""
-    if producer in ("echo", "printf"):
-        return [" ".join(w.text for w in argv[1:])], True
-    if producer not in ("cat", "tee"):
-        return [], False
-    operands = [w for w in argv[1:] if w.text == "-" or not w.text.startswith("-")]
-    texts, complete = [], True
-    if producer == "tee" or not operands or any(w.text == "-" for w in operands):
-        texts, complete = stdin_of(pipeline, k, cwd, depth)
-    if producer == "cat":
-        for w in operands:
-            if w.text == "-":
-                continue
-            body = None if w.dynamic else read_script_file(w.text, cwd)
-            if body is None:
-                complete = False
-            else:
-                texts.append(body)
-    return texts, complete
-
-
-def redirect_input(target, cwd, depth):
-    """The contents behind `< target` or `--input target`: a file, or a
-    process substitution <(...)."""
-    if target.startswith("<(") and target.endswith(")"):
-        return script_output(target[2:-1], cwd, depth + 1)
-    body = read_script_file(target, cwd)
-    return ([body], True) if body is not None else ([], False)
-
-
-def resolve_text(text, dynamic, cwd, depth):
-    """A word or heredoc body as the shell will expand it, as (texts, complete).
-    Command substitutions with predictable output are added as that output;
-    any other expansion ($VAR, ${...}) makes it incomplete."""
-    if not dynamic:
-        return [text], True
+        pr = json.loads(out) if out is not None else None
+    except ValueError:
+        pr = None
+    if not isinstance(pr, dict):
+        return None, f"couldn't read the PR with `gh api {endpoint}`, so the merge can't be checked."
+    m = re.fullmatch(r"https://github\.com/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/pull/([0-9]+)", str(pr.get("url")))
+    if not m or m.group(2) != number:
+        return None, "couldn't tell which repository the PR is in."
+    slug = m.group(1)
+    lines = run(["gh", "api", "--paginate", f"repos/{slug}/pulls/{number}/reviews",
+                 "--jq", ".[] | {commit: .commit_id, state, submittedAt: .submitted_at}"], cwd)
     try:
-        subs = parse_substitutions(text)
-    except ParseError:
-        return [text], False
-    texts, complete, rest = [text], True, text
-    for inner in subs:
-        t, c = script_output(inner, cwd, depth + 1)
-        texts, complete = texts + t, complete and c
-        rest = rest.replace("$(" + inner + ")", "").replace("`" + inner + "`", "")
-    if "$" in rest or "`" in rest:
-        complete = False
-    return texts, complete
+        found = [json.loads(line) for line in lines.splitlines() if line.strip()] if lines is not None else None
+        reviews = [{"commit": r.get("commit"), "submittedAt": r.get("submittedAt")}
+                   for r in found if r.get("state") != "PENDING"] if found is not None else None
+    except (ValueError, AttributeError):
+        reviews = None
+    if reviews is None:
+        return None, "couldn't list the PR's reviews over REST, so the merge can't be checked."
+    return {"slug": slug, "number": number, "head": pr.get("head") or "", "base": pr.get("base") or "",
+            "reviews": reviews}, None
 
 
-def script_output(text, cwd, depth):
-    """What a script prints, when the last command of each pipeline is predictable."""
-    if depth > MAX_DEPTH:
-        return [], False
-    try:
-        parsed = parse(text)
-    except ParseError:
-        return [], False
-    texts, complete = [], True
-    for pipeline in parsed.pipelines:
-        t, c = output_of(pipeline, len(pipeline) - 1, cwd, depth)
-        texts, complete = texts + t, complete and c
-    return texts, complete
+def pr_verdict(pr, cwd):
+    """main's merge_verdict for a PR read by pr_from_view or pr_over_rest, with
+    the commits, base and clean-merge checks main's review_check makes."""
+    slug, number, base_ref, reviews = pr["slug"], pr["number"], pr["base"], pr["reviews"]
+    lines = run(["gh", "api", "--paginate", f"repos/{slug}/pulls/{number}/commits",
+                 "--jq", ".[] | {sha, parents: [.parents[].sha]}"], cwd)
+    if lines is None:
+        return "couldn't list the PR's commits, so the merge can't be checked."
+    parents = {}
+    for line in lines.splitlines():
+        if line.strip():
+            c = json.loads(line)
+            parents[c["sha"]] = c["parents"]
+
+    def base_ancestor(sha):
+        behind = run(["gh", "api", f"repos/{slug}/compare/{sha}...{base_ref}", "--jq", ".behind_by"], cwd)
+        return behind == "0"
+
+    def merge_clean(merge, first, second):
+        return base.have_commits([merge, first, second], slug, cwd) and merge_is_clean(merge, first, second, cwd)
+
+    return merge_verdict(pr["head"], reviews, parents, base_ancestor, merge_clean)
 
 
-def read_script_file(path, cwd):
-    full = os.path.realpath(os.path.join(cwd, os.path.expanduser(path)))
-    if full.startswith(("/dev/", "/proc/")):
-        return None  # devices and the hook's own stdin are never a script
-    try:
-        if os.path.isfile(full) and os.path.getsize(full) <= MAX_SCRIPT_BYTES:
-            with open(full, "r", errors="replace") as f:
-                return f.read()
-    except OSError:
-        pass
-    return None
+# ================================================================ step 3: refusals added where main allows
 
-
-def check_command(cmd, cwd, depth, feeds_shell, shell_vars, stdin=([], True), plain=False):
-    argv, env, opaque, scripts = unwrap(cmd.words, depth)
-    for script in scripts:
-        check_script(script, cwd, depth + 1)
-    if feeds_shell:  # this command's output is run as code by a later shell
-        texts = list(cmd.stdin)
-        producer = os.path.basename(argv[0].text) if argv else ""
-        if producer in ("echo", "printf", "cat"):
-            texts.append(" ".join(w.text for w in argv[1:]))
-        for t in texts:
-            if producer == "printf":  # a format string can assemble any command
-                coarse_check(t, "a printf piped into a shell")
-            check_script(t, cwd, depth + 1)
-    if not argv:
-        shell_vars.update(env)
-        return cwd
-    prog = argv[0]
-    head = program_name(prog.text)
-    args = argv[1:]
-    if head in ("cd", "pushd"):
-        if args and not args[0].dynamic and args[0].text != "-":
-            return os.path.normpath(os.path.join(cwd, os.path.expanduser(args[0].text)))
-        return cwd
-    if head in SHELLS:
-        inline, path, reads_stdin = shell_invocation(argv)
-        if inline is not None:
-            check_script(inline, cwd, depth + 1)
-        elif path is not None:
-            body = read_script_file(path, cwd)
-            if body is not None:
-                check_script(body, cwd, depth + 1)
-        if reads_stdin or inline is not None:
-            for t in cmd.stdin:
-                check_script(t, cwd, depth + 1)
-        return cwd
-    if head in ("source", "."):
-        if args and args[0].text in ("/dev/stdin", "-"):
-            for t in cmd.stdin:
-                check_script(t, cwd, depth + 1)
-        elif args:
-            body = read_script_file(args[0].text, cwd)
-            if body is not None:
-                check_script(body, cwd, depth + 1)
-        return cwd
-    if head in INTERPRETERS:
-        for t in cmd.stdin + [w.text for w in args]:
-            coarse_check(t, f"code passed to {head}")
-        return cwd
-    if head == "git":
-        check_git(args, cwd, opaque, depth, env)
-        return cwd
-    if head == "gh":
-        # typed: `gh` starts a command of plain words on the line itself, the form Codex's prefix rules see
-        typed = plain and depth == 0 and len(argv) == len(cmd.words) and prog.text == "gh"
-        check_gh(args, cwd, opaque, depth, stdin, typed)
-        return cwd
-    if head in ("curl", "wget", "http", "https", "xh"):
-        check_http_client(args)
-        return cwd
-    if prog.dynamic:  # the program itself is chosen at run time
-        raw = " ".join(w.text for w in argv)
-        if "IFS" in raw:  # word splitting on $IFS turns one word into a command line
-            check_script(re.sub(r"\$\{?IFS\}?", " ", raw), cwd, depth + 1)
-        names = set(re.findall(r"\b(git|gh)\b", prog.text))
-        m = re.fullmatch(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", prog.text)
-        if m and m.group(1) in shell_vars:
-            names.add(program_name(shell_vars[m.group(1)]))
-        if "git" in names:
-            check_git(args, cwd, opaque, depth, env)
-        if "gh" in names:
-            check_gh(args, cwd, opaque, depth, stdin)
-        return cwd
-    if "/" in prog.text:  # a script run by path
-        body = read_script_file(prog.text, cwd)
-        if body is not None and re.match(r"#!\s*\S*(/|env\s+)(ba|z|da|k)?sh\b", body):
-            check_script(body, cwd, depth + 1)
-    return cwd
-
-
-def check_env_identity(env):
-    for name in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
-        value = env.get(name)
-        if value is not None and not value.endswith(NOREPLY):
-            raise Blocked(f"{name} is set to '{value}', not a GitHub noreply address.")
-
-
-# ---------------------------------------------------------------- git
-
-GIT_GLOBAL_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix"}
-GIT_BUILTINS = {
-    "add", "am", "annotate", "apply", "archive", "bisect", "blame", "branch", "bundle", "cat-file", "check-ignore",
-    "checkout", "cherry", "cherry-pick", "clean", "clone", "commit", "commit-tree", "config", "count-objects",
-    "describe", "diff", "diff-files", "diff-index", "diff-tree", "difftool", "fetch", "for-each-ref",
-    "format-patch", "fsck", "gc", "grep", "hash-object", "help", "init", "log", "ls-files", "ls-remote", "ls-tree",
-    "maintenance", "merge", "merge-base", "merge-file", "merge-tree", "mergetool", "mv", "name-rev", "notes",
-    "pull", "push", "range-diff", "read-tree", "rebase", "reflog", "remote", "repack", "replace", "rerere", "reset",
-    "restore", "rev-list", "rev-parse", "revert", "rm", "send-pack", "shortlog", "show", "show-branch", "show-ref",
-    "sparse-checkout", "stash", "status", "submodule", "subtree", "switch", "symbolic-ref", "tag", "update-index",
-    "update-ref", "var", "verify-commit", "verify-tag", "version", "whatchanged", "worktree", "write-tree",
-}
-COMMITTING = {"commit", "merge", "pull", "cherry-pick", "revert", "am", "rebase", "commit-tree"}
-
-
-def check_git(args, cwd, opaque, depth, env):
-    globals_, i = [], 0
-    while i < len(args) and args[i].text.startswith("-"):
-        a = args[i].text
-        if a in GIT_GLOBAL_WITH_VALUE:
-            value = args[i + 1].text if i + 1 < len(args) else ""
-            if a == "-C":
-                if not args[i + 1 : i + 2] or not args[i + 1].dynamic:  # $(pwd) and the like: keep cwd
-                    cwd = os.path.normpath(os.path.join(cwd, os.path.expanduser(value)))
-            else:
-                globals_ += [a, value]
-            i += 2
-        else:
-            if a.startswith(("--git-dir=", "--work-tree=", "--namespace=", "--config-env=")):
-                globals_.append(a)
-            i += 1
-    if i >= len(args):
-        return
-    git = ["git"] + globals_
-    sub, rest = args[i], args[i + 1 :]
-    if sub.dynamic:  # subcommand chosen at run time: apply every check that could fire
-        for name in ("push", "reset", "clean"):
-            check_git_sub(name, rest, cwd, git, opaque, depth, env)
-        return
-    check_git_sub(sub.text, rest, cwd, git, opaque, depth, env)
-
-
-def check_git_sub(sub, rest, cwd, git, opaque, depth, env):
-    if sub not in GIT_BUILTINS:
-        alias = run(git + ["config", "--get", f"alias.{sub}"], cwd)
-        if alias:
-            if depth > MAX_DEPTH:
-                raise Blocked("git alias chain too deep to check.")
-            tail = " ".join(shlex.quote(w.text) for w in rest)
-            if alias.startswith("!"):
-                check_script(alias[1:] + " " + tail, cwd, depth + 1)
-            else:
-                check_script(" ".join(shlex.quote(x) for x in git) + " " + alias + " " + tail, cwd, depth + 1)
-        return
-    if sub in ("push", "send-pack"):
-        check_push(rest, cwd, git, opaque)
-    elif sub == "subtree" and rest and rest[0].text == "push":
-        tail, k = [], 1
-        while k < len(rest):
-            if rest[k].text in ("-P", "--prefix", "-m", "--message"):
-                k += 2
-                continue
-            if not rest[k].text.startswith(("--prefix=", "--message=")):
-                tail.append(rest[k])
-            k += 1
-        check_push(tail, cwd, git, opaque)
-    elif sub == "reset":
-        options = rest[: next((k for k, w in enumerate(rest) if w.text == "--"), len(rest))]
-        if opaque or any(w.text == "--hard" for w in options):
-            raise Blocked("`git reset --hard` discards work. Use `git stash`, or `git restore <path>` for specific files.")
-    elif sub == "clean":
-        check_clean(rest, cwd, git, opaque)
-    if sub in COMMITTING:
-        check_identity(rest, cwd, git, env)
-
-
-def check_identity(rest, cwd, git, env):
-    for i, w in enumerate(rest):
-        author = None
-        if w.text == "--author" and i + 1 < len(rest):
-            author = rest[i + 1].text
-        elif w.text.startswith("--author="):
-            author = w.text.split("=", 1)[1]
-        if author is not None:
-            m = re.search(r"<([^>]*)>", author)
-            if not m or not m.group(1).endswith(NOREPLY):
-                raise Blocked(f"--author '{author}' isn't a GitHub noreply address.")
-    check_env_identity(os.environ)
-    check_env_identity(env)
-    email = run(git + ["config", "user.email"], cwd) or ""
-    if not email.endswith(NOREPLY):
-        raise Blocked(
-            f"git user.email is '{email}', not a GitHub noreply address. "
-            f"Set it with `git config user.email <id+login>{NOREPLY}` first."
-        )
-
-
-def long_option(arg, full, minimum):
-    """Git accepts any unambiguous prefix of a long option. Returns True for
-    --<prefix of full>, False for --no-<prefix of full>, None otherwise."""
-    body = arg[2:].split("=", 1)[0]
-    if body.startswith("no-") and len(body) - 3 >= minimum and full.startswith(body[3:]):
-        return False
-    if len(body) >= minimum and full.startswith(body):
-        return True
-    return None
-
-
-def check_clean(rest, cwd, git, opaque):
-    force = dry = False  # each flag in order; the last dry-run flag wins
-    i = 0
-    while i < len(rest):
-        a = rest[i].text
-        if a == "--":
-            break
-        if a.startswith("--"):
-            flag_dry = long_option(a, "dry-run", 1)
-            flag_force = long_option(a, "force", 3)
-            if flag_dry is not None:
-                dry = flag_dry
-            elif flag_force is not None:
-                force = flag_force
-            elif long_option(a, "exclude", 2) and "=" not in a:
-                i += 1
-        elif a.startswith("-") and len(a) > 1:
-            for k, ch in enumerate(a[1:]):
-                if ch == "f":
-                    force = True
-                elif ch == "n":
-                    dry = True
-                elif ch == "e":
-                    if k == len(a) - 2:
-                        i += 1  # the pattern is the next word
-                    break  # the rest of the cluster is the pattern
-        i += 1
-    if dry and not opaque:
-        return
-    if not force:
-        require = run(git + ["config", "--type=bool", "--get", "clean.requireForce"], cwd)
-        force = require == "false"
-    if force or opaque:
-        raise Blocked("`git clean` that deletes files is blocked. Run `git clean -n` and remove files by name.")
-
-
-def check_push(rest, cwd, git, opaque):
-    if opaque:
-        raise Blocked("`git push` with arguments supplied at run time (xargs, find -exec) can't be checked. Run it directly.")
-    positionals, deleting, repo_option, end = [], False, False, False
-    dry, everything = False, None  # the last dry-run flag wins
-    i = 0
-    while i < len(rest):
-        w = rest[i]
-        a = w.text
-        if end or not a.startswith("-") or a == "-":
-            positionals.append(w)
-        elif a == "--":
-            end = True
-        elif a.startswith("--"):
-            name, eq, _ = a.partition("=")
-            flag_dry = long_option(a, "dry-run", 2)
-            if flag_dry is not None:
-                dry = flag_dry
-            elif name in ("--all", "--mirror", "--branches"):
-                everything = name
-            elif name == "--delete":
-                deleting = True
-            elif name == "--repo":
-                repo_option = True
-                if not eq:
-                    if i + 1 < len(rest):
-                        positionals.append(rest[i + 1])  # check it like a refspec too
-                    i += 1
-            elif name in ("--push-option", "--receive-pack", "--exec") and not eq:
-                i += 1
-        else:
-            letters = a[1:]
-            for k, ch in enumerate(letters):
-                if ch == "n":
-                    dry = True
-                if ch == "d":
-                    deleting = True
-                if ch == "o":
-                    if k == len(letters) - 1:
-                        i += 1
-                    break
-        i += 1
-    if dry:
-        return
-    if everything:
-        raise Blocked(f"`git push {everything}` would update main. Push only your branch.")
-    for k, w in enumerate(positionals):
-        if CURRENT_BRANCH_SUB.match(w.text):
-            positionals[k] = Word("HEAD")  # the usual way to name the current branch
-        elif w.dynamic or "@{" in w.text:
-            raise Blocked(f"`git push` argument '{w.text}' is computed at run time. Write the branch name, or HEAD.")
-    # With --repo every positional is checked; otherwise the first is the remote.
-    refspecs = positionals if repo_option else positionals[1:]
-    remote = None if repo_option or not positionals else positionals[0].text
-    if not refspecs:
-        if deleting:
-            return
-        for dst in implicit_destinations(cwd, git, remote):
-            if dst in PROTECTED:
-                raise Blocked(f"this `git push` would update {dst} (from your branch or push config). "
-                              "Push an explicit refspec such as `git push -u origin HEAD`.")
-        return
-    branch = None
-    for w in refspecs:
-        spec = w.text
-        force_spec = spec.startswith("+")
-        spec = spec[1:] if force_spec else spec
-        if spec == ":":
-            raise Blocked("`git push <remote> :` pushes every matching branch, main included.")
-        if deleting:
-            src, dst = "", spec
-        elif ":" in spec:
-            src, dst = spec.split(":", 1)
-        else:
-            src, dst = spec, spec
-        if dst in ("HEAD", "@"):
-            if branch is None:
-                branch = current_branch(cwd, git) or "HEAD"
-            dst = branch
-        dst = normalize_ref(dst)
-        if dst in PROTECTED or "*" in dst:
-            raise Blocked(f"`git push` to {dst} is not allowed. Push your branch and open a PR.")
-        if src == "":
-            check_no_dependents(dst, cwd, "delete")
-
-
-CURRENT_BRANCH_SUB = re.compile(
-    r"^\$\(\s*git\s+(branch\s+--show-current|rev-parse\s+--abbrev-ref\s+HEAD|symbolic-ref\s+(-q\s+)?--short\s+(-q\s+)?HEAD)\s*\)$"
-)
-
-
-def normalize_ref(ref):
-    ref = re.sub(r"/+", "/", ref.strip()).lstrip("/")
-    return ref[len("refs/heads/") :] if ref.startswith("refs/heads/") else ref
-
-
-def implicit_destinations(cwd, git, remote):
-    """Branches a push without refspecs would update."""
-    branch = current_branch(cwd, git)
-    remote = remote or (branch and run(git + ["config", "--get", f"branch.{branch}.pushRemote"], cwd)) \
-        or run(git + ["config", "--get", "remote.pushDefault"], cwd) \
-        or (branch and run(git + ["config", "--get", f"branch.{branch}.remote"], cwd)) or "origin"
-    if run(git + ["config", "--type=bool", "--get", f"remote.{remote}.mirror"], cwd) == "true":
-        return ["main"]  # a mirror remote gets every branch
-    mapped = run(git + ["config", "--get-all", f"remote.{remote}.push"], cwd)
-    if mapped:
-        dsts = []
-        for spec in mapped.splitlines():
-            spec = spec.lstrip("+")
-            src, _, dst = spec.partition(":")
-            dst = dst or src
-            if dst in ("HEAD", "@"):
-                dst = branch or "HEAD"
-            dsts.append(normalize_ref(dst) if "*" not in dst else "main")
-        return dsts
-    mode = run(git + ["config", "--get", "push.default"], cwd) or "simple"
-    if mode == "matching":
-        local = run(git + ["for-each-ref", "--format=%(refname:short)", "refs/heads"], cwd) or ""
-        return [b for b in local.splitlines() if b in PROTECTED] or []
-    if mode in ("upstream", "tracking"):
-        merge = branch and run(git + ["config", "--get", f"branch.{branch}.merge"], cwd)
-        return [normalize_ref(merge)] if merge else []
-    return [branch] if branch else []
-
-
-def current_branch(cwd, git=("git",)):
-    return run(list(git) + ["symbolic-ref", "--short", "-q", "HEAD"], cwd)
-
-
-def check_no_dependents(branch, cwd, action):
-    out = run(["gh", "pr", "list", "--base", branch, "--state", "open", "--json", "number"], cwd)
-    if out is None:
-        raise Blocked(f"couldn't list PRs based on {branch} (is `gh` logged in?), so it can't {action} it safely.")
-    numbers = [str(pr["number"]) for pr in json.loads(out or "[]")]
-    if numbers:
-        listed = ", ".join("#" + n for n in numbers)
-        raise Blocked(
-            f"open PR(s) {listed} use {branch} as their base, and deleting it closes them. "
-            f"Retarget each first with `gh pr edit <n> --base <new-base>`."
-        )
-
-
-def check_http_client(args):
-    """curl and friends against the GitHub API: the same writes `gh api` may not make."""
-    texts = [w.text for w in args]
-    joined = " ".join(texts)
-    urls = [t for t in texts if "api.github.com" in t]
-    if not urls:
-        return
-    method = None
-    for k, t in enumerate(texts):
-        if t in ("-X", "--request", "--method") and k + 1 < len(texts):
-            method = texts[k + 1].upper()
-        elif t.startswith(("-X", "--request=", "--method=")) and len(t) > 2:
-            method = t.split("=", 1)[1].upper() if "=" in t else t[2:].upper()
-    data = any(t.startswith(("-d", "--data", "--json", "-F", "--form", "-T", "--upload-file", "--post-data",
-                             "--post-file", "--body-data")) for t in texts)
-    write = (method or ("POST" if data else "GET")) not in ("GET", "HEAD")
-    for url in urls:
-        rest = re.sub(r"^(?:[A-Za-z][A-Za-z0-9+.-]*://)?[^/?#]*", "", url)  # after the scheme, host and any port
-        path = api_path(rest)
-        legacy = legacy_path(re.sub(r"^.*api\.github\.com", "", url))  # as main read it
-        if (path == "graphql" or legacy.endswith("/graphql")) and GRAPHQL_WRITES.search(joined):
-            raise Blocked(f"GraphQL mutations that merge PRs or move refs are blocked. {MERGE_WAYS}")
-        if write and (hides_delimiter(rest) or API_WRITE_PATHS.search(path) or API_WRITE_PATHS.search(legacy)):
-            raise Blocked(f"GitHub API writes that merge PRs or move, delete or write branches are blocked. {MERGE_WAYS}")
-
-
-# ---------------------------------------------------------------- gh
-
-GH_COMMANDS = {
-    "alias", "api", "attestation", "auth", "browse", "cache", "co", "codespace", "completion", "config",
-    "copilot", "extension", "gist", "gpg-key", "help", "issue", "label", "org", "pr", "preview", "project",
-    "release", "repo", "ruleset", "run", "search", "secret", "ssh-key", "status", "variable", "workflow",
-}
-GH_FLAGS_WITH_VALUE = {"-R", "--repo", "-b", "--body", "-F", "--body-file", "-t", "--subject", "-A",
-                       "--author-email", "--match-head-commit", "--hostname"}
-GRAPHQL_WRITES = re.compile(r"\b(mergePullRequest|enablePullRequestAutoMerge|updateRefs?|deleteRef|createRef|"
-                            r"createCommitOnBranch|mergeBranch|updatePullRequestBranch)\b")
-API_WRITE_PATHS = re.compile(r"(^|/)(pulls/[^/]+/(merge|ccr/auto_merge|update-branch)|merges|git/refs(/.*)?|"
-                             r"contents/.*|branches/[^/]+/rename)$")
+WRITE_PATHS = re.compile(r"(^|/)(pulls/[^/]+/(merge|ccr/auto_merge|update-branch)|merges|git/refs(/.*)?|"
+                         r"contents/.*|branches/[^/]+/rename)$")
 MERGE_PATH = re.compile(r"(^|/)pulls/[^/]+/merge$")
 AUTO_MERGE_PATH = re.compile(r"(^|/)pulls/[^/]+/ccr/auto_merge$")  # the cloud session's route for auto-merge
+HTTP_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
 
 
 def raw_path(endpoint):
@@ -1207,172 +232,31 @@ def hides_delimiter(endpoint):
     return any(plain.count(c) > path.count(c) for c in "?#/\\.;")
 
 
-def legacy_path(endpoint):
-    """The path as main's guard read it (cut at `?`, trailing `/` stripped).
-    Writes are checked against it as well, so protection only grows."""
-    return endpoint.split("?", 1)[0].rstrip("/")
-REST_MERGE = "gh api -X PUT repos/<owner>/<repo>/pulls/<n>/merge -f merge_method=merge -f sha=<head sha>"
-REST_MERGE_ENDPOINT = re.compile(r"/?repos/([A-Za-z0-9][A-Za-z0-9-]*/(?!\.+/)[A-Za-z0-9._-]+)/pulls/([1-9][0-9]*)/merge")
-MERGE_WAYS = (f"Merge with `gh pr merge <n> --merge`, or where GraphQL is unavailable `{REST_MERGE}` with the "
-              "owner, repo, PR number and full head SHA written out; push branches with `git push`. Those are checked.")
+def write_reason(path, hidden):
+    """Why a write step 3 refuses is refused."""
+    if hidden:
+        return ("this write's endpoint hides a `?`, `#`, `/`, `\\`, `.` or `;` behind percent-encoding, so GitHub "
+                f"may route it either way. Write the path out plainly. {MERGE_WAYS}")
+    if AUTO_MERGE_PATH.search(path):
+        return ("auto-merge (`pulls/<n>/ccr/auto_merge`) merges later, after the review check, like "
+                f"`gh pr merge --auto`. Merge once a review covers the head, with the whole command line `{REST_MERGE}`.")
+    if MERGE_PATH.search(path):
+        return (f"a REST merge passes only as the whole command line `{REST_MERGE}` (or with `--method PUT`, or `-F` "
+                "for a field), every part written out and nothing else on the line, once a review covers the head.")
+    return f"API writes that merge PRs or move, delete or write branches are blocked. {MERGE_WAYS}"
 
 
-def check_gh(args, cwd, opaque, depth, stdin=([], True), typed=False):
-    texts = [w.text for w in args]
-    positionals, flags = [], []  # flags: (name, value or None)
-    i = 0
-    while i < len(texts):
-        a = texts[i]
-        if a.startswith("--") and len(a) > 2:
-            name, eq, value = a.partition("=")
-            if not eq and name in GH_FLAGS_WITH_VALUE:
-                value = texts[i + 1] if i + 1 < len(texts) else ""
-                i += 1
-            flags.append((name, value if (eq or name in GH_FLAGS_WITH_VALUE) else None))
-        elif a.startswith("-") and len(a) > 1:
-            letters = a[1:]
-            for k, ch in enumerate(letters):
-                flag = "-" + ch
-                if flag in GH_FLAGS_WITH_VALUE:
-                    value = letters[k + 1 :].lstrip("=")
-                    if not value:
-                        value = texts[i + 1] if i + 1 < len(texts) else ""
-                        i += 1
-                    flags.append((flag, value))
-                    break
-                flags.append((flag, None))
-        else:
-            positionals.append(args[i])
-            if len(positionals) == 1 and a == "api":
-                check_gh_api(args[i + 1 :], cwd, stdin, opaque, texts[:i], typed)
-                return
-            if len(positionals) == 1 and a not in GH_COMMANDS:
-                check_gh_alias(a, texts[i + 1 :], cwd, depth)
-                return
-        i += 1
-    words = [w.text for w in positionals]
-    if words[:2] == ["repo", "sync"] and len(words) > 2:
-        raise Blocked("`gh repo sync <repo>` rewrites a remote branch. Ask the maintainer.")
-    if words[:2] != ["pr", "merge"]:
-        return
-    if opaque:
-        raise Blocked("`gh pr merge` with arguments supplied at run time can't be checked.")
-    repo, delete_branch = [], False
-    for name, value in flags:
-        on = value is None or value.lower() not in ("false", "0")
-        if name == "--admin" and on:
-            raise Blocked("`gh pr merge --admin` bypasses branch protection and review.")
-        if name == "--auto" and on:
-            raise Blocked("`gh pr merge --auto` merges later, after the review check. Merge directly once reviewed.")
-        if name in ("--squash", "-s", "--rebase", "-r") and on:
-            raise Blocked("use merge commits (`gh pr merge --merge`) so stacked PRs keep their base history.")
-        if name in ("--delete-branch", "-d") and on:
-            delete_branch = True
-        if name in ("-R", "--repo"):
-            repo = ["--repo", value or ""]
-    target = positionals[2] if len(positionals) > 2 else None
-    if target is not None and target.dynamic:
-        raise Blocked("`gh pr merge` target is computed at run time. Write the PR number.")
-    reason = review_check(target.text if target else None, repo, cwd)
-    if reason:
-        raise Blocked(f"PR can't merge yet: {reason}")
-    if delete_branch:
-        head = run(["gh", "pr", "view"] + ([target.text] if target else []) + repo
-                   + ["--json", "headRefName", "-q", ".headRefName"], cwd)
-        if not head:
-            raise Blocked("couldn't read the PR's head branch, so --delete-branch can't be checked.")
-        check_no_dependents(head, cwd, "delete")
-
-
-def check_gh_alias(name, extra, cwd, depth):
-    expansion = gh_alias(name, cwd)
-    if not expansion or depth > MAX_DEPTH:
-        return
-    used = set()
-
-    def sub(m):
-        n = int(m.group(1))
-        used.add(n)
-        return shlex.quote(extra[n - 1]) if n <= len(extra) else ""
-
-    body = re.sub(r"\$([1-9])", sub, expansion.lstrip("!"))
-    tail = " ".join(shlex.quote(x) for idx, x in enumerate(extra, 1) if idx not in used)
-    script = (body if expansion.startswith("!") else "gh " + body) + " " + tail
-    check_script(script, cwd, depth + 1)
-
-
-def gh_alias(name, cwd):
-    out = run(["gh", "alias", "list"], cwd)
-    for line in (out or "").splitlines():
-        key, sep, value = line.partition(":")
-        if sep and key.strip() == name:
-            return value.strip().strip("'\"")
-    return None
-
-
-GH_API_VALUE_FLAGS = {
-    "-X": "method", "--method": "method",
-    "-f": "field", "--raw-field": "field", "-F": "field", "--field": "field",
-    "--input": "input",
-    "-H": "other", "--header": "other", "-q": "other", "--jq": "other", "-t": "other", "--template": "other",
-    "--cache": "other", "--hostname": "other", "-p": "other", "--preview": "other",
-}
-
-
-def split_api_flag(arg):
-    """(flag, attached value or None) for a gh api option that takes a value,
-    in any spelling: -fkey=v, -f=key=v, --raw-field=key=v, -XPUT, and POSIX
-    short clusters such as -iXPUT, where boolean flags come first."""
-    if arg.startswith("--"):
-        name, eq, value = arg.partition("=")
-        return (name, value if eq else None) if name in GH_API_VALUE_FLAGS else (None, None)
-    if arg.startswith("-") and len(arg) >= 2:
-        for k in range(1, len(arg)):
-            flag = "-" + arg[k]
-            if flag in GH_API_VALUE_FLAGS:
-                rest = arg[k + 1 :]
-                if not rest:
-                    return flag, None
-                return flag, rest[1:] if rest.startswith("=") else rest
-    return None, None
-
-
-def json_strings(text):
-    """Every string inside a JSON document, decoded, so escapes can't hide a word."""
-    try:
-        doc = json.loads(text)
-    except ValueError:
-        return ""
-    found = []
-
-    def walk(x):
-        if isinstance(x, str):
-            found.append(x)
-        elif isinstance(x, dict):
-            for k, v in x.items():
-                found.append(str(k))
-                walk(v)
-        elif isinstance(x, list):
-            for v in x:
-                walk(v)
-
-    walk(doc)
-    return " ".join(found)
-
-
-STDIN_PATHS = {"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"}
-
-
-def check_gh_api(args, cwd, stdin=([], True), opaque=False, leading=(), typed=False):
-    """args follow `api`; leading are the words between `gh` and `api`; typed
-    says `gh` starts a command on the line itself (see check_command)."""
+def api_request(args, cwd, stdin):
+    """What a `gh api` call sends, read the way main's check_gh_api reads it:
+    (method, endpoint word, whether fields or --input make it a write,
+    (text, dynamic) body pieces, whether some body can't be read)."""
     method, endpoint, writes, unreadable = None, None, False, False
-    bodies = []  # (text, dynamic) pieces of the request body
+    bodies = []
     stdin_texts, stdin_complete = stdin
     i = 0
     while i < len(args):
         a = args[i].text
-        flag, value = split_api_flag(a)
+        flag, value = base.split_api_flag(a)
         if flag is None:
             if not a.startswith("-") and endpoint is None:
                 endpoint = args[i]
@@ -1384,13 +268,13 @@ def check_gh_api(args, cwd, stdin=([], True), opaque=False, leading=(), typed=Fa
             dynamic = args[i + 1].dynamic if i + 1 < len(args) else False
             i += 1
         i += 1
-        kind = GH_API_VALUE_FLAGS[flag]
+        kind = base.GH_API_VALUE_FLAGS[flag]
         if kind == "method":
             method = value.upper()
             continue
         if kind == "other":
             continue
-        writes = True  # any field or input body makes gh send a POST by default
+        writes = True
         if kind == "field":
             bodies.append((value, dynamic))
             source = value.split("=", 1)[1] if "=" in value else ""
@@ -1399,298 +283,155 @@ def check_gh_api(args, cwd, stdin=([], True), opaque=False, leading=(), typed=Fa
             source = source[1:]
         else:
             source = value
-        if source in STDIN_PATHS:
+        if source in base.STDIN_PATHS:
             bodies.extend((t, False) for t in stdin_texts)
             unreadable = unreadable or not stdin_complete
         elif dynamic and not source.startswith("<("):
             unreadable = True
         else:
-            t, c = redirect_input(source, cwd, 0)
+            t, c = base.redirect_input(source, cwd, 0)
             bodies.extend((x, False) for x in t)
             unreadable = unreadable or not c
-    if endpoint is None:
-        return
-    path = api_path(endpoint.text)  # as GitHub routes it: `/graphql` and `merge#` are spellings too
-    legacy = legacy_path(endpoint.text)  # as main read it
-    if path == "graphql" or legacy == "graphql":
-        texts = []
-        for body, dynamic in bodies:
-            t, c = resolve_text(body, dynamic, cwd, 0)
-            texts, unreadable = texts + t, unreadable or not c
-        text = " ".join(texts + [json_strings(b) for b in texts])
-        if GRAPHQL_WRITES.search(text):
-            raise Blocked(f"GraphQL mutations that merge PRs or move refs are blocked. {MERGE_WAYS}")
-        if unreadable:
-            raise Blocked("can't read this GraphQL request's body, so it can't be checked for merges or ref writes. "
-                          "Pass the query inline with -f query=..., or from a file in the repo.")
-        return
-    write = (method or ("POST" if writes else "GET")) not in ("GET", "HEAD")
-    hidden = hides_delimiter(endpoint.text)
-    if write and (endpoint.dynamic or hidden or API_WRITE_PATHS.search(path) or API_WRITE_PATHS.search(legacy)):
-        if hidden:
-            raise Blocked("this write's endpoint hides a `?`, `#`, `/`, `\\`, `.` or `;` behind percent-encoding, so "
-                          f"GitHub may route it either way. Write the path out plainly. {MERGE_WAYS}")
-        if AUTO_MERGE_PATH.search(path) or AUTO_MERGE_PATH.search(legacy):
-            raise Blocked("auto-merge (`pulls/<n>/ccr/auto_merge`) merges later, after the review check, like "
-                          f"`gh pr merge --auto`. Merge once a review covers the head, with `{REST_MERGE}`.")
-        if not (MERGE_PATH.search(path) or MERGE_PATH.search(legacy)):
-            raise Blocked(f"`gh api` writes that merge PRs or move, delete or write branches are blocked. {MERGE_WAYS}")
-        slug, number, sha = rest_merge_request(args, leading, opaque, typed)
-        reason = rest_review_check(slug, number, sha, cwd)
-        if reason:
-            raise Blocked(f"PR can't merge yet: {reason}")
+    return method, endpoint, writes, bodies, unreadable
 
 
-def rest_merge_request(args, leading, opaque, typed):
-    """The one `gh api` merge the guard lets through, for sessions without
-    GraphQL: REST_MERGE and nothing else. It is a command of its own that
-    starts `gh api` and then the method (`-X PUT`, `-XPUT`, `-X=PUT`, `--method
-    PUT`, `--method=PUT`), on a line of plain words (plain_words), so a prefix
-    rule such as Codex's, which sees the command as typed and unwraps nothing,
-    can ask a person first, as it does for `gh pr merge`. The endpoint and
-    -f/-F/--raw-field/--field follow in any order and spelling. Every word
-    must be written out, and each field given once (gh applies -F after -f,
-    whatever their order). Returns (owner/repo, number, sha), or raises
-    Blocked naming what differs."""
-
-    def refuse(why):
-        raise Blocked(f"this REST merge isn't the one form the guard checks: {why}. Write `{REST_MERGE}`, "
-                      "with the owner, repo, PR number and full head SHA written out.")
-
-    if opaque:
-        refuse("more arguments arrive at run time (xargs, find -exec)")
-    if leading:
-        refuse(f"`gh {' '.join(leading)}` before `api` isn't part of it")
-    if not typed:
-        refuse("it must be a command of its own that starts `gh api`, on a line of plain words joined only by `&&`, "
-               "`||`, `;` or `|`: no wrapper (`timeout`, `env`), `VAR=` or alias, no quotes, escapes or `$`, no "
-               "redirection (`2>&1`), `&`, parentheses or comment, and not inside `bash -c`, `eval` or `$(...)`")
-    methods, fields, positionals = [], [], []
-    i = 0
-    while i < len(args):
-        w, start = args[i], i
-        if w.dynamic:
-            refuse(f"'{w.text}' is computed at run time")
-        a = w.text
-        if a.startswith("--"):
-            name, eq, value = a.partition("=")
-            value = value if eq else None
-        elif a.startswith("-") and len(a) > 1:
-            name, value = a[:2], a[2:]
-            value = value[1:] if value.startswith("=") else (value or None)  # -XPUT, -X=PUT; -X alone takes the next word
-        else:
-            positionals.append(a)
-            i += 1
-            continue
-        into = {"-X": methods, "--method": methods, "-f": fields, "--raw-field": fields,
-                "-F": fields, "--field": fields}.get(name)
-        if into is None:
-            refuse(f"`{a}` isn't part of it")
-        if into is methods and start != 0:
-            refuse("the method goes right after `api`: `gh api -X PUT repos/...`")
-        if value is None:
-            if i + 1 >= len(args):
-                refuse(f"`{a}` has no value")
-            if args[i + 1].dynamic:
-                refuse(f"'{args[i + 1].text}' is computed at run time")
-            value = args[i + 1].text
-            i += 1
-        into.append(value)
-        i += 1
-    if len(methods) != 1 or methods[0] != "PUT":
-        refuse("it takes exactly one method, PUT, right after `api`")
-    m = REST_MERGE_ENDPOINT.fullmatch(positionals[0]) if len(positionals) == 1 else None
-    if not m:
-        refuse(f"the endpoint must be repos/<owner>/<repo>/pulls/<n>/merge, not '{' '.join(positionals)}'")
-    given = {}
-    for field in fields:
-        key, eq, value = field.partition("=")
-        if not eq or key not in ("merge_method", "sha"):
-            refuse(f"field '{field}' isn't part of it")
-        if key in given:
-            refuse(f"`{key}` is given twice")
-        given[key] = value
-    if given.get("merge_method") != "merge":
-        refuse("it needs `merge_method=merge`: merge commits keep stacked PRs' history")
-    sha = given.get("sha", "")
-    if not re.fullmatch(r"[0-9a-f]{40}", sha):
-        refuse("it needs `sha=<the PR's head>`, all 40 lowercase hex digits, so GitHub refuses the merge "
-               "if the head moves after this check")
-    return m.group(1), m.group(2), sha
+def check_gh_api_extra(args, cwd, stdin=([], True)):
+    """Step 3 for `gh api`, then main's own check_gh_api. An endpoint that
+    reads as graphql gets main's GraphQL test and still the write test."""
+    method, endpoint, writes, bodies, unreadable = api_request(args, cwd, stdin)
+    if endpoint is not None:
+        path = api_path(endpoint.text)
+        if path == "graphql":
+            texts = []
+            for body, dynamic in bodies:
+                t, c = base.resolve_text(body, dynamic, cwd, 0)
+                texts, unreadable = texts + t, unreadable or not c
+            text = " ".join(texts + [base.json_strings(b) for b in texts])
+            if GRAPHQL_WRITES.search(text):
+                raise Blocked(f"GraphQL mutations that merge PRs or move refs are blocked. {MERGE_WAYS}")
+            if unreadable:
+                raise Blocked("can't read this GraphQL request's body, so it can't be checked for merges or ref "
+                              "writes. Pass the query inline with -f query=..., or from a file in the repo.")
+        write = (method or ("POST" if writes else "GET")) not in ("GET", "HEAD")
+        hidden = hides_delimiter(endpoint.text)
+        if write and (hidden or WRITE_PATHS.search(path)):
+            raise Blocked(write_reason(path, hidden))
+    MAIN["check_gh_api"](args, cwd, stdin)
 
 
-def rest_review_check(slug, number, sha, cwd):
-    """The review rule for the REST merge: sha must be the PR's current head,
-    and a review must cover it, all read over REST."""
-    pr, reason = pr_over_rest(slug, number, cwd)
-    if reason:
-        return reason
-    if pr["head"] != sha:
-        return (f"sha {sha[:7]} isn't the PR's head, which is {pr['head'] or 'unknown'}. "
-                "Merge the head a review covers.")
-    return pr_verdict(pr, cwd)
+def http_request(texts):
+    """(method, sends data) for curl, wget, httpie or xh arguments: -X,
+    --request and --method in any spelling, also inside a short-option
+    cluster (`-sX PUT`, `-sXPUT`); a method word (`http PUT`, `xh put`); data
+    options; and httpie request items (`key=value`, `key:=json`, `key@file`)."""
+    method, data = None, False
+    for k, t in enumerate(texts):
+        following = texts[k + 1] if k + 1 < len(texts) else ""
+        if t in ("-X", "--request", "--method"):
+            method = following
+        elif t.startswith(("--request=", "--method=")):
+            method = t.split("=", 1)[1]
+        elif t.startswith("-") and not t.startswith("--") and "X" in t:
+            method = t[t.index("X") + 1 :].lstrip("=") or following
+        elif not t.startswith("-") and t.upper() in HTTP_METHODS:
+            method = t
+        if t.startswith(("-d", "--data", "--json", "-F", "--form", "-T", "--upload-file", "--post-data",
+                         "--post-file", "--body-data")) or re.fullmatch(r"[\w.\[\]-]+(?::=|=|@)[^=].*|[\w.\[\]-]+=", t):
+            data = True
+    return (method.upper() if method else None), data
 
 
-# ---------------------------------------------------------------- merge review rule
-
-def merge_verdict(head, reviews, parents, base_ancestor, merge_clean):
-    """Decide whether a PR may merge. Returns None, or the reason it can't.
-
-    - head: the PR's head commit
-    - reviews: [{"commit": sha, "submittedAt": iso, ...}]
-    - parents: {sha: [parent shas]} for the PR's commits
-    - base_ancestor(sha): True if sha is already in the base branch
-    - merge_clean(merge, first, second): True if the merge's tree is exactly
-      git's own clean merge of its two parents
-
-    A review covers the head when every commit after the reviewed one, along
-    the first-parent chain, is a two-parent merge that brings in commits
-    already in the base branch and is byte-for-byte git's clean automatic
-    merge. Such a merge adds nothing of its own, so the reviewed edits are
-    still exactly where they were reviewed. What the review says is for the
-    maintainer to weigh; the guard only checks that one covers the code.
-    """
-    reviewed = {r["commit"] for r in reviews if r.get("commit")}
-    if not reviewed:
-        return "it has no review. The cross-review posts one (see the katwork-review skill), then the maintainer merges."
-    sha = head
-    while sha not in reviewed:
-        ps = parents.get(sha)
-        if not ps:
-            return (f"no review covers its head {head[:7]}: the commits after the last review "
-                    "aren't all merges of the base branch. Ask for a review of the delta.")
-        if len(ps) == 1:
-            return (f"commit {sha[:7]} came after the last review and isn't a merge of the base branch. "
-                    "Ask for a review of the delta.")
-        if len(ps) > 2:
-            return f"merge {sha[:7]} after the last review has {len(ps)} parents. Ask for a review of the merge."
-        if not base_ancestor(ps[1]):
-            return f"merge {sha[:7]} after the last review brings in {ps[1][:7]}, which isn't in the base branch."
-        if not merge_clean(sha, ps[0], ps[1]):
-            return (f"merge {sha[:7]} after the last review isn't git's own clean merge of its parents: it resolves "
-                    "a conflict or changes code (or its commits couldn't be fetched here). Ask for a review of the merge.")
-        sha = ps[0]
-    return None
+def check_http_client_extra(args):
+    """Step 3 for curl, wget, httpie and xh, then main's own check_http_client."""
+    texts = [w.text for w in args]
+    urls = [t for t in texts if "api.github.com" in t.lower()]
+    if urls:
+        method, data = http_request(texts)
+        write = (method or ("POST" if data else "GET")) not in ("GET", "HEAD")
+        joined = " ".join(texts)
+        globbing = not any(t == "--globoff" or re.fullmatch(r"-[A-Za-z]*g[A-Za-z]*", t) for t in texts)
+        for url in urls:
+            rest = re.sub(r"^(?:[A-Za-z][A-Za-z0-9+.-]*://)?[^/?#]*", "", url)  # after the scheme, host and any port
+            path = api_path(rest)
+            if path == "graphql" and GRAPHQL_WRITES.search(joined):
+                raise Blocked(f"GraphQL mutations that merge PRs or move refs are blocked. {MERGE_WAYS}")
+            if write and globbing and re.search(r"[{}\[\]]", url):
+                raise Blocked("this write's URL holds a curl glob (`{...}` or `[...]`), so the guard can't tell which "
+                              f"path it reaches. Write the URL out, or pass -g. {MERGE_WAYS}")
+            hidden = hides_delimiter(rest)
+            if write and (hidden or WRITE_PATHS.search(path)):
+                raise Blocked(write_reason(path, hidden))
+    MAIN["check_http_client"](args)
 
 
-def merge_is_clean(merge, first, second, cwd):
-    """True when merge's tree is exactly what `git merge-tree` produces for a
-    conflict-free merge of first and second."""
-    out = run(["git", "merge-tree", "--write-tree", first, second], cwd)
-    actual = run(["git", "rev-parse", "--verify", "-q", merge + "^{tree}"], cwd)
-    return bool(out) and bool(actual) and out.splitlines()[0].strip() == actual
-
-
-def have_commits(shas, slug, cwd):
-    """Make sure the commits are in the local object store, fetching them by
-    id from GitHub if needed."""
-    missing = [s for s in shas if run(["git", "cat-file", "-e", s + "^{commit}"], cwd) is None]
-    if missing:
-        run(["git", "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
-             f"https://github.com/{slug}.git", *missing], cwd, timeout=120)
-    return all(run(["git", "cat-file", "-e", s + "^{commit}"], cwd) is not None for s in shas)
-
-
-def review_check(target, repo, cwd):
-    """The review rule for `gh pr merge`, on the PR `gh pr view` reads."""
+def review_check_extra(target, repo, cwd):
+    """Step 3 for `gh pr merge`: main's review rule with pending reviews
+    dropped. Its gh reads are the ones main's review_check just made."""
     view = ["gh", "pr", "view"] + ([target] if target else []) + repo
     out = run(view + ["--json", "number,url,headRefOid,baseRefName,reviews"], cwd)
-    if out is None:  # without GraphQL, `gh pr merge` can't merge either
+    if out is None:
         return ("couldn't read the PR with `gh pr view`, so the merge can't be checked. Where GraphQL is "
-                f"unavailable, merge with `{REST_MERGE}`.")
+                f"unavailable, merge with the whole command line `{REST_MERGE}`.")
     pr, reason = pr_from_view(out)
     return reason or pr_verdict(pr, cwd)
 
 
-def pr_from_view(out):
-    """(pr, None) from `gh pr view --json` output, or (None, reason). pr holds
-    slug, number, head, base and reviews ({"commit", "submittedAt"}). A
-    pending review hasn't been posted, so it never counts."""
-    pr = json.loads(out)
-    m = re.search(r"github\.com/([^/]+/[^/]+)/pull/(\d+)", pr.get("url", ""))
-    if not m:
-        return None, "couldn't tell which repository the PR is in."
-    reviews = [{"commit": (r.get("commit") or {}).get("oid"), "submittedAt": r.get("submittedAt")}
-               for r in pr.get("reviews", []) if r.get("state") != "PENDING"]
-    return {"slug": m.group(1), "number": m.group(2), "head": pr.get("headRefOid", ""),
-            "base": pr.get("baseRefName", ""), "reviews": reviews}, None
+EXTRA = {"check_gh_api": check_gh_api_extra, "check_http_client": check_http_client_extra,
+         "review_check": review_check_extra}
 
 
-def pr_over_rest(slug, number, cwd):
-    """pr_from_view's result for the REST merge, read over REST: the PR, then
-    its reviews by each one's commit_id."""
-    endpoint = f"repos/{slug}/pulls/{number}"
-    out = run(["gh", "api", endpoint, "--jq", "{number, url: .html_url, head: .head.sha, base: .base.ref}"], cwd)
+def extra_reason(payload):
+    """Step 3: main's guard walks the command again with the checks above in
+    place of its check_gh_api, check_http_client and review_check. The first
+    two end by running main's own; the third is main's review rule with
+    pending reviews dropped. decide calls this only where main's guard
+    allowed, or to word a refusal main's guard already made, so it can only
+    refuse more."""
+    for name, fn in EXTRA.items():
+        setattr(base, name, fn)
     try:
-        pr = json.loads(out) if out is not None else None
-    except ValueError:
-        pr = None
-    if not isinstance(pr, dict):
-        return None, f"couldn't read the PR with `gh api {endpoint}`, so the merge can't be checked."
-    m = re.fullmatch(r"https://github\.com/([A-Za-z0-9-]+/[A-Za-z0-9._-]+)/pull/([0-9]+)", str(pr.get("url")))
-    if not m or m.group(2) != number:
-        return None, "couldn't tell which repository the PR is in."
-    slug = m.group(1)
-    lines = run(["gh", "api", "--paginate", f"repos/{slug}/pulls/{number}/reviews",
-                 "--jq", ".[] | {commit: .commit_id, state, submittedAt: .submitted_at}"], cwd)
-    try:
-        found = [json.loads(line) for line in lines.splitlines() if line.strip()] if lines is not None else None
-        reviews = [{"commit": r.get("commit"), "submittedAt": r.get("submittedAt")}
-                   for r in found if r.get("state") != "PENDING"] if found is not None else None
-    except (ValueError, AttributeError):
-        reviews = None
-    if reviews is None:
-        return None, "couldn't list the PR's reviews over REST, so the merge can't be checked."
-    return {"slug": slug, "number": number, "head": pr.get("head") or "", "base": pr.get("base") or "",
-            "reviews": reviews}, None
-
-
-def pr_verdict(pr, cwd):
-    """merge_verdict for a PR read by pr_from_view or pr_over_rest."""
-    slug, number, base, reviews = pr["slug"], pr["number"], pr["base"], pr["reviews"]
-    lines = run(["gh", "api", "--paginate", f"repos/{slug}/pulls/{number}/commits",
-                 "--jq", ".[] | {sha, parents: [.parents[].sha]}"], cwd)
-    if lines is None:
-        return "couldn't list the PR's commits, so the merge can't be checked."
-    parents = {}
-    for line in lines.splitlines():
-        if line.strip():
-            c = json.loads(line)
-            parents[c["sha"]] = c["parents"]
-
-    def base_ancestor(sha):
-        behind = run(["gh", "api", f"repos/{slug}/compare/{sha}...{base}", "--jq", ".behind_by"], cwd)
-        return behind == "0"
-
-    def merge_clean(merge, first, second):
-        return have_commits([merge, first, second], slug, cwd) and merge_is_clean(merge, first, second, cwd)
-
-    return merge_verdict(pr["head"], reviews, parents, base_ancestor, merge_clean)
+        return base.decide(payload)
+    finally:
+        for name, fn in MAIN.items():
+            setattr(base, name, fn)
 
 
 # ================================================================ entry
 
 
-def command_text(payload):
-    cmd = (payload.get("tool_input") or {}).get("command", "")
-    if isinstance(cmd, list):
-        return " ".join(shlex.quote(str(x)) for x in cmd)
-    return str(cmd)
-
-
 def decide(payload):
-    """Return None to allow, or the reason to block."""
+    """Return None to allow, or the reason to block, in the three steps of
+    the module docstring."""
     cwd = payload.get("cwd") or os.getcwd()
+    inner, memo = run, {}
+
+    def cached(args, cwd, timeout=20):  # gh reads repeat between the steps; git's answers can change (fetch)
+        if args[:1] != ["gh"]:
+            return inner(args, cwd, timeout)
+        key = (tuple(args), cwd)
+        if key not in memo:
+            memo[key] = inner(args, cwd, timeout)
+        return memo[key]
+
+    use_run(cached)
     try:
-        check_script(command_text(payload), cwd)
-    except Blocked as e:
-        return str(e)
-    except RecursionError:
-        return "this command nests too deeply to check."
-    return None
+        refused = base.decide(payload)  # 1. main's guard
+        if refused is None:
+            return extra_reason(payload)  # 3. refusals it adds
+        merge = canonical_rest_merge(command_text(payload))  # 2. the one line it may still pass
+        if merge is None:
+            return extra_reason(payload) or refused
+        reason = rest_review_check(*merge, cwd)
+        return None if reason is None else f"PR can't merge yet: {reason}"
+    finally:
+        use_run(inner)
 
 
 def main():
+    if base is None:
+        print(f"BLOCKED by .claude/hooks/guard.py: can't load guard_main.py beside it ({LOAD_ERROR}), so nothing "
+              "can be checked.", file=sys.stderr)
+        return 2
     if sys.argv[1:] == ["--self-test"]:
         return self_test()
     try:
@@ -1712,8 +453,9 @@ def main():
 
 
 def self_test():
-    """Offline: no network, no `gh`. Scratch repos stand in for this one, and
-    the differential reads the guard at DIFF_BASELINE from this clone's git."""
+    """Offline: no network, no `gh`. Scratch repos stand in for this one. The
+    differential reads main's guard at DIFF_BASELINE from this clone's git,
+    and checks that guard_main.py is that guard, byte for byte."""
     import tempfile
 
     empty = tempfile.mkstemp()[1]
@@ -1955,7 +697,7 @@ def self_test():
                 failures += 1
     failures += merge_self_test()
     failures += rest_self_test()
-    total = len(blocked) + len(allowed) + generated + MERGE_CASES + REST_CASES + DIFF_CASES
+    total = len(blocked) + len(allowed) + generated + MERGE_CASES + REST_CASES + DIFF_CASES + PIN_CASES
     print(f"guard self-test: {total - failures}/{total} passed")
     return 1 if failures else 0
 
@@ -2059,7 +801,7 @@ def real_merge_cases():
     ]
 
 
-REST_CASES = 145
+REST_CASES = 174
 
 
 def rest_self_test():
@@ -2111,7 +853,7 @@ def rest_self_test():
         for n, (head, reviews, commits) in prs.items():
             url = f"https://github.com/o/r/pull/{n}"
             posted = [{"commit": c, "state": s, "submittedAt": None if s == "PENDING" else "1"} for c, s in reviews]
-            for slug in ("o/r", "{owner}/{repo}"):  # gh fills {owner}/{repo} in, so a guard reading it would pass
+            for slug in ("o/r", "{owner}/{repo}", "o/.."):  # gh fills {owner}/{repo} in; `..` might route to o/r too
                 table[f"api repos/{slug}/pulls/{n} --jq {{number, url: .html_url, head: .head.sha, base: .base.ref}}"] = \
                     json.dumps({"number": n, "url": url, "head": head, "base": "main"})
             table[f"api --paginate repos/o/r/pulls/{n}/reviews --jq .[] | "
@@ -2131,11 +873,12 @@ def rest_self_test():
         (put.format(n=21, sha=a), True, False),
         (put.format(n=22, sha=m), True, False),
         (f"gh api --method PUT repos/o/r/pulls/21/merge -F merge_method=merge -F sha={a}", True, False),
-        (f"gh api --method=PUT repos/o/r/pulls/21/merge --field sha={a} --raw-field merge_method=merge", True, False),
-        (f"gh api -XPUT /repos/o/r/pulls/21/merge -fmerge_method=merge -f=sha={a}", True, False),
+        # only the whole command line passes (round 3): other spellings and chains are refused
+        (f"gh api --method=PUT repos/o/r/pulls/21/merge --field sha={a} --raw-field merge_method=merge", False, False),
+        (f"gh api -XPUT /repos/o/r/pulls/21/merge -fmerge_method=merge -f=sha={a}", False, False),
         (f"timeout 60 {put.format(n=22, sha=m)} && echo merged", False, False),  # a wrapper hides it from Codex
-        (f"true && {put.format(n=22, sha=m)} && echo merged", True, False),
-        (f"gh api -X=PUT repos/o/r/pulls/21/merge -f merge_method=merge -f sha={a}", True, False),
+        (f"true && {put.format(n=22, sha=m)} && echo merged", False, False),
+        (f"gh api -X=PUT repos/o/r/pulls/21/merge -f merge_method=merge -f sha={a}", False, False),
         # no review covers the head: none, one on an older plain commit, one still pending
         (put.format(n=24, sha=a), False, False),
         (put.format(n=23, sha=d), False, False),
@@ -2159,6 +902,7 @@ def rest_self_test():
         (put.format(n=21, sha="\"$(git rev-parse HEAD)\""), False, False),
         (put.format(n=21, sha=a) + f" -f sha={b}", False, False),
         ("gh api -X PUT repos/o/r/pulls/21/merge -f merge_method=merge -F sha=@sha.txt", False, False),
+        (f"gh api -X PUT repos/o/../pulls/21/merge -f merge_method=merge -f sha={a}", False, False),  # a `..` name
         # the PR number computed at run time, or another endpoint or method
         (put.format(n="$N", sha=a), False, False),
         (put.format(n="\"$(cat pr.txt)\"", sha=a), False, False),
@@ -2248,12 +992,45 @@ def rest_self_test():
         *((put.format(n=21, sha=a).replace(old, new), False, False) for old, new in (
             ("gh api", "\\gh api"), ("gh api", '"gh" api'), ("gh api", 'g"h" api'), ("gh api", "gh a\\pi"),
             ("-X PUT", "-X $'PUT'"), ("-X PUT", "-X PU\\T"), ("repos/o/r/pulls/21/merge", "'repos/o/r/pulls/21/merge'"))),
-        (put.format(n=21, sha=a) + " | cat", True, False),
+        (put.format(n=21, sha=a) + " | cat", False, False),
         # options and run-time words the review found no failing case for (review round 1)
         *((put.format(n=21, sha=a) + extra, False, False) for extra in (
             " --input=body.json", " --hostname=example.com", " --verbose", " --silent", " -i")),
         (put.format(n=21, sha=a).replace("-f merge_method=merge", "-fmerge_method=$'\\merge'"), False, False),
         (put.format(n=21, sha=a).replace("-f merge_method=merge", "-f merge_method=$'\\merge'"), False, False),
+        # endpoints that climb to graphql skipped the write check (review round 2): main refuses all of these
+        ("EP='repos/o/r/pulls/24/merge#'; gh api -X PUT \"$EP/../graphql\" -f merge_method=merge", False, False),
+        ("gh api -X PUT 'repos/o/r/contents/a.txt/../../../../../graphql' -f message=m", False, False),
+        ("gh api -X PUT 'repos/o/r/contents/a\\..\\..\\..\\..\\..\\graphql' -f message=m", False, False),
+        ("gh api -X PUT 'repos/o/r/contents/a.txt/..;/..;/..;/..;/..;/graphql' -f message=m", False, False),
+        (f"gh api -X PATCH repos/o/r/git/refs/heads/x/../../../../../../../graphql -f sha={a}", False, False),
+        ("gh api -X DELETE repos/o/r/git/refs/heads/x/../../../../../../../graphql", False, False),
+        # dot segments at the end, and curl to a path ending in graphql (review round 2): main refuses these too
+        ("gh api -X PUT repos/o/r/contents/x/.. -f message=m", False, False),
+        ("gh api -X DELETE repos/o/r/git/refs/../", False, False),
+        ("curl -X POST https://api.github.com/repos/o/r/x/graphql "
+         "-d '{\"query\":\"mutation { mergePullRequest(input: {}) { clientMutationId } }\"}'", False, False),
+        # curl's method in a short cluster, URL globs, httpie and xh method words and items (review round 2)
+        ("curl -sX PUT https://api.github.com/repos/o/r/pulls/24/merge", False, False),
+        ("curl -sXPUT https://api.github.com/repos/o/r/pulls/24/merge", False, False),
+        ("curl -X PUT 'https://api.github.com/repos/o/r/pulls/24/{merge}'", False, False),
+        ("curl -X PUT 'https://api.github.com/repos/o/r/pulls/24/[m-m]erge'", False, False),
+        ("http PUT https://api.github.com/repos/o/r/pulls/24/merge", False, False),
+        ("xh put https://api.github.com/repos/o/r/pulls/24/merge", False, False),
+        (f"http https://api.github.com/repos/o/r/git/refs ref=refs/heads/x sha={a}", False, False),
+        ("curl -X PUT https://API.GITHUB.COM/repos/o/r/pulls/24/merge -d '{}'", False, False),
+        ("curl -sX GET https://api.github.com/repos/o/r/pulls/24/merge", True, False),
+        ("curl -sg 'https://api.github.com/repos/o/r/pulls/24/{merge}'", True, False),
+        ("http GET https://api.github.com/repos/o/r/pulls/24", True, False),
+        # anything else on the line, which Codex's parser wouldn't split (review round 2), and hidden `.` and `/`
+        ("x=1 && " + put.format(n=21, sha=a), False, False),
+        ("x=1; " + put.format(n=21, sha=a), False, False),
+        ("echo =x && " + put.format(n=21, sha=a), False, False),
+        *((f"gh api -X PUT repos/o/r/pulls/24/{ep} -f merge_method=squash", False, False)
+          for ep in ("merge%2E", "merge%2F", "%2E/merge")),
+        # the whole line in its other spellings
+        (f"gh api --method PUT repos/o/r/pulls/21/merge -f merge_method=merge -F sha={a}", True, False),
+        (f"  {put.format(n=21, sha=a)}  ", True, False),
         # gh pr merge reads the PR with gh pr view; without GraphQL it is refused, even on a covered head
         ("gh pr merge 22 --merge", True, True),
         ("gh pr merge 24 --merge", False, True),
@@ -2282,8 +1059,15 @@ def rest_self_test():
                 print(f"FAIL (merge {where} GraphQL, should {'allow' if ok else 'block'}): {cmd!r}: {reason}")
                 failures += 1
         # Protection only grows: what main's guard refuses, this one refuses, but the canonical REST merge.
-        corpus, baseline = diff_corpus({21: a, 22: m, 24: a}), baseline_guard()
+        source = baseline_source()
+        corpus, baseline = diff_corpus({21: a, 22: m, 24: a}), baseline_guard(source)
         assert len(corpus) == DIFF_CASES
+        if globals().get("base") is not None:  # step 1's guard_main.py (an older single-file guard has none)
+            with open(os.path.join(HERE, "guard_main.py")) as f:
+                if source is None or f.read() != source:
+                    print(f"FAIL (main's guard): guard_main.py isn't the guard at {DIFF_BASELINE[:7]} byte for byte, "
+                          "and step 1 must run that guard unchanged.")
+                    failures += 1
         if baseline is None:
             print(f"FAIL (differential): can't read the guard at {DIFF_BASELINE[:7]} from git. Fetch it, then rerun.")
             failures += DIFF_CASES
@@ -2303,35 +1087,45 @@ def rest_self_test():
 
 
 DIFF_BASELINE = "a536fa524711e1042d6fcee54cd4e849e51e3b66"  # main's guard before it learned the REST merge
-DIFF_CASES = 2136
+DIFF_CASES = 3030
+PIN_CASES = 1  # guard_main.py is the guard at DIFF_BASELINE
 
 
-def baseline_guard():
-    """The guard at DIFF_BASELINE, read from git and loaded as a module, or
-    None when this clone doesn't have that commit."""
-    import types
-
+def baseline_source():
+    """main's guard.py at DIFF_BASELINE, read from this clone's git, or None
+    when the clone doesn't have that commit."""
     for where in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
         out = subprocess.run(["git", "-C", where, "show", f"{DIFF_BASELINE}:.claude/hooks/guard.py"],
                              capture_output=True, text=True)
         if out.returncode == 0:
-            module = types.ModuleType("guard_at_" + DIFF_BASELINE[:7])
-            exec(compile(out.stdout, f"guard.py@{DIFF_BASELINE[:7]}", "exec"), module.__dict__)
-            return module
+            return out.stdout
     return None
 
 
+def baseline_guard(source):
+    """That guard loaded as a module of its own, or None without its source."""
+    import types
+
+    if source is None:
+        return None
+    module = types.ModuleType("guard_at_" + DIFF_BASELINE[:7])
+    exec(compile(source, f"guard.py@{DIFF_BASELINE[:7]}", "exec"), module.__dict__)
+    return module
+
+
 def diff_corpus(heads):
-    """Write commands for the differential: each merge, auto-merge,
+    """Write commands for the differential. Each merge, auto-merge,
     update-branch, ref, merges, contents and rename endpoint (on PRs 21, 22
-    and 24 where it names one) in 25 spellings (fragments, queries, case,
-    `.`, `..`, `//`, `\\`, `;`, spaces, and single and double percent-
-    encoding of letters, `/`, `.`, `?` and `#`), each through gh api as a
-    squash, a merge with the head's sha, a DELETE and a POST, and through curl
-    with and without a port; then GraphQL mutations by gh api and curl, the
-    REST merge under wrappers and in other line forms, and gh pr merge. Items
+    and 24 where it names one) in 35 spellings: fragments and queries, case,
+    `.`, `..` and `//` in the middle and at the end, `\\`, `;`, spaces, and
+    single, double and triple percent-encoding of letters, `/`, `.`, `?` and
+    `#`. Each runs through gh api as a squash, a merge with the head's sha, a
+    DELETE and a POST, and through curl with and without a port. Then:
+    endpoints that climb to `graphql` (`"$EP/../graphql"`, contents and
+    git/refs), GraphQL mutations by gh api and curl, curl host spellings, the
+    REST merge's field and line forms, under wrappers, and gh pr merge. Items
     are (command, GraphQL served, may pass where main refused): only the
-    canonical REST merge of a covered head (PR 21 or 22) may."""
+    whole-line REST merge of a covered head (PR 21 or 22) may."""
     def spellings(ep):
         head, _, last = ep.rpartition("/")
         enc = "%%%02X" % ord(last[0])
@@ -2342,7 +1136,11 @@ def diff_corpus(heads):
                 ("enc-slash", f"{head}%2F{last}"), ("enc2-slash", f"{head}%252F{last}"), ("enc-?", f"{head}%3F/{last}"),
                 ("enc-#", f"{head}%23/{last}"), ("enc2-?", f"{head}%253F/{last}"), ("enc2-#", f"{head}%2523/{last}"),
                 ("param", f"{ep};x"), ("param-mid", f"{head};x/{last}"), ("backslash", f"{head}\\{last}"),
-                ("space", f"{ep}%20"), ("enc-dot", f"{head}/%2E/{last}"), ("enc-dotdot", f"{head}/x/%2E%2E/{last}")]
+                ("space", f"{ep}%20"), ("enc-dot", f"{head}/%2E/{last}"), ("enc-dotdot", f"{head}/x/%2E%2E/{last}"),
+                ("trail-dot", ep + "/."), ("trail-dotdot", ep + "/.."), ("trail-x-dotdot", ep + "/x/.."),
+                ("enc-slash-lower", f"{head}%2f{last}"), ("enc3-slash", f"{head}%25252F{last}"),
+                ("enc-dotdot-lower", f"{head}/x/%2e%2e/{last}"), ("enc-climb", f"{ep}%2F..%2F{last}"),
+                ("frag-query", ep + "#?"), ("query-frag", ep + "?#"), ("frag-climb", ep + "#/../x")]
 
     def quoted(text):  # its own pattern, so this self-test also runs against older checking code
         return text if re.fullmatch(r"[A-Za-z0-9_@%+=:,./-]+", text) else shlex.quote(text)
@@ -2354,7 +1152,7 @@ def diff_corpus(heads):
                                     "repos/o/r/contents/a.txt", "repos/o/r/branches/main/rename")]
     for ep, n in targets:
         for name, spelled in spellings(ep):
-            canonical = n in (21, 22) and ep.endswith(f"/{n}/merge") and name in ("plain", "slash")
+            canonical = n in (21, 22) and ep.endswith(f"/{n}/merge") and name == "plain"
             q = quoted(spelled)
             url, port = (quoted(f"https://api.github.com{p}/{spelled.lstrip('/')}") for p in ("", ":443"))
             corpus += [(f"gh api -X PUT {q} -f merge_method=squash", False, False),
@@ -2362,23 +1160,65 @@ def diff_corpus(heads):
                        (f"gh api -X DELETE {q}", False, False), (f"gh api {q} -f x=1", False, False),
                        (f"curl -X PUT {url} -d '{{}}'", False, False), (f"curl -X PUT {port} -d '{{}}'", False, False)]
     mutation = 'mutation { mergePullRequest(input: {pullRequestId: "x"}) { clientMutationId } }'
+    body = shlex.quote(json.dumps({"query": mutation}))
+    # endpoints that climb to graphql: a run-time segment, or a contents or git/refs path (review round 2)
+    climb = "/../../../../../../../graphql"
+    for cmd in ("EP='repos/o/r/pulls/24/merge#'; gh api -X PUT \"$EP/../graphql\" -f merge_method=merge",
+                "EP='repos/o/r/pulls/24/merge#'; gh api -X PUT \"$EP/../graphql\" -f merge_method=squash",
+                "EP='repos/o/r/pulls/24/merge#'; gh api -X PUT \"x/$EP/../../graphql\" -f merge_method=merge",
+                "gh api -X PUT \"$N/../graphql\" -f merge_method=merge", "gh api -X PUT \"$EP/../graphql\"",
+                "gh api -X PUT \"$(cat ep.txt)/../graphql\" -f merge_method=merge",
+                "gh api -X PUT 'repos/o/r/contents/a.txt/../../../../../graphql' -f message=m",
+                "gh api -X PUT 'repos/o/r/contents/a\\..\\..\\..\\..\\..\\graphql' -f message=m",
+                "gh api -X PUT 'repos/o/r/contents/a.txt/..;/..;/..;/..;/..;/graphql' -f message=m",
+                f"gh api -X PATCH repos/o/r/git/refs/heads/x{climb} -f sha={heads[21]}",
+                f"gh api -X DELETE repos/o/r/git/refs/heads/x{climb}",
+                f"curl -X PATCH https://api.github.com/repos/o/r/git/refs/heads/x{climb} -d '{{}}'",
+                # dot segments at the end (review round 2)
+                "gh api -X PUT repos/o/r/contents/x/.. -f message=m", "gh api -X PUT repos/o/r/contents/.. -f message=m",
+                "gh api -X DELETE repos/o/r/git/refs/../", "gh api -X PUT repos/o/r/git/refs/../",
+                "gh api repos/o/r/git/refs/../ -f x=1", "curl -X DELETE https://api.github.com/repos/o/r/git/refs/../",
+                # curl to a path ending in graphql, and curl host spellings
+                f"curl -X POST https://api.github.com/repos/o/r/x/graphql -d {body}",
+                f"curl https://api.github.com/repos/o/r/x/graphql -d {body}",
+                "curl -X PUT https://u:p@api.github.com/repos/o/r/pulls/24/merge -d '{}'",
+                "curl -X PUT https://api.github.com./repos/o/r/pulls/24/merge -d '{}'",
+                "curl -X PUT HTTPS://api.github.com/repos/o/r/pulls/24/merge -d '{}'",
+                "curl -X PUT api.github.com/repos/o/r/pulls/24/merge -d '{}'",
+                "curl -X PUT //api.github.com/repos/o/r/pulls/24/merge -d '{}'",
+                "curl -X PUT https://api.github.com:0443/repos/o/r/pulls/24/merge -d '{}'",
+                "curl -X PUT https://x.example/api.github.com/repos/o/r/pulls/24/merge -d '{}'"):
+        corpus.append((cmd, False, False))
     for g in ("graphql", "/graphql", "graphql/", "/graphql/", "GRAPHQL", "graphql#", "graphql?x=1",
+              "graphql%3F", "graphql%2F", "graphql%23",
               "https://api.github.com/graphql", "https://api.github.com:443/graphql",
               "https://api.github.com:443/graphql/", "https://API.GITHUB.COM/graphql"):
         corpus.append((f"gh api {quoted(g)} -f query={shlex.quote(mutation)}", False, False))
     for u in ("https://api.github.com/graphql", "https://api.github.com/graphql/", "https://api.github.com:443/graphql",
               "https://api.github.com:443/graphql/", "api.github.com/graphql", "api.github.com:443/graphql"):
-        corpus.append((f"curl -X POST {u} -d {shlex.quote(json.dumps({'query': mutation}))}", False, False))
+        corpus.append((f"curl -X POST {u} -d {body}", False, False))
+    # the REST merge: its whole-line spellings may pass; field, method and line forms around it may not
     put = f"gh api -X PUT repos/o/r/pulls/21/merge -f merge_method=merge -f sha={heads[21]}"
+    for cmd in (f"gh api --method PUT repos/o/r/pulls/21/merge -F merge_method=merge -F sha={heads[21]}",
+                f"gh api -X PUT repos/o/r/pulls/22/merge -F merge_method=merge -f sha={heads[22]}",
+                f"  {put}  ", put.replace(" ", "\t")):
+        corpus.append((cmd, False, True))
+    for cmd in (put + " -f merge_method=squash", put.replace("-f merge_method=merge", "-F merge_method=squash -f merge_method=merge"),
+                put.replace("-f merge_method", "-f=merge_method"), put.replace("-f merge_method", "-Fmerge_method"),
+                put.replace("merge_method=", "merge_method[]="), put + " -f commit_title=x", put + " -X PUT",
+                put.replace("gh api", "gh api --"), put + " -H 'Accept: x'", put + " -p x", put + " --input body.json",
+                put.replace("pulls/21", "pulls/22"), put.replace(heads[21], heads[22]),
+                put.replace(f"sha={heads[21]}", "sha=@sha.txt"), "x=1 && " + put, "x=1; " + put,
+                "echo =x && " + put, put + ";", "cd /tmp && " + put, put + " | cat"):
+        corpus.append((cmd, False, False))
     for form in ("env {p}", "timeout 60 {p}", "GH_X=1 {p}", "bash -c {q}", "eval {q}", "x=$({p})", "( {p} )",
                  "{p} &", "{p} 2>&1", "{p} # c", "echo x | xargs {p}", "true; {p}"):
-        corpus.append((form.format(p=put, q=shlex.quote(put)), False, form == "true; {p}"))
+        corpus.append((form.format(p=put, q=shlex.quote(put)), False, False))
     for flags, graphql in (("24 --merge", True), ("21 --squash", True), ("21 --auto --merge", True),
                            ("21 --admin --merge", True), ("25 --merge", True), ("21 --merge", False),
                            ("24 --rebase", False)):
         corpus.append((f"gh pr merge {flags}", graphql, False))
     return corpus
-
 
 if __name__ == "__main__":
     sys.exit(main())
