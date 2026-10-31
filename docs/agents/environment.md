@@ -15,6 +15,7 @@ How Claude Code and Codex are set up in this repo, and what to do when a tool is
 | `.codex/config.toml` | Codex | Sandbox, approvals, network, and the two hooks below. |
 | `.codex/rules/katwork.rules` | Codex | Forbidden commands, and frequent commands allowed outside the sandbox. |
 | `.claude/hooks/guard.py` | both | PreToolUse guard for `git` and `gh` (below). |
+| `.claude/hooks/guard_main.py` | both | The guard as it was at `a536fa5`, byte for byte. `guard.py` runs it first; edit `guard.py`, not this. |
 | `.claude/hooks/session-env.sh` | both | SessionStart: puts cargo on PATH and exports the test `DATABASE_URL`. |
 | `scripts/test-db.sh` | both | Private PostgreSQL 17 cluster per worktree. |
 
@@ -44,13 +45,24 @@ In Claude Code, every command run inside a worktree of this repo gets that workt
 
 ## Blocked commands
 
-`guard.py` runs before every shell command in both tools. It parses the command the way the shell would, through `&&`/`;`/`|` chains, `sh -c`, `eval`, heredocs fed to a shell, `$(...)`, wrappers such as `env`, `sudo`, `xargs` and `find -exec`, and git and gh aliases. It blocks:
+`guard.py` runs before every shell command in both tools. It decides in three steps.
+
+1. The guard as it was at `a536fa5` (`guard_main.py`, unchanged) decides.
+2. Where that guard refuses, only the one REST merge below may still pass.
+3. Where it allows, `guard.py` may still refuse.
+
+So `guard.py` never allows anything the old guard refused, other than that merge. The guard parses the command the way the shell would, through `&&`/`;`/`|` chains, `sh -c`, `eval`, heredocs fed to a shell, `$(...)`, wrappers such as `env`, `sudo`, `xargs` and `find -exec`, and git and gh aliases. It blocks:
 
 - `git push` that updates or deletes `main` or `master`. That covers explicit refspecs, `HEAD` or a bare push from `main`, push config (`remote.<name>.push`, `push.default=upstream`), `--all`/`--mirror`, and a refspec computed at run time (write the branch name, or `HEAD`)
 - deleting a remote branch, by `git push --delete` or `gh pr merge --delete-branch`, while open PRs use it as their base
 - `git reset --hard`, and `git clean` that would delete files (dry runs pass)
 - commits and merges whose author or committer email isn't a GitHub noreply address
-- `gh pr merge` with `--admin`, `--auto`, `--squash` or `--rebase`, or when no review covers the code being merged, and `gh api` or `curl` writes that merge PRs or move refs, except the one REST merge below. The guard reads an endpoint the way GitHub routes it (cut at `?` and `#`, then `.`, `..` and `//` resolved and percent-decoded, in any case), so `.../merge#` or `%6Derge` is still a merge. It refuses a write whose path hides a `?`, `#`, `/`, `\`, `.` or `;` behind percent-encoding, and it still checks each write against the path as written. Auto-merge through the cloud route `.../pulls/<n>/ccr/auto_merge` and `.../pulls/<n>/update-branch` are refused too, like `gh pr merge --auto` and their GraphQL forms
+- `gh pr merge` with `--admin`, `--auto`, `--squash` or `--rebase`, or when no review covers the code being merged, and `gh api` or `curl` writes that merge PRs or move refs, except the one REST merge below. Step 3 adds these refusals:
+  - an endpoint spelling GitHub routes to such a write, read as GitHub routes it (cut at `?` and `#`, then `.`, `..` and `//` resolved and percent-decoded, in any case), so `.../merge#` or `%6Derge` is still a merge;
+  - a write whose path hides a `?`, `#`, `/`, `\`, `.` or `;` behind percent-encoding;
+  - auto-merge through the cloud route `.../pulls/<n>/ccr/auto_merge`, and `.../pulls/<n>/update-branch`, like `gh pr merge --auto` and their GraphQL forms;
+  - GraphQL mutations sent to `/graphql` or a full URL;
+  - for curl, httpie and xh: the method inside a short-option cluster (`curl -sX PUT`), a method word (`http PUT`, `xh put`), request items (`key=value`), a URL glob (`{merge}`, `[m-m]erge`), and an upper-case host
 
 A review covers the head when it was posted on the head commit, or on an earlier commit followed only by merges of the base branch, each byte-identical to git's own clean merge of its two parents (`git merge-tree --write-tree`). Merging `main` into a reviewed PR keeps the review valid; resolving a conflict, changing code in the merge or adding a commit needs a new review. A pending review, created but not yet submitted, covers nothing. The guard doesn't read what a review says; the coordinator weighs that at the merge gate.
 
@@ -61,9 +73,15 @@ Without GraphQL (a cloud session, where every GraphQL call fails with HTTP 403, 
 - its checks: `gh api 'repos/{owner}/{repo}/commits/<sha>/check-runs?per_page=100'` (a page holds 30 by default, and a failing check on page 2 is easy to miss)
 - more than 100 of anything: `--paginate` stops after the first page in a cloud session, because the next-page link names the repository by its numeric id, which the session's proxy refuses. Read later pages with `page=2` and so on on the `repos/...` path. The guard's own review and commit reads fail closed on a PR with more than 100 reviews or commits.
 - review it: `gh api repos/{owner}/{repo}/pulls/<n>/reviews -f commit_id=<sha> -f event=COMMENT -F body=@<file>` (without `event` the review stays pending)
-- merge it: `gh api -X PUT repos/<owner>/<repo>/pulls/<n>/merge -f merge_method=merge -f sha=<head sha>`, the one REST merge the guard allows, under the same review rule. It is a command of its own that starts `gh api -X PUT` (or `--method PUT`), on a line of plain words joined only by `&&`, `||`, `;` or `|`. So no wrapper (`timeout`, `env`), `VAR=` or alias, no quotes, escapes or `$`, no redirection (`2>&1`), `&`, parentheses or comment, and not inside `bash -c`, `eval` or `$(...)`. Only such a line is split into commands by Codex, so its prefix rules ask a person first, as they do for `gh pr merge`. The owner, repo, PR number and full head SHA are written out (no `{owner}/{repo}`, no variables), nothing else is on the command, and the SHA is the PR's current head, so GitHub refuses the merge if the head moves after the check.
+- merge it: the whole command line `gh api -X PUT repos/<owner>/<repo>/pulls/<n>/merge -f merge_method=merge -f sha=<head sha>` (or `--method PUT`, or `-F` for a field). This is the one REST merge the guard allows, under the same review rule.
+  - Write it word for word with the owner, repo, PR number and full head SHA, and nothing else on the line: no `cd ... &&`, pipe, redirection, wrapper, quotes, variables or `{owner}/{repo}`.
+  - Run it from the clone, since a merge of the base after the review is checked with git there.
+  - The SHA must be the PR's current head, so GitHub refuses the merge if the head moves after the check.
+  - Codex's prefix rules ask a person before it, as they do for `gh pr merge`.
 
-The blocking message says what to do instead. Run `.claude/hooks/guard.py --self-test` after changing it. Its differential part runs some two thousand merge, ref, contents and GraphQL writes, in every spelling found so far, through this guard and through the guard as it was before the REST merge (read from git at `DIFF_BASELINE`). It fails if this one allows anything the old one refused, other than the REST merge itself.
+The blocking message says what to do instead. Run `.claude/hooks/guard.py --self-test` after changing it.
+
+The self-test's differential part reads the guard at `DIFF_BASELINE` from git. It runs some three thousand merge, ref, contents and GraphQL writes, in the spellings the reviews found, through this guard and through that one. It fails if this guard allows anything the old one refused, other than the whole-line REST merge of a covered head. It also checks that `guard_main.py` is that guard, byte for byte.
 
 ## Guard scope
 
@@ -88,4 +106,4 @@ Fix a hole when an agent could plausibly fall into it by mistake; otherwise leav
 2. Review and trust the two hooks with `/hooks`; Codex skips hooks it hasn't been told to trust, and asks again whenever they change.
 3. The config runs commands in the `workspace-write` sandbox with `on-request` approvals and network access on. Two limits of the macOS sandbox drive this: Postgres can't create shared memory inside it, so the rules run `scripts/test-db.sh` outside the sandbox; and with network access off, the sandbox also blocks connections to the test database on `127.0.0.1`.
 4. The rules also let frequent `cargo`, read-only `gh` and read-only `git` commands (plus `git fetch`) run outside the sandbox without a prompt, matching Claude Code's allowlist. `.git` is read-only inside the sandbox, so commits and pushes ask for approval.
-5. The rules ask a person before `gh pr merge`, and before a `gh api` command whose method comes first and is PUT in any letter case, which covers the REST merge as the guard allows it. They match the command as typed, and Codex splits a line into commands only when it is plain words joined by `&&`, `||`, `;` or `|`. So with hooks off they don't see either one under a wrapper such as `timeout`, on a line with quotes, escapes, redirections, `&`, parentheses or a comment, or a REST merge with the method after the endpoint. With hooks on, the guard refuses the REST merge in each of those forms.
+5. The rules ask a person before `gh pr merge`. They also ask before a `gh api` command whose method comes first and is PUT in any letter case, which covers the REST merge: the guard allows it only as a whole line that starts `gh api -X PUT` or `gh api --method PUT`. The rules match a command as typed. So with hooks off they don't see either merge under a wrapper such as `timeout`, on a line Codex doesn't split into plain commands, or with the method after the endpoint. With hooks on, the guard refuses the REST merge in every such form.
