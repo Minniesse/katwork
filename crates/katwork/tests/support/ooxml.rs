@@ -249,6 +249,473 @@ pub fn xlsx(rows: &str) -> Vec<u8> {
     )
 }
 
+/// SpreadsheetML's main namespace, Transitional and Strict.
+pub const SML: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+pub const STRICT_SML: &str = "http://purl.oclc.org/ooxml/spreadsheetml/main";
+/// The namespace of `r:id` attributes.
+pub const RELATIONSHIPS: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+
+/// `value` escaped for an XML attribute or text.
+pub fn escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// A worksheet part whose root holds `body` (`sheetData` and the elements around it).
+pub fn worksheet(body: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="{SML}" xmlns:r="{RELATIONSHIPS}">{body}</worksheet>"#
+    )
+}
+
+/// One sheet of an `Xlsx` workbook.
+#[derive(Clone)]
+pub struct XlsxSheet {
+    pub name: String,
+    pub id: u32,
+    /// The `state` attribute as written, if any.
+    pub state: Option<String>,
+    /// The whole worksheet part.
+    pub xml: String,
+    /// Where the part is stored, relative to `xl/`.
+    pub target: String,
+    /// The sheet part's relationships: (type, target, part bytes when the part is added).
+    pub rels: Vec<(String, String, Option<Vec<u8>>)>,
+}
+
+/// An XLSX package: a workbook part listing its sheets in order, the parts its relationships
+/// name, and any other entries.
+#[derive(Clone)]
+pub struct Xlsx {
+    sheets: Vec<XlsxSheet>,
+    styles: Option<String>,
+    shared: Option<String>,
+    theme: Option<String>,
+    /// Workbook children before `sheets` (`workbookPr` ...) and after it (`calcPr` ...).
+    head: String,
+    tail: String,
+    /// The workbook part written as is.
+    workbook: Option<String>,
+    /// More of the workbook's relationships: (type, target, part bytes when added).
+    related: Vec<(String, String, Option<Vec<u8>>)>,
+    root_rels: Option<String>,
+    extra: Vec<(String, Vec<u8>)>,
+}
+
+impl Default for Xlsx {
+    fn default() -> Self {
+        Xlsx::new()
+    }
+}
+
+impl Xlsx {
+    pub fn new() -> Xlsx {
+        Xlsx {
+            sheets: Vec::new(),
+            styles: None,
+            shared: None,
+            theme: None,
+            head: String::new(),
+            tail: String::new(),
+            workbook: None,
+            related: Vec::new(),
+            root_rels: None,
+            extra: Vec::new(),
+        }
+    }
+
+    /// A visible sheet named `name` whose worksheet root holds `body`; its `sheetId` is its
+    /// position from 1.
+    pub fn sheet(self, name: &str, body: &str) -> Xlsx {
+        let at = self.sheets.len() + 1;
+        self.sheet_with(XlsxSheet {
+            name: name.into(),
+            id: at as u32,
+            state: None,
+            xml: worksheet(body),
+            target: format!("worksheets/sheet{at}.xml"),
+            rels: Vec::new(),
+        })
+    }
+
+    /// A sheet whose `state` attribute is `state`.
+    pub fn sheet_state(self, name: &str, state: &str, body: &str) -> Xlsx {
+        let mut xlsx = self.sheet(name, body);
+        xlsx.sheets.last_mut().unwrap().state = Some(state.into());
+        xlsx
+    }
+
+    pub fn sheet_with(mut self, sheet: XlsxSheet) -> Xlsx {
+        self.sheets.push(sheet);
+        self
+    }
+
+    /// The last sheet added, to change.
+    pub fn last_sheet(&mut self) -> &mut XlsxSheet {
+        self.sheets.last_mut().expect("a sheet")
+    }
+
+    /// The sheet at `at` (from 0), to change.
+    pub fn sheet_at(&mut self, at: usize) -> &mut XlsxSheet {
+        &mut self.sheets[at]
+    }
+
+    /// The whole styles part.
+    pub fn styles(mut self, xml: &str) -> Xlsx {
+        self.styles = Some(xml.into());
+        self
+    }
+
+    /// A shared-strings part whose `si` elements hold `items`.
+    pub fn shared_strings(self, items: &[&str]) -> Xlsx {
+        let items: String = items
+            .iter()
+            .map(|item| format!("<si>{item}</si>"))
+            .collect();
+        self.shared_strings_xml(&format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><sst xmlns="{SML}">{items}</sst>"#
+        ))
+    }
+
+    pub fn shared_strings_xml(mut self, xml: &str) -> Xlsx {
+        self.shared = Some(xml.into());
+        self
+    }
+
+    pub fn theme(mut self, xml: &str) -> Xlsx {
+        self.theme = Some(xml.into());
+        self
+    }
+
+    /// Workbook children written before `sheets`.
+    pub fn workbook_head(mut self, xml: &str) -> Xlsx {
+        self.head.push_str(xml);
+        self
+    }
+
+    /// Workbook children written after `sheets`.
+    pub fn workbook_tail(mut self, xml: &str) -> Xlsx {
+        self.tail.push_str(xml);
+        self
+    }
+
+    /// The workbook part written as is.
+    pub fn workbook_xml(mut self, xml: &str) -> Xlsx {
+        self.workbook = Some(xml.into());
+        self
+    }
+
+    /// A relationship of the workbook part of type `kind` (a suffix of the transitional
+    /// relationship namespace, or a whole URI), and the part it names when `bytes` is given.
+    pub fn related(mut self, kind: &str, target: &str, bytes: Option<&[u8]>) -> Xlsx {
+        self.related
+            .push((kind.into(), target.into(), bytes.map(<[u8]>::to_vec)));
+        self
+    }
+
+    pub fn root_rels(mut self, relationships: &str) -> Xlsx {
+        self.root_rels = Some(format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="{PACKAGE_RELATIONSHIPS}">{relationships}</Relationships>"#
+        ));
+        self
+    }
+
+    pub fn entry(mut self, name: &str, bytes: &[u8]) -> Xlsx {
+        self.extra.push((name.into(), bytes.to_vec()));
+        self
+    }
+
+    /// The workbook part as `build` writes it.
+    pub fn workbook_part(&self) -> String {
+        if let Some(xml) = &self.workbook {
+            return xml.clone();
+        }
+        let sheets: String = self
+            .sheets
+            .iter()
+            .enumerate()
+            .map(|(at, sheet)| {
+                let state = sheet
+                    .state
+                    .as_ref()
+                    .map(|state| format!(r#" state="{}""#, escape(state)))
+                    .unwrap_or_default();
+                format!(
+                    r#"<sheet name="{}" sheetId="{}"{state} r:id="rIdS{at}"/>"#,
+                    escape(&sheet.name),
+                    sheet.id
+                )
+            })
+            .collect();
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="{SML}" xmlns:r="{RELATIONSHIPS}">{}<sheets>{sheets}</sheets>{}</workbook>"#,
+            self.head, self.tail
+        )
+    }
+
+    pub fn entries(&self) -> Vec<(String, Vec<u8>)> {
+        let rels = |items: &[(String, String, bool)]| {
+            let items: String = items
+                .iter()
+                .enumerate()
+                .map(|(at, (kind, target, external))| {
+                    let kind = if kind.starts_with("http") {
+                        kind.clone()
+                    } else {
+                        format!("{RELATIONSHIP}{kind}")
+                    };
+                    let mode = if *external {
+                        r#" TargetMode="External""#
+                    } else {
+                        ""
+                    };
+                    format!(
+                        r#"<Relationship Id="rIdX{at}" Type="{kind}" Target="{target}"{mode}/>"#
+                    )
+                })
+                .collect();
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="{PACKAGE_RELATIONSHIPS}">{items}</Relationships>"#
+            )
+        };
+        let mut entries = vec![(
+            "[Content_Types].xml".to_owned(),
+            br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>"#.to_vec(),
+        )];
+        let root_rels = self.root_rels.clone().unwrap_or_else(|| {
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="{PACKAGE_RELATIONSHIPS}"><Relationship Id="rId1" Type="{RELATIONSHIP}officeDocument" Target="xl/workbook.xml"/></Relationships>"#
+            )
+        });
+        entries.push(("_rels/.rels".into(), root_rels.into_bytes()));
+        entries.push(("xl/workbook.xml".into(), self.workbook_part().into_bytes()));
+        // The sheets' relationships come first, with ids `rIdS<n>` the workbook part names.
+        let mut workbook_rels = String::new();
+        for (at, sheet) in self.sheets.iter().enumerate() {
+            workbook_rels.push_str(&format!(
+                r#"<Relationship Id="rIdS{at}" Type="{RELATIONSHIP}worksheet" Target="{}"/>"#,
+                sheet.target
+            ));
+        }
+        let mut parts = Vec::new();
+        for (kind, target, xml) in [
+            ("styles", "styles.xml", &self.styles),
+            ("sharedStrings", "sharedStrings.xml", &self.shared),
+            ("theme", "theme/theme1.xml", &self.theme),
+        ] {
+            if let Some(xml) = xml {
+                parts.push((
+                    kind.to_owned(),
+                    target.to_owned(),
+                    Some(xml.as_bytes().to_vec()),
+                ));
+            }
+        }
+        parts.extend(self.related.iter().cloned());
+        for (at, (kind, target, bytes)) in parts.iter().enumerate() {
+            let kind = if kind.starts_with("http") {
+                kind.clone()
+            } else {
+                format!("{RELATIONSHIP}{kind}")
+            };
+            let mode = if target.contains("://") {
+                r#" TargetMode="External""#
+            } else {
+                ""
+            };
+            workbook_rels.push_str(&format!(
+                r#"<Relationship Id="rIdW{at}" Type="{kind}" Target="{target}"{mode}/>"#
+            ));
+            if let Some(bytes) = bytes {
+                entries.push((format!("xl/{target}"), bytes.clone()));
+            }
+        }
+        entries.push((
+            "xl/_rels/workbook.xml.rels".into(),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="{PACKAGE_RELATIONSHIPS}">{workbook_rels}</Relationships>"#
+            )
+            .into_bytes(),
+        ));
+        for sheet in &self.sheets {
+            entries.push((
+                format!("xl/{}", sheet.target),
+                sheet.xml.clone().into_bytes(),
+            ));
+            if sheet.rels.is_empty() {
+                continue;
+            }
+            let (dir, file) = sheet.target.rsplit_once('/').unwrap_or(("", &sheet.target));
+            let dir = if dir.is_empty() {
+                "xl".to_owned()
+            } else {
+                format!("xl/{dir}")
+            };
+            let items: Vec<(String, String, bool)> = sheet
+                .rels
+                .iter()
+                .map(|(kind, target, _)| (kind.clone(), target.clone(), target.contains("://")))
+                .collect();
+            entries.push((
+                format!("{dir}/_rels/{file}.rels"),
+                rels(&items).into_bytes(),
+            ));
+            for (_, target, bytes) in &sheet.rels {
+                if let Some(bytes) = bytes {
+                    entries.push((format!("{dir}/{target}"), bytes.clone()));
+                }
+            }
+        }
+        entries.extend(self.extra.iter().cloned());
+        entries
+    }
+
+    pub fn build(&self) -> Vec<u8> {
+        let entries = self.entries();
+        zip(
+            &entries
+                .iter()
+                .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+                .collect::<Vec<_>>(),
+            true,
+        )
+    }
+
+    /// `build`, the sheet at `at` (from 0) written as `xml` whole.
+    pub fn build_with_sheet_xml(mut self, at: usize, xml: &str) -> Vec<u8> {
+        self.sheets[at].xml = xml.into();
+        self.build()
+    }
+}
+
+/// A styles part made one record at a time: each call returns the record's index. It starts as
+/// Excel's does: font 0 (11 pt, `theme="1"`), fills 0 (`none`) and 1 (`gray125`), and cell
+/// format 0 using them.
+#[derive(Clone)]
+pub struct StyleSet {
+    num_fmts: Vec<(u32, String)>,
+    fonts: Vec<String>,
+    fills: Vec<String>,
+    xfs: Vec<String>,
+    extra: String,
+}
+
+impl Default for StyleSet {
+    fn default() -> Self {
+        StyleSet::new()
+    }
+}
+
+impl StyleSet {
+    pub fn new() -> StyleSet {
+        StyleSet {
+            num_fmts: Vec::new(),
+            fonts: vec![r#"<sz val="11"/><color theme="1"/><name val="Calibri"/>"#.into()],
+            fills: vec![
+                r#"<patternFill patternType="none"/>"#.into(),
+                r#"<patternFill patternType="gray125"/>"#.into(),
+            ],
+            xfs: vec![r#"<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>"#.into()],
+            extra: String::new(),
+        }
+    }
+
+    /// A font record holding `inner`.
+    pub fn font(&mut self, inner: &str) -> u32 {
+        self.fonts.push(inner.into());
+        (self.fonts.len() - 1) as u32
+    }
+
+    /// A fill record holding `inner`.
+    pub fn fill(&mut self, inner: &str) -> u32 {
+        self.fills.push(inner.into());
+        (self.fills.len() - 1) as u32
+    }
+
+    /// A solid fill of `rgb` (`AARRGGBB`).
+    pub fn solid(&mut self, rgb: &str) -> u32 {
+        self.fill(&format!(
+            r#"<patternFill patternType="solid"><fgColor rgb="{rgb}"/><bgColor indexed="64"/></patternFill>"#
+        ))
+    }
+
+    /// A custom number format; its id, from 164.
+    pub fn num_fmt(&mut self, code: &str) -> u32 {
+        let id = 164 + self.num_fmts.len() as u32;
+        self.num_fmts.push((id, code.into()));
+        id
+    }
+
+    /// A cell format.
+    pub fn xf(&mut self, num_fmt: u32, font: u32, fill: u32) -> u32 {
+        self.xf_xml(&format!(
+            r#"<xf numFmtId="{num_fmt}" fontId="{font}" fillId="{fill}" borderId="0" xfId="0"/>"#
+        ))
+    }
+
+    pub fn xf_xml(&mut self, xml: &str) -> u32 {
+        self.xfs.push(xml.into());
+        (self.xfs.len() - 1) as u32
+    }
+
+    /// A cell format with a new font holding `inner`.
+    pub fn with_font(&mut self, inner: &str) -> u32 {
+        let font = self.font(inner);
+        self.xf(0, font, 0)
+    }
+
+    /// A cell format with a new number format.
+    pub fn with_format(&mut self, code: &str) -> u32 {
+        let format = self.num_fmt(code);
+        self.xf(format, 0, 0)
+    }
+
+    /// Records written after `cellStyles` (`dxfs`, `colors` ...).
+    pub fn extra(&mut self, xml: &str) {
+        self.extra.push_str(xml);
+    }
+
+    pub fn xml(&self) -> String {
+        let num_fmts = if self.num_fmts.is_empty() {
+            String::new()
+        } else {
+            let items: String = self
+                .num_fmts
+                .iter()
+                .map(|(id, code)| {
+                    format!(r#"<numFmt numFmtId="{id}" formatCode="{}"/>"#, escape(code))
+                })
+                .collect();
+            format!(
+                r#"<numFmts count="{}">{items}</numFmts>"#,
+                self.num_fmts.len()
+            )
+        };
+        let list = |name: &str, items: &[String], wrap: Option<&str>| {
+            let count = items.len();
+            let items: String = items
+                .iter()
+                .map(|item| match wrap {
+                    Some(tag) => format!("<{tag}>{item}</{tag}>"),
+                    None => item.clone(),
+                })
+                .collect();
+            format!(r#"<{name} count="{count}">{items}</{name}>"#)
+        };
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="{SML}">{num_fmts}{}{}<borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>{}<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>{}</styleSheet>"#,
+            list("fonts", &self.fonts, Some("font")),
+            list("fills", &self.fills, Some("fill")),
+            list("cellXfs", &self.xfs, None),
+            self.extra
+        )
+    }
+}
+
 /// An honest zip of `entries`, deflated or stored, with fixed timestamps.
 pub fn zip(entries: &[(&str, &[u8])], deflate: bool) -> Vec<u8> {
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));

@@ -48,7 +48,15 @@ zip.workspace = true
 quick-xml.workspace = true
 crc32fast.workspace = true
 
+# The XLSX reader: header units through Task 1's number reader, and number formats rounded in
+# decimal.
+katwork-thai = { path = "../katwork-thai" }
+rust_decimal.workspace = true
+
 [dev-dependencies]
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util", "io-util"] }
 flate2.workspace = true
+
+# A workbook written by another writer, for the XLSX reader's tests.
+rust_xlsxwriter = { version = "=0.101.0", default-features = false }
