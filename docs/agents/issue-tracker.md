@@ -4,15 +4,17 @@ Issues and specs for this repo live as GitHub issues. Use the `gh` CLI for all o
 
 ## Conventions
 
-- **Create an issue**: `gh issue create --title "..." --body "..."`. Use a heredoc for multi-line bodies.
-- **Read an issue**: `gh issue view <number> --json number,title,body,labels,comments`.
-- **List issues**: `gh issue list --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters.
-- **Make an issue a sub-issue of a parent**: `gh issue create --parent <parent> ...`, or `gh issue edit <parent> --add-sub-issue <child>` afterwards (`gh` 2.94+). Older `gh`: `gh api --method POST repos/<owner>/<repo>/issues/<parent>/sub_issues -F sub_issue_id=<child-db-id>` (database id, as in **Blocking** below). Without sub-issues, put `Part of #<parent>` at the top of the child body.
-- **Comment on an issue**: `gh issue comment <number> --body "..."`
-- **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
-- **Close**: `gh issue close <number> --comment "..."`
+Most `gh issue` and `gh pr` commands use GraphQL, which a cloud session doesn't have: there they fail with HTTP 403 (`gh pr diff` may still work). Use the REST form given after each command instead.
 
-Infer the repo from `git remote -v`; `gh` does this automatically when run inside a clone.
+- **Create an issue**: `gh issue create --title "..." --body "..."`. Use a heredoc for multi-line bodies. REST: `gh api repos/{owner}/{repo}/issues -f title="..." -F body=@<file>`.
+- **Read an issue**: `gh issue view <number> --json number,title,body,labels,comments`. REST: `gh api repos/{owner}/{repo}/issues/<number>`, and `.../issues/<number>/comments`.
+- **List issues**: `gh issue list --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters. REST: `gh api --paginate 'repos/{owner}/{repo}/issues?state=open&labels=<label>' --jq '.[] | select(.pull_request | not) | {number, title, body, labels: [.labels[].name]}'` (this endpoint lists PRs too, and leaves out comments: read them per issue with `.../issues/<number>/comments`).
+- **Make an issue a sub-issue of a parent**: `gh issue create --parent <parent> ...`, or `gh issue edit <parent> --add-sub-issue <child>` afterwards (`gh` 2.94+). Older `gh`: `gh api --method POST repos/<owner>/<repo>/issues/<parent>/sub_issues -F sub_issue_id=<child-db-id>` (database id, as in **Blocking** below). Without sub-issues, put `Part of #<parent>` at the top of the child body.
+- **Comment on an issue**: `gh issue comment <number> --body "..."`. REST: `gh api repos/{owner}/{repo}/issues/<number>/comments -F body=@<file>`.
+- **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`. REST: `gh api repos/{owner}/{repo}/issues/<number>/labels -f "labels[]=..."` / `gh api -X DELETE repos/{owner}/{repo}/issues/<number>/labels/<label>`.
+- **Close**: `gh issue close <number> --comment "..."`. REST: comment as above, then `gh api -X PATCH repos/{owner}/{repo}/issues/<number> -f state=closed`.
+
+Infer the repo from `git remote -v`; `gh` does this automatically when run inside a clone, and fills `{owner}/{repo}` in `gh api` paths the same way.
 
 ## Pull requests as a triage surface
 
@@ -20,11 +22,11 @@ Infer the repo from `git remote -v`; `gh` does this automatically when run insid
 
 When set to `yes`, PRs run through the same labels and states as issues, using the `gh pr` equivalents:
 
-- **Read a PR**: `gh pr view <number> --comments` and `gh pr diff <number>` for the diff.
+- **Read a PR**: `gh pr view <number> --comments` and `gh pr diff <number>` for the diff. REST: `gh api repos/{owner}/{repo}/pulls/<number>` (its head is `.head.sha`), `.../issues/<number>/comments`, and the diff with `gh api repos/{owner}/{repo}/pulls/<number> -H 'Accept: application/vnd.github.diff'`.
 - **List external PRs for triage**: `gh api --paginate 'repos/{owner}/{repo}/pulls?state=open' --jq '.[] | select(.author_association | IN("OWNER","MEMBER","COLLABORATOR") | not) | {number, title, author: .user.login, author_association, labels: [.labels[].name]}'`.
-- **Comment / label / close**: `gh pr comment`, `gh pr edit --add-label`/`--remove-label`, `gh pr close`.
+- **Comment / label / close**: `gh pr comment`, `gh pr edit --add-label`/`--remove-label`, `gh pr close`. REST: the issue forms above work on a PR's number, and `gh api -X PATCH repos/{owner}/{repo}/pulls/<number> -f state=closed` closes it.
 
-GitHub shares one number space across issues and PRs, so a bare `#42` may be either: resolve with `gh pr view 42` and fall back to `gh issue view 42`.
+GitHub shares one number space across issues and PRs, so a bare `#42` may be either: resolve with `gh pr view 42` and fall back to `gh issue view 42`. REST: `gh api repos/{owner}/{repo}/issues/42` answers for both, and has a `pull_request` key when it's a PR.
 
 ## When a skill says "publish to the issue tracker"
 
