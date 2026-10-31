@@ -58,8 +58,11 @@ const HEADER_ROWS: u32 = 5;
 const DEFAULT_FONT_PT: f64 = 11.0;
 /// The colours one place may be drawn in: past this many, what Excel draws is left undecided.
 const MAX_CANDIDATES: usize = 64;
-/// Blocks made between two checks of the job's deadline and memory budget.
+/// Cells given headers between two checks of the job's deadline and memory budget.
 const BLOCKS_PER_CHECK: usize = 64;
+/// Header bytes copied into blocks between two checks: a step past the memory budget is at most
+/// this and one block's copies.
+const HEADER_BYTES_PER_CHECK: usize = 1 << 20;
 
 /// The standard 64-entry palette that `indexed` colours name (ECMA-376 Part 1 §18.8.27).
 const PALETTE: [u32; 64] = [
@@ -123,9 +126,15 @@ pub fn hidden_why(look: &CellLook, limits: &DocLimits) -> Option<HiddenWhy> {
 /// starts with `หน่วย` or, in any case, `unit`. A hidden cell supplies none of them. The pieces of
 /// a long cell are joined as its text. Blocks with no cell facts are left as they are.
 ///
-/// Inside a read's job scope it stops early once `deadline::check` fails, leaving the rest
-/// unset: the caller's next check then fails the read.
+/// Inside a job scope it stops early once a check of the job's deadline and memory budget fails,
+/// leaving the rest unset; the reader then fails the read with that check's error. Outside one
+/// every check passes.
 pub fn fill_headers(blocks: &mut [Block]) {
+    let _ = headers(blocks);
+}
+
+/// `fill_headers`, failing with the first check that fails.
+fn headers(blocks: &mut [Block]) -> Result<(), DocError> {
     let mut order: Vec<(u32, u32, u32, usize)> = blocks
         .iter()
         .enumerate()
@@ -183,9 +192,11 @@ pub fn fill_headers(blocks: &mut [Block]) {
             .clone()
     };
     let mut row_header: Option<(u32, usize)> = None;
+    // Bytes of headers copied since the last check: a long header copied into many pieces.
+    let mut copied = 0usize;
     for at in 0..cells.len() {
-        if at % BLOCKS_PER_CHECK == BLOCKS_PER_CHECK - 1 && deadline::check().is_err() {
-            return;
+        if at % BLOCKS_PER_CHECK == BLOCKS_PER_CHECK - 1 {
+            check("header_cells")?;
         }
         let (row, col) = (cells[at].row, cells[at].col);
         let left = row_header
@@ -201,7 +212,15 @@ pub fn fill_headers(blocks: &mut [Block]) {
         let unit = above
             .and_then(|header| unit_of(header, &cells))
             .or_else(|| left.and_then(|header| unit_of(header, &cells)));
+        let bytes = left.map_or(0, |header| cells[header].text.len())
+            + above.map_or(0, |header| cells[header].text.len())
+            + unit.as_ref().map_or(0, String::len)
+            + unit_context.as_ref().map_or(0, String::len);
         for &block in &cells[at].blocks {
+            if copied >= HEADER_BYTES_PER_CHECK {
+                check("header_bytes")?;
+                copied = 0;
+            }
             let block = &mut blocks[block];
             if let Some(facts) = &mut block.cell {
                 facts.row_header = left.map(|header| cells[header].text.clone());
@@ -209,11 +228,13 @@ pub fn fill_headers(blocks: &mut [Block]) {
                 facts.header_unit = unit.clone();
             }
             block.unit_context = unit_context.clone();
+            copied += bytes;
         }
         if cells[at].header {
             row_header = Some((row, at));
         }
     }
+    Ok(())
 }
 
 struct HeaderCell {
@@ -281,6 +302,8 @@ pub enum Stage {
     Model,
     /// The reader read this part's bytes (their CRC-32).
     Read { part: String, crc: u32 },
+    /// One of the reader's loops checked the job's deadline and memory budget, at this site.
+    Check(&'static str),
 }
 
 thread_local! {
@@ -302,6 +325,12 @@ fn record(stage: impl FnOnce() -> Stage) {
             trace.push(stage());
         }
     });
+}
+
+/// `deadline::check`, from the reader's loop at `site`.
+fn check(site: &'static str) -> Result<(), DocError> {
+    record(|| Stage::Check(site));
+    deadline::check()
 }
 
 fn record_read(part: &str, xml: &[u8]) {
@@ -396,6 +425,8 @@ pub(super) fn read(bytes: &[u8], limits: &DocLimits) -> Result<Extracted, DocErr
         theme: theme.as_ref(),
         limits,
         default_pt: styles.default_pt(),
+        looks: RefCell::default(),
+        paints: RefCell::default(),
     };
     let mut out = Output {
         limits,
@@ -415,8 +446,8 @@ pub(super) fn read(bytes: &[u8], limits: &DocLimits) -> Result<Extracted, DocErr
         let data = read_sheet(xml, &strings, limits)?;
         let start = out.blocks.len();
         out.sheet(&judge, sheet, &data)?;
-        fill_headers(&mut out.blocks[start..]);
-        deadline::check()?;
+        headers(&mut out.blocks[start..])?;
+        check("sheet")?;
     }
     Ok(Extracted {
         extractor: ExtractorId::XLSX,
@@ -524,7 +555,7 @@ fn relationships(
     let (mut depth, mut found, mut ids) = (0u32, Vec::new(), HashSet::new());
     for events in 0u64.. {
         if events % 1024 == 1023 {
-            deadline::check()?;
+            check("relationships")?;
         }
         let (resolved, event) = reader.read_resolved_event().map_err(xml_guard::map_error)?;
         let ours = matches!(&resolved, ResolveResult::Bound(ns) if ns.0 == PACKAGE_RELATIONSHIPS);
@@ -1013,7 +1044,7 @@ impl<'x> Walk<'x> {
     fn event(&mut self) -> Result<(ResolveResult<'_>, Event<'x>), DocError> {
         self.events += 1;
         if self.events.is_multiple_of(1024) {
-            deadline::check()?;
+            check("walk")?;
         }
         self.reader
             .read_resolved_event()
@@ -1542,6 +1573,16 @@ impl Font {
     fn add_size(&mut self, size: Size) {
         self.size = Some(self.size.map_or(size, |written| written.and(size)));
     }
+
+    /// A colour it writes, each a candidate; past `MAX_CANDIDATES` (Excel writes one) its colour
+    /// is undecided.
+    fn add_colour(&mut self, spec: ColourSpec) {
+        if self.colours.len() >= MAX_CANDIDATES {
+            self.undecided = true;
+        } else {
+            self.colours.push(spec);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1678,44 +1719,55 @@ impl Styles {
             } else if walk.at(&[ROOT, "fonts", "font", "color"]) {
                 let spec = ColourSpec::read(&walk, &start)?;
                 if let Some(font) = styles.fonts.last_mut() {
-                    font.colours.push(spec);
+                    font.add_colour(spec);
                 }
             } else if walk.at(&[ROOT, "fills", "fill"]) {
                 styles.fills.push(Fill::default());
             } else if walk.at(&[ROOT, "fills", "fill", "patternFill"]) {
                 let [pattern] = walk.attrs(&start, ["patternType"])?;
                 if let Some(fill) = styles.fills.last_mut() {
-                    fill.patterns.push(PatternFill {
-                        pattern,
-                        ..PatternFill::default()
-                    });
+                    if fill.patterns.len() >= MAX_CANDIDATES {
+                        fill.undecided = true;
+                    } else {
+                        fill.patterns.push(PatternFill {
+                            pattern,
+                            ..PatternFill::default()
+                        });
+                    }
                 }
             } else if walk.at(&[ROOT, "fills", "fill", "patternFill", "fgColor"])
                 || walk.at(&[ROOT, "fills", "fill", "patternFill", "bgColor"])
             {
                 let spec = ColourSpec::read(&walk, &start)?;
-                let pattern = styles
-                    .fills
-                    .last_mut()
-                    .and_then(|fill| fill.patterns.last_mut());
-                if let Some(pattern) = pattern {
-                    match open.name {
-                        "fgColor" => pattern.fg.push(spec),
-                        _ => pattern.bg.push(spec),
+                if let Some(fill) = styles.fills.last_mut()
+                    && let Some(pattern) = fill.patterns.last_mut()
+                {
+                    if pattern.fg.len() + pattern.bg.len() >= MAX_CANDIDATES {
+                        fill.undecided = true;
+                    } else if open.name == "fgColor" {
+                        pattern.fg.push(spec);
+                    } else {
+                        pattern.bg.push(spec);
                     }
                 }
             } else if walk.at(&[ROOT, "fills", "fill", "gradientFill"]) {
                 if let Some(fill) = styles.fills.last_mut() {
-                    fill.gradients.push(Vec::new());
+                    if fill.gradients.len() >= MAX_CANDIDATES {
+                        fill.undecided = true;
+                    } else {
+                        fill.gradients.push(Vec::new());
+                    }
                 }
             } else if walk.at(&[ROOT, "fills", "fill", "gradientFill", "stop", "color"]) {
                 let spec = ColourSpec::read(&walk, &start)?;
-                let gradient = styles
-                    .fills
-                    .last_mut()
-                    .and_then(|fill| fill.gradients.last_mut());
-                if let Some(gradient) = gradient {
-                    gradient.push(spec);
+                if let Some(fill) = styles.fills.last_mut()
+                    && let Some(gradient) = fill.gradients.last_mut()
+                {
+                    if gradient.len() >= MAX_CANDIDATES {
+                        fill.undecided = true;
+                    } else {
+                        gradient.push(spec);
+                    }
                 }
             } else if walk.at(&[ROOT, "cellXfs", "xf"]) {
                 let [num_fmt, font, fill] = walk.attrs(&start, ["numFmtId", "fontId", "fillId"])?;
@@ -1891,7 +1943,7 @@ impl RstBuilder {
                     props: Some(props), ..
                 }) = &mut self.run
                 {
-                    props.colours.push(spec);
+                    props.add_colour(spec);
                 }
             }
             ["r", "t"] => match &mut self.run {
@@ -2672,7 +2724,7 @@ fn covered(cells: &[(u32, u32)], merges: &mut [Merge]) -> Result<Vec<bool>, DocE
         };
     for (at, merge) in merges.iter().enumerate() {
         if at % 1024 == 1023 {
-            deadline::check()?;
+            check("merges")?;
         }
         close_before(merge.top, &mut open, &mut ends);
         let before = open.range(..=merge.left).next_back();
@@ -2691,7 +2743,7 @@ fn covered(cells: &[(u32, u32)], merges: &mut [Merge]) -> Result<Vec<bool>, DocE
     let mut under = Vec::with_capacity(cells.len());
     for (at, &(row, col)) in cells.iter().enumerate() {
         if at % 1024 == 1023 {
-            deadline::check()?;
+            check("merged_cells")?;
         }
         close_before(row, &mut open, &mut ends);
         while let Some(merge) = merges.get(next).filter(|merge| merge.top <= row) {
@@ -2754,6 +2806,9 @@ struct Judge<'a> {
     theme: Option<&'a ThemeColours>,
     limits: &'a DocLimits,
     default_pt: f64,
+    /// Each font's look and each fill's paint, worked out once.
+    looks: RefCell<HashMap<u32, Look>>,
+    paints: RefCell<HashMap<u32, Paint>>,
 }
 
 /// The share of a pattern fill its foreground covers, for the patterns that are an even mix.
@@ -2831,6 +2886,15 @@ impl Judge<'_> {
     }
 
     fn font(&self, index: u32) -> Result<Look, DocError> {
+        if let Some(look) = self.looks.borrow().get(&index) {
+            return Ok(look.clone());
+        }
+        let look = self.font_look(index)?;
+        self.looks.borrow_mut().insert(index, look.clone());
+        Ok(look)
+    }
+
+    fn font_look(&self, index: u32) -> Result<Look, DocError> {
         if self
             .styles
             .fonts_from
@@ -2862,6 +2926,9 @@ impl Judge<'_> {
         let Some(props) = props else {
             return cell.clone();
         };
+        if props.undecided {
+            return self.undecided_look();
+        }
         Look {
             pt: match props.size {
                 Some(Size::Points(points)) => points,
@@ -2964,6 +3031,15 @@ impl Judge<'_> {
     /// The colours a cell's fill may show. Fills 0 and 1 are Excel's reserved `none` and
     /// `gray125`, whatever the file writes for them; no fill is white.
     fn fill(&self, index: u32) -> Result<Paint, DocError> {
+        if let Some(paint) = self.paints.borrow().get(&index) {
+            return Ok(paint.clone());
+        }
+        let paint = self.fill_paint(index)?;
+        self.paints.borrow_mut().insert(index, paint.clone());
+        Ok(paint)
+    }
+
+    fn fill_paint(&self, index: u32) -> Result<Paint, DocError> {
         let gray125 = blend(Rgb::BLACK, Rgb::WHITE, 0.125);
         match index {
             0 => return Ok(Paint::Colours(vec![Rgb::WHITE])),
@@ -3159,6 +3235,9 @@ impl Output<'_> {
         let mut merges = data.merges.clone();
         let under = covered(&positions, &mut merges)?;
         for (at, cell) in data.cells.iter().enumerate() {
+            // A cell's work is bounded (its pieces, its formats, its capped colours): one check
+            // each.
+            check("cells")?;
             let locator = Locator::XlsxCell {
                 sheet_id: sheet.id,
                 sheet: sheet.name.clone(),
@@ -3210,9 +3289,6 @@ impl Output<'_> {
             for (piece, range) in pieces.into_iter().enumerate() {
                 if self.blocks.len() as u64 >= u64::from(self.limits.max_blocks) {
                     return Err(DocError::TooComplex("blocks"));
-                }
-                if self.blocks.len() % BLOCKS_PER_CHECK == BLOCKS_PER_CHECK - 1 {
-                    deadline::check()?;
                 }
                 self.blocks.push(Block {
                     ordinal: self.ordinal,
@@ -3400,7 +3476,7 @@ impl Output<'_> {
         let (mut text, mut first, mut all) = (String::new(), None, true);
         for (at, run) in rst.runs.iter().enumerate() {
             if at % 1024 == 1023 {
-                deadline::check()?;
+                check("runs")?;
             }
             let why = if rst.undecided || run.undecided {
                 Some((HiddenWhy::LowContrast, UNKNOWN_NAMESPACE))

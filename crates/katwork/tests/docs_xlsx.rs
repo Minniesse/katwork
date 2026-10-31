@@ -2854,6 +2854,48 @@ fn xlsx_theme_colours_resolve_every_form_or_hide() {
 }
 
 #[test]
+fn xlsx_colour_elements_past_64_leave_the_colour_undecided() {
+    // Excel writes one colour per font, fill and run; past 64 the reader does not judge them
+    // one by one (each would be a candidate): what is drawn there is undecided.
+    let colours = |count: usize| r#"<color rgb="FF000000"/>"#.repeat(count);
+    let mut styles = StyleSet::new();
+    let fonts = [
+        styles.with_font(&format!(r#"<sz val="11"/>{}"#, colours(64))),
+        styles.with_font(&format!(r#"<sz val="11"/>{}"#, colours(65))),
+    ];
+    let fill = |count: usize| {
+        format!(
+            r#"<patternFill patternType="solid">{}</patternFill>"#,
+            r#"<fgColor rgb="FFFFFFFF"/>"#.repeat(count)
+        )
+    };
+    let fills = [styles.fill(&fill(64)), styles.fill(&fill(65))];
+    let on_fills = fills.map(|fill| styles.xf(0, 0, fill));
+    let runs = |count: usize| {
+        format!(
+            r#"<c r="{{at}}" t="inlineStr"><is><r><t xml:space="preserve">shown </t></r><r><rPr>{}</rPr><t>run</t></r></is></c>"#,
+            colours(count)
+        )
+    };
+    let cells = [
+        num("A1", fonts[0], "1"),
+        num("B1", fonts[1], "2"),
+        num("C1", on_fills[0], "3"),
+        num("D1", on_fills[1], "4"),
+        runs(64).replace("{at}", "E1"),
+        runs(65).replace("{at}", "F1"),
+    ];
+    let extracted = read(&book(&styles, &row(1, &cells.concat())));
+    use HiddenWhy::LowContrast as L;
+    assert_eq!(
+        first_row(&extracted),
+        [None, Some(L), None, Some(L), None, None]
+    );
+    assert_eq!(block(&extracted, "Sheet1", "E1").text, "shown run");
+    assert_eq!(block(&extracted, "Sheet1", "F1").text, "shown ");
+}
+
+#[test]
 fn xlsx_fill_ids_0_and_1_are_never_solid() {
     // The file writes fills 0 and 1 solid black; Excel keeps them `none` and `gray125`.
     let styles = format!(
@@ -3822,6 +3864,115 @@ fn xlsx_reader_loops_stop_at_the_job_deadline() {
     assert!(high > 20, "{high}");
 }
 
+/// Reads `xlsx` with the job's deadline passing at the first check the reader makes at `site`:
+/// the read stops right there with `Timeout`, that check its last stage.
+fn stops_at_its_check(site: &'static str, xlsx: &Xlsx) {
+    let bytes = xlsx.build();
+    let within = |checks: Option<u32>| {
+        xlsx::trace(|| {
+            deadline::scope(
+                Instant::now() + Duration::from_secs(3600),
+                None,
+                u64::MAX,
+                || {
+                    if let Some(checks) = checks {
+                        deadline::expire_after_checks(checks);
+                    }
+                    docs::extract(MediaKind::Xlsx, &bytes, &limits())
+                },
+            )
+        })
+    };
+    let reader_checks = |stages: &[Stage]| {
+        stages
+            .iter()
+            .filter(|stage| matches!(stage, Stage::Check(_)))
+            .count()
+    };
+    let (result, stages) = within(None);
+    assert!(result.is_ok(), "{site}: {result:?}");
+    let first = stages
+        .iter()
+        .filter(|stage| matches!(stage, Stage::Check(_)))
+        .position(|stage| *stage == Stage::Check(site))
+        .unwrap_or_else(|| panic!("{site} is never checked"));
+    // The fewest checks the job may pass for the read to reach that one.
+    let (mut low, mut high) = (0u32, 1 << 30);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if reader_checks(&within(Some(mid)).1) > first {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    let (result, stages) = within(Some(low));
+    assert_eq!(result, Err(DocError::Timeout), "{site}");
+    assert_eq!(stages.last(), Some(&Stage::Check(site)), "{site}");
+}
+
+#[test]
+fn xlsx_each_reader_loop_stops_at_its_own_deadline_check() {
+    let rows = |count: u32| {
+        (1..=count)
+            .map(|r| row(r, &num(&format!("A{r}"), 0, "1")))
+            .collect::<String>()
+    };
+    let sheet = |body: &str| Xlsx::new().sheet("S", body);
+    stops_at_its_check("sheet", &sheet(&data(&rows(1))));
+    stops_at_its_check("cells", &sheet(&data(&rows(1))));
+    stops_at_its_check("walk", &sheet(&data(&rows(600))));
+    stops_at_its_check("merged_cells", &sheet(&data(&rows(1_100))));
+    stops_at_its_check("header_cells", &sheet(&data(&rows(70))));
+    let merges: String = (1..=1_100u32)
+        .map(|r| format!(r#"<mergeCell ref="B{r}:C{r}"/>"#))
+        .collect();
+    stops_at_its_check(
+        "merges",
+        &sheet(&format!(
+            "{}<mergeCells>{merges}</mergeCells>",
+            data(&rows(1))
+        )),
+    );
+    let runs = "<r><t>x</t></r>".repeat(1_100);
+    stops_at_its_check(
+        "runs",
+        &sheet(&data(&row(
+            1,
+            &format!(r#"<c r="A1" t="inlineStr"><is>{runs}</is></c>"#),
+        ))),
+    );
+    let mut linked = sheet(&data(&rows(1)));
+    linked.last_sheet().rels.extend((0..1_100).map(|at| {
+        (
+            "hyperlink".to_owned(),
+            format!("https://example.com/{at}"),
+            None,
+        )
+    }));
+    stops_at_its_check("relationships", &linked);
+    // A unit context and column header of 96 KB copied into 19 cells: a step of header bytes.
+    let unit = format!("unit {}", noise(7, 32_000));
+    let headed = [
+        row(1, &inline("A1", 0, &unit)),
+        rows(20).replacen(&row(1, &num("A1", 0, "1")), "", 1),
+    ]
+    .concat();
+    stops_at_its_check("header_bytes", &sheet(&data(&headed)));
+}
+
+/// `len` Thai letters in a pseudo-random order from `seed`: text that does not compress past the
+/// package guard's ratio cap.
+fn noise(seed: u32, len: usize) -> String {
+    let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    (0..len)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            char::from_u32(0x0E01 + (state >> 16) % 46).unwrap()
+        })
+        .collect()
+}
+
 /// Hostile workbooks read inside a job scope that counts their bytes: each is refused or read
 /// within the read's budget.
 #[test]
@@ -3864,6 +4015,29 @@ fn xlsx_floods_are_refused_or_read_within_the_budget() {
                             .collect::<String>(),
                     ]
                     .concat(),
+                ),
+            ),
+        ),
+        (
+            "32,767-character headers over 32,767-character cells",
+            Xlsx::new().sheet(
+                "S",
+                &data(
+                    &(1..=6u32)
+                        .map(|r| {
+                            let head = if r == 1 { "unit " } else { "" };
+                            let a = format!("{head}{}", noise(r, 32_767 - head.len()));
+                            let b = noise(r + 100, 32_767);
+                            row(
+                                r,
+                                &[
+                                    inline(&format!("A{r}"), 0, &a),
+                                    inline(&format!("B{r}"), 0, &b),
+                                ]
+                                .concat(),
+                            )
+                        })
+                        .collect::<String>(),
                 ),
             ),
         ),
@@ -3918,5 +4092,13 @@ fn xlsx_floods_are_refused_or_read_within_the_budget() {
         );
         // Past the budget only by what one step between two checks allocates.
         assert!(peak < limits.max_read_bytes + (16 << 20), "{name}: {peak}");
+        // What does not fit the budget is refused, never read with headers left unset.
+        if name.contains("32,767-character") {
+            assert_eq!(
+                result.as_ref().map(|_| ()),
+                Err(&DocError::TooComplex("memory")),
+                "{name}"
+            );
+        }
     }
 }
