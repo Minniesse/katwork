@@ -939,6 +939,14 @@ enum Node<'x> {
     Eof,
 }
 
+/// What markup compatibility makes of an element: one to report, one read past, or a node in
+/// its place.
+enum Compat<'x> {
+    Report,
+    Skip,
+    Node(Node<'x>),
+}
+
 /// An open element of the walk: one reported (on the path), or markup compatibility's.
 enum Frame {
     Reported,
@@ -1002,10 +1010,11 @@ impl<'x> Walk<'x> {
             let empty = matches!(event, Event::Empty(_));
             match event {
                 Event::Start(start) | Event::Empty(start) => {
-                    if compatible && let Some(node) = self.compatibility(&start, mc, sml, empty)? {
-                        match node {
-                            Some(node) => return Ok(node),
-                            None => continue,
+                    if compatible {
+                        match self.compatibility(&start, mc, sml, empty)? {
+                            Compat::Report => {}
+                            Compat::Skip => continue,
+                            Compat::Node(node) => return Ok(node),
                         }
                     }
                     return Ok(self.open(start, sml, strict, empty));
@@ -1051,16 +1060,14 @@ impl<'x> Walk<'x> {
             .map_err(xml_guard::map_error)
     }
 
-    /// Markup compatibility at an element that starts where it applies: `None` when the element
-    /// is an ordinary one to report; else what to report instead, if anything.
-    #[allow(clippy::option_option)]
+    /// Markup compatibility at an element that starts where it applies.
     fn compatibility(
         &mut self,
         start: &BytesStart,
         mc: bool,
         sml: bool,
         empty: bool,
-    ) -> Result<Option<Option<Node<'x>>>, DocError> {
+    ) -> Result<Compat<'x>, DocError> {
         let in_alternate = matches!(self.frames.last(), Some(Frame::Alternate { .. }));
         if mc {
             let local = start.local_name();
@@ -1072,7 +1079,7 @@ impl<'x> Walk<'x> {
                             fallback: false,
                         });
                     }
-                    return Ok(Some(None));
+                    return Ok(Compat::Skip);
                 }
                 ("Choice", true) => {
                     let understood = self.requires_understood(start)?;
@@ -1084,18 +1091,22 @@ impl<'x> Walk<'x> {
                     }
                     if *taken {
                         self.skip(empty)?;
-                        return Ok(Some(None));
+                        return Ok(Compat::Skip);
                     }
                     if understood {
                         *taken = true;
                         if !empty {
                             self.frames.push(Frame::Branch);
                         }
-                        return Ok(Some(None));
+                        return Ok(Compat::Skip);
                     }
                     // Excel may take this choice: what it holds is undecided.
                     let (held, any) = self.skip(empty)?;
-                    return Ok(Some(any.then_some(Node::Undecided { held, any })));
+                    return Ok(if any {
+                        Compat::Node(Node::Undecided { held, any })
+                    } else {
+                        Compat::Skip
+                    });
                 }
                 ("Fallback", true) => {
                     let Some(Frame::Alternate { taken, fallback }) = self.frames.last_mut() else {
@@ -1113,7 +1124,7 @@ impl<'x> Walk<'x> {
                             self.frames.push(Frame::Branch);
                         }
                     }
-                    return Ok(Some(None));
+                    return Ok(Compat::Skip);
                 }
                 _ => {}
             }
@@ -1128,10 +1139,13 @@ impl<'x> Walk<'x> {
             {
                 held.push(own);
             }
-            let node = (!held.is_empty()).then_some(Node::Undecided { held, any: true });
-            return Ok(Some(node));
+            return Ok(if held.is_empty() {
+                Compat::Skip
+            } else {
+                Compat::Node(Node::Undecided { held, any: true })
+            });
         }
-        Ok(None)
+        Ok(Compat::Report)
     }
 
     /// Whether every prefix a `mc:Choice`'s `Requires` names is bound to a namespace the reader
@@ -3362,7 +3376,7 @@ impl Output<'_> {
             _ => None,
         };
         let (kind, cached) = match (&cell.value, &runs, &date) {
-            (_, Some((text, ..)), _) => (CellKind::Text, Some(text.clone())),
+            (_, Some(runs), _) => (CellKind::Text, Some(runs.text.clone())),
             (_, _, Some(Ok(serial))) => (CellKind::Number, Some(serial.clone())),
             (_, _, Some(Err(text))) => (CellKind::Text, Some((*text).clone())),
             (Some(Value::Number(text)), ..) => (CellKind::Number, Some(text.clone())),
@@ -3409,9 +3423,10 @@ impl Output<'_> {
                 })
             })
             .or_else(|| match &runs {
-                Some((_, first, true)) => {
-                    first.map(|(why, _)| why).or(Some(HiddenWhy::LowContrast))
-                }
+                Some(runs) if runs.all => runs
+                    .first
+                    .map(|(why, _)| why)
+                    .or(Some(HiddenWhy::LowContrast)),
                 _ => None,
             });
         let displayed = match (&cached, number_format) {
@@ -3430,7 +3445,7 @@ impl Output<'_> {
             .unwrap_or_default();
         let run_why = runs
             .as_ref()
-            .and_then(|(_, first, all)| first.filter(|_| !all))
+            .and_then(|runs| runs.first.filter(|_| !runs.all))
             .map(|(_, why)| why);
         Ok(Made {
             text,
@@ -3458,12 +3473,7 @@ impl Output<'_> {
     /// in: a run shows only if it shows in all of them, and never when markup compatibility
     /// left it or its string undecided. The first hidden run's reason comes with the `why` of
     /// its warning.
-    fn runs(
-        &self,
-        judge: &Judge,
-        rst: &Rst,
-        styles: &[Drawn],
-    ) -> Result<(String, Option<(HiddenWhy, &'static str)>, bool), DocError> {
+    fn runs(&self, judge: &Judge, rst: &Rst, styles: &[Drawn]) -> Result<Runs, DocError> {
         let plain = CellLook {
             sheet_hidden: false,
             row_hidden: false,
@@ -3500,8 +3510,16 @@ impl Output<'_> {
                 }
             }
         }
-        Ok((text, first, all))
+        Ok(Runs { text, first, all })
     }
+}
+
+/// A string's runs as judged: the text of its visible runs, its first hidden run's reason and
+/// warning `why`, and whether every run with text is hidden.
+struct Runs {
+    text: String,
+    first: Option<(HiddenWhy, &'static str)>,
+    all: bool,
 }
 
 /// One format a cell may be drawn in: its font, its fill and its number format, and whether
