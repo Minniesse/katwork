@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use sqlx::PgPool;
 
@@ -23,6 +23,9 @@ pub struct Core {
     pub docs: Arc<DocPool>,
     pub blobs: Arc<dyn BlobStore>,
     pub uploads: Arc<UploadLimiter>,
+    /// The upload commits running in tasks of their own, which a client that leaves cannot
+    /// drop; `finish_commits` waits for them at shutdown.
+    pub commits: tokio_util::task::TaskTracker,
 }
 
 impl Core {
@@ -58,7 +61,18 @@ impl Core {
             docs,
             blobs,
             uploads: Arc::new(UploadLimiter::new(UPLOADS_AT_ONCE, UPLOADS_PER_PERSON)),
+            commits: tokio_util::task::TaskTracker::new(),
         })
+    }
+
+    /// Waits, at most `grace`, for the upload commits still running once the server has
+    /// stopped taking requests; false when one outlived it. A commit left then ends with the
+    /// process, as in a crash: its blob may stand without its rows.
+    pub async fn finish_commits(&self, grace: Duration) -> bool {
+        self.commits.close();
+        tokio::time::timeout(grace, self.commits.wait())
+            .await
+            .is_ok()
     }
 
     /// Replaces the blob store (tests use it).

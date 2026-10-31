@@ -73,7 +73,8 @@ pub(crate) struct FileList {
 /// the type, and one transaction for the rows and the blob. 201 with the file.
 ///
 /// Once the body is in, the commit runs in a task of its own that holds the upload's slot, so a
-/// client that leaves then gets a 201 nobody reads, never a blob without its rows.
+/// client that leaves then gets a 201 nobody reads, never a blob without its rows; `Core.commits`
+/// tracks it, so a shutdown waits for it too.
 pub(crate) async fn upload(
     State(state): State<AppState>,
     tenant: Tenant,
@@ -119,7 +120,7 @@ pub(crate) async fn upload(
     )
     .await?;
     let core = state.core.clone();
-    let commit = tokio::spawn(async move {
+    let commit = state.core.commits.spawn(async move {
         let _permit = permit;
         let staged = staging.finish().await?;
         let media = media::sniff(&name, &staged.head, staged.text)?;

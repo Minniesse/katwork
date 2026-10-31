@@ -1210,6 +1210,42 @@ async fn upload_commits_when_its_client_leaves_after_the_rename(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../katwork/migrations")]
+async fn shutdown_waits_for_an_upload_commit_whose_client_left(pool: PgPool) {
+    let gate = Gate {
+        reached: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+    };
+    let env = Env::committing(&pool, OnCommit::PauseAfterRename(gate.clone())).await;
+    let bytes = b"committed before the process ends";
+    let request = post(
+        &env.upload_uri("shutdown.txt"),
+        &env.cookie,
+        Some("application/octet-stream"),
+        Some(bytes.len() as u64),
+        Body::from(bytes.to_vec()),
+    );
+    let client = tokio::spawn(env.app.clone().oneshot(request));
+    tokio::time::timeout(Duration::from_secs(10), gate.reached.notified())
+        .await
+        .expect("the upload never reached its rename");
+    client.abort();
+    assert!(client.await.unwrap_err().is_cancelled());
+    // The server has stopped taking requests, as `serve` does on a shutdown signal: it waits for
+    // the commit, paused after its rename, and never past the grace it is given.
+    assert!(
+        !env.core.finish_commits(Duration::from_millis(100)).await,
+        "the shutdown passed a commit that was still running"
+    );
+    let mut finishing = Box::pin(env.core.finish_commits(Duration::from_secs(30)));
+    assert!(futures::poll!(finishing.as_mut()).is_pending());
+    gate.release.notify_one();
+    assert!(finishing.await, "the commit outlived the grace");
+    assert_eq!(env.rows().await, 1);
+    assert_eq!(env.blob_files(), vec![env.blob_path(&sha256(bytes))]);
+    env.assert_slots_free();
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
 async fn a_panic_in_the_commit_answers_500_and_frees_the_slot(pool: PgPool) {
     let env = Env::committing(&pool, OnCommit::Panic).await;
     assert_code(
