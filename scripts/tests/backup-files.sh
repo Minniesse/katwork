@@ -16,6 +16,11 @@ cat > "$tmp/bin/pg_dump" <<'SCRIPT'
 #!/bin/sh
 set -eu
 printf '%s\n' 'archive fixture' > "$3"
+# A file stored while the dump runs.
+if [ -n "${DUMP_ADDS:-}" ]; then
+    mkdir -p "${DUMP_ADDS%/*}"
+    printf '%s' "$DUMP_ADDS_TEXT" > "$DUMP_ADDS"
+fi
 [ "${DUMP_FAIL:-0}" = 0 ]
 SCRIPT
 chmod +x "$tmp/bin/psql" "$tmp/bin/pg_dump"
@@ -25,10 +30,14 @@ digest() {
 mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 inode() { stat -c %i "$1" 2>/dev/null || stat -f %i "$1"; }
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
+# The relative path at which the app stores TEXT under WORKSPACE.
+stored_path() {
+    hex=$(printf '%s' "$2" | digest)
+    printf '%s\n' "$1/sha256/$(printf '%s' "$hex" | cut -c1-2)/$(printf '%s' "$hex" | cut -c3-4)/$hex"
+}
 # Stores TEXT the way the app does, under WORKSPACE, and prints its relative path.
 blob() {
-    hex=$(printf '%s' "$2" | digest)
-    relative="$1/sha256/$(printf '%s' "$hex" | cut -c1-2)/$(printf '%s' "$hex" | cut -c3-4)/$hex"
+    relative=$(stored_path "$1" "$2")
     mkdir -p "$tmp/artifacts/${relative%/*}"
     printf '%s' "$2" > "$tmp/artifacts/$relative"
     printf '%s\n' "$relative"
@@ -77,6 +86,13 @@ rm "$tmp/artifacts/$second"
 three=$(backups .files | grep -vxF -e "$one" -e "$two")
 [ ! -e "$three/$second" ] || fail 'a removed file leaves the next backup'
 [ -f "$two/$second" ] || fail 'an older backup keeps it'
+
+# The copy comes after the dump, so it holds every file the dump can name: here, one stored
+# while the dump runs.
+during=$(stored_path "$w2" 'stored during the dump')
+DUMP_ADDS="$tmp/artifacts/$during" DUMP_ADDS_TEXT='stored during the dump' "$root/scripts/compose-backup.sh" 2> /dev/null
+four=$(backups .files | grep -vxF -e "$one" -e "$two" -e "$three")
+[ "$(cat "$four/$during" 2> /dev/null)" = 'stored during the dump' ] || fail 'the copy comes after the dump'
 
 # A failed dump publishes neither half.
 before=$(find "$KATWORK_BACKUP_DIR" | wc -l | tr -d ' ')
