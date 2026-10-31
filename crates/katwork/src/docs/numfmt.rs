@@ -9,7 +9,7 @@
 //! format's decimals, half away from zero, in decimal arithmetic (so 1.005 under `0.00` is 1.01).
 use std::str::FromStr;
 
-use chrono::{Datelike, Days, NaiveDate};
+use chrono::{Datelike, Days, NaiveDate, NaiveDateTime, Timelike};
 use rust_decimal::{Decimal, RoundingStrategy};
 
 use super::CellKind;
@@ -182,6 +182,30 @@ pub fn serial_to_date(serial: f64, date1904: bool) -> Option<NaiveDate> {
         }
     };
     (date.year() <= 9999).then_some(date)
+}
+
+/// The Excel serial number of `date`, as `serial_to_date` counts days (Excel's 29 February 1900
+/// included in the 1900 system), its time of day the fraction. `None` before the system's first
+/// day (1900-01-01, or 1904-01-01 in the 1904 system) and past 9999-12-31.
+pub fn date_to_serial(date: NaiveDateTime, date1904: bool) -> Option<f64> {
+    let day = date.date();
+    if day.year() > 9999 {
+        return None;
+    }
+    let (epoch, first) = if date1904 {
+        (NaiveDate::from_ymd_opt(1904, 1, 1)?, 0)
+    } else if day <= NaiveDate::from_ymd_opt(1900, 2, 28)? {
+        (NaiveDate::from_ymd_opt(1899, 12, 31)?, 1)
+    } else {
+        (NaiveDate::from_ymd_opt(1899, 12, 30)?, 1)
+    };
+    let days = day.signed_duration_since(epoch).num_days();
+    if days < first {
+        return None;
+    }
+    let time = date.time();
+    let seconds = f64::from(time.num_seconds_from_midnight()) + f64::from(time.nanosecond()) / 1e9;
+    Some(days as f64 + seconds / 86_400.0)
 }
 
 /// A number as SpreadsheetML stores it: XML Schema's `double` written without `INF` or `NaN`,

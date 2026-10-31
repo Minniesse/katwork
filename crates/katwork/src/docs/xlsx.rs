@@ -15,6 +15,7 @@ use std::{
     collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
 };
 
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use quick_xml::{
     NsReader,
     events::{BytesStart, Event},
@@ -2499,6 +2500,22 @@ fn finish_cell(
     row_hidden: bool,
     strings: &[Rst],
 ) -> Result<Option<Cell>, DocError> {
+    // A formula's empty cached value is a value: the cell shows nothing, and its formula's text
+    // is not read in its place.
+    if cell.formula.is_some()
+        && let Some(cached) = &cell.value
+    {
+        let empty = match cell.kind.as_str() {
+            "str" => cached.is_empty(),
+            "inlineStr" => false,
+            _ => cached
+                .trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'))
+                .is_empty(),
+        };
+        if empty {
+            return Ok(None);
+        }
+    }
     let value = match (cell.kind.as_str(), cell.value, cell.inline) {
         ("inlineStr", _, Some(builder)) => Some(Value::Inline(builder.rst)),
         ("inlineStr", _, None) => None,
@@ -2558,7 +2575,7 @@ fn finish_cell(
         return Ok(None);
     }
     let kind = match cell.kind.as_str() {
-        "s" | "str" | "inlineStr" | "d" => CellKind::Text,
+        "s" | "str" | "inlineStr" => CellKind::Text,
         "b" => CellKind::Bool,
         "e" => CellKind::Error,
         _ => CellKind::Number,
@@ -2575,6 +2592,45 @@ fn finish_cell(
         formula,
         has_formula,
     }))
+}
+
+/// A `d` value as ISO 8601 writes a date, with or without a time of day and a trailing `Z`:
+/// `2024-01-31`, `2024-01-31T12:00`, `2024-01-31T12:00:00.5Z`.
+fn iso_date(text: &str) -> Option<NaiveDateTime> {
+    let text = text.strip_suffix('Z').unwrap_or(text);
+    let (date, time) = match text.split_once('T') {
+        Some((date, time)) => (date, Some(time)),
+        None => (text, None),
+    };
+    let shape = |text: &str, pattern: &str| {
+        text.len() == pattern.len()
+            && text.bytes().zip(pattern.bytes()).all(|(byte, expected)| {
+                if expected == b'9' {
+                    byte.is_ascii_digit()
+                } else {
+                    byte == expected
+                }
+            })
+    };
+    if !shape(date, "9999-99-99") {
+        return None;
+    }
+    let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    let time = match time {
+        None => NaiveTime::MIN,
+        Some(time) if shape(time, "99:99") => NaiveTime::parse_from_str(time, "%H:%M").ok()?,
+        Some(time) => {
+            let (whole, fraction) = time.split_once('.').unwrap_or((time, "9"));
+            if !shape(whole, "99:99:99")
+                || fraction.is_empty()
+                || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return None;
+            }
+            NaiveTime::parse_from_str(time, "%H:%M:%S%.f").ok()?
+        }
+    };
+    Some(date.and_time(time))
 }
 
 /// A stored string, decoded and held to Excel's 32,767 characters.
@@ -3077,6 +3133,7 @@ struct Made {
     hidden: Option<HiddenWhy>,
     run_why: Option<&'static str>,
     phonetic: bool,
+    suspect: Option<&'static str>,
 }
 
 impl Output<'_> {
@@ -3153,7 +3210,7 @@ impl Output<'_> {
                     cell: Some(made.facts.clone()),
                     unit_context: None,
                     hidden: made.hidden,
-                    suspect: None,
+                    suspect: made.suspect,
                 });
             }
         }
@@ -3204,16 +3261,31 @@ impl Output<'_> {
             Some(rst) => Some(self.runs(judge, rst, &styles)?),
             None => None,
         };
-        let (kind, cached) = match (&cell.value, &runs) {
-            (_, Some((text, ..))) => (CellKind::Text, Some(text.clone())),
-            (Some(Value::Number(text)), _) => (CellKind::Number, Some(text.clone())),
-            (Some(Value::Str(text) | Value::Date(text)), _) => (CellKind::Text, Some(text.clone())),
-            (Some(Value::Bool(value)), _) => (
+        // A `d` value is the serial number of the date it writes, when that is one Excel holds;
+        // anything else is its text, suspect, since what Excel shows for it is not known.
+        let date = match &cell.value {
+            Some(Value::Date(text)) => Some(
+                iso_date(text)
+                    .and_then(|date| numfmt::date_to_serial(date, self.date1904))
+                    .map(|serial| serial.to_string())
+                    .ok_or(text),
+            ),
+            _ => None,
+        };
+        let (kind, cached) = match (&cell.value, &runs, &date) {
+            (_, Some((text, ..)), _) => (CellKind::Text, Some(text.clone())),
+            (_, _, Some(Ok(serial))) => (CellKind::Number, Some(serial.clone())),
+            (_, _, Some(Err(text))) => (CellKind::Text, Some((*text).clone())),
+            (Some(Value::Number(text)), ..) => (CellKind::Number, Some(text.clone())),
+            (Some(Value::Str(text) | Value::Date(text)), ..) => {
+                (CellKind::Text, Some(text.clone()))
+            }
+            (Some(Value::Bool(value)), ..) => (
                 CellKind::Bool,
                 Some(if *value { "TRUE" } else { "FALSE" }.to_owned()),
             ),
-            (Some(Value::Error(text)), _) => (CellKind::Error, Some(text.clone())),
-            (Some(Value::Shared(_) | Value::Inline(_)), None) | (None, _) => (cell.kind, None),
+            (Some(Value::Error(text)), ..) => (CellKind::Error, Some(text.clone())),
+            (Some(Value::Shared(_) | Value::Inline(_)), None, _) | (None, ..) => (cell.kind, None),
         };
         let empty = |code: Option<&str>| {
             code.is_some_and(|code| match &cached {
@@ -3289,6 +3361,7 @@ impl Output<'_> {
             hidden,
             run_why,
             phonetic: rst.is_some_and(|rst| rst.phonetic),
+            suspect: matches!(date, Some(Err(_))).then_some("xlsx_date_text"),
         })
     }
 
