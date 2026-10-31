@@ -2456,12 +2456,19 @@ impl Judge<'_> {
                     return Paint::Bad;
                 };
                 match self.theme {
-                    Some(theme) if theme.slot(slot).is_some() => {
-                        Paint::Colours(vec![theme.resolve(slot, tint)])
-                    }
-                    // No theme part, or a slot it leaves unknown: the default Office theme's, and
-                    // the RGB value beside it.
-                    _ => {
+                    // The theme part's colour in whatever form it writes it; a slot it leaves
+                    // undecided is not one Excel's drawing can be known in.
+                    Some(theme) => match theme.candidates(slot) {
+                        Some(colours) => Paint::Colours(
+                            colours
+                                .iter()
+                                .map(|&colour| colour::apply_tint(colour, tint))
+                                .collect(),
+                        ),
+                        None => Paint::Bad,
+                    },
+                    // No theme part: the default Office theme's, and the RGB value beside it.
+                    None => {
                         let default = ThemeColours::office_default().resolve(slot, tint);
                         let beside = match spec.rgb {
                             Attr::Value(rgb) => vec![colour::apply_tint(rgb, tint)],

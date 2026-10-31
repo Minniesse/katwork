@@ -2291,6 +2291,108 @@ fn xlsx_colour_attribute_priority_and_palettes() {
 }
 
 #[test]
+fn xlsx_theme_colours_resolve_every_form_or_hide() {
+    // A font in `theme="4"` (accent1) on no fill, under a theme part whose accent1 is written in
+    // each DrawingML colour form: white in any form hides the text, black shows it, and a slot
+    // the reader cannot resolve hides it.
+    let mut styles = StyleSet::new();
+    let accent = styles.with_font(r#"<sz val="11"/><color theme="4"/>"#);
+    let judged = |slot: &str| {
+        let theme = theme(&[("accent1", &format!("<a:accent1>{slot}</a:accent1>"))]);
+        let extracted = read(&book(&styles, &row(1, &num("A1", accent, "1"))).theme(&theme));
+        hidden(&extracted, "Sheet1", "A1")
+    };
+    for white in [
+        r#"<a:srgbClr val="FFFFFF"/>"#,
+        r#"<a:prstClr val="white"/>"#,
+        r#"<a:scrgbClr r="100000" g="100000" b="100000"/>"#,
+        r#"<a:hslClr hue="0" sat="0" lum="100000"/>"#,
+        r#"<a:srgbClr val="000000"><a:lumMod val="0"/><a:lumOff val="100000"/></a:srgbClr>"#,
+        r#"<a:srgbClr val="000000"><a:lum val="100000"/></a:srgbClr>"#,
+        r#"<a:srgbClr val="000000"><a:inv/></a:srgbClr>"#,
+        r#"<a:srgbClr val="808080"><a:tint val="0"/></a:srgbClr>"#,
+        // A 15% tint of black is D9D9D9 in sRGB, which shows, but EDEDED in linear light,
+        // which does not: both are candidates.
+        r#"<a:srgbClr val="000000"><a:tint val="15000"/></a:srgbClr>"#,
+        r#"<a:srgbClr val="FFFFFF"><a:alpha val="100000"/></a:srgbClr>"#,
+        r#"<a:srgbClr val="FF0000"><a:satMod val="0"/><a:lumMod val="200000"/></a:srgbClr>"#,
+        r#"<a:schemeClr val="lt1"/>"#,
+        r#"<a:schemeClr val="bg1"/>"#,
+        r#"<a:sysClr val="window"/>"#,
+        // A system colour is drawn as the system names it; the colour its writer last saw is a
+        // second candidate.
+        r#"<a:sysClr val="window" lastClr="000000"/>"#,
+        r#"<a:sysClr val="windowText" lastClr="FFFFFF"/>"#,
+    ] {
+        assert_eq!(judged(white), Some(HiddenWhy::LowContrast), "{white}");
+    }
+    for dark in [
+        r#"<a:srgbClr val="000000"/>"#,
+        r#"<a:prstClr val="black"/>"#,
+        r#"<a:prstClr val="navy"/>"#,
+        r#"<a:prstClr val="dkBlue"/>"#,
+        r#"<a:scrgbClr r="0" g="0" b="0"/>"#,
+        r#"<a:hslClr hue="0" sat="0" lum="0"/>"#,
+        r#"<a:hslClr hue="14400000" sat="100000" lum="25000"/>"#,
+        r#"<a:srgbClr val="FFFFFF"><a:lumMod val="0"/></a:srgbClr>"#,
+        r#"<a:srgbClr val="FFFFFF"><a:shade val="0"/></a:srgbClr>"#,
+        r#"<a:srgbClr val="FFFFFF"><a:inv/></a:srgbClr>"#,
+        r#"<a:srgbClr val="FFFFFF"><a:gray/><a:lumMod val="10000"/></a:srgbClr>"#,
+        r#"<a:schemeClr val="dk1"/>"#,
+        r#"<a:schemeClr val="tx1"/>"#,
+        r#"<a:sysClr val="windowText" lastClr="000000"/>"#,
+        r#"<a:sysClr val="windowText"/>"#,
+    ] {
+        assert_eq!(judged(dark), None, "{dark}");
+    }
+    for undecided in [
+        "",
+        r#"<a:prstClr val="notAColour"/>"#,
+        r#"<a:srgbClr val="00000G"/>"#,
+        r#"<a:srgbClr val="000000"/><a:srgbClr val="000000"/>"#,
+        r#"<a:hslClr hue="0" sat="0"/>"#,
+        r#"<a:srgbClr val="000000"><a:unknownTransform val="1"/></a:srgbClr>"#,
+        r#"<a:srgbClr val="000000"><a:lumMod val="many"/></a:srgbClr>"#,
+        r#"<a:srgbClr val="000000"><a:alpha val="0"/></a:srgbClr>"#,
+        r#"<a:srgbClr val="000000"><a:alpha val="50000"/></a:srgbClr>"#,
+        r#"<a:srgbClr val="000000"><a:alphaMod val="50000"/></a:srgbClr>"#,
+        r#"<a:schemeClr val="phClr"/>"#,
+        r#"<a:schemeClr val="accent1"/>"#,
+        r#"<a:sysClr val="btnFace" lastClr="000000"/>"#,
+        r#"<a:sysClr lastClr="000000"/>"#,
+        r#"<x:colour xmlns:x="urn:example:other"/>"#,
+    ] {
+        assert_eq!(
+            judged(undecided),
+            Some(HiddenWhy::LowContrast),
+            "{undecided}"
+        );
+    }
+    // A theme part with no accent1 leaves it undecided too; with no theme part at all, the
+    // default Office theme's accent1 (blue) shows on white.
+    let without = book(&styles, &row(1, &num("A1", accent, "1"))).theme(&theme(&[("accent1", "")]));
+    assert_eq!(
+        hidden(&read(&without), "Sheet1", "A1"),
+        Some(HiddenWhy::LowContrast)
+    );
+    let no_theme = book(&styles, &row(1, &num("A1", accent, "1")));
+    assert_eq!(hidden(&read(&no_theme), "Sheet1", "A1"), None);
+    // The cell's tint applies to the theme's colour in any form: navy lightened all the way is
+    // white.
+    let mut styles = StyleSet::new();
+    let lightened = styles.with_font(r#"<sz val="11"/><color theme="4" tint="1"/>"#);
+    let navy = theme(&[(
+        "accent1",
+        r#"<a:accent1><a:prstClr val="navy"/></a:accent1>"#,
+    )]);
+    let extracted = read(&book(&styles, &row(1, &num("A1", lightened, "1"))).theme(&navy));
+    assert_eq!(
+        hidden(&extracted, "Sheet1", "A1"),
+        Some(HiddenWhy::LowContrast)
+    );
+}
+
+#[test]
 fn xlsx_fill_ids_0_and_1_are_never_solid() {
     // The file writes fills 0 and 1 solid black; Excel keeps them `none` and `gray125`.
     let styles = format!(
