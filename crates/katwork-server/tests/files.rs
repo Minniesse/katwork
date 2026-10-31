@@ -69,13 +69,22 @@ impl Drop for TestDir {
     }
 }
 
+/// What the test store's `commit` does.
+enum OnCommit {
+    /// Commits, as the local store does.
+    Commit,
+    /// Signals the gate after the real rename and waits for its release, so a test can act
+    /// while the blob is in place and its transaction has not committed.
+    PauseAfterRename(Gate),
+    /// Panics before any file I/O, as a bug in a store would.
+    Panic,
+}
+
 /// The local store, with a fixed answer for free space so no test depends on the disk.
 struct FreeBytes {
     inner: LocalBlobStore,
     free: u64,
-    /// When set, `commit` signals it after the real rename and waits for its release, so a test
-    /// can act while the blob is in place and its transaction has not committed.
-    after_rename: Option<Gate>,
+    on_commit: OnCommit,
 }
 
 #[async_trait::async_trait]
@@ -85,12 +94,16 @@ impl BlobStore for FreeBytes {
     }
 
     async fn commit(&self, staged: StagedBlob) -> Result<BlobRef, KatError> {
-        let blob = self.inner.commit(staged).await?;
-        if let Some(gate) = &self.after_rename {
-            gate.reached.notify_one();
-            gate.release.notified().await;
+        match &self.on_commit {
+            OnCommit::Commit => self.inner.commit(staged).await,
+            OnCommit::PauseAfterRename(gate) => {
+                let blob = self.inner.commit(staged).await?;
+                gate.reached.notify_one();
+                gate.release.notified().await;
+                Ok(blob)
+            }
+            OnCommit::Panic => panic!("the test store's commit panics"),
         }
-        Ok(blob)
     }
 
     async fn read(&self, blob: &BlobRef, max_bytes: u64) -> Result<Vec<u8>, KatError> {
@@ -126,12 +139,12 @@ impl Env {
     }
 
     async fn with_free(pool: &PgPool, tweak: impl FnOnce(&mut Config), free: u64) -> Self {
-        Self::build(pool, pool.clone(), tweak, free, None).await
+        Self::build(pool, pool.clone(), tweak, free, OnCommit::Commit).await
     }
 
-    /// The app whose store pauses at `gate` after each rename.
-    async fn paused_after_rename(pool: &PgPool, gate: Gate) -> Self {
-        Self::build(pool, pool.clone(), |_| {}, u64::MAX / 4, Some(gate)).await
+    /// The app whose store does `on_commit` in each commit.
+    async fn committing(pool: &PgPool, on_commit: OnCommit) -> Self {
+        Self::build(pool, pool.clone(), |_| {}, u64::MAX / 4, on_commit).await
     }
 
     /// The app on a pool of one connection, which `drop_during_guarded_statement` needs.
@@ -141,7 +154,7 @@ impl Env {
             .connect_with((*pool.connect_options()).clone())
             .await
             .unwrap();
-        Self::build(pool, single, |_| {}, u64::MAX / 4, None).await
+        Self::build(pool, single, |_| {}, u64::MAX / 4, OnCommit::Commit).await
     }
 
     async fn build(
@@ -149,7 +162,7 @@ impl Env {
         app_pool: PgPool,
         tweak: impl FnOnce(&mut Config),
         free: u64,
-        after_rename: Option<Gate>,
+        on_commit: OnCommit,
     ) -> Self {
         let (user, cookie) = person(pool).await;
         let workspace = workspace::create(pool, "Files", user, LOCK).await.unwrap();
@@ -168,7 +181,7 @@ impl Env {
         let store = FreeBytes {
             inner: LocalBlobStore::new(dir.0.join("artifacts")).unwrap(),
             free,
-            after_rename,
+            on_commit,
         };
         let core = Arc::new(Core::new(app_pool, Arc::new(config)).with_blob_store(Arc::new(store)));
         let app = build_router(AppState { core: core.clone() });
@@ -1160,7 +1173,7 @@ async fn upload_commits_when_its_client_leaves_after_the_rename(pool: PgPool) {
         reached: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
     };
-    let env = Env::paused_after_rename(&pool, gate.clone()).await;
+    let env = Env::committing(&pool, OnCommit::PauseAfterRename(gate.clone())).await;
     let bytes = b"kept after the client left";
     let request = post(
         &env.upload_uri("kept.txt"),
@@ -1193,6 +1206,20 @@ async fn upload_commits_when_its_client_leaves_after_the_rename(pool: PgPool) {
     })
     .await;
     wait_for(|| env.tmp_files().is_empty()).await;
+    assert_pool_clean(&env.core.pool).await;
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
+async fn a_panic_in_the_commit_answers_500_and_frees_the_slot(pool: PgPool) {
+    let env = Env::committing(&pool, OnCommit::Panic).await;
+    assert_code(
+        env.upload("panics.txt", b"never stored").await,
+        500,
+        "io_error",
+    )
+    .await;
+    env.assert_nothing_stored().await;
+    env.assert_slots_free();
     assert_pool_clean(&env.core.pool).await;
 }
 
