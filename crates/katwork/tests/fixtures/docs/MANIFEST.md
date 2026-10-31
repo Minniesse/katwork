@@ -52,3 +52,4 @@ checks that the committed seeds are exactly the files listed, with these hashes.
 | `xlsx/formulas.xlsx` | `530de5546df851c5030d18046593914cd34c27cb4aeb7431f6f514147f3f19a2` | a 1904 workbook that recalculates on load, with shared formulas, every cell type and escapes |
 | `xlsx/prefixed.xlsx` | `0fab3942936bc6394f9f73b592dfe39ad73315105a8714b4aa12fe27907c7e1f` | SpreadsheetML under a prefix, with an external link and macros the reader warns about |
 | `xlsx/strict.xlsx` | `a71085b8e1cb06d1b8d8453c269de48a9651a3bc857e80c9629f44f9aada1e39` | a Strict SpreadsheetML workbook |
+| `xlsx/huge-numbers.xlsx` | `8b5a70668a8a5ee4f38f77c97d2e04cab3a2d285a05806a261fe392b2b144743` | numbers too large for a decimal at their format's decimals, under built-in ids 2 and 4 and custom formats |

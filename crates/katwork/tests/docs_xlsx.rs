@@ -2947,6 +2947,63 @@ fn numfmt_rounds_decimal_half_away_from_zero() {
 }
 
 #[test]
+fn numfmt_huge_numbers_and_point_formats_show_every_digit() {
+    // Too large for a decimal to hold at the format's decimals: the decimals it cannot hold are
+    // zeros, since the value is rounded to Excel's 15 significant digits first.
+    for (value, code, shown) in [
+        ("1e27", "0.00", "1000000000000000000000000000.00"),
+        (
+            "1E27",
+            "#,##0.00",
+            "1,000,000,000,000,000,000,000,000,000.00",
+        ),
+        ("1e20", "0.000000000", "100000000000000000000.000000000"),
+        (
+            "79228162514264337593543950335",
+            "0.0",
+            "79228162514264300000000000000.0",
+        ),
+        ("1e28", "0.00", "10000000000000000000000000000.00"),
+        ("5e28", "0.0000", "50000000000000000000000000000.0000"),
+        ("-1e27", "0.00", "-1000000000000000000000000000.00"),
+        // A format with no integer placeholder still shows the integer digits.
+        ("12.5", ".00", "12.50"),
+        ("1234.5", "#,.0", "1.2"),
+        ("0.5", ".00", ".50"),
+        ("-12.5", ".0", "-12.5"),
+    ] {
+        assert_eq!(
+            numfmt::display(value, code).as_deref(),
+            Some(shown),
+            "{value} {code}"
+        );
+        assert!(
+            !numfmt::section_is_empty(value, CellKind::Number, code),
+            "{value} {code}"
+        );
+    }
+    // Read through a workbook, under built-in ids 2 (`0.00`) and 4 (`#,##0.00`).
+    let mut styles = StyleSet::new();
+    let (two, four) = (styles.xf(2, 0, 0), styles.xf(4, 0, 0));
+    let cells = [
+        num("A1", two, "1E27"),
+        num("B1", four, "1E27"),
+        num("C1", two, "123"),
+        num("D1", two, "79228162514264337593543950335"),
+    ];
+    let extracted = read(&book(&styles, &row(1, &cells.concat())));
+    for (at, shown) in [
+        ("A1", "1000000000000000000000000000.00"),
+        ("B1", "1,000,000,000,000,000,000,000,000,000.00"),
+        ("C1", "123.00"),
+        ("D1", "79228162514264300000000000000.00"),
+    ] {
+        assert_eq!(block(&extracted, "Sheet1", at).text, shown, "{at}");
+        assert_eq!(hidden(&extracted, "Sheet1", at), None, "{at}");
+    }
+}
+
+#[test]
 fn numfmt_is_date_format_table() {
     for id in (14..=22).chain(45..=47).chain(71..=81) {
         let code = numfmt::builtin(id).unwrap();

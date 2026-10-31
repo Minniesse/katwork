@@ -7230,6 +7230,19 @@ fn seeds() -> Vec<(&'static str, &'static str, &'static str, Vec<u8>)> {
             .sheet("S", r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#)
             .workbook_xml(&format!(r#"<?xml version="1.0"?><workbook xmlns="{STRICT_SML}" xmlns:r="{RELATIONSHIPS}"><sheets><sheet name="S" sheetId="1" r:id="rIdS0"/></sheets></workbook>"#))
             .build()),
+        ("xlsx", "huge-numbers.xlsx", "numbers too large for a decimal at their format's decimals, under built-in ids 2 and 4 and custom formats", {
+            let mut styles = StyleSet::new();
+            let (two, four) = (styles.xf(2, 0, 0), styles.xf(4, 0, 0));
+            let nine = styles.with_format("0.000000000");
+            let one = styles.with_format("0.0");
+            let point = styles.with_format(".00");
+            Xlsx::new()
+                .styles(&styles.xml())
+                .sheet("S", &format!(
+                    r#"<sheetData><row r="1"><c r="A1" s="{two}"><v>1E27</v></c><c r="B1" s="{four}"><v>1E27</v></c><c r="C1" s="{nine}"><v>1e20</v></c><c r="D1" s="{one}"><v>79228162514264337593543950335</v></c><c r="E1" s="{two}"><v>5e28</v></c><c r="F1" s="{point}"><v>12.5</v></c></row></sheetData>"#
+                ))
+                .build()
+        }),
     ]
 }
 

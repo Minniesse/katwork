@@ -675,9 +675,12 @@ fn render(section: &Section, magnitude: Decimal) -> Option<String> {
     }
     let mut rounded =
         value.round_dp_with_strategy(decimals, RoundingStrategy::MidpointAwayFromZero);
+    // A value too large for a decimal at this many decimals keeps fewer: the ones it cannot
+    // hold are zeros, since it was rounded to 15 significant digits.
     rounded.rescale(decimals);
     let text = rounded.to_string();
     let (whole, part) = text.split_once('.').unwrap_or((&text, ""));
+    let part = format!("{part:0<width$}", width = fraction.len());
     let whole = if whole == "0" { "" } else { whole };
     let mut out = String::new();
     for token in &tokens[..first] {
@@ -686,7 +689,7 @@ fn render(section: &Section, magnitude: Decimal) -> Option<String> {
     out.push_str(&fill_integer(&integer, whole, grouping));
     if point.is_some() {
         out.push('.');
-        out.push_str(&fill_fraction(&fraction, part));
+        out.push_str(&fill_fraction(&fraction, &part));
     }
     for token in &tokens[end..] {
         out.push_str(&literal(token)?);
@@ -695,8 +698,12 @@ fn render(section: &Section, magnitude: Decimal) -> Option<String> {
 }
 
 /// The integer digits laid into their placeholders from the right, the leftmost taking any left
-/// over: a missing digit is `0` under `0`, a space under `?` and nothing under `#`.
+/// over: a missing digit is `0` under `0`, a space under `?` and nothing under `#`. With no
+/// integer placeholder (`.00`) every integer digit still shows, as Excel shows them.
 fn fill_integer(placeholders: &[Placeholder], digits: &str, grouping: bool) -> String {
+    if placeholders.is_empty() {
+        return digits.to_owned();
+    }
     let digits: Vec<char> = digits.chars().collect();
     let mut left = digits.len();
     let mut out = Vec::new();
@@ -740,10 +747,13 @@ fn fill_integer(placeholders: &[Placeholder], digits: &str, grouping: bool) -> S
 fn fill_fraction(placeholders: &[Placeholder], digits: &str) -> String {
     let mut out: Vec<Option<char>> = digits.chars().map(Some).collect();
     for (at, placeholder) in placeholders.iter().enumerate().rev() {
-        if out[at] != Some('0') || *placeholder == Placeholder::Zero {
+        let Some(digit) = out.get_mut(at) else {
+            continue;
+        };
+        if *digit != Some('0') || *placeholder == Placeholder::Zero {
             break;
         }
-        out[at] = (*placeholder == Placeholder::Question).then_some(' ');
+        *digit = (*placeholder == Placeholder::Question).then_some(' ');
     }
     out.into_iter().flatten().collect()
 }
