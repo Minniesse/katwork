@@ -556,8 +556,10 @@ fn trailer_offsets(bytes: &[u8], at: usize) -> Option<(Option<i64>, Option<i64>)
     }
 }
 
-/// The classic table at `offset` (which starts with `xref`). lopdf reads every entry that
-/// follows a subsection header, whatever its count says.
+/// The classic table at `offset` (which starts with `xref`), read strictly: each subsection
+/// holds exactly the rows its header counts. lopdf reads every row that follows a header,
+/// whatever the count, while viewers rebuild a table whose counts lie; so a section whose
+/// rows and counts disagree is one lopdf may read differently from a viewer (`None`).
 fn table_section(bytes: &[u8], offset: usize) -> Result<Option<Section>, DocError> {
     let mut cursor = Cursor {
         bytes,
@@ -576,20 +578,18 @@ fn table_section(bytes: &[u8], offset: usize) -> Result<Option<Section>, DocErro
             cursor.at += 7;
             break;
         }
-        let (Some(start), Some(_count)) = (cursor.unsigned(), cursor.unsigned()) else {
+        let (Some(start), Some(count)) = (cursor.unsigned(), cursor.unsigned()) else {
             return Ok(None);
         };
-        for index in 0u64.. {
-            let row = cursor.at;
+        for index in 0..count {
             let (Some(position), Some(generation)) = (cursor.unsigned(), cursor.unsigned()) else {
-                cursor.at = row;
-                break;
+                // Fewer rows than the count.
+                return Ok(None);
             };
             cursor.skip();
             let kind = cursor.rest().first().copied();
             if !matches!(kind, Some(b'n' | b'f')) {
-                cursor.at = row;
-                break;
+                return Ok(None);
             }
             cursor.at += 1;
             read += 1;
@@ -613,6 +613,16 @@ fn table_section(bytes: &[u8], offset: usize) -> Result<Option<Section>, DocErro
                 _ => section.free.push(number),
             }
         }
+        // More rows than the count: what follows is a row, not a header or the trailer.
+        let after = cursor.at;
+        let row = cursor.unsigned().is_some() && cursor.unsigned().is_some() && {
+            cursor.skip();
+            matches!(cursor.rest().first(), Some(b'n' | b'f'))
+        };
+        if row {
+            return Ok(None);
+        }
+        cursor.at = after;
     }
     let Some((prev, stream)) = trailer_offsets(bytes, cursor.at) else {
         return Ok(None);
@@ -875,11 +885,88 @@ fn freed_numbers(
     ))
 }
 
+/// The member numbers an object stream's header lists, in order (`None` when it cannot be
+/// read).
+fn members_of(stream: &Stream) -> Option<Vec<u32>> {
+    let count = usize::try_from(stream.dict.get(b"N").ok()?.as_i64().ok()?).ok()?;
+    let first = usize::try_from(stream.dict.get(b"First").ok()?.as_i64().ok()?).ok()?;
+    let header = stream.content.get(..first)?;
+    let mut cursor = Cursor {
+        bytes: header,
+        at: 0,
+    };
+    let mut members = Vec::with_capacity(count.min(header.len() / 4));
+    for _ in 0..count {
+        let number = u32::try_from(cursor.unsigned()?).ok()?;
+        cursor.unsigned()?;
+        members.push(number);
+    }
+    Some(members)
+}
+
+/// Whether every in-use entry of lopdf's table points at its own object: a classic entry at
+/// the header `n g obj` of its own number and generation, and a compressed entry at the member
+/// of its index, in an object stream that lists its number once. lopdf files each object it
+/// parses under the number its header or object stream gives, so an entry that points
+/// elsewhere lets another definition, or a second copy, stand in for the one viewers use.
+fn entries_point_home(bytes: &[u8], doc: &Document) -> Result<bool, DocError> {
+    let base = bytes
+        .windows(5)
+        .position(|five| five == b"%PDF-")
+        .unwrap_or(0);
+    let bytes = &bytes[base..];
+    let mut containers: HashMap<u32, Option<Vec<u32>>> = HashMap::new();
+    for (checked, (number, entry)) in doc.reference_table.entries.iter().enumerate() {
+        if checked % 4096 == 4095 {
+            deadline::check()?;
+        }
+        match entry {
+            XrefEntry::Normal { offset, generation } => {
+                let mut cursor = Cursor {
+                    bytes,
+                    at: *offset as usize,
+                };
+                let header = (cursor.unsigned(), cursor.unsigned());
+                cursor.skip();
+                let home = header == (Some(u64::from(*number)), Some(u64::from(*generation)))
+                    && cursor.rest().starts_with(b"obj");
+                if !home {
+                    return Ok(false);
+                }
+            }
+            XrefEntry::Compressed { container, index } => {
+                let members = containers.entry(*container).or_insert_with(|| {
+                    let generation = match doc.reference_table.get(*container) {
+                        Some(XrefEntry::Normal { generation, .. }) => *generation,
+                        _ => return None,
+                    };
+                    match doc.objects.get(&(*container, generation)) {
+                        Some(Object::Stream(stream)) => members_of(stream),
+                        _ => None,
+                    }
+                });
+                let Some(members) = members else {
+                    return Ok(false);
+                };
+                let home = members.get(usize::from(*index)) == Some(number)
+                    && members.iter().filter(|member| *member == number).count() == 1;
+                if !home {
+                    return Ok(false);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(true)
+}
+
 /// Loads `bytes` with lopdf under the open budget (`BudgetScope`), then refuses an encrypted
 /// result and, when lopdf read the cross-reference table as written, drops every object the
 /// table does not list as in use and every object a newer section frees, so a deleted
-/// object's old copy is never read. When the sections cannot be read again as lopdf read them,
-/// the document is treated as one whose table lopdf rebuilt (`PrescanReport::xref_rebuilt`).
+/// object's old copy is never read. When the sections cannot be read again exactly as lopdf
+/// read them (a subsection whose rows and count disagree among them), or an entry does not
+/// point at its own object, the document is treated as one whose table lopdf rebuilt
+/// (`PrescanReport::xref_rebuilt`).
 pub(crate) fn load(bytes: &[u8], limits: &DocLimits) -> Result<Document, DocError> {
     scan_bytes(bytes, limits)?;
     let options = LoadOptions {
@@ -910,6 +997,8 @@ pub(crate) fn load(bytes: &[u8], limits: &DocLimits) -> Result<Document, DocErro
     } else {
         freed_numbers(bytes, &doc, limits)?
     };
+    // Every entry must point at its own object, or another definition stands in for it.
+    let home = freed.is_some() && entries_point_home(bytes, &doc)?;
     let is_freed = |number: u32| freed.as_ref().is_some_and(|freed| freed.contains(&number));
     // An object stream lopdf could not parse is dropped with its members; never read a file
     // with objects silently missing.
@@ -931,8 +1020,9 @@ pub(crate) fn load(bytes: &[u8], limits: &DocLimits) -> Result<Document, DocErro
                     _ => false,
                 }
         });
-        if freed.is_none() {
-            // A deleted object may be back: read the file as one whose table was rebuilt.
+        if !home {
+            // A deleted object may be back, or another definition may stand in for one: read
+            // the file as one whose table was rebuilt.
             doc.xref_recovery = Some(XrefRecovery::Reconstructed);
         }
     }

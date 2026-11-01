@@ -502,3 +502,112 @@ pub fn text(size: f32, x: f32, y: f32, text: &str) -> String {
 pub fn utext(size: f32, x: f32, y: f32, text: &str) -> String {
     format!("BT /U {size} Tf {x} {y} Td {} Tj ET\n", Doc::utf16(text))
 }
+
+/// A file written object by object in the order given, a number repeated as given (an object
+/// defined twice is two definitions): the bytes so far and each definition's offset, in order.
+pub fn hand(objects: &[(u32, Vec<u8>)]) -> (Vec<u8>, Vec<usize>) {
+    let mut out = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+    let mut offsets = Vec::new();
+    for (id, body) in objects {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    (out, offsets)
+}
+
+/// `out` with `table` (from `xref` to its last row), a trailer of `trailer` and `startxref`.
+pub fn finish(mut out: Vec<u8>, table: &str, trailer: &str) -> Vec<u8> {
+    let start = out.len();
+    out.extend_from_slice(table.as_bytes());
+    out.extend_from_slice(
+        format!("trailer\n<< {trailer} >>\nstartxref\n{start}\n%%EOF\n").as_bytes(),
+    );
+    out
+}
+
+/// One in-use row of a classic table.
+pub fn row(offset: usize) -> String {
+    format!("{offset:010} 00000 n \n")
+}
+
+/// A file of `plain` objects, an object stream holding `members` exactly as given (a number may
+/// repeat) and a cross-reference stream: each plain object normal, and each `(number, index)`
+/// of `compressed` in the object stream.
+pub fn packed_by_hand(
+    plain: &[(u32, Vec<u8>)],
+    members: &[(u32, Vec<u8>)],
+    compressed: &[(u32, u16)],
+    root: u32,
+) -> Vec<u8> {
+    let highest = plain
+        .iter()
+        .chain(members)
+        .map(|(id, _)| *id)
+        .max()
+        .unwrap_or(0);
+    let (container, xref_id) = (highest + 1, highest + 2);
+    let mut index = String::new();
+    let mut data = Vec::new();
+    for (id, body) in members {
+        index.push_str(&format!("{id} {} ", data.len()));
+        data.extend_from_slice(body);
+        data.push(b'\n');
+    }
+    let mut content = index.into_bytes();
+    let first = content.len();
+    content.extend_from_slice(&data);
+    let mut objects = plain.to_vec();
+    objects.push((
+        container,
+        stream(
+            &format!(
+                "/Type /ObjStm /N {} /First {first} /Filter /FlateDecode",
+                members.len()
+            ),
+            &flate(&content),
+        ),
+    ));
+    let (mut out, offsets) = hand(&objects);
+    let numbers: Vec<u32> = objects.iter().map(|(id, _)| *id).collect();
+    let size = xref_id + 1;
+    let mut rows = Vec::new();
+    for number in 0..size {
+        let normal = numbers
+            .iter()
+            .position(|id| *id == number)
+            .map(|at| offsets[at] as u32)
+            .or_else(|| (number == xref_id).then_some(out.len() as u32));
+        let row: [u8; 7] = match (normal, compressed.iter().find(|(id, _)| *id == number)) {
+            (_, Some((_, at))) => [
+                2,
+                (container >> 24) as u8,
+                (container >> 16) as u8,
+                (container >> 8) as u8,
+                container as u8,
+                (at >> 8) as u8,
+                *at as u8,
+            ],
+            (Some(offset), None) => [
+                1,
+                (offset >> 24) as u8,
+                (offset >> 16) as u8,
+                (offset >> 8) as u8,
+                offset as u8,
+                0,
+                0,
+            ],
+            (None, None) => [0, 0, 0, 0, 0, 0xFF, 0xFF],
+        };
+        rows.extend_from_slice(&row);
+    }
+    let start = out.len();
+    out.extend_from_slice(format!("{xref_id} 0 obj\n").as_bytes());
+    out.extend_from_slice(&stream(
+        &format!("/Type /XRef /Size {size} /W [1 4 2] /Root {root} 0 R /Filter /FlateDecode"),
+        &flate(&rows),
+    ));
+    out.extend_from_slice(format!("\nendobj\nstartxref\n{start}\n%%EOF\n").as_bytes());
+    out
+}

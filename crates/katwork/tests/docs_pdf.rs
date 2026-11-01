@@ -696,8 +696,46 @@ fn pdf_transparency_groups_fold_into_their_content() {
         &format!("/XObject << /In {inner} 0 R >>"),
     );
     add(&mut page, &mut xobjects, "G13", "", outer);
+    // A later character, not only an area, replaces what it overlaps in a knockout group.
+    let g = group(
+        &mut doc,
+        true,
+        &format!(
+            "0 g {} {}",
+            text_at(24, "KNOCKCHAR"),
+            text_at(24, "WWWWWWWWW")
+        ),
+        "",
+    );
+    add(&mut page, &mut xobjects, "G14", "", g);
+    let g = group(
+        &mut doc,
+        false,
+        &format!(
+            "0 g {} {}",
+            text_at(4, "KNOCKFREE"),
+            text_at(4, "MMMMMMMMM")
+        ),
+        "",
+    );
+    add(&mut page, &mut xobjects, "G15", "", g);
     doc.page(&page, &format!("{states} /XObject << {xobjects} >>"));
     let extracted = read(&doc.build());
+    assert!(
+        hidden(&extracted).contains(&("KNOCKCHAR", HiddenWhy::UnknownPaint)),
+        "{:?}",
+        texts(&extracted)
+    );
+    assert!(
+        visible(&extracted)
+            .iter()
+            .any(|text| text.contains("KNOCKFREE"))
+    );
+    assert!(
+        hidden(&extracted)
+            .iter()
+            .all(|(text, _)| !text.contains("KNOCKFREE"))
+    );
     let unknown = Some(HiddenWhy::UnknownPaint);
     assert_verdicts(
         &extracted,
@@ -883,6 +921,15 @@ fn pdf_flate_bomb_fails_bounded() {
         read_counted(&doc.build(), &limits).0.unwrap_err(),
         DocError::TooComplex("stream_bytes")
     );
+    // Under the default limits, a stream inflating to 17 MiB stops at 16 MiB.
+    let mut doc = Doc::new();
+    doc.add(stream("/Filter /FlateDecode", &zeros(17 << 20)));
+    doc.page("", "");
+    let defaults = DocLimits::default();
+    let (result, decoded, walks) = read_counted(&doc.build(), &defaults);
+    assert_eq!(result.unwrap_err(), DocError::TooComplex("stream_bytes"));
+    assert!(decoded <= defaults.max_stream_bytes, "{decoded}");
+    assert_eq!(walks, 0);
 }
 
 fn raw_has(raw: &Raw, id: u32, needle: &str) -> bool {
@@ -2898,4 +2945,490 @@ fn hidden_why_names_match_serde() {
             serde_json::Value::String(why.as_str().to_owned())
         );
     }
+}
+
+// Fix round 1: cross-reference tables that lie, unbounded work, malformed Form boxes, glyph
+// widths, and the named limits.
+
+/// A one-page file's first four objects, its content stream left to the test as object 5: the
+/// catalog, the page tree, Helvetica and the page.
+fn page_objects() -> Vec<(u32, Vec<u8>)> {
+    vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (2, b"<< /Type /Pages /Kids [4 0 R] /Count 1 >>".to_vec()),
+        (
+            3,
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+                .to_vec(),
+        ),
+        (
+            4,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>"
+                .to_vec(),
+        ),
+    ]
+}
+
+fn content_of(word: &str) -> Vec<u8> {
+    stream("", text(10.0, 10.0, 100.0, word).as_bytes())
+}
+
+#[test]
+fn pdf_xref_subsection_count_must_match_its_rows() {
+    // Object 5 is defined twice, INJECTED first and BENIGN after an unrelated object 6.
+    let mut objects = page_objects();
+    objects.push((5, content_of("INJECTED")));
+    objects.push((6, b"<< >>".to_vec()));
+    objects.push((5, content_of("BENIGN")));
+    let (out, at) = hand(&objects);
+    let head = format!(
+        "xref\n0 5\n0000000000 65535 f \n{}{}{}{}",
+        row(at[0]),
+        row(at[1]),
+        row(at[2]),
+        row(at[3])
+    );
+    let trailer = "/Size 7 /Root 1 0 R";
+    // An honest `5 2` lists INJECTED and object 6, and every reader shows INJECTED.
+    let honest = finish(
+        out.clone(),
+        &format!("{head}5 2\n{}{}", row(at[4]), row(at[5])),
+        trailer,
+    );
+    let extracted = read(&honest);
+    assert_eq!(visible(&extracted), vec!["INJECTED"]);
+    assert_eq!(extracted.pages[0].text_layer, TextLayer::Ok);
+    // `5 1` followed by two rows: viewers rebuild the table and show BENIGN, so lopdf's reading
+    // cannot be trusted and the page is suspect. So is a count larger than its rows.
+    for count in [1, 3] {
+        let lying = finish(
+            out.clone(),
+            &format!("{head}5 {count}\n{}{}", row(at[4]), row(at[5])),
+            trailer,
+        );
+        let extracted = read(&lying);
+        assert_eq!(
+            extracted.pages[0].text_layer,
+            TextLayer::Suspect("xref_recovered"),
+            "count {count}"
+        );
+        assert!(
+            extracted
+                .warnings
+                .contains(&ExtractWarning::SuspectTextLayer {
+                    page: 1,
+                    why: "xref_recovered"
+                })
+        );
+    }
+}
+
+#[test]
+fn pdf_xref_entry_naming_another_object_is_not_read() {
+    // Entries 1 to 5 are honest; entry 6 points at a second definition of object 5.
+    let mut objects = page_objects();
+    objects.push((5, content_of("REALTEXT")));
+    objects.push((5, content_of("DECOYTEXT")));
+    let (out, at) = hand(&objects);
+    let rows: String = at.iter().map(|offset| row(*offset)).collect();
+    let file = finish(
+        out.clone(),
+        &format!("xref\n0 7\n0000000000 65535 f \n{rows}"),
+        "/Size 7 /Root 1 0 R",
+    );
+    let extracted = read(&file);
+    assert_eq!(
+        extracted.pages[0].text_layer,
+        TextLayer::Suspect("xref_recovered"),
+        "{:?}",
+        texts(&extracted)
+    );
+    // Without the decoy's entry, the table points every number home.
+    let rows: String = at[..5].iter().map(|offset| row(*offset)).collect();
+    let file = finish(
+        out,
+        &format!("xref\n0 6\n0000000000 65535 f \n{rows}"),
+        "/Size 6 /Root 1 0 R",
+    );
+    let extracted = read(&file);
+    assert_eq!(visible(&extracted), vec!["REALTEXT"]);
+    assert_eq!(extracted.pages[0].text_layer, TextLayer::Ok);
+}
+
+#[test]
+fn pdf_object_stream_member_index_follows_the_table() {
+    // Object 4, the page, sits in an object stream twice: the real page first, naming content
+    // 5, then a decoy naming content 6. The table gives 4 as member 0.
+    let page = |contents: u32| {
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Resources << /Font << /F1 3 0 R >> >> /Contents {contents} 0 R >>"
+        )
+        .into_bytes()
+    };
+    let objects = page_objects();
+    let mut plain = objects[..3].to_vec();
+    plain.push((5, content_of("REALTEXT")));
+    plain.push((6, content_of("DECOYTEXT")));
+    let doubled = packed_by_hand(&plain, &[(4, page(5)), (4, page(6))], &[(4, 0)], 1);
+    let extracted = read(&doubled);
+    assert_eq!(
+        extracted.pages[0].text_layer,
+        TextLayer::Suspect("xref_recovered"),
+        "{:?}",
+        texts(&extracted)
+    );
+    // A member at another index than the table's.
+    let moved = packed_by_hand(
+        &plain,
+        &[(9, b"<< >>".to_vec()), (4, page(5))],
+        &[(4, 0)],
+        1,
+    );
+    assert_eq!(
+        read(&moved).pages[0].text_layer,
+        TextLayer::Suspect("xref_recovered")
+    );
+    // Listed once, at its index, it reads.
+    let honest = packed_by_hand(&plain, &[(4, page(5))], &[(4, 0)], 1);
+    let extracted = read(&honest);
+    assert_eq!(visible(&extracted), vec!["REALTEXT"]);
+    assert_eq!(extracted.pages[0].text_layer, TextLayer::Ok);
+}
+
+/// A page `width` points wide with one line: `show` (a `Tj` operand or sequence) at 4 pt.
+fn wide_line(width: f32, show: &str) -> Vec<u8> {
+    let mut doc = Doc::new();
+    doc.size = (width, 50.0);
+    doc.page(&format!("BT /F1 4 Tf 10 20 Td {show} ET"), "");
+    doc.build()
+}
+
+#[tokio::test]
+async fn pdf_long_lines_read_within_the_deadline() {
+    // 100,000 glyphs on one line, ten letters round, and 100,000 spaces between two white
+    // letters: grouping them into lines is linear, so both read inside the call timeout.
+    let letters = wide_line(200_000.0, &format!("({}) Tj", "abcdefghij".repeat(10_000)));
+    let spaces = wide_line(
+        200_000.0,
+        &format!("1 g (A) Tj 0 g ({}) Tj 1 g (B) Tj", " ".repeat(100_000)),
+    );
+    let pool = docs::DocPool::new(1, limits()).unwrap();
+    let workspace = katwork::ids::WorkspaceId::new();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let read_in_pool = |file: Vec<u8>| {
+        pool.run(workspace, &cancel, None, move |limits| {
+            docs::extract(MediaKind::Pdf, &file, limits)
+        })
+    };
+    let extracted = read_in_pool(letters)
+        .await
+        .expect("within the call timeout");
+    let shown: usize = visible(&extracted)
+        .iter()
+        .map(|text| text.chars().count())
+        .sum();
+    assert_eq!(shown, 100_000);
+    let extracted = read_in_pool(spaces).await.expect("within the call timeout");
+    assert!(visible(&extracted).is_empty(), "{:?}", visible(&extracted));
+}
+
+/// `f` inside a job scope whose deadline passes at check `checks + 1`.
+fn after_checks<T>(checks: u32, f: impl FnOnce() -> T) -> T {
+    docs::deadline::scope(
+        std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        None,
+        u64::MAX,
+        || {
+            docs::deadline::expire_after_checks(checks);
+            f()
+        },
+    )
+}
+
+#[test]
+fn pdf_reader_loops_stop_at_the_job_deadline() {
+    // A Form whose one operator is a TJ of 100,000 numbers, drawn 100 times: 10 million array
+    // elements in 200 operators. The walker checks the deadline as it works through them.
+    let mut doc = Doc::new();
+    let numbers = "-1 ".repeat(100_000);
+    let form = doc.add(stream(
+        &format!(
+            "/Type /XObject /Subtype /Form /BBox [0 0 300 300] {} /Filter /FlateDecode",
+            doc.resources("")
+        ),
+        &flate(format!("BT /F1 10 Tf [{numbers}] TJ ET").as_bytes()),
+    ));
+    doc.page(
+        &"/Fm Do ".repeat(100),
+        &format!("/XObject << /Fm {form} 0 R >>"),
+    );
+    let fanout = doc.build();
+    assert_eq!(
+        after_checks(200, || read_with(&fanout, &limits())).unwrap_err(),
+        DocError::Timeout
+    );
+    // One line of 100,000 glyphs: grouping them into lines checks the deadline too. The walk
+    // and the visibility rules take fewer checks than LINE_CHECKS; the lines take more.
+    let line = wide_line(200_000.0, &format!("({}) Tj", "abcdefghij".repeat(10_000)));
+    assert_eq!(
+        after_checks(LINE_CHECKS, || read_with(&line, &limits())).unwrap_err(),
+        DocError::Timeout
+    );
+}
+
+/// Deadline checks on the long line before lines are made (below) and after (above).
+const LINE_CHECKS: u32 = 1_500;
+
+#[test]
+fn pdf_form_with_a_malformed_bbox_clips_everything() {
+    let mut doc = Doc::new();
+    let resources = doc.resources("");
+    let shown = text(10.0, 20.0, 100.0, "FORMBBOX");
+    let form = |doc: &mut Doc, bbox: &str| {
+        doc.add_stream(
+            &format!("/Type /XObject /Subtype /Form {bbox} {resources}"),
+            shown.as_bytes(),
+        )
+    };
+    let cases: Vec<(u32, Option<HiddenWhy>)> = vec![
+        (form(&mut doc, "/BBox [0 0 612]"), Some(HiddenWhy::Clipped)),
+        (
+            form(&mut doc, "/BBox [0 0 612 792 5]"),
+            Some(HiddenWhy::Clipped),
+        ),
+        (
+            form(&mut doc, "/BBox [0 0 (612) 792]"),
+            Some(HiddenWhy::Clipped),
+        ),
+        (form(&mut doc, "/BBox (box)"), Some(HiddenWhy::Clipped)),
+        // No /BBox at all: two of three renderers draw it.
+        (form(&mut doc, ""), None),
+        (form(&mut doc, "/BBox [0 0 300 300]"), None),
+    ];
+    for (form, _) in &cases {
+        doc.page("/Fm Do", &format!("/XObject << /Fm {form} 0 R >>"));
+    }
+    let extracted = read(&doc.build());
+    for (index, (_, why)) in cases.iter().enumerate() {
+        assert_eq!(
+            on_page(&extracted, index as u32 + 1),
+            vec![("FORMBBOX".to_owned(), *why, None)],
+            "case {index}"
+        );
+    }
+}
+
+#[test]
+fn pdf_glyph_width_far_past_the_font_size_is_suspect() {
+    // Helvetica with every width 50,000: at 12 pt each glyph's box is 600 pt wide, and Tc -595
+    // pulls the next glyph back, so each box's centre stands 300 pt right of its ink. The clip
+    // holds the centres and none of the ink; renderers draw nothing of the word.
+    let mut doc = Doc::new();
+    doc.size = (1000.0, 300.0);
+    let widths = "50000 ".repeat(95);
+    let wide = doc.add(format!(
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding /FirstChar 32 /LastChar 126 /Widths [{widths}] >>"
+    ));
+    doc.page(
+        "q 300 0 700 300 re W n BT /W 12 Tf -595 Tc 10 100 Td (CLIPWORDS) Tj ET Q \
+         BT /F1 12 Tf 10 50 Td (CONTROL) Tj ET",
+        &format!("/Font << /W {wide} 0 R >>"),
+    );
+    let extracted = read(&doc.build());
+    let word = block(&extracted, "CLIPWORDS");
+    assert_eq!((word.hidden, word.suspect), (None, Some("glyph_width")));
+    assert_eq!(block(&extracted, "CONTROL").suspect, None);
+}
+
+#[test]
+fn pdf_header_must_start_in_the_first_kilobyte() {
+    let mut doc = Doc::new();
+    doc.page(&text(10.0, 10.0, 100.0, "late header"), "");
+    let file = doc.build();
+    let shifted = |junk: usize| [vec![b' '; junk], file.clone()].concat();
+    assert_eq!(visible(&read(&shifted(1_019))), vec!["late header"]);
+    assert_eq!(error(&shifted(1_020)), DocError::Malformed("pdf_header"));
+    // An executable renamed .pdf.
+    assert_eq!(
+        error(b"MZ\x90\x00\x03\x00\x00\x00"),
+        DocError::Malformed("pdf_header")
+    );
+}
+
+#[test]
+fn pdf_over_max_input_is_too_large() {
+    let mut doc = Doc::new();
+    doc.page(&text(10.0, 10.0, 100.0, "x"), "");
+    let file = doc.build();
+    let limits = DocLimits {
+        max_input_bytes: file.len() as u64 - 1,
+        ..DocLimits::default()
+    };
+    assert_eq!(
+        read_with(&file, &limits).unwrap_err(),
+        DocError::TooLarge("input")
+    );
+}
+
+#[test]
+fn pdf_page_tree_depth_is_capped() {
+    // `levels` nested Pages nodes above one page: the root is at depth 1, the page at
+    // `levels + 1`, and the default cap is 32.
+    let nested = |levels: u32| {
+        let mut raw = Raw::new();
+        let catalog = raw.reserve();
+        let nodes: Vec<u32> = (0..levels).map(|_| raw.reserve()).collect();
+        let font = raw.add("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        let contents = raw.add(stream("", text(10.0, 10.0, 100.0, "deep page").as_bytes()));
+        let page = raw.add(format!(
+            "<< /Type /Page /Parent {} 0 R /MediaBox [0 0 300 300] /Resources << /Font << /F1 {font} 0 R >> >> /Contents {contents} 0 R >>",
+            nodes[nodes.len() - 1]
+        ));
+        for (level, node) in nodes.iter().enumerate() {
+            let kid = nodes.get(level + 1).copied().unwrap_or(page);
+            let parent = if level == 0 {
+                String::new()
+            } else {
+                format!("/Parent {} 0 R", nodes[level - 1])
+            };
+            raw.set(
+                *node,
+                format!("<< /Type /Pages {parent} /Kids [{kid} 0 R] /Count 1 >>"),
+            );
+        }
+        raw.set(
+            catalog,
+            format!("<< /Type /Catalog /Pages {} 0 R >>", nodes[0]),
+        );
+        raw.build(catalog, "")
+    };
+    assert_eq!(visible(&read(&nested(31))), vec!["deep page"]);
+    assert_eq!(error(&nested(32)), DocError::TooComplex("page_tree_depth"));
+}
+
+#[test]
+fn pdf_page_chars_areas_and_fonts_are_capped() {
+    // 200,001 glyphs on one page.
+    let mut doc = Doc::new();
+    doc.page(
+        &format!("BT /F1 1 Tf 0 10 Td ({}) Tj ET", "x".repeat(200_001)),
+        "",
+    );
+    assert_eq!(error(&doc.build()), DocError::TooComplex("page_chars"));
+    // 100,001 filled rectangles on one page.
+    let mut doc = Doc::new();
+    doc.page(&"0 0 1 1 re f\n".repeat(100_001), "");
+    assert_eq!(error(&doc.build()), DocError::TooComplex("areas"));
+    // 4,097 fonts.
+    let mut doc = Doc::new();
+    let mut fonts = String::from("/Font << ");
+    let mut content = String::from("BT ");
+    for at in 0..4_097 {
+        let font = doc.add(format!(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar {} /LastChar 126 >>",
+            32 + at % 2
+        ));
+        fonts.push_str(&format!("/X{at} {font} 0 R "));
+        content.push_str(&format!("/X{at} 10 Tf "));
+    }
+    fonts.push_str(">>");
+    content.push_str("ET");
+    doc.page(&content, &fonts);
+    assert_eq!(error(&doc.build()), DocError::TooComplex("fonts"));
+}
+
+#[test]
+fn pdf_each_attachment_marker_warns() {
+    let attachment = ExtractWarning::EmbeddedContentIgnored {
+        what: "pdf_attachment",
+    };
+    // An /EmbeddedFiles names tree alone, its file specification with no embedded stream.
+    let mut doc = Doc::new();
+    let spec = doc.add("<< /Type /Filespec /F (a.txt) >>");
+    doc.catalog(&format!(
+        "/Names << /EmbeddedFiles << /Names [(a.txt) {spec} 0 R] >> >>"
+    ));
+    doc.page(&text(10.0, 10.0, 100.0, "page text"), "");
+    assert_eq!(read(&doc.build()).warnings, vec![attachment.clone()]);
+    // A file attachment annotation alone.
+    let mut doc = Doc::new();
+    doc.add("<< /Type /Annot /Subtype /FileAttachment /Rect [0 0 10 10] >>");
+    doc.page(&text(10.0, 10.0, 100.0, "page text"), "");
+    assert_eq!(read(&doc.build()).warnings, vec![attachment]);
+}
+
+#[test]
+fn pdf_cmap_and_type1_caps_hold() {
+    // A ToUnicode map whose first 262,144 mappings all give A: the next one, for B, is past
+    // the cap and ignored, so B has no text.
+    let font_with_map = |map: &[u8]| {
+        let mut doc = Doc::new();
+        let cmap = doc.add(stream("", map));
+        let descendant = doc.add("<< /Type /Font /Subtype /CIDFontType2 /BaseFont /C /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> >>");
+        let font = doc.add(format!(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /C /Encoding /Identity-H /DescendantFonts [{descendant} 0 R] /ToUnicode {cmap} 0 R >>"
+        ));
+        doc.page(
+            "BT /C 10 Tf 10 100 Td <00410042> Tj ET",
+            &format!("/Font << /C {font} 0 R >>"),
+        );
+        visible(&read(&doc.build())).concat()
+    };
+    let singles = format!(
+        "262145 beginbfchar {}<0042> <0042>\nendbfchar",
+        "<0041> <0041>\n".repeat(262_144)
+    );
+    assert_eq!(font_with_map(singles.as_bytes()), "A");
+    let ranges = format!(
+        "65537 beginbfrange {}<0042> <0042> <0042>\nendbfrange",
+        "<0041> <0041> <0041>\n".repeat(65_536)
+    );
+    assert_eq!(font_with_map(ranges.as_bytes()), "A");
+    // A Type 1 program whose encoding comes after 1,048,576 other tokens is not read, so code
+    // 65 keeps the standard encoding's A instead of the program's B.
+    let program = |filler: usize| {
+        let mut doc = Doc::new();
+        let body = [
+            "0 ".repeat(filler).into_bytes(),
+            b"/Encoding 256 array dup 65 /B put readonly def eexec".to_vec(),
+        ]
+        .concat();
+        let file = doc.add(stream("", &body));
+        let descriptor = doc.add(format!(
+            "<< /Type /FontDescriptor /FontName /T /FontFile {file} 0 R >>"
+        ));
+        let font = doc.add(format!(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /T /FontDescriptor {descriptor} 0 R >>"
+        ));
+        doc.page(
+            "BT /T 10 Tf 10 100 Td (A) Tj ET",
+            &format!("/Font << /T {font} 0 R >>"),
+        );
+        visible(&read(&doc.build())).concat()
+    };
+    assert_eq!(program(10), "B");
+    assert_eq!(program(1_048_576), "A");
+}
+
+#[test]
+fn pdf_saved_state_depth_is_capped() {
+    // 300 nested q: the 257th to 300th are skipped with their Q, so after 44 Q the white set at
+    // the deepest level is still in force (a viewer would have restored black).
+    let mut doc = Doc::new();
+    doc.page(
+        &format!(
+            "{}1 g {}BT /F1 10 Tf 10 100 Td (DEEPWHITE) Tj ET {}BT /F1 10 Tf 10 50 Td (RESTORED) Tj ET",
+            "q ".repeat(300),
+            "Q ".repeat(44),
+            "Q ".repeat(256)
+        ),
+        "",
+    );
+    assert_verdicts(
+        &read(&doc.build()),
+        &[
+            ("DEEPWHITE", Some(HiddenWhy::LowContrast)),
+            ("RESTORED", None),
+        ],
+    );
 }

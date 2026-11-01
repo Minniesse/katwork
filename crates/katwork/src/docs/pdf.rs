@@ -20,9 +20,16 @@
 //! - A glyph whose text repeats that of a glyph or span not hidden earlier on its line, with its
 //!   box centre inside that one's box (within 5% of the font size), adds no text: it draws over
 //!   a character already read (Typst draws a cluster's positioned mark again with the cluster's
-//!   text; some producers overprint text to embolden it).
+//!   text; some producers overprint text to embolden it). The look-back covers the last 64
+//!   glyphs of the same text on the line.
+//! - A glyph whose advance is past three times its font size is `Suspect("glyph_width")`: its
+//!   box, which the rules test, may stand far from its ink. It is never taken for a repeat.
 //! - Ordinals count emitted blocks from 1 across the file, hidden blocks included.
-use std::{cell::Cell, collections::HashMap, rc::Rc};
+use std::{
+    cell::Cell,
+    collections::{HashMap, VecDeque},
+    rc::Rc,
+};
 
 use lopdf::Document;
 use pdf_extract::{
@@ -44,6 +51,15 @@ pub const MAX_PAGE_CHARS: usize = 200_000;
 pub const MAX_PAGE_AREAS: usize = 100_000;
 /// Distinct fonts one file may load (`TooComplex("fonts")`).
 pub const MAX_FONTS: usize = 4_096;
+/// A glyph advance past this many times its font size is no real glyph's: the box the rules
+/// test would stand far from the ink, so the character is `Suspect("glyph_width")`.
+pub const MAX_GLYPH_ADVANCE: f64 = 3.0;
+/// Earlier glyphs of the same text on a line that an overprinted repeat is looked for in.
+const REPEAT_WINDOW: usize = 64;
+/// Walker work units (array elements, glyphs, KiB of Form content) between deadline checks.
+const WORK_PER_CHECK: u64 = 1_024;
+/// Characters, line items and spans the grouping steps handle between deadline checks.
+const ITEMS_PER_CHECK: usize = 64;
 
 thread_local! {
     static WALKS: Cell<u64> = const { Cell::new(0) };
@@ -72,6 +88,8 @@ struct Char {
     size: f64,
     /// Shown from a font with no ToUnicode map in a way that loses text.
     unmapped_font: bool,
+    /// Its advance is past `MAX_GLYPH_ADVANCE` times its font size.
+    wide: bool,
 }
 
 #[derive(Default)]
@@ -89,6 +107,10 @@ struct Collector<'l> {
     pages: Vec<Scene>,
     scene: Scene,
     operators: u64,
+    /// Work units reported inside operators, and the count at which the deadline is next
+    /// checked.
+    work: u64,
+    next_check: u64,
     stop: Option<DocError>,
     groups: (Vec<u32>, Rc<[GroupPaint]>),
 }
@@ -205,6 +227,17 @@ impl OutputDev for Collector<'_> {
         Ok(())
     }
 
+    fn work(&mut self, units: u64) -> Result<(), OutputError> {
+        self.work = self.work.saturating_add(units);
+        if self.work >= self.next_check {
+            self.next_check = self.work.saturating_add(WORK_PER_CHECK);
+            if let Err(error) = deadline::check() {
+                return Err(self.fail(error));
+            }
+        }
+        Ok(())
+    }
+
     fn glyph(&mut self, glyph: &Glyph) -> Result<(), OutputError> {
         if self.scene.chars.len() >= MAX_PAGE_CHARS {
             return Err(self.fail(DocError::TooComplex("page_chars")));
@@ -257,6 +290,7 @@ impl OutputDev for Collector<'_> {
             direction: (glyph.trm.m11 / along, glyph.trm.m12 / along),
             size,
             unmapped_font: !font.has_to_unicode && (font.composite || !glyph.text.is_ascii()),
+            wide: glyph.width.abs() > MAX_GLYPH_ADVANCE,
         });
         Ok(())
     }
@@ -303,6 +337,8 @@ fn walk(
         pages: Vec::new(),
         scene: Scene::default(),
         operators: 0,
+        work: 0,
+        next_check: WORK_PER_CHECK,
         stop: None,
         groups: (Vec::new(), Rc::from(Vec::new())),
     };
@@ -364,14 +400,20 @@ fn is_mark(c: char) -> bool {
 
 /// Replaces each `/ActualText` span's glyph texts with its text, on its first glyph, and gives
 /// every glyph of the span the span's verdict.
-fn apply_actual_text(chars: &mut [Char], verdicts: &mut [Visibility]) {
+fn apply_actual_text(chars: &mut [Char], verdicts: &mut [Visibility]) -> Result<(), DocError> {
     let mut spans: HashMap<u32, Vec<usize>> = HashMap::new();
     for (at, char) in chars.iter().enumerate() {
+        if at % ITEMS_PER_CHECK == 0 {
+            deadline::check()?;
+        }
         if let Some((id, _)) = &char.actual {
             spans.entry(*id).or_default().push(at);
         }
     }
-    for members in spans.values() {
+    for (index, members) in spans.values().enumerate() {
+        if index % ITEMS_PER_CHECK == 0 {
+            deadline::check()?;
+        }
         let hidden = members.iter().find_map(|at| match verdicts[*at] {
             Visibility::Hidden(why) => Some(Visibility::Hidden(why)),
             _ => None,
@@ -397,6 +439,7 @@ fn apply_actual_text(chars: &mut [Char], verdicts: &mut [Visibility]) {
             verdicts[*at] = verdict;
         }
     }
+    Ok(())
 }
 
 /// Whether `inner`'s centre lies in `outer`, within 5% of `outer`'s height (its font size): a
@@ -409,12 +452,16 @@ fn holds(outer: [f32; 4], inner: [f32; 4]) -> bool {
 }
 
 /// The page's glyphs as lines, in painting order.
-fn lines(chars: &[Char], verdicts: &[Visibility]) -> Vec<Line> {
+fn lines(chars: &[Char], verdicts: &[Visibility]) -> Result<Vec<Line>, DocError> {
     let mut lines: Vec<Line> = Vec::new();
     let mut previous: Option<&Char> = None;
-    // The texts read on the current line, with their boxes, for overprinted repeats.
-    let mut read: Vec<(&str, [f32; 4])> = Vec::new();
-    for (char, verdict) in chars.iter().zip(verdicts) {
+    // The boxes of the last `REPEAT_WINDOW` glyphs read on the current line, by text, for
+    // overprinted repeats: a bounded look-back, so a line of any length costs linear time.
+    let mut read: HashMap<&str, VecDeque<[f32; 4]>> = HashMap::new();
+    for (at, (char, verdict)) in chars.iter().zip(verdicts).enumerate() {
+        if at % ITEMS_PER_CHECK == 0 {
+            deadline::check()?;
+        }
         let (hidden, suspect) = match verdict {
             Visibility::Visible => (None, None),
             Visibility::Suspect(why) => (None, Some(*why)),
@@ -455,12 +502,19 @@ fn lines(chars: &[Char], verdicts: &[Visibility]) -> Vec<Line> {
             });
             read.clear();
         }
+        // A wide glyph's box says nothing of where its ink is: it is never a repeat, and no
+        // later glyph is one of it.
         let repeat = !char.text.is_empty()
+            && !char.wide
             && read
-                .iter()
-                .any(|(text, text_box)| *text == char.text && holds(*text_box, char.text_box));
-        if !repeat && hidden.is_none() && !char.text.is_empty() {
-            read.push((&char.text, char.text_box));
+                .get(char.text.as_str())
+                .is_some_and(|boxes| boxes.iter().any(|text_box| holds(*text_box, char.text_box)));
+        if !repeat && hidden.is_none() && !char.text.is_empty() && !char.wide {
+            let boxes = read.entry(char.text.as_str()).or_default();
+            if boxes.len() == REPEAT_WINDOW {
+                boxes.pop_front();
+            }
+            boxes.push_back(char.text_box);
         }
         let Some(line) = lines.last_mut() else {
             continue;
@@ -486,12 +540,15 @@ fn lines(chars: &[Char], verdicts: &[Visibility]) -> Vec<Line> {
         });
         previous = Some(char);
     }
-    lines
+    Ok(lines)
 }
 
-/// A space is hidden only between two hidden characters of its line.
+/// A space is hidden only between two hidden characters of its line. Linear: the nearest
+/// glyph on each side of every space is found in one pass each way.
 fn settle_spaces(items: &mut [Item]) {
-    let hidden: Vec<Option<bool>> = items
+    // Each item's own state: hidden or not for a glyph with text, none for a space or an
+    // empty glyph.
+    let states: Vec<Option<bool>> = items
         .iter()
         .map(|item| {
             if item.is_space() || item.text.is_empty() {
@@ -501,17 +558,34 @@ fn settle_spaces(items: &mut [Item]) {
             }
         })
         .collect();
-    for at in 0..items.len() {
-        if hidden[at].is_some() || !items[at].is_space() {
-            continue;
+    let mut before = vec![None; items.len()];
+    let mut last = None;
+    for (at, state) in states.iter().enumerate() {
+        before[at] = last;
+        if state.is_some() {
+            last = *state;
         }
-        let before = hidden[..at].iter().rev().find_map(|state| *state);
-        let after = hidden[at + 1..].iter().find_map(|state| *state);
-        let reason = items[..at].iter().rev().find_map(|item| item.hidden);
-        items[at].hidden = match (before, after) {
-            (Some(true), Some(true)) => reason,
-            _ => None,
-        };
+    }
+    let mut after = vec![None; items.len()];
+    let mut next = None;
+    for (at, state) in states.iter().enumerate().rev() {
+        after[at] = next;
+        if state.is_some() {
+            next = *state;
+        }
+    }
+    // A hidden space takes the reason of the nearest hidden item before it.
+    let mut reason = None;
+    for at in 0..items.len() {
+        if states[at].is_none() && items[at].is_space() {
+            items[at].hidden = match (before[at], after[at]) {
+                (Some(true), Some(true)) => reason,
+                _ => None,
+            };
+        }
+        if items[at].hidden.is_some() {
+            reason = items[at].hidden;
+        }
     }
 }
 
@@ -554,7 +628,7 @@ struct Assembled {
     visible_lines: Vec<String>,
 }
 
-fn assemble_block(block: &mut [Line]) -> Assembled {
+fn assemble_block(block: &mut [Line]) -> Result<Assembled, DocError> {
     let mut out = Assembled {
         visible: Text::default(),
         hidden: Text::default(),
@@ -563,16 +637,26 @@ fn assemble_block(block: &mut [Line]) -> Assembled {
         visible_lines: Vec::new(),
     };
     let mut hidden_line = 0usize;
+    let mut handled = 0usize;
     for (line_at, line) in block.iter_mut().enumerate() {
+        deadline::check()?;
         settle_spaces(&mut line.items);
+        // Byte and code point offsets where the line starts and where its content starts (a
+        // Text holds one box per code point, so its box count is its length in code points).
         let line_start = out.visible.text.len();
+        let line_start_chars = out.visible.boxes.len();
         if line_start > 0 {
             out.visible.push("\n", None, None);
         }
         let content_start = out.visible.text.len();
+        let content_start_chars = out.visible.boxes.len();
         let mut cut = false;
         let mut run_open = false;
         for item in &line.items {
+            handled += 1;
+            if handled % ITEMS_PER_CHECK == 0 {
+                deadline::check()?;
+            }
             match item.hidden {
                 Some(why) => {
                     if !item.is_space() {
@@ -625,26 +709,28 @@ fn assemble_block(block: &mut [Line]) -> Assembled {
         let trimmed = line_text.trim_start();
         let skip = line_text.chars().count() - trimmed.chars().count();
         if skip > 0 {
-            let chars_before = out.visible.text[..content_start].chars().count();
             out.visible.text.replace_range(
                 content_start..content_start + (line_text.len() - trimmed.len()),
                 "",
             );
-            out.visible.boxes.drain(chars_before..chars_before + skip);
-            out.visible.lines.drain(chars_before..chars_before + skip);
+            out.visible
+                .boxes
+                .drain(content_start_chars..content_start_chars + skip);
+            out.visible
+                .lines
+                .drain(content_start_chars..content_start_chars + skip);
         }
         if out.visible.text.len() == content_start {
             // Nothing visible on this line: drop its line break too.
-            let chars_before = out.visible.text[..line_start].chars().count();
             out.visible.text.truncate(line_start);
-            out.visible.boxes.truncate(chars_before);
-            out.visible.lines.truncate(chars_before);
+            out.visible.boxes.truncate(line_start_chars);
+            out.visible.lines.truncate(line_start_chars);
         } else {
             out.visible_lines
                 .push(out.visible.text[content_start..].to_owned());
         }
     }
-    out
+    Ok(out)
 }
 
 /// The most common reason, the earliest on a tie.
@@ -798,7 +884,13 @@ pub(crate) fn read(bytes: &[u8], limits: &DocLimits) -> Result<Extracted, DocErr
         let paints: Vec<CharPaint> = scene.chars.iter().map(|char| char.paint.clone()).collect();
         let mut verdicts = pdf_visibility::try_classify(&paints, &scene.areas, &page, limits)?;
         drop(paints);
-        apply_actual_text(&mut scene.chars, &mut verdicts);
+        // A glyph whose box stands far from its ink cannot be judged by its box.
+        for (char, verdict) in scene.chars.iter().zip(verdicts.iter_mut()) {
+            if char.wide && *verdict == Visibility::Visible {
+                *verdict = Visibility::Suspect("glyph_width");
+            }
+        }
+        apply_actual_text(&mut scene.chars, &mut verdicts)?;
         let shown = |verdict: &Visibility| !matches!(verdict, Visibility::Hidden(_));
         let unmapped_font = scene
             .chars
@@ -814,12 +906,12 @@ pub(crate) fn read(bytes: &[u8], limits: &DocLimits) -> Result<Extracted, DocErr
                     && (char.text.is_empty() || !char.text.chars().all(char::is_whitespace))
             })
             .count();
-        let mut lines = lines(&scene.chars, &verdicts);
+        let mut lines = lines(&scene.chars, &verdicts)?;
         let starts = block_starts(&lines);
         let mut visible_lines = Vec::new();
         for (index, start) in starts.iter().enumerate() {
             let end = starts.get(index + 1).copied().unwrap_or(lines.len());
-            let block = assemble_block(&mut lines[*start..end]);
+            let block = assemble_block(&mut lines[*start..end])?;
             if !block.visible.text.is_empty() {
                 output.emit(page.page, &block.visible, None, block.suspect)?;
             }
