@@ -3105,9 +3105,9 @@ fn wide_line(width: f32, show: &str) -> Vec<u8> {
 
 #[tokio::test]
 async fn pdf_long_lines_read_within_the_deadline() {
-    // 100,000 glyphs on one line, ten letters round, and 100,000 spaces between two white
-    // letters: grouping them into lines is linear, so both read inside the call timeout.
-    let letters = wide_line(200_000.0, &format!("({}) Tj", "abcdefghij".repeat(10_000)));
+    // 100,000 glyphs of one letter on one line, and 100,000 spaces between two white letters:
+    // grouping them into lines is linear, so both read inside the call timeout.
+    let letters = wide_line(210_000.0, &format!("({}) Tj", "x".repeat(100_000)));
     let spaces = wide_line(
         200_000.0,
         &format!("1 g (A) Tj 0 g ({}) Tj 1 g (B) Tj", " ".repeat(100_000)),
@@ -3169,14 +3169,16 @@ fn pdf_reader_loops_stop_at_the_job_deadline() {
     );
     // One line of 100,000 glyphs: grouping them into lines checks the deadline too. The walk
     // and the visibility rules take fewer checks than LINE_CHECKS; the lines take more.
-    let line = wide_line(200_000.0, &format!("({}) Tj", "abcdefghij".repeat(10_000)));
+    let line = wide_line(210_000.0, &format!("({}) Tj", "x".repeat(100_000)));
     assert_eq!(
         after_checks(LINE_CHECKS, || read_with(&line, &limits())).unwrap_err(),
         DocError::Timeout
     );
 }
 
-/// Deadline checks on the long line before lines are made (below) and after (above).
+/// On the long line, the walk, the visibility rules and the steps after the lines take about
+/// 800 deadline checks in all, and grouping the glyphs into lines about 1,560 more: a deadline
+/// at check 1,500 passes inside the lines.
 const LINE_CHECKS: u32 = 1_500;
 
 #[test]

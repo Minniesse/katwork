@@ -58,8 +58,10 @@ pub const MAX_GLYPH_ADVANCE: f64 = 3.0;
 const REPEAT_WINDOW: usize = 64;
 /// Walker work units (array elements, glyphs, KiB of Form content) between deadline checks.
 const WORK_PER_CHECK: u64 = 1_024;
-/// Characters, line items and spans the grouping steps handle between deadline checks.
-const ITEMS_PER_CHECK: usize = 64;
+/// Glyphs grouped into lines between deadline checks: the heaviest step per glyph.
+const GLYPHS_PER_CHECK: usize = 64;
+/// Characters, line items and spans the other grouping steps handle between deadline checks.
+const ITEMS_PER_CHECK: usize = 1_024;
 
 thread_local! {
     static WALKS: Cell<u64> = const { Cell::new(0) };
@@ -459,7 +461,7 @@ fn lines(chars: &[Char], verdicts: &[Visibility]) -> Result<Vec<Line>, DocError>
     // overprinted repeats: a bounded look-back, so a line of any length costs linear time.
     let mut read: HashMap<&str, VecDeque<[f32; 4]>> = HashMap::new();
     for (at, (char, verdict)) in chars.iter().zip(verdicts).enumerate() {
-        if at % ITEMS_PER_CHECK == 0 {
+        if at % GLYPHS_PER_CHECK == 0 {
             deadline::check()?;
         }
         let (hidden, suspect) = match verdict {
