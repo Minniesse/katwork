@@ -405,7 +405,7 @@ fn is_mark(c: char) -> bool {
 fn apply_actual_text(chars: &mut [Char], verdicts: &mut [Visibility]) -> Result<(), DocError> {
     let mut spans: HashMap<u32, Vec<usize>> = HashMap::new();
     for (at, char) in chars.iter().enumerate() {
-        if at % ITEMS_PER_CHECK == 0 {
+        if at.is_multiple_of(ITEMS_PER_CHECK) {
             deadline::check()?;
         }
         if let Some((id, _)) = &char.actual {
@@ -413,7 +413,7 @@ fn apply_actual_text(chars: &mut [Char], verdicts: &mut [Visibility]) -> Result<
         }
     }
     for (index, members) in spans.values().enumerate() {
-        if index % ITEMS_PER_CHECK == 0 {
+        if index.is_multiple_of(ITEMS_PER_CHECK) {
             deadline::check()?;
         }
         let hidden = members.iter().find_map(|at| match verdicts[*at] {
@@ -461,7 +461,7 @@ fn lines(chars: &[Char], verdicts: &[Visibility]) -> Result<Vec<Line>, DocError>
     // overprinted repeats: a bounded look-back, so a line of any length costs linear time.
     let mut read: HashMap<&str, VecDeque<[f32; 4]>> = HashMap::new();
     for (at, (char, verdict)) in chars.iter().zip(verdicts).enumerate() {
-        if at % GLYPHS_PER_CHECK == 0 {
+        if at.is_multiple_of(GLYPHS_PER_CHECK) {
             deadline::check()?;
         }
         let (hidden, suspect) = match verdict {
@@ -656,7 +656,7 @@ fn assemble_block(block: &mut [Line]) -> Result<Assembled, DocError> {
         let mut run_open = false;
         for item in &line.items {
             handled += 1;
-            if handled % ITEMS_PER_CHECK == 0 {
+            if handled.is_multiple_of(ITEMS_PER_CHECK) {
                 deadline::check()?;
             }
             match item.hidden {
