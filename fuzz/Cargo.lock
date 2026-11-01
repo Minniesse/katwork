@@ -1803,7 +1803,7 @@ dependencies = [
 [[package]]
 name = "pdf-extract"
 version = "0.12.1"
-source = "git+https://github.com/Minniesse/pdf-extract?rev=3fa5d4a04ca44fab48269a410e56478299e6e8b5#3fa5d4a04ca44fab48269a410e56478299e6e8b5"
+source = "git+https://github.com/Minniesse/pdf-extract?rev=8427c57d106382a16ced9508be28b4eaf8e193b5#8427c57d106382a16ced9508be28b4eaf8e193b5"
 dependencies = [
  "cff-parser",
  "euclid",
