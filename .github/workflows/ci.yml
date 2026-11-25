@@ -100,6 +100,13 @@ jobs:
       - run: npm run check:contrast
       - run: npm run build
 
+  craft-lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: sh scripts/check-craft-lock.sh --self-test
+      - run: sh scripts/check-craft-lock.sh
+
   fuzz-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 60
