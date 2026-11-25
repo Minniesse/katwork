@@ -254,7 +254,8 @@ pub fn read_page(
         .iter()
         .enumerate()
         .skip(start)
-        .take(PAGE_BLOCKS)
+        // With the minted ids, exactly the planned range.
+        .take(ids.map_or(PAGE_BLOCKS, <[SpanId]>::len))
     {
         if block.hidden.is_some() {
             hidden += 1;
