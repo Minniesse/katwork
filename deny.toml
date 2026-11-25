@@ -1,5 +1,8 @@
 [advisories]
-ignore = []
+ignore = [
+    # chrono is unmaintained with no safe upgrade; not a vulnerability. Replacing it is #141.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, replacement tracked in #141" },
+]
 
 [licenses]
 # Unlisted licenses are denied, including GPL-2.0, GPL-3.0 and AGPL-3.0

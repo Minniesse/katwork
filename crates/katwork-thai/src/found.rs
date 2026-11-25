@@ -431,12 +431,25 @@ mod tests {
                 }
             }
         }
+        let unicode = char::UNICODE_VERSION;
+        let expected = RULES
+            .iter()
+            .find(|(version, _)| *version == unicode)
+            .map(|(_, fingerprint)| *fingerprint);
         assert_eq!(
-            hash, RULES,
-            "a character rule changed (fingerprint {hash:#018x})"
+            Some(hash),
+            expected,
+            "a character rule changed, or this toolchain's Unicode {unicode:?} has no fingerprint \
+             yet (fingerprint {hash:#018x}); review the rules' new behaviour before adding it"
         );
     }
 
-    /// The fingerprint of the rules as written in fix round 2.
-    const RULES: u64 = 0xcdd7_3bfb_5990_53cf;
+    /// The fingerprint of the rules as written in fix round 2, per Unicode version: the rules
+    /// call std's `is_alphabetic`, `is_alphanumeric` and `is_whitespace`, whose tables follow
+    /// the toolchain's Unicode version, so each version the MSRV and stable toolchains ship
+    /// has its own reviewed fingerprint.
+    const RULES: &[((u8, u8, u8), u64)] = &[
+        ((17, 0, 0), 0xcdd7_3bfb_5990_53cf),
+        ((18, 0, 0), 0xd704_52a4_89c4_d950),
+    ];
 }
