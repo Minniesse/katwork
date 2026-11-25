@@ -708,3 +708,29 @@ async fn batch_authority_refuses_before_starting_next_call(pool: PgPool) {
     assert_eq!(rows[1].get::<String, _>("state"), "refused");
     assert_eq!(rows[1].get::<String, _>("result"), "policy_changed");
 }
+#[sqlx::test]
+async fn refused_workspace_read_clears_effects_marker(pool: PgPool) {
+    // A WorkspaceRead call ran, then a write was refused after its start: the refusal's
+    // recount ignores the WorkspaceRead row, so the marker is cleared.
+    let mut h = Harness::new(
+        pool,
+        vec![turn(
+            "",
+            vec![
+                call("read", "probe", json!({})),
+                call("first", "write", json!({})),
+            ],
+        )],
+    )
+    .await;
+    let read = h.add(Probe::new("probe", SideEffect::WorkspaceRead));
+    let write = h.add(Probe::new("write", SideEffect::WorkspaceWrite));
+    let facts = interrupted_run(&h, Interruption::ToolPause, 1).await;
+    assert_eq!(facts.stop, Some(StopReason::KatPaused));
+    assert_eq!(read.load(Ordering::SeqCst), 1);
+    assert_eq!(write.load(Ordering::SeqCst), 0);
+    let rows = h.rows().await;
+    assert_eq!(rows[0].get::<String, _>("state"), "succeeded");
+    assert_eq!(rows[1].get::<String, _>("state"), "refused");
+    assert!(!h.effects().await);
+}
