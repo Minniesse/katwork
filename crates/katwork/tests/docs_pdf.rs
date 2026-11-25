@@ -1611,6 +1611,14 @@ fn pdf_thai_fixture_text_matches_its_source() {
         .unwrap();
     assert_eq!(paragraph.lines.len(), 4);
     assert_eq!(paragraph.text.matches('\n').count(), 3);
+    // Typst's ToUnicode map gives each glyph the text of its first use and its `/ActualText`
+    // spans correct that, so its spans differ from their glyphs and every block is suspect.
+    assert!(
+        extracted
+            .blocks
+            .iter()
+            .all(|block| block.suspect == Some("actual_text"))
+    );
 }
 
 #[test]
@@ -3240,6 +3248,43 @@ fn pdf_glyph_width_far_past_the_font_size_is_suspect() {
     let word = block(&extracted, "CLIPWORDS");
     assert_eq!((word.hidden, word.suspect), (None, Some("glyph_width")));
     assert_eq!(block(&extracted, "CONTROL").suspect, None);
+}
+
+#[test]
+fn pdf_actual_text_is_trusted_only_when_it_matches_its_glyphs() {
+    let span = |actual: &str, drawn: &str| {
+        format!(
+            "BT /F1 10 Tf 10 {{y}} Td /Span << /ActualText ({actual}) >> BDC ({drawn}) Tj EMC ET\n"
+        )
+    };
+    let mut doc = Doc::new();
+    doc.page(
+        &lines_at(&[
+            &span("MATCHED", "MATCHED"),
+            // The reader's normalization collapses the run of spaces.
+            &span("TWO  WORDS", "TWO WORDS"),
+            &span("WIRE THE FUNDS", "Hi"),
+            &span("900", "100"),
+        ]),
+        "",
+    );
+    let extracted = read(&doc.build());
+    let verdict = |text: &str| {
+        let block = block(&extracted, text);
+        (block.hidden, block.suspect)
+    };
+    assert_eq!(verdict("MATCHED"), (None, None));
+    assert_eq!(verdict("TWO  WORDS"), (None, None));
+    // A span whose text differs from its glyphs' is the file's claim alone: it still reads, but
+    // never at full quality, so a figure it hides cannot be cited as verified.
+    assert_eq!(verdict("WIRE THE FUNDS"), (None, Some("actual_text")));
+    assert_eq!(verdict("900"), (None, Some("actual_text")));
+    assert!(
+        extracted
+            .pages
+            .iter()
+            .all(|page| page.text_layer == TextLayer::Ok)
+    );
 }
 
 #[test]

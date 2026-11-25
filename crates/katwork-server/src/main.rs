@@ -92,6 +92,8 @@ fn dependency_log_allowed(metadata: &tracing::Metadata<'_>) -> bool {
 
 /// Drops what the PDF libraries log through the `log` crate. lopdf logs a line for every
 /// malformed object, so a hostile file could flood the log, and a line may quote the file.
+/// They are dropped, not turned into warnings: the reader's own warnings and refusals report a
+/// damaged file.
 /// Their events reach tracing through the `log` bridge with the target "log", so this reads
 /// each event's original target; a `filter_fn` sees only the bridge's.
 struct DocumentLibraryLogs;

@@ -52,6 +52,8 @@ flate2.workspace = true
 lopdf.workspace = true
 pdf-extract.workspace = true
 weezl.workspace = true
+# The PDF reader compares an /ActualText span with its glyphs as matching does.
+katwork-thai = { path = "../katwork-thai" }
 
 # statvfs for the artifact store's free space (f_bavail x f_frsize); std has no call for it.
 [target.'cfg(unix)'.dependencies]
@@ -60,4 +62,3 @@ nix = { version = "0.31", default-features = false, features = ["fs"] }
 [dev-dependencies]
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util", "io-util"] }
-katwork-thai = { path = "../katwork-thai" }

@@ -16,7 +16,9 @@
 //!   right after it, its reason the runs' most common.
 //! - A marked-content `/ActualText` replaces the text of the glyphs it encloses (Typst writes
 //!   one around every Thai cluster its ToUnicode map cannot express); the span is hidden when
-//!   any of its glyphs is, and suspect when any is suspect.
+//!   any of its glyphs is, and suspect when any is suspect. A span whose text differs from its
+//!   glyphs' own text after `normalize_th` is `Suspect("actual_text")`: it reads, but never at
+//!   full quality, since only the file says the glyphs mean it.
 //! - A glyph whose text repeats that of a glyph or span not hidden earlier on its line, with its
 //!   box centre inside that one's box (within 5% of the font size), adds no text: it draws over
 //!   a character already read (Typst draws a cluster's positioned mark again with the cluster's
@@ -31,6 +33,7 @@ use std::{
     rc::Rc,
 };
 
+use katwork_thai::normalize_th;
 use lopdf::Document;
 use pdf_extract::{
     Area, AreaKind as WalkedArea, Glyph, MediaBox, Optional, OutputDev, OutputError, Transform,
@@ -424,7 +427,21 @@ fn apply_actual_text(chars: &mut [Char], verdicts: &mut [Visibility]) -> Result<
             Visibility::Suspect(why) => Some(Visibility::Suspect(why)),
             _ => None,
         });
-        let verdict = hidden.or(suspect).unwrap_or(Visibility::Visible);
+        // A span whose text is not its glyphs' own (after normalization) is the file's claim
+        // alone, so it never reads at full quality.
+        let drawn: String = members.iter().map(|at| chars[*at].text.as_str()).collect();
+        let matches = members.first().is_some_and(|first| {
+            chars[*first]
+                .actual
+                .as_ref()
+                .is_some_and(|(_, actual)| normalize_th(actual).text == normalize_th(&drawn).text)
+        });
+        let trusted = if matches {
+            Visibility::Visible
+        } else {
+            Visibility::Suspect("actual_text")
+        };
+        let verdict = hidden.or(suspect).unwrap_or(trusted);
         let span_box = members
             .iter()
             .map(|at| chars[*at].paint.bbox)
