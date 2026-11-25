@@ -3285,7 +3285,8 @@ fn pdf_actual_text_is_trusted_only_when_it_matches_its_glyphs() {
             .iter()
             .all(|page| page.text_layer == TextLayer::Ok)
     );
-    // A span past the comparison cap is never compared, so it is suspect even when it matches.
+    // A span past the comparison cap is never copied or compared: its glyphs keep their own
+    // text, suspect even when the span matches.
     let long = "L".repeat(70_000);
     let file = wide_line(
         210_000.0,

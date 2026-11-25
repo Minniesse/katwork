@@ -18,8 +18,8 @@
 //!   one around every Thai cluster its ToUnicode map cannot express); the span is hidden when
 //!   any of its glyphs is, and suspect when any is suspect. A span whose text differs from its
 //!   glyphs' own text after `normalize_th` is `Suspect("actual_text")`: it reads, but never at
-//!   full quality, since only the file says the glyphs mean it. So is a span whose text or
-//!   glyph text passes 64 KiB, which is not compared.
+//!   full quality, since only the file says the glyphs mean it. A span whose text or glyph
+//!   text passes 64 KiB is neither copied nor compared: its glyphs keep their own text, suspect.
 //! - A glyph whose text repeats that of a glyph or span not hidden earlier on its line, with its
 //!   box centre inside that one's box (within 5% of the font size), adds no text: it draws over
 //!   a character already read (Typst draws a cluster's positioned mark again with the cluster's
@@ -83,7 +83,8 @@ pub fn output_doc_calls() -> u64 {
 /// One glyph as the walker reported it.
 struct Char {
     text: String,
-    actual: Option<(u32, Rc<str>)>,
+    /// The id of the `/ActualText` span around it, a key of `Scene::actual`.
+    actual: Option<u32>,
     paint: CharPaint,
     /// The box its text covers: its own, or for an `/ActualText` span's first glyph the
     /// union of the span's glyphs.
@@ -107,6 +108,9 @@ struct Scene {
     areas: Vec<AreaPaint>,
     images: usize,
     order: u32,
+    /// Each `/ActualText` span's text, copied once when its first glyph arrives; `None` past
+    /// `MAX_ACTUAL_TEXT_COMPARE`, which is never copied.
+    actual: HashMap<u32, Option<String>>,
 }
 
 /// pdf-extract's output device: it collects each page's glyphs and areas, counts executed
@@ -273,9 +277,14 @@ impl OutputDev for Collector<'_> {
             0.0
         };
         let font = glyph.font;
+        if let Some((id, text)) = glyph.actual_text {
+            self.scene.actual.entry(id).or_insert_with(|| {
+                (text.len() <= MAX_ACTUAL_TEXT_COMPARE).then(|| text.to_owned())
+            });
+        }
         self.scene.chars.push(Char {
             text: glyph.text.to_owned(),
-            actual: glyph.actual_text.map(|(id, text)| (id, Rc::from(text))),
+            actual: glyph.actual_text.map(|(id, _)| id),
             paint: CharPaint {
                 order,
                 bbox: rect(bbox),
@@ -408,19 +417,25 @@ fn is_mark(c: char) -> bool {
 }
 
 /// Replaces each `/ActualText` span's glyph texts with its text, on its first glyph, and gives
-/// every glyph of the span the span's verdict.
-fn apply_actual_text(chars: &mut [Char], verdicts: &mut [Visibility]) -> Result<(), DocError> {
+/// every glyph of the span the span's verdict. A span past `MAX_ACTUAL_TEXT_COMPARE` keeps its
+/// glyphs' own text and is suspect.
+fn apply_actual_text(
+    chars: &mut [Char],
+    actual: &HashMap<u32, Option<String>>,
+    verdicts: &mut [Visibility],
+) -> Result<(), DocError> {
     let mut spans: HashMap<u32, Vec<usize>> = HashMap::new();
     for (at, char) in chars.iter().enumerate() {
         if at.is_multiple_of(ITEMS_PER_CHECK) {
             deadline::check()?;
         }
-        if let Some((id, _)) = &char.actual {
-            spans.entry(*id).or_default().push(at);
+        if let Some(id) = char.actual {
+            spans.entry(id).or_default().push(at);
         }
     }
-    for members in spans.values() {
+    for (id, members) in &spans {
         deadline::check()?;
+        let text = actual.get(id).and_then(Option::as_deref);
         let hidden = members.iter().find_map(|at| match verdicts[*at] {
             Visibility::Hidden(why) => Some(Visibility::Hidden(why)),
             _ => None,
@@ -432,11 +447,9 @@ fn apply_actual_text(chars: &mut [Char], verdicts: &mut [Visibility]) -> Result<
         // A span whose text is not its glyphs' own (after normalization) is the file's claim
         // alone, so it never reads at full quality.
         let drawn: String = members.iter().map(|at| chars[*at].text.as_str()).collect();
-        let matches = members.first().is_some_and(|first| {
-            chars[*first].actual.as_ref().is_some_and(|(_, actual)| {
-                actual.len().max(drawn.len()) <= MAX_ACTUAL_TEXT_COMPARE
-                    && normalize_th(actual).text == normalize_th(&drawn).text
-            })
+        let matches = text.is_some_and(|text| {
+            drawn.len() <= MAX_ACTUAL_TEXT_COMPARE
+                && normalize_th(text).text == normalize_th(&drawn).text
         });
         let trusted = if matches {
             Visibility::Visible
@@ -444,19 +457,22 @@ fn apply_actual_text(chars: &mut [Char], verdicts: &mut [Visibility]) -> Result<
             Visibility::Suspect("actual_text")
         };
         let verdict = hidden.or(suspect).unwrap_or(trusted);
+        // Only a span whose text replaces its glyphs' gives its first glyph the span's box.
         let span_box = members
             .iter()
             .map(|at| chars[*at].paint.bbox)
             .reduce(|a, b| union(Some(a), b));
-        if let (Some(first), Some(span_box)) = (members.first(), span_box) {
+        if let (Some(_), Some(first), Some(span_box)) = (text, members.first(), span_box) {
             chars[*first].text_box = span_box;
         }
         for (index, at) in members.iter().enumerate() {
-            let text = match (&chars[*at].actual, index) {
-                (Some((_, text)), 0) => text.to_string(),
-                _ => String::new(),
-            };
-            chars[*at].text = text;
+            if let Some(text) = text {
+                chars[*at].text = if index == 0 {
+                    text.to_owned()
+                } else {
+                    String::new()
+                };
+            }
             verdicts[*at] = verdict;
         }
     }
@@ -911,7 +927,7 @@ pub(crate) fn read(bytes: &[u8], limits: &DocLimits) -> Result<Extracted, DocErr
                 *verdict = Visibility::Suspect("glyph_width");
             }
         }
-        apply_actual_text(&mut scene.chars, &mut verdicts)?;
+        apply_actual_text(&mut scene.chars, &scene.actual, &mut verdicts)?;
         let shown = |verdict: &Visibility| !matches!(verdict, Visibility::Hidden(_));
         let unmapped_font = scene
             .chars

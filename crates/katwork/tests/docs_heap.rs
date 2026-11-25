@@ -8,6 +8,8 @@
 //! `cargo test --release -p katwork --test docs_heap -- --ignored --nocapture`
 #[path = "support/ooxml.rs"]
 mod ooxml;
+#[path = "support/pdf_build.rs"]
+mod pdf_build;
 
 use std::{
     sync::Arc,
@@ -600,6 +602,32 @@ fn floods() -> Vec<Flood> {
             },
         },
     ]
+}
+
+/// A PDF `/ActualText` span costs its text once, not once per glyph: one span of 1 MiB over
+/// 1,000 glyphs, fewer than the walk reads between two budget checks, stays far under a 256 MiB
+/// budget (a copy per glyph held 1 GiB before the first check).
+#[test]
+fn a_pdf_actual_text_span_is_held_once() {
+    let mut doc = pdf_build::Doc::new();
+    doc.size = (5_000.0, 50.0);
+    let actual = "A".repeat(1 << 20);
+    let glyphs = "x".repeat(1_000);
+    doc.page(
+        &format!(
+            "BT /F1 4 Tf 10 20 Td /Span << /ActualText ({actual}) >> BDC ({glyphs}) Tj EMC ET"
+        ),
+        "",
+    );
+    let bytes = doc.build();
+    let started = Instant::now();
+    let (result, peak) = heap::measure(|| {
+        deadline::scope(started + Duration::from_secs(60), None, 256 << 20, || {
+            docs::extract(MediaKind::Pdf, &bytes, &DocLimits::default()).map(drop)
+        })
+    });
+    assert!(peak < 64 << 20, "peak {peak} ({result:?})");
+    assert_eq!(result, Ok(()));
 }
 
 /// A read as the pool runs it, its peak live bytes and how long it took.
