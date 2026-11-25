@@ -979,6 +979,16 @@ async fn mint_on_flag_mismatch_fails_closed(pool: PgPool) {
 async fn duplicate_block_keys_in_one_extraction_are_refused(pool: PgPool) {
     let env = Env::new(pool).await;
     let file = env.upload("a.txt", MediaType::Text, b"x").await;
+    // The same text twice: the stored row would agree with both, so only the up-front check
+    // refuses it.
+    let same = extracted(
+        ExtractorId::TEXT,
+        vec![text_block(1, "ก"), text_block(1, "ก")],
+    );
+    assert!(matches!(
+        mint(&env, &file, &same, ArtifactRole::Input).await,
+        Err(KatError::SpanMismatch)
+    ));
     let twice = extracted(
         ExtractorId::TEXT,
         vec![text_block(1, "ก"), text_block(1, "ข")],
@@ -1769,10 +1779,12 @@ async fn the_cache_is_shared_by_two_runs_of_one_core(pool: PgPool) {
     assert_eq!(calls(&calls_made), 1);
 }
 
-#[sqlx::test]
-async fn a_failed_mint_does_not_fill_the_cache(pool: PgPool) {
-    let env = Env::new(pool).await;
-    let file = env.upload("a.txt", MediaType::Text, b"x").await;
+/// Runs `read_file` with an extraction that waits until `between` has run, and returns its code.
+async fn read_with_a_change_before_the_mint(
+    env: &Env,
+    file: ArtifactId,
+    between: impl AsyncFnOnce(),
+) -> &'static str {
     let gate = Arc::new(std::sync::Barrier::new(2));
     let release = Arc::new(std::sync::Barrier::new(2));
     let (g, r) = (gate.clone(), release.clone());
@@ -1783,17 +1795,46 @@ async fn a_failed_mint_does_not_fill_the_cache(pool: PgPool) {
     });
     let tool = env.fake(extract);
     let ctx = env.ctx();
-    let mut read = Box::pin(call(&tool, &ctx, file_args(file.id)));
+    let mut read = Box::pin(call(&tool, &ctx, file_args(file)));
     let waiter = tokio::task::spawn_blocking(move || gate.wait());
     tokio::select! {
         result = &mut read => panic!("finished early: {result:?}"),
         _ = waiter => {}
     }
-    env.delete(file.id).await;
+    between().await;
     let released = tokio::task::spawn_blocking(move || release.wait());
     let (result, _) = tokio::join!(read, released);
-    assert_eq!(code(result), "not_found");
+    code(result)
+}
+
+#[sqlx::test]
+async fn a_failed_mint_does_not_fill_the_cache(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let file = env.upload("a.txt", MediaType::Text, b"x").await;
+    let result =
+        read_with_a_change_before_the_mint(&env, file.id, async || env.delete(file.id).await).await;
+    assert_eq!(result, "not_found");
     assert_eq!(env.core.extract_cache.text_bytes(), 0);
+    assert_eq!(env.spans().await, 0);
+}
+
+#[sqlx::test]
+async fn a_file_moved_to_another_space_before_the_mint_is_not_found(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let file = env.upload("a.txt", MediaType::Text, b"x").await;
+    let other = Uuid::now_v7();
+    sqlx::query("INSERT INTO spaces (id, workspace_id, name, allow_external) VALUES ($1, $2, 'Other', false)")
+        .bind(other).bind(env.f.workspace).execute(&env.pool).await.unwrap();
+    let result = read_with_a_change_before_the_mint(&env, file.id, async || {
+        sqlx::query("UPDATE artifacts SET space_id = $2 WHERE id = $1")
+            .bind(file.id)
+            .bind(other)
+            .execute(&env.pool)
+            .await
+            .unwrap();
+    })
+    .await;
+    assert_eq!(result, "not_found");
     assert_eq!(env.spans().await, 0);
 }
 
