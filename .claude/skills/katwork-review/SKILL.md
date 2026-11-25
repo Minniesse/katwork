@@ -10,7 +10,7 @@ Every PR gets two independent reviews from fresh sessions that did not write it 
 - the **checklist reviewer** (Sonnet): the **checklist** in `CODING_STANDARDS.md`, item by item;
 - the **verifier**: tries to refute each P0 and P1 finding before it goes back to the builder, and records each as confirmed or refuted.
 
-A PR gets at most three fix rounds; after the second, P3 findings become follow-up issues, while P0, P1 and security findings always block. Code PRs merge on the merge gate: the coordinator merges only when all three have run on the exact head SHA, nothing blocking is open and CI is green, and reads the full diff of a trust-core PR first. The founder approves plans and answers "NEEDS FOUNDER DECISION" items. `gh pr merge` refuses unless a review covers the head: one posted on it, or on an earlier commit followed only by clean merges of the base branch.
+A PR gets at most three fix rounds; after the second, P3 findings become follow-up issues, while P0, P1 and security findings always block. Code PRs merge on the merge gate: the coordinator merges only when all three have run on the exact head SHA, nothing blocking is open and CI is green, and reads the full diff of a trust-core PR first. The founder approves plans and answers "NEEDS FOUNDER DECISION" items. `gh pr merge` and its REST form refuse unless a review covers the head: one posted on it, or on an earlier commit followed only by clean merges of the base branch.
 
 ## Steps
 
@@ -21,7 +21,7 @@ A PR gets at most three fix rounds; after the second, P3 findings become follow-
    git log --format='%h %ae %(trailers:key=Co-Authored-By,valueonly)' origin/<base>..<head>
    ```
 
-   The trailers name the model that wrote each commit. Review only a PR you didn't write, in a fresh session that took no part in writing it. On a re-review, the scope is the delta from the head your last review names (`git diff <reviewed-sha>..<head>`) plus each earlier finding.
+   Without GraphQL (a cloud session, where most `gh pr` commands fail with HTTP 403), read the PR and its head with `gh api repos/{owner}/{repo}/pulls/<n> --jq '{number, base: .base.ref, head: .head.ref, sha: .head.sha, body}'` and its reviews with `gh api repos/{owner}/{repo}/pulls/<n>/reviews --paginate`. The trailers name the model that wrote each commit. Review only a PR you didn't write, in a fresh session that took no part in writing it. On a re-review, the scope is the delta from the head your last review names (`git diff <reviewed-sha>..<head>`) plus each earlier finding.
 
 2. **Check out the head in a scratch worktree** and start its database:
 
@@ -33,7 +33,7 @@ A PR gets at most three fix rounds; after the second, P3 findings become follow-
 
 3. **Read the spec.** The issue the PR closes, its task in its plan (`docs/plans/2026-10-22-sp1-core-runtime.md` for SP1, `docs/plans/2026-10-24-sp2a-documents-evidence.md` for SP2a), the Global Constraints, and the Review Focus items the task names. Done when you can list what the task promises: files, interfaces, tests and failure modes.
 
-4. **Read every changed file** (`gh pr diff <n>`), and apply every rule in `CODING_STANDARDS.md` to the diff. The checklist reviewer answers each checklist item as pass or a finding. Done when each rule is either satisfied or a finding.
+4. **Read every changed file** (`gh pr diff <n>`, which may work even without GraphQL; or `gh api repos/{owner}/{repo}/pulls/<n> -H 'Accept: application/vnd.github.diff'`, or `git diff origin/<base>...<head-sha>` after the fetch in step 2), and apply every rule in `CODING_STANDARDS.md` to the diff. The checklist reviewer answers each checklist item as pass or a finding. Done when each rule is either satisfied or a finding.
 
    **Spec deviations.** A review of a plan, an ADR or any PR that touches the spec has a "Spec deviations" section: every tool, service, dependency, product rule or decision in the change that the approved spec on `main` does not name or that contradicts it, with `file:line`, each marked "founder-decided (<label or date>)" or "NEEDS FOUNDER DECISION". "NEEDS FOUNDER DECISION" is only for a product, scope or process choice that the spec and the founder decisions do not settle; a defect that breaks a spec rule (a tenant leak, a lock-order break, a wrong limit) is a finding with a severity, never a founder question. A plan review is not Ready while a "NEEDS FOUNDER DECISION" entry is unanswered.
 
@@ -44,7 +44,7 @@ A PR gets at most three fix rounds; after the second, P3 findings become follow-
 
    Done when every claim is verified, refuted, or listed as unverifiable and why.
 
-6. **Run the checks** from the `katwork-task` skill's step 5 on the head, or confirm CI ran them green on it with `gh pr checks <n>`.
+6. **Run the checks** from the `katwork-task` skill's step 5 on the head, or confirm CI ran them green on it with `gh pr checks <n>` (without GraphQL, `gh api 'repos/{owner}/{repo}/commits/<head-sha>/check-runs?per_page=100'`).
 
 7. **Write the review** in one file:
 
@@ -79,4 +79,11 @@ A PR gets at most three fix rounds; after the second, P3 findings become follow-
    gh pr review <n> --comment --body-file <file>
    ```
 
-   Post one review per round, with every finding in it; fixes go to the author as findings. Then remove the scratch worktree (`scripts/test-db.sh stop`, `git worktree remove <scratch-dir>`).
+   Without GraphQL, over REST:
+
+   ```sh
+   test "$(gh api repos/{owner}/{repo}/pulls/<n> --jq .head.sha)" = "<sha>"
+   gh api repos/{owner}/{repo}/pulls/<n>/reviews -f commit_id=<sha> -f event=COMMENT -F body=@<file>
+   ```
+
+   `event=COMMENT` posts the review; without it the review stays pending, and a pending review covers nothing. Post one review per round, with every finding in it; fixes go to the author as findings. Then remove the scratch worktree (`scripts/test-db.sh stop`, `git worktree remove <scratch-dir>`).
