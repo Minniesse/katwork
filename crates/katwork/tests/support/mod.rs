@@ -2,10 +2,40 @@
     clippy::disallowed_methods,
     reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
 )]
+pub mod cancel_sql;
 mod legacy;
+pub mod locks;
+
+use std::time::Duration;
 
 use sqlx::PgPool;
+use tokio::time::timeout;
 use uuid::Uuid;
+
+/// Every connection of `pool` is idle in it, and no other client backend of the test database
+/// is busy or inside a transaction. Opens its own observer connection, so it never takes a
+/// permit a test pool shares.
+#[allow(dead_code, reason = "Only some test binaries cancel database work")]
+pub async fn assert_pool_clean(pool: &PgPool) {
+    // sqlx test pools share permits: inspecting a pool must never grow it to maximum capacity.
+    timeout(Duration::from_secs(30), async {
+        use sqlx::Connection;
+        let mut observer = sqlx::PgConnection::connect_with(&pool.connect_options())
+            .await
+            .unwrap();
+        loop {
+            let clean: bool = sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND backend_type='client backend' AND pid<>pg_backend_pid() AND state IS DISTINCT FROM 'idle')")
+                .fetch_one(&mut observer).await.unwrap();
+            if pool.num_idle() as u32 == pool.size() && clean {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        observer.close().await.unwrap();
+    })
+    .await
+    .expect("worker shutdown left a busy pool or a backend inside a transaction");
+}
 
 pub struct Fixture {
     pub workspace: Uuid,

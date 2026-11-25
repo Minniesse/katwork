@@ -1358,6 +1358,39 @@ fn serve_config_error_names_the_variable_not_its_value() {
 }
 
 #[sqlx::test(migrations = "../katwork/migrations")]
+async fn serve_refuses_an_unusable_artifact_dir(pool: sqlx::PgPool) {
+    let dir = std::env::temp_dir().join(format!("katwork-cli-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a-file");
+    std::fs::write(&file, b"not a directory").unwrap();
+    let mut child = server()
+        .arg("serve")
+        .env("DATABASE_URL", database_url(&pool))
+        .env("KATWORK_ARTIFACT_DIR", file.join("artifacts"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // A server that started would not exit; the deadline only bounds that hang.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("serve started with an unusable artifact directory");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("config_invalid (KATWORK_ARTIFACT_DIR)"),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[sqlx::test(migrations = "../katwork/migrations")]
 async fn seed_demo_applies_changed_demo_password(pool: sqlx::PgPool) {
     let seed = |password: &str| {
         let output = server()

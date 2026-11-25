@@ -100,7 +100,57 @@ pub enum KatError {
     LeaseLost,
     #[error("io_error")]
     Io(#[from] std::io::Error),
+
+    #[error("file_name_invalid")]
+    FileNameInvalid,
+    #[error("file_type_unsupported")]
+    FileTypeUnsupported,
+    /// A text-named file that is neither UTF-8 nor UTF-16 with a BOM (TIS-620, Windows-874).
+    #[error("file_encoding_unsupported")]
+    FileEncodingUnsupported,
+    /// An upload whose body is not `application/octet-stream`.
+    #[error("octet_stream_required")]
+    OctetStreamRequired,
+    #[error("too_many_uploads")]
+    TooManyUploads,
+    #[error("upload_too_slow")]
+    UploadTooSlow,
+    /// The disk is below the free-space floor, or the filesystem reported it full.
+    #[error("storage_full")]
+    StorageFull,
+    #[error("storage_quota_exceeded")]
+    StorageQuotaExceeded,
+    /// A blob's bytes no longer match its SHA-256 or its length.
+    #[error("blob_corrupt")]
+    BlobCorrupt,
+    #[error("span_mismatch")]
+    SpanMismatch,
+    /// An input is never versioned.
+    #[error("artifact_immutable")]
+    ArtifactImmutable,
+    /// A writer's source that is missing, in another workspace or deleted: a tool error, never
+    /// an API code.
+    #[error("citation_unknown")]
+    CitationUnknown,
 }
+
+/// The API error codes the SP2a plan adds, which the web copy covers: every one is a
+/// `KatError::code` except `doc_pool_wedged`, which only `/healthz` returns. Later tasks append
+/// theirs.
+pub const API_CODES: &[&str] = &[
+    "file_name_invalid",
+    "file_type_unsupported",
+    "file_encoding_unsupported",
+    "octet_stream_required",
+    "too_many_uploads",
+    "upload_too_slow",
+    "storage_full",
+    "storage_quota_exceeded",
+    "blob_corrupt",
+    "span_mismatch",
+    "artifact_immutable",
+    "doc_pool_wedged",
+];
 
 impl From<sqlx::Error> for KatError {
     fn from(error: sqlx::Error) -> Self {
@@ -171,6 +221,19 @@ impl KatError {
             Self::Migration(_) => "migration_failed",
             Self::LeaseLost => "lease_lost",
             Self::Io(_) => "io_error",
+
+            Self::FileNameInvalid => "file_name_invalid",
+            Self::FileTypeUnsupported => "file_type_unsupported",
+            Self::FileEncodingUnsupported => "file_encoding_unsupported",
+            Self::OctetStreamRequired => "octet_stream_required",
+            Self::TooManyUploads => "too_many_uploads",
+            Self::UploadTooSlow => "upload_too_slow",
+            Self::StorageFull => "storage_full",
+            Self::StorageQuotaExceeded => "storage_quota_exceeded",
+            Self::BlobCorrupt => "blob_corrupt",
+            Self::SpanMismatch => "span_mismatch",
+            Self::ArtifactImmutable => "artifact_immutable",
+            Self::CitationUnknown => "citation_unknown",
         }
     }
 }

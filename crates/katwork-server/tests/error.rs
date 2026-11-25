@@ -127,6 +127,71 @@ async fn api_errors_return_only_stable_codes() {
             StatusCode::UNPROCESSABLE_ENTITY,
             "smtp_unconfigured",
         ),
+        (
+            KatError::FileNameInvalid,
+            StatusCode::BAD_REQUEST,
+            "file_name_invalid",
+        ),
+        (
+            KatError::FileTypeUnsupported,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "file_type_unsupported",
+        ),
+        (
+            KatError::FileEncodingUnsupported,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "file_encoding_unsupported",
+        ),
+        (
+            KatError::OctetStreamRequired,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "octet_stream_required",
+        ),
+        (
+            KatError::TooManyUploads,
+            StatusCode::TOO_MANY_REQUESTS,
+            "too_many_uploads",
+        ),
+        (
+            KatError::UploadTooSlow,
+            StatusCode::REQUEST_TIMEOUT,
+            "upload_too_slow",
+        ),
+        (
+            KatError::StorageFull,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "storage_full",
+        ),
+        (
+            KatError::StorageQuotaExceeded,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "storage_quota_exceeded",
+        ),
+        (
+            KatError::BlobCorrupt,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "blob_corrupt",
+        ),
+        (
+            KatError::SpanMismatch,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "span_mismatch",
+        ),
+        (
+            KatError::ArtifactImmutable,
+            StatusCode::CONFLICT,
+            "artifact_immutable",
+        ),
+        (
+            KatError::CitationUnknown,
+            StatusCode::BAD_REQUEST,
+            "citation_unknown",
+        ),
+        (
+            KatError::BodyTooLarge,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body_too_large",
+        ),
     ] {
         let response = ApiError::from(error).into_response();
         assert_eq!(response.status(), status);
@@ -138,6 +203,59 @@ async fn api_errors_return_only_stable_codes() {
             serde_json::json!({"code": code})
         );
     }
+}
+
+/// `API_CODES` is the plan's list of the API codes SP2a adds, in its order, then
+/// `doc_pool_wedged`: Task 3 merged first, so Task 2 appends it. Every entry but that one is a
+/// `KatError` code with an HTTP status of its own; `/healthz` alone returns `doc_pool_wedged`.
+#[tokio::test]
+async fn api_codes_list_matches_error_codes() {
+    assert_eq!(
+        katwork::error::API_CODES,
+        [
+            "file_name_invalid",
+            "file_type_unsupported",
+            "file_encoding_unsupported",
+            "octet_stream_required",
+            "too_many_uploads",
+            "upload_too_slow",
+            "storage_full",
+            "storage_quota_exceeded",
+            "blob_corrupt",
+            "span_mismatch",
+            "artifact_immutable",
+            "doc_pool_wedged",
+        ]
+    );
+    let api = [
+        KatError::FileNameInvalid,
+        KatError::FileTypeUnsupported,
+        KatError::FileEncodingUnsupported,
+        KatError::OctetStreamRequired,
+        KatError::TooManyUploads,
+        KatError::UploadTooSlow,
+        KatError::StorageFull,
+        KatError::StorageQuotaExceeded,
+        KatError::BlobCorrupt,
+        KatError::SpanMismatch,
+        KatError::ArtifactImmutable,
+    ];
+    let codes: Vec<&str> = api.iter().map(KatError::code).collect();
+    assert_eq!(codes, katwork::error::API_CODES[..api.len()]);
+    for error in api {
+        let code = error.code();
+        let response = ApiError::from(error).into_response();
+        assert!(response.status().is_client_error() || response.status().is_server_error());
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"code": code})
+        );
+    }
+    // A tool error, never an API code.
+    assert!(!katwork::error::API_CODES.contains(&KatError::CitationUnknown.code()));
 }
 
 #[tokio::test]
