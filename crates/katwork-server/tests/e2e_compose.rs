@@ -847,12 +847,19 @@ async fn backup_archive_restores_seeded_data() {
             .is_dir()
     );
     stack.run(&["up", "-d", "restore"]);
+    // Over TCP: the image's first-start server listens only on the socket and stops after
+    // init, so a socket check can pass just before the socket disappears.
     poll(|| {
-        output(
-            stack
-                .compose()
-                .args(["exec", "-T", "restore", "pg_isready", "-U", "postgres"]),
-        )
+        output(stack.compose().args([
+            "exec",
+            "-T",
+            "restore",
+            "pg_isready",
+            "-h",
+            "127.0.0.1",
+            "-U",
+            "postgres",
+        ]))
         .status
         .success()
     })
