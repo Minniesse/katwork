@@ -1,6 +1,6 @@
 # KatWork roadmap
 
-This document lists every KatWork sub-project from the design spec (`docs/spec/katwork-design.md` §19), what each one covers, what it depends on, its rough size, the order of work, and the entry criteria for the public alpha. It is a map, not a plan. Each sub-project gets its own detailed plan, written and reviewed one wave ahead of its build, and the founder approves each plan before that build starts (spec §19.1).
+This document lists every KatWork sub-project from the design spec (`docs/spec/katwork-design.md` §19), what each one covers, what it depends on, its rough size, the order of work, and the entry criteria for the public alpha. It is a map, not a plan. Each sub-project gets its own detailed plan, and the founder approves each plan before that build starts (spec §19.1). The founder decided (2026-11-25) that each plan is written and reviewed one wave ahead of its build; that is process, not scope.
 
 Where this roadmap and the spec or an approved plan disagree, the spec and the plan win. Scope listed here comes only from the spec, the approved plans and the ADRs in `docs/adr/`. Anything nobody has ruled on is marked as an open question and collected at the end.
 
@@ -14,7 +14,7 @@ Sizes count the tasks in a sub-project's plan:
 | M | 9 to 20 |
 | L | more than 20 |
 
-Two sizes are counted from approved plans. The sub-project 1 plan has 17 task headings (Tasks 1 to 14, plus 3b, 7b and 13a/13b), so it is M. The sub-project 2a plan has 44 tasks, so it is L. Every other size is an estimate from the spec's scope and carried requirements, and the sub-project's own plan replaces it. These letters are not the S/M sizes inside the sub-project 2a plan, which measure worker time for a single task.
+Two sizes are counted from approved plans. The sub-project 1 plan has 17 task headings (Tasks 1 to 14 except 13, plus 3b, 7b, 13a and 13b), so it is M. The sub-project 2a plan has 44 tasks, so it is L. Every other size is an estimate from the spec's scope and carried requirements, and the sub-project's own plan replaces it. These letters are not the S/M sizes inside the sub-project 2a plan, which measure worker time for a single task.
 
 ## Summary
 
@@ -34,11 +34,11 @@ Two sizes are counted from approved plans. The sub-project 1 plan has 17 task he
 
 ## Order of work
 
-Two sources give the order, and they do not fully agree.
+Two sources give the order.
 
-**Spec §19 (build order).** The sub-projects are listed in build order, and each depends only on the ones before it: 1, then 2 (2a, 2b, 2c), then 3, 4, 5, 6 and 7. Sub-project 8 comes after the alpha.
+**Spec §19 (build order).** The sub-projects are listed in build order, and each depends only on the ones before it: 1, then 2 (2a, 2b, 2c), then 3, 4, 5, 6 and 7. Sub-project 8 comes after the alpha. This is a dependency rule; it does not forbid building sub-projects side by side.
 
-**Spec §17 (weekly milestones).** The week-by-week schedule runs several sub-projects side by side:
+**Spec §17 (weekly milestones).** The approved week-by-week schedule runs several sub-projects side by side:
 
 - agentOS computers and the browser supervisor (2b) sit in the week of 2026-11-09, beside 2a's document tools.
 - The approval host, the policy function and statuses (3) sit in the week of 2026-11-16, before 2a ends.
@@ -46,9 +46,14 @@ Two sources give the order, and they do not fully agree.
 - The memory stores and the RustShare connector (2c) sit last among the builds, in the week of 2026-12-28.
 - The sub-project 2a plan has its own week table, which ends with OCR in the weeks of 2026-12-21 and 2026-12-28.
 
-**How plans are written.** The plans for 2b, 2c and 3 are written and reviewed while 2a builds. Each later plan is written one wave ahead of its build.
+**How plans are written.** The founder decided (2026-11-25) that the plans for 2b, 2c and 3 are written and reviewed while 2a builds, and that each later plan is written one wave ahead of its build. This is process, not scope.
 
-Whether builds overlap as §17 shows or run strictly in §19 order is an open question (Q2 below).
+**Where the two sources conflict.** Some dependencies run against the §19 order or the §17 weeks:
+- Sub-project 4 carries a recall tool and a memory byte cap (§19 item 4), which need 2c's memory, but §17 runs routing in the weeks of 2026-11-23 and 2026-11-30, before 2c in the week of 2026-12-28 (Q2).
+- Sub-project 3's templates need teams (§8) and so sub-project 4's lead-Kat planning and delegation, and the research brief needs saved web spans, which arrive with 2b; §19 lists sub-project 3 before 4 (Q4).
+- Sub-project 4's Stage 0 sends approval callbacks to sub-project 3's approval host and resumes `needs_input` jobs from sub-project 3 (§6.2), which fits the §19 order but not §17's weeks.
+
+Rescheduling after the slip in Q1 is a separate question.
 
 ## Sub-projects
 
@@ -97,7 +102,8 @@ In sub-project 1, `needs_input` is a final job status: the person's next message
 - the legal read of which public Thai documents are usable;
 - the start of the two Thai reviewers, and approval of the annotator programme;
 - permission to publish the Craft image and keep the forks public;
-- the Craft licence notes.
+- the Craft licence notes;
+- approval of the Craft round, which the plan still lists as outstanding and ADR-0011 still records as Proposed.
 
 ### 2b. Kat computers (#130)
 
@@ -110,7 +116,8 @@ In sub-project 1, `needs_input` is a final job status: the person's next message
 - The private sign-in card.
 - The browser take-over lease and its permissions.
 - Captured, hashed downloads that become Kat-owned inputs.
-- The rest of the carried requirements in spec §19 item 2, which cover the sidecar lifecycle, argv process APIs, quotas, package pinning and the real-Chromium CI lane.
+- The rest of the carried requirements in spec §19 item 2, including the GUI tier with a virtual display, the control-lease API, guest filesystem snapshots, CDP on a per-Kat network, Web Bot Auth signing, the env allowlist, the sidecar lifecycle, argv process APIs, quotas, package pinning and the real-Chromium CI lane.
+- From the 2a plan's deferrals: browser reader and authenticated modes, and the lab brief for the in-house agentOS.
 
 **Entry gate, first:**
 - The inventory of commands the alpha templates need inside agentOS.
@@ -118,7 +125,7 @@ In sub-project 1, `needs_input` is a final job status: the person's next message
 
 Both feed ADR-0009's kill criteria for switching the code tier to gVisor. KatsAgentOS, the in-house sandbox that replaces agentOS, is a separate track after the alpha. Sub-project 2b builds only the agentOS adapter and the `Computer` contract.
 
-**Depends on:** sub-project 1. It also uses 2a's artifact store for browser downloads, through a migration that relaxes 2a's "inputs are uploaded by a person" check.
+**Depends on:** sub-project 1, and 2a's artifact store: browser downloads become Kat-owned inputs through a migration that relaxes 2a's check that "an input has `created_by_user` and no Kat".
 
 **Size:** L (estimate). The spec carries about twenty requirements into it.
 
@@ -141,7 +148,7 @@ Both feed ADR-0009's kill criteria for switching the code tier to gVisor. KatsAg
 
 **Scope** (spec §6.5, §7, §19 item 3; ADR-0002; the 2a plan's SP3 seam):
 - The approval host.
-- Proposals with expiry, precondition digest, revision and states.
+- Proposals with expiry, precondition digest, revision and states, with admin-set expiry per action type, re-checked right before acting.
 - An approve endpoint that executes once per tool call.
 - Action types from KatWork's registry.
 - Approval cards rendered by code.
@@ -151,7 +158,10 @@ Both feed ADR-0009's kill criteria for switching the code tier to gVisor. KatsAg
 - Acceptance on top of 2a's evidence verifier: zero failed claims, and every claim in the required-evidence scope passed.
 - A contract hash that stops the job when the contract changes.
 - The same-Kat rule, which caps a job at `ready`.
-- Replay and kill-switch tests.
+- Checks that pass only on a harness-owned completion record, where before/after drift makes a claim unverified and stale (§5.1).
+- Replay and kill-switch tests. §17 runs these gates in the hardening week of 2027-01-04; sub-project 3 builds them.
+- LLM-judged evaluations that use a different model or provider from the system under test.
+- Every team DAG has exactly one sink task, owned by the lead or the Writer; an invalid plan goes back as a tool error within the repair cap (§6.4). Sub-project 4 builds the planner that must honour it.
 - Templates and their acceptance contracts.
 - Template filling, after a fill-engine bake-off; editing existing workbooks; lopdf's constrained PDF edits.
 - The render check, advisory until it passes the §9.1 gate.
@@ -159,9 +169,11 @@ Both feed ADR-0009's kill criteria for switching the code tier to gVisor. KatsAg
 - Real-model injection runs, seeded from KatBench-Inject.
 - The KatBench SAR and One Report worlds, with the templates.
 
-The spec puts templates in this sub-project, but it does not say which of the six alpha templates (spec §8) are built here or are needed for the alpha (Q4).
+This list is not complete; §19 item 3 has the full set of carried requirements.
 
-**Depends on:** 2a (the evidence verifier, evidence reports and trust flags). Templates that read scans need 2a's OCR.
+All six templates in spec §8 are alpha goals (§1.1 goal 8), and §18's cut order names none of them. §19 item 3 gives templates to this sub-project, while the 2a plan builds the meeting-minutes template and §17 puts the HA rubric pack in the hardening week of 2027-01-04. Which sub-project builds each of the others, and how their dependencies on later sub-projects are handled, is open (Q4).
+
+**Depends on:** 2a (the evidence verifier, evidence reports and trust flags; a scanned Thai PDF goes through OCR in the §15 fidelity gates). Its templates also need sub-project 4's lead-Kat planning and delegation for their teams (§8), and the research brief needs saved web spans from 2b (Q4).
 
 **Size:** L (estimate).
 
@@ -171,13 +183,15 @@ The spec puts templates in this sub-project, but it does not say which of the si
 - Stage 0 in code: approval callbacks, `@mentions`, the closed set of eligible Kats, Thai script detection, an `addressed` flag, per-channel trigger modes, dropping bot messages, and a hop cap on `KatEnvelope`.
 - Laya in Rust from a checksum-pinned bundle, in shadow mode until each language passes the 50-case calibration gate.
 - The 200-case calibration set and its preregistered protocol.
-- Lead-Kat planning: a validated DAG of at most 5 tasks and 3 levels, with exactly one sink task.
+- Lead-Kat planning: a validated DAG of at most 5 tasks and 3 levels. The one-sink-task rule is carried in §19 item 3 (sub-project 3), and this planner must honour it.
 - Delegation through `KatEnvelope`.
-- Context and provider-quota handling.
+- Context and provider-quota handling: a compaction threshold, a bounded handoff on model change, a recall tool, a memory byte cap, and a queue hold until the provider limit resets.
+
+Plan-item closure (§6.4) is decided by a lead-Kat structured check plus the registered checks, and its items drive the live graph and the office view. §19 does not assign it to a sub-project (Q7).
 
 The 2a plan notes that the minutes team (Writer, Scheduler, Reviewer) needs this delegation; the 2a demo runs one Writer.
 
-**Depends on:** sub-project 1. The spec's list order places it after sub-project 3.
+**Depends on:** sub-project 1; sub-project 3 (Stage 0 sends approval callbacks to the approval host and resumes `needs_input` jobs, §6.2); 2c (the recall tool and the memory byte cap, Q2).
 
 **Size:** M (estimate).
 
@@ -187,10 +201,10 @@ The 2a plan notes that the minutes team (Writer, Scheduler, Reviewer) needs this
 - One adapter boundary.
 - Seven adapters: LINE, Slack, Teams, RustChat/Mattermost, Telegram, Discord, and WhatsApp through the official Cloud API.
 - The documented tunnel recipe for webhook channels behind NAT.
-- Approval cards and clarifying questions in each channel.
+- Approval cards in each channel (§7.2), and clarifying questions through LINE quick-reply and Slack buttons where available (§6.4).
 - The channel tests in spec §15, including `two_bots_in_one_channel_do_not_loop`.
 
-**Depends on:** sub-project 1. Approval cards need sub-project 3's approval host, and clarifying questions need sub-project 3's resume.
+**Depends on:** sub-project 1; sub-project 3 (approval cards need the approval host, and clarifying questions need resume); sub-project 4 (`two_bots_in_one_channel_do_not_loop` relies on Stage 0 dropping bot and self messages and on the `KatEnvelope` hop cap).
 
 **Size:** M (estimate).
 
@@ -207,7 +221,7 @@ The 2a plan notes that the minutes team (Writer, Scheduler, Reviewer) needs this
 
 All views read one event model.
 
-**Depends on:** sub-project 1's event stream; 2a's Craft previews and panel; 2b's browser screencast.
+**Depends on:** sub-project 1's event stream; 2a's Craft previews and panel; 2b's browser screencast; sub-project 3 (the board shows the approval queue); sub-project 4 (plan items drive the live graph and the office view, §6.4).
 
 **Size:** M (estimate).
 
@@ -246,13 +260,12 @@ A peer can never approve a local side effect.
 
 ## Alpha (#138)
 
-**Date:** the spec gives "by 2027-01-31" (§1.1), with the public alpha in the week of 2027-01-25 (§17). Issue #138 says the date follows the sub-projects it needs. Whether that date still holds is an open question (Q1).
+**Date:** the spec's §1.1 heading reads "Goals for the alpha (2027-01-31)", with the public alpha in the week of 2027-01-25 (§17). Issue #138 says the date follows the sub-projects it needs. Whether that date still holds is an open question (Q1).
 
 **Work that belongs to the release itself.** No §19 item owns this work:
-- Hardening: the kill-switch, replay and fidelity gates.
+- Running the hardening gates (kill-switch, replay and fidelity). Sub-project 3 builds the kill-switch and replay tests; §17 runs the gates in the week of 2027-01-04, the same week as the HA rubric pack, which is a template (Q4).
 - Demo mode.
 - Docs.
-- The HA self-assessment rubric pack with its redaction check.
 - Design-partner dry runs and the fixes from them.
 - The licence review.
 - A release candidate.
@@ -280,11 +293,14 @@ These come from §17's last four weeks.
    - The channel tests, including a behind-NAT install.
    - The view tests (browser, Tauri and Capacitor builds, Thai input, screen reader, reconnecting).
    - A licence review of sources, models, fonts and assets.
-3. Laya's 50-case routing benchmark is the release gate (§15). A language that fails it stays in shadow mode, and the lead Kat routes (§6.3, §18).
+3. The 50-case routing and delegation benchmark is the release gate (§15). A language that fails it stays in shadow mode, and the lead Kat routes (§6.3, §18).
 4. No Kat runs code in agentOS until the CI conformance test passes for every enabled runtime (§13, ADR-0009).
-5. Each Craft app or operation that fails its §9.1 gate is forbidden in that app's policy. A failing optional app never blocks a template, but a template whose Rust baseline fails its Thai gate is blocked (§9.1).
+5. Each Craft app or operation that fails its §9.1 gate is forbidden in that app's policy. A failing optional app never blocks a template, but a template whose Rust baseline fails its Thai gate is blocked (§9.1). GridCraft's check of XLSX outputs is not optional in this sense: it runs on every XLSX save, its outage marks the version "not checked by GridCraft", and a file it reports Excel would repair is refused.
 6. Demo mode runs with no keys, and its canned decisions are labelled synthetic. A live demo never depends on an external login (§15, §18).
 7. The 2a plan's legal reads come before any customer deployment uses the parts they gate. Until the Typhoon OCR terms pass, Typhoon OCR stays off.
+8. The human-labelled Thai claim set from real documents, which the 2a plan defers, is built before the design-partner dry runs (week of 2027-01-11). No sub-project owns it yet.
+
+**Fallbacks in §18:** for Thai document fidelity, a narrower supported-feature list; if the Craft track slips, the forks the demo does not use merge after it, and their apps stay watchable through previews.
 
 **Cut order if a week slips twice** (§18): WhatsApp and Teams first, then Capacitor, then 3D (the board stays).
 
@@ -303,9 +319,10 @@ The spec names, without assigning them to sub-projects:
 
 Nobody has ruled on these. This roadmap does not decide them.
 
-1. **The alpha date.** The spec says "by 2027-01-31", with the public alpha in the week of 2027-01-25. The 2a plan put the meeting-minutes demo in the week of 2026-11-30. When this roadmap was written, 4 of 2a's 44 tasks had merged. Does the date hold, move, or hold with §18's cut order (or a wider cut) applied?
-2. **Build overlap.** Spec §19 says each sub-project depends only on the ones before it, while §17 builds 2b, 3, 4, 5 and 6 work beside 2a and puts memory (2c) last. Do later sub-projects start building while 2a is still open, and if so, which ones?
+1. **The alpha date.** The spec's §1.1 heading gives 2027-01-31, with the public alpha in the week of 2027-01-25. The 2a plan put the meeting-minutes demo in the week of 2026-11-30. When this roadmap was written, 4 of 2a's 44 tasks had merged. Does the date hold, move, or hold with §18's cut order (or a wider cut) applied?
+2. **Routing before memory.** Sub-project 4 carries a recall tool and a memory byte cap (§19 item 4), which need 2c's memory, but §17 runs routing in the weeks of 2026-11-23 and 2026-11-30 and memory in the week of 2026-12-28. Does sub-project 4 wait for 2c, build those two parts after 2c lands, or does 2c move earlier?
 3. **Sub-project 7 and the alpha.** §19 lists sub-project 7 before federation, and only federation is marked "after the alpha". §17 gives sub-project 7 no week, and §1.2 defers the streamed Craft desktop to it. Is sub-project 7 required for the alpha, partly required, or after it?
-4. **Templates.** Are all six alpha templates (§8) required for the alpha, or may some be cut? §18's cut order names channels, Capacitor and 3D, not templates. Which sub-project builds the research brief, SAR, One Report, monthly pack and HA rubric pack: all in sub-project 3, or each with the sub-project it first needs?
+4. **Templates.** All six templates are alpha goals (§1.1 goal 8), and §18's cut order names none, so cutting one would be a new founder decision. Two things are open. First, which sub-project builds each of the research brief, SAR, One Report, monthly pack and HA rubric pack: all in sub-project 3 (§19 item 3), or each with the sub-project it first needs? Second, how their dependencies on later sub-projects are handled: their teams need sub-project 4's planning and delegation, and the research brief needs 2b's saved web spans, while §19 lists sub-project 3 before both. Should any template be cut if the date in Q1 cannot hold?
 5. **Design partners.** The dry runs (week of 2027-01-11) and any partner samples need a signed data annex (§15). Who are the partners, and when is the annex signed?
 6. **After the alpha.** How do the Phase 2 to 4 use cases (§8), the Enterprise features (§16) and KatsAgentOS (§14) map onto sub-projects or plans, and in what order relative to federation?
+7. **Plan-item closure.** §6.4's plan-item closure (a lead-Kat structured check plus the registered checks, driving the live graph and the office view) is not assigned to a sub-project in §19. Does it belong to sub-project 4 (lead-Kat planning) or sub-project 3 (registered checks)?
