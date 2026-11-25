@@ -713,6 +713,202 @@ fn array_and_data_table_ranges_are_formula_cells() {
     }
 }
 
+/// The cells whose blocks are flagged recalculated, as `Sheet!A1`, sorted.
+fn recalculated(extracted: &Extracted) -> Vec<String> {
+    let mut found: Vec<String> = extracted
+        .blocks
+        .iter()
+        .filter(|block| {
+            let untrusted = block.cell.as_ref().unwrap().cache_untrusted;
+            assert_eq!(
+                block.suspect == Some("xlsx_recalculated"),
+                untrusted,
+                "{block:?}"
+            );
+            untrusted
+        })
+        .map(|block| match &block.locator {
+            Locator::XlsxCell {
+                sheet, row, col, ..
+            } => format!("{sheet}!{}", name_of(*row, *col)),
+            _ => unreachable!(),
+        })
+        .collect();
+    found.dedup();
+    found.sort();
+    found
+}
+
+#[test]
+fn volatile_formulas_and_their_dependents_are_suspect() {
+    // Excel recalculates a volatile function, a formula marked `ca`, and every formula that
+    // depends on one, whenever it opens a workbook in automatic mode, even one the current
+    // engine saved: their caches are what a person never sees.
+    let f = |at: &str, formula: &str, value: &str| {
+        format!(r#"<c r="{at}"><f>{formula}</f><v>{value}</v></c>"#)
+    };
+    let main = [
+        row(
+            1,
+            &[
+                f("A1", "NOW()*0+1", "999"),
+                f("B1", "A1+0", "777"),
+                f("C1", "B1*2", "1554"),
+                num("D1", 0, "5"),
+                f("E1", "D1+1", "6"),
+                r#"<c r="F1"><f ca="1">D1*2</f><v>10</v></c>"#.to_owned(),
+                r#"<c r="G1" t="str"><f>"NOW()"&amp;D1</f><v>NOW()5</v></c>"#.to_owned(),
+                f("H1", "Stamp+1", "2"),
+                f("I1", "Alias*2", "4"),
+                f("J1", "SUM(B1:C1)", "3"),
+                f("K1", "SUM(D1:E1)", "11"),
+                f("L1", "Table1[Total]", "12"),
+                f("M1", "_xlfn.LET(_xlpm.x,D1,_xlpm.x+1)", "6"),
+                f("N1", "Fixed+1", "6"),
+                f("O1", "Missing+1", "6"),
+            ]
+            .concat(),
+        ),
+        row(
+            2,
+            &[
+                r#"<c r="A2"><f t="shared" ref="A2:A3" si="0">D1+1</f><v>6</v></c>"#.to_owned(),
+                f("D2", "A1*0", "0"),
+            ]
+            .concat(),
+        ),
+        row(3, r#"<c r="A3"><f t="shared" si="0"/><v>1</v></c>"#),
+        row(
+            4,
+            &[
+                r#"<c r="A4"><f t="array" ref="A4:B4">A1:B1*1</f><v>1</v></c>"#,
+                r#"<c r="B4"><v>2</v></c>"#,
+                r#"<c r="C4"><f>B4+0</f><v>2</v></c>"#,
+            ]
+            .concat(),
+        ),
+    ]
+    .concat();
+    let other = row(
+        1,
+        &[f("A1", "'S'!A1+0", "1"), f("B1", "S!D1", "5")].concat(),
+    );
+    let names = r#"<definedNames><definedName name="Stamp">NOW()</definedName><definedName name="Alias">Stamp</definedName><definedName name="Fixed">S!$D$1</definedName></definedNames>"#;
+    let with = |calc: &str| {
+        read(
+            &Xlsx::new()
+                .sheet("S", &data(&main))
+                .sheet("อื่น", &data(&other))
+                .without_calc_pr()
+                .workbook_tail(&format!("{names}{calc}")),
+        )
+    };
+    let expected = [
+        "S!A1",
+        "S!A3",
+        "S!A4",
+        "S!B1",
+        "S!B4",
+        "S!C1",
+        "S!C4",
+        "S!D2",
+        "S!F1",
+        "S!H1",
+        "S!I1",
+        "S!J1",
+        "S!L1",
+        "S!O1",
+        "อื่น!A1",
+    ];
+    for calc in [
+        r#"<calcPr calcId="191029"/>"#,
+        r#"<calcPr calcId="191029" calcMode="auto"/>"#,
+        r#"<calcPr calcId="191029" calcMode="autoNoTable"/>"#,
+    ] {
+        assert_eq!(recalculated(&with(calc)), expected, "{calc}");
+    }
+    // A workbook in manual mode is not recalculated on open by this rule.
+    assert!(recalculated(&with(r#"<calcPr calcId="191029" calcMode="manual"/>"#)).is_empty());
+}
+
+#[test]
+fn a_workbook_with_no_volatile_formula_keeps_its_caches() {
+    let rows = row(
+        1,
+        &[
+            num("A1", 0, "1"),
+            r#"<c r="B1"><f>A1+1</f><v>2</v></c>"#.to_owned(),
+            r#"<c r="C1"><f>SUM(A1:B1)</f><v>3</v></c>"#.to_owned(),
+            r#"<c r="D1"><f>NOWHERE+1</f><v>3</v></c>"#.to_owned(),
+        ]
+        .concat(),
+    );
+    assert!(recalculated(&read(&Xlsx::new().sheet("S", &data(&rows)))).is_empty());
+}
+
+#[test]
+fn volatile_dependency_chains_read_in_any_order_within_the_caps() {
+    // One TODAY() above long chains: forward and backward through single cells, through
+    // growing ranges, and across sheets. Each is read whole, every formula flagged.
+    let n = 12_000u32;
+    let main: String = (1..=n)
+        .map(|r| {
+            let a = if r == 1 {
+                "TODAY()".to_owned()
+            } else {
+                format!("A{}+1", r - 1)
+            };
+            let c = if r == n {
+                "A1".to_owned()
+            } else {
+                format!("C{}+1", r + 1)
+            };
+            row(
+                r,
+                &format!(
+                    r#"<c r="A{r}"><f>{a}</f><v>1</v></c><c r="B{r}"><f>SUM($A$1:A{r})</f><v>1</v></c><c r="C{r}"><f>{c}</f><v>1</v></c>"#
+                ),
+            )
+        })
+        .collect();
+    let other: String = (1..=n / 2)
+        .map(|r| row(r, &format!(r#"<c r="A{r}"><f>S!C{r}*2</f><v>1</v></c>"#)))
+        .collect();
+    let extracted = read(
+        &Xlsx::new()
+            .sheet("S", &data(&main))
+            .sheet("T", &data(&other)),
+    );
+    assert_eq!(extracted.blocks.len(), (3 * n + n / 2) as usize);
+    assert!(
+        extracted
+            .blocks
+            .iter()
+            .all(|block| block.suspect == Some("xlsx_recalculated"))
+    );
+    // A chain of ranges that only resolves backwards, one link per pass, is refused past the
+    // walk's work cap rather than walked without bound.
+    let n = 900u32;
+    let rows: String = (1..=n)
+        .map(|r| {
+            let formula = if r == n {
+                "NOW()".to_owned()
+            } else {
+                format!("SUM(A{}:A{})", r + 1, (r + 2).min(n))
+            };
+            row(r, &format!(r#"<c r="A{r}"><f>{formula}</f><v>1</v></c>"#))
+        })
+        .collect();
+    let small = DocLimits {
+        max_cells: 1_000,
+        ..limits()
+    };
+    assert_eq!(
+        extract_with(&Xlsx::new().sheet("S", &data(&rows)), &small),
+        Err(DocError::TooComplex("formula_dependencies"))
+    );
+}
+
 #[test]
 fn xlsx_block_cap_refuses_a_workbook_past_max_blocks() {
     // The block cap binds before the cell cap: a workbook of more non-empty cells than
@@ -4293,6 +4489,21 @@ fn xlsx_each_reader_loop_stops_at_its_own_deadline_check() {
     stops_at_its_check("walk", &sheet(&data(&rows(600))));
     stops_at_its_check("merged_cells", &sheet(&data(&rows(1_100))));
     stops_at_its_check("header_cells", &sheet(&data(&rows(70))));
+    // The dependency walk: formulas read for what they depend on, and a volatile chain.
+    let formulas = |count: u32, first: &str| {
+        (1..=count)
+            .map(|r| {
+                let formula = if r == 1 {
+                    first.to_owned()
+                } else {
+                    format!("A{}+1", r - 1)
+                };
+                row(r, &format!(r#"<c r="A{r}"><f>{formula}</f><v>1</v></c>"#))
+            })
+            .collect::<String>()
+    };
+    stops_at_its_check("formulas", &sheet(&data(&formulas(70, "1"))));
+    stops_at_its_check("dependents", &sheet(&data(&formulas(600, "NOW()"))));
     let merges: String = (1..=1_100u32)
         .map(|r| format!(r#"<mergeCell ref="B{r}:C{r}"/>"#))
         .collect();

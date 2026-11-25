@@ -32,6 +32,8 @@ use super::{
     xml_guard::{self, ElementBudget},
 };
 
+mod deps;
+
 const SML: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const STRICT: &str = "http://purl.oclc.org/ooxml/";
 const PACKAGE_RELATIONSHIPS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
@@ -433,19 +435,38 @@ pub(super) fn read(bytes: &[u8], limits: &DocLimits) -> Result<Extracted, DocErr
         strings: &strings,
         date1904: workbook.date1904,
         full_calc_on_load: workbook.full_calc_on_load,
+        volatile: HashSet::new(),
         blocks: Vec::new(),
         warnings,
         ordinal: 0,
     };
-    for sheet in &sheets {
+    // Every worksheet is read before any is judged: a formula may depend on another sheet's.
+    let mut read_sheets = Vec::new();
+    for (at, sheet) in sheets.iter().enumerate() {
         let SheetKind::Worksheet(part) = &sheet.kind else {
             continue;
         };
         let xml = package.part(part).unwrap_or_default();
         record_read(part, xml);
-        let data = read_sheet(xml, &strings, limits)?;
+        read_sheets.push((at, read_sheet(xml, &strings, limits)?));
+    }
+    // A workbook Excel recalculates whole already has every formula flagged; one in manual mode
+    // is not recalculated for its volatile formulas.
+    if !workbook.full_calc_on_load && !workbook.manual {
+        let names: Vec<&str> = sheets.iter().map(|sheet| sheet.name.as_str()).collect();
+        let read: Vec<(usize, &SheetData)> =
+            read_sheets.iter().map(|(at, data)| (*at, data)).collect();
+        out.volatile = deps::volatile_cells(
+            &names,
+            &read,
+            &workbook.names,
+            workbook.names_undecided,
+            limits,
+        )?;
+    }
+    for (at, data) in &read_sheets {
         let start = out.blocks.len();
-        out.sheet(&judge, sheet, &data)?;
+        out.sheet(&judge, &sheets[*at], *at, data)?;
         headers(&mut out.blocks[start..])?;
         check("sheet")?;
     }
@@ -1380,10 +1401,24 @@ struct Workbook {
     /// manual `calcMode` changes nothing, since Excel keeps the mode of the first workbook it
     /// opened.
     full_calc_on_load: bool,
+    /// `calcMode="manual"`: Excel does not recalculate volatile formulas on open (though it
+    /// may still recalculate the whole workbook, see `full_calc_on_load`).
+    manual: bool,
     sheets: Vec<SheetEntry>,
+    names: Vec<deps::DefinedName>,
+    /// Markup compatibility left some defined name undecided.
+    names_undecided: bool,
 }
 
-const WORKBOOK_NAMES: &[&str] = &["workbook", "workbookPr", "calcPr", "sheets", "sheet"];
+const WORKBOOK_NAMES: &[&str] = &[
+    "workbook",
+    "workbookPr",
+    "calcPr",
+    "sheets",
+    "sheet",
+    "definedNames",
+    "definedName",
+];
 
 impl Workbook {
     /// `workbookPr`, `calcPr` and the sheets, each read only where the schema puts it: an
@@ -1393,8 +1428,13 @@ impl Workbook {
         let mut workbook = Workbook {
             date1904: false,
             full_calc_on_load: true,
+            manual: false,
             sheets: Vec::new(),
+            names: Vec::new(),
+            names_undecided: false,
         };
+        // The defined name being read: its name, its sheet and its text so far.
+        let mut name: Option<(String, Option<usize>, String)> = None;
         let (mut seen, mut ids, mut names) = (HashSet::new(), HashSet::new(), HashSet::new());
         let mut rel_ids = HashSet::new();
         let bad = DocError::Malformed("xlsx_workbook");
@@ -1406,7 +1446,38 @@ impl Workbook {
                     strict,
                 } => (start, open, strict),
                 Node::Eof => break,
-                Node::End(_) | Node::Text(_) | Node::Undecided { .. } => continue,
+                Node::Text(text) => {
+                    if let Some((_, _, formula)) = &mut name {
+                        formula.push_str(&text);
+                        if formula.len() > MAX_FORMULA_CHARS * ESCAPED_BYTES {
+                            return Err(DocError::TooComplex("formula"));
+                        }
+                    }
+                    continue;
+                }
+                Node::End(open) => {
+                    if open.sml
+                        && open.name == "definedName"
+                        && let Some((key, local, formula)) = name.take()
+                    {
+                        let text = decode_xstring(&formula).into_owned();
+                        if text.chars().count() > MAX_FORMULA_CHARS {
+                            return Err(DocError::TooComplex("formula"));
+                        }
+                        workbook.names.push(deps::DefinedName {
+                            name: key,
+                            local,
+                            text,
+                        });
+                    }
+                    continue;
+                }
+                Node::Undecided { .. } => {
+                    if walk.stack.iter().any(|open| open.name == "definedNames") {
+                        workbook.names_undecided = true;
+                    }
+                    continue;
+                }
             };
             if walk.stack.len() == 1 {
                 if strict {
@@ -1430,12 +1501,14 @@ impl Workbook {
                 "calcPr" => walk.at(&["workbook", "calcPr"]),
                 "sheets" => walk.at(&["workbook", "sheets"]),
                 "sheet" => walk.at(&["workbook", "sheets", "sheet"]),
+                "definedNames" => walk.at(&["workbook", "definedNames"]),
+                "definedName" => walk.at(&["workbook", "definedNames", "definedName"]),
                 _ => false,
             };
             if !placed {
                 return Err(DocError::Malformed("xlsx_structure"));
             }
-            if open.name != "sheet" && !seen.insert(open.name) {
+            if !matches!(open.name, "sheet" | "definedName") && !seen.insert(open.name) {
                 return Err(bad);
             }
             match open.name {
@@ -1447,8 +1520,15 @@ impl Workbook {
                     };
                 }
                 "calcPr" => {
-                    let [full, force, id] =
-                        walk.attrs(&start, ["fullCalcOnLoad", "forceFullCalc", "calcId"])?;
+                    let [full, force, id, mode] = walk.attrs(
+                        &start,
+                        ["fullCalcOnLoad", "forceFullCalc", "calcId", "calcMode"],
+                    )?;
+                    workbook.manual = match mode.as_deref() {
+                        None | Some("auto" | "autoNoTable") => false,
+                        Some("manual") => true,
+                        Some(_) => return Err(bad),
+                    };
                     let flag = |value: Option<String>| match value {
                         Some(value) => boolean(&value).ok_or(bad),
                         None => Ok(false),
@@ -1459,6 +1539,15 @@ impl Workbook {
                     };
                     workbook.full_calc_on_load =
                         flag(full)? | flag(force)? | (id < CURRENT_CALC_ID);
+                }
+                "definedName" => {
+                    let [key, local] = walk.attrs(&start, ["name", "localSheetId"])?;
+                    let key = decode_xstring(&key.ok_or(bad)?).into_owned();
+                    let local = match local {
+                        Some(local) => Some(unsigned(&local).ok_or(bad)? as usize),
+                        None => None,
+                    };
+                    name = Some((key, local, String::new()));
                 }
                 "sheet" => {
                     let [name, id, state] = walk.attrs(&start, ["name", "sheetId", "state"])?;
@@ -2211,6 +2300,12 @@ struct Cell {
     formula: Option<String>,
     /// The cell holds a formula, whatever its text.
     has_formula: bool,
+    /// Its formula says it must be calculated again (`ca`), or is a data table's, whose
+    /// dependencies the reader does not follow.
+    ca: bool,
+    data_table: bool,
+    /// For a shared formula's child, the cell of its master, whose text it carries.
+    master: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2225,9 +2320,10 @@ struct SheetData {
     cells: Vec<Cell>,
     columns: Vec<Column>,
     merges: Vec<Merge>,
-    /// The `ref` ranges of array formulas and data tables: only their top-left cell holds the
-    /// `f`, but a recalculation replaces every cell's value (ECMA-376 Part 1 §18.17.6.3).
-    formula_ranges: Vec<Merge>,
+    /// The `ref` ranges of array formulas and data tables, with the cell holding their `f`:
+    /// only that cell holds it, but a recalculation replaces every cell's value (ECMA-376
+    /// Part 1 §18.17.6.3).
+    formula_ranges: Vec<(Merge, (u32, u32))>,
 }
 
 const SHEET_NAMES: &[&str] = &[
@@ -2281,6 +2377,9 @@ struct OpenCell {
     value: Option<String>,
     inline: Option<RstBuilder>,
     formula: Option<(String, Option<u32>, bool)>,
+    ca: bool,
+    data_table: bool,
+    master: Option<(u32, u32)>,
     seen_formula: bool,
     seen_value: bool,
 }
@@ -2302,7 +2401,7 @@ fn read_sheet(xml: &[u8], strings: &[Rst], limits: &DocLimits) -> Result<SheetDa
     let mut row: Option<(u32, bool, u32, Option<u32>)> = None;
     let mut cell: Option<OpenCell> = None;
     // Shared formulas' masters, by their `si`.
-    let mut masters: HashMap<u32, String> = HashMap::new();
+    let mut masters: HashMap<u32, (String, (u32, u32))> = HashMap::new();
     // The raw text of the `f` or `v` being read.
     let mut raw: Option<String> = None;
     loop {
@@ -2420,6 +2519,9 @@ fn read_sheet(xml: &[u8], strings: &[Rst], limits: &DocLimits) -> Result<SheetDa
                             value: None,
                             inline: None,
                             formula: None,
+                            ca: false,
+                            data_table: false,
+                            master: None,
                             seen_formula: false,
                             seen_value: false,
                         });
@@ -2429,15 +2531,21 @@ fn read_sheet(xml: &[u8], strings: &[Rst], limits: &DocLimits) -> Result<SheetDa
                         if std::mem::replace(&mut open_cell.seen_formula, true) {
                             return Err(structure);
                         }
-                        let [kind, si, range] = walk.attrs(&start, ["t", "si", "ref"])?;
+                        let [kind, si, range, ca] = walk.attrs(&start, ["t", "si", "ref", "ca"])?;
                         if matches!(kind.as_deref(), Some("array" | "dataTable")) {
-                            data.formula_ranges.push(
+                            data.formula_ranges.push((
                                 range
                                     .as_deref()
                                     .and_then(merge_range)
                                     .ok_or(DocError::Malformed("xlsx_formula_range"))?,
-                            );
+                                (open_cell.row, open_cell.col),
+                            ));
                         }
+                        open_cell.ca = match ca {
+                            Some(ca) => boolean(&ca).ok_or(DocError::Malformed("xlsx_formula"))?,
+                            None => false,
+                        };
+                        open_cell.data_table = kind.as_deref() == Some("dataTable");
                         let shared = kind.as_deref() == Some("shared");
                         let si = match (shared, si) {
                             (true, Some(si)) => Some(
@@ -2536,16 +2644,21 @@ fn read_sheet(xml: &[u8], strings: &[Rst], limits: &DocLimits) -> Result<SheetDa
                         if text.chars().count() > MAX_FORMULA_CHARS {
                             return Err(DocError::TooComplex("formula"));
                         }
+                        let at = (open_cell.row, open_cell.col);
                         if let Some((formula, si, shared)) = &mut open_cell.formula {
                             *formula = match (*shared, *si, text.is_empty()) {
                                 (true, Some(si), false) => {
-                                    masters.insert(si, text.clone());
+                                    masters.insert(si, (text.clone(), at));
                                     text
                                 }
-                                (true, Some(si), true) => masters
-                                    .get(&si)
-                                    .cloned()
-                                    .ok_or(DocError::Malformed("xlsx_shared_formula"))?,
+                                (true, Some(si), true) => {
+                                    let (text, master) = masters
+                                        .get(&si)
+                                        .cloned()
+                                        .ok_or(DocError::Malformed("xlsx_shared_formula"))?;
+                                    open_cell.master = Some(master);
+                                    text
+                                }
                                 _ => text,
                             };
                         }
@@ -2696,6 +2809,9 @@ fn finish_cell(
         value,
         formula,
         has_formula,
+        ca: cell.ca,
+        data_table: cell.data_table,
+        master: cell.master,
     }))
 }
 
@@ -3255,6 +3371,8 @@ struct Output<'l> {
     strings: &'l [Rst],
     date1904: bool,
     full_calc_on_load: bool,
+    /// Cells Excel recalculates for their volatile formulas, as (sheet index, row, column).
+    volatile: HashSet<(usize, u32, u32)>,
     blocks: Vec<Block>,
     warnings: Warnings,
     ordinal: u32,
@@ -3274,13 +3392,23 @@ struct Made {
 impl Output<'_> {
     /// One worksheet's cells as blocks: each cell judged, its hidden runs left out with a
     /// warning, its text split into pieces.
-    fn sheet(&mut self, judge: &Judge, sheet: &Sheet, data: &SheetData) -> Result<(), DocError> {
+    fn sheet(
+        &mut self,
+        judge: &Judge,
+        sheet: &Sheet,
+        index: usize,
+        data: &SheetData,
+    ) -> Result<(), DocError> {
         let columns = columns(data.columns.clone())?;
         let positions: Vec<(u32, u32)> =
             data.cells.iter().map(|cell| (cell.row, cell.col)).collect();
         let mut merges = data.merges.clone();
         let under = covered(&positions, &mut merges, "xlsx_merge", false)?;
-        let mut ranges = data.formula_ranges.clone();
+        let mut ranges: Vec<Merge> = data
+            .formula_ranges
+            .iter()
+            .map(|(range, _)| *range)
+            .collect();
         // The `f` need not stand in its range's top-left cell, so every cell of it counts.
         let in_range = covered(&positions, &mut ranges, "xlsx_formula_range", true)?;
         for (at, cell) in data.cells.iter().enumerate() {
@@ -3313,7 +3441,9 @@ impl Output<'_> {
                     }
                 }
             }
-            let made = self.cell(judge, cell, &formats, base, under[at], in_range[at])?;
+            let recalculated = (self.full_calc_on_load && (cell.has_formula || in_range[at]))
+                || self.volatile.contains(&(index, cell.row, cell.col));
+            let made = self.cell(judge, cell, &formats, base, under[at], recalculated)?;
             if made.hidden.is_none() {
                 if let Some(why) = made.run_why {
                     self.warnings.push(ExtractWarning::HiddenContent {
@@ -3365,7 +3495,7 @@ impl Output<'_> {
         formats: &[u32],
         base: CellLook,
         covered: bool,
-        in_range: bool,
+        recalculated: bool,
     ) -> Result<Made, DocError> {
         let mut styles = Vec::with_capacity(formats.len());
         for &format in formats {
@@ -3479,8 +3609,6 @@ impl Output<'_> {
             .or_else(|| cached.clone())
             .or_else(|| cell.formula.clone())
             .unwrap_or_default();
-        // A cell of an array or data-table range that holds no `f` is recalculated with it.
-        let recalculated = self.full_calc_on_load && (cell.has_formula || in_range);
         let run_why = runs
             .as_ref()
             .and_then(|runs| runs.first.filter(|_| !runs.all))

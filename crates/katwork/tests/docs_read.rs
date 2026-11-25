@@ -7243,6 +7243,11 @@ fn seeds() -> Vec<(&'static str, &'static str, &'static str, Vec<u8>)> {
                 ))
                 .build()
         }),
+        ("xlsx", "volatile.xlsx", "volatile formulas, their dependents across sheets and names, an array and a data table, structured and 3-D references", Xlsx::new()
+            .workbook_tail(r#"<definedNames><definedName name="Stamp">NOW()</definedName><definedName name="Alias">Stamp</definedName><definedName name="Local" localSheetId="1">'ที่สอง'!$A$1:$A$3</definedName></definedNames>"#)
+            .sheet("S", r#"<sheetData><row r="1"><c r="A1"><f>_xlfn.RANDARRAY()*0+NOW()</f><v>1</v></c><c r="B1"><f ca="1">A1+Alias</f><v>2</v></c><c r="C1"><f t="array" ref="C1:D2">A1:B2*1</f><v>3</v></c><c r="D1"><v>4</v></c><c r="E1" t="str"><f>"NOW()"&amp;Table1[[#This Row],[x]]</f><v>x</v></c></row><row r="2"><c r="A2"><f t="shared" ref="A2:A3" si="0">$A$1+A1</f><v>1</v></c><c r="F2"><f t="dataTable" ref="F2:G3" dt2D="1" dtr="1" r1="A1" r2="B1"/><v>0</v></c></row><row r="3"><c r="A3"><f t="shared" si="0"/><v>1</v></c><c r="B3"><f>SUM(S:ที่สอง!A1, A:A, 1:1, #REF!, [1]X!A1)</f><v>0</v></c></row></sheetData>"#)
+            .sheet("ที่สอง", r#"<sheetData><row r="1"><c r="A1"><f>'S'!C1+Local</f><v>1</v></c></row></sheetData>"#)
+            .build()),
     ]
 }
 
