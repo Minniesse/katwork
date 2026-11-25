@@ -1394,6 +1394,7 @@ dependencies = [
  "flate2",
  "futures",
  "jsonschema",
+ "katwork-thai",
  "lettre",
  "nix",
  "percent-encoding",

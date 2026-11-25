@@ -40,6 +40,7 @@ async fn migrations_apply_cleanly(pool: PgPool) {
             "password_resets",
             "runs",
             "sessions",
+            "source_spans",
             "spaces",
             "task_leases",
             "tasks",
@@ -914,6 +915,30 @@ async fn tool_calls_reject_run_in_another_workspace(pool: PgPool) {
             .unwrap_err(),
         "tool_calls_run_id_workspace_id_fkey",
     );
+}
+
+#[sqlx::test]
+async fn source_spans_reject_a_version_of_another_workspace(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let other = Fixture::new(&pool).await;
+    let artifact = uuid::Uuid::now_v7();
+    let version = uuid::Uuid::now_v7();
+    sqlx::query("INSERT INTO artifacts (id, workspace_id, space_id, name, role, created_by_user) VALUES ($1, $2, $3, 'a.txt', 'input', $4)")
+        .bind(artifact).bind(other.workspace).bind(other.space).bind(other.user).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO artifact_versions (id, workspace_id, artifact_id, version, sha256, bytes, media_type) VALUES ($1, $2, $3, 1, repeat('a', 64), 1, 'text')")
+        .bind(version).bind(other.workspace).bind(artifact).execute(&pool).await.unwrap();
+    let insert = |workspace: uuid::Uuid| {
+        sqlx::query("INSERT INTO source_spans (id, workspace_id, artifact_version_id, extractor, extractor_version, ordinal, piece, source_ref, text, text_sha256, match_key, normalize_version, generated) VALUES ($1, $2, $3, 'text', 1, 1, 0, '{}', 'x', repeat('b', 64), 'x', 1, false)")
+            .bind(uuid::Uuid::now_v7()).bind(workspace).bind(version).execute(&pool)
+    };
+    workspace_fk(
+        insert(f.workspace).await.unwrap_err(),
+        "source_spans_artifact_version_id_workspace_id_fkey",
+    );
+    insert(other.workspace).await.unwrap();
+    let default: String = sqlx::query_scalar("SELECT column_default FROM information_schema.columns WHERE table_name = 'tool_calls' AND column_name = 'output_trust'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(default, "'untrusted'::text");
 }
 
 #[sqlx::test]

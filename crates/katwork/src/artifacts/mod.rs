@@ -11,6 +11,7 @@ pub mod blob;
 pub mod media;
 pub mod names;
 pub mod store;
+pub mod tools;
 pub mod uploads;
 
 pub use blob::{BlobRef, BlobStore, BlobStream, LocalBlobStore, StagedBlob, Staging};
@@ -52,6 +53,19 @@ impl MediaType {
             Self::Csv => "csv",
             Self::Png => "png",
             Self::Jpeg => "jpeg",
+        }
+    }
+
+    /// The reader a file of this type goes through.
+    pub fn kind(&self) -> crate::docs::MediaKind {
+        use crate::docs::MediaKind;
+        match self {
+            Self::Pdf => MediaKind::Pdf,
+            Self::Docx => MediaKind::Docx,
+            Self::Xlsx => MediaKind::Xlsx,
+            // A CSV reads as plain text: paragraphs split on blank lines.
+            Self::Text | Self::Markdown | Self::Csv => MediaKind::Text,
+            Self::Png | Self::Jpeg => MediaKind::Image,
         }
     }
 

@@ -1,5 +1,5 @@
 use katwork::{
-    agent::{RunFacts, StopReason, ToolCallRecord, ToolCallState},
+    agent::{OutputTrust, RunFacts, StopReason, ToolCallRecord, ToolCallState},
     events::KatworkEvent,
     ids::*,
     policy::{self, NextStep, PolicyInputs, PolicyStatus, Thresholds, Verdict},
@@ -80,6 +80,7 @@ fn call(effect: Option<SideEffect>, state: ToolCallState) -> ToolCallRecord {
         name: "tool".into(),
         side_effect: effect,
         state,
+        output_trust: OutputTrust::Untrusted,
     }
 }
 fn answered() -> RunFacts {
@@ -364,8 +365,10 @@ fn policy_table_covers_fact_combinations_and_every_call_state_and_effect() {
                     ToolCallState::OutcomeUnknown,
                     ToolCallState::Refused,
                 ] {
+                    // WorkspaceRead no longer demands review (SP2a Task 6): only an effect that
+                    // changes state, or an unknown one, does.
                     let review =
-                        effect != Some(SideEffect::Read) && state != ToolCallState::Refused;
+                        effect.is_none_or(|e| e.changes_state()) && state != ToolCallState::Refused;
                     f.tool_calls = vec![call(effect, state)];
                     let inputs = PolicyInputs::from_facts(&f);
                     assert_eq!(inputs.effects_dispatched, review);
@@ -387,5 +390,73 @@ fn policy_table_covers_fact_combinations_and_every_call_state_and_effect() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn refused_and_unfinished_calls_do_not_taint() {
+    let mut f = answered();
+    for state in [
+        ToolCallState::Refused,
+        ToolCallState::Started,
+        ToolCallState::Failed,
+        ToolCallState::TimedOut,
+        ToolCallState::OutcomeUnknown,
+    ] {
+        f.tool_calls = vec![call(Some(SideEffect::WorkspaceRead), state)];
+        assert!(!PolicyInputs::from_facts(&f).context_untrusted, "{state:?}");
+    }
+    f.tool_calls = vec![call(
+        Some(SideEffect::WorkspaceRead),
+        ToolCallState::Succeeded,
+    )];
+    assert!(PolicyInputs::from_facts(&f).context_untrusted);
+    let mut trusted = call(Some(SideEffect::Read), ToolCallState::Succeeded);
+    trusted.output_trust = OutputTrust::Trusted;
+    f.tool_calls = vec![trusted];
+    assert!(!PolicyInputs::from_facts(&f).context_untrusted);
+}
+
+#[test]
+fn an_old_decision_event_without_context_untrusted_still_replays() {
+    let mut inputs = serde_json::to_value(PolicyInputs::from_facts(&answered())).unwrap();
+    inputs.as_object_mut().unwrap().remove("contextUntrusted");
+    let old: PolicyInputs = serde_json::from_value(inputs).unwrap();
+    assert!(!old.context_untrusted);
+    assert_eq!(
+        policy::decide(&old, &Thresholds::SP1),
+        policy::decide_job(&answered(), &Thresholds::SP1)
+    );
+    let record = serde_json::json!({"id": ToolCallRecordId::new(), "step": 1,
+        "tool_call_id": "c", "name": "read_file", "side_effect": "workspace_read",
+        "state": "succeeded"});
+    let old: ToolCallRecord = serde_json::from_value(record).unwrap();
+    assert_eq!(old.output_trust, OutputTrust::Untrusted);
+}
+
+#[test]
+fn changes_state_and_policy_agree_for_all_13_effects() {
+    let all = [
+        "read",
+        "navigate",
+        "workspace_read",
+        "draft",
+        "workspace_write",
+        "exec",
+        "credential_use",
+        "destructive",
+        "outward_send",
+        "outward_publish",
+        "outward_pay",
+        "outward_share",
+        "outward_external_api",
+    ];
+    for wire in all {
+        let effect = SideEffect::from_wire(wire).unwrap();
+        assert_eq!(
+            effect.changes_state(),
+            !matches!(wire, "read" | "workspace_read"),
+            "{wire}"
+        );
     }
 }
