@@ -3310,6 +3310,46 @@ fn pdf_actual_text_is_trusted_only_when_it_matches_its_glyphs() {
 }
 
 #[test]
+fn pdf_actual_text_is_trusted_only_over_one_line_of_adjacent_glyphs() {
+    // The span joins "9" after "Total" and "00" after "Fee" into "Total 900", a figure no line
+    // of the page draws: matching text alone does not make it trusted.
+    let mut doc = Doc::new();
+    doc.page(
+        "BT /F1 10 Tf 10 100 Td (Fee) Tj ET\n\
+         BT /F1 10 Tf 10 200 Td (Total) Tj ET\n\
+         /Span << /ActualText (900) >> BDC\n\
+         BT /F1 10 Tf 40 200 Td (9) Tj ET\n\
+         BT /F1 10 Tf 40 100 Td (00) Tj ET\n\
+         EMC",
+        "",
+    );
+    let extracted = read(&doc.build());
+    let total = block(&extracted, "Total 900");
+    assert_eq!((total.hidden, total.suspect), (None, Some("actual_text")));
+    // The same span with its glyphs side by side on one line (Helvetica's 9 is 5.56 pt wide at
+    // 10 pt), and a Thai cluster span as Typst writes one, stay trusted.
+    let thai = "\u{E01}\u{E33}\u{E44}\u{E23}";
+    let actual = Doc::utf16(thai).replacen('<', "<FEFF", 1);
+    let mut doc = Doc::new();
+    doc.page(
+        &format!(
+            "/Span << /ActualText (900) >> BDC\n\
+             BT /F1 10 Tf 40 200 Td (9) Tj ET\n\
+             BT /F1 10 Tf 45.56 200 Td (00) Tj ET\n\
+             EMC\n\
+             BT /U 10 Tf 10 100 Td /Span << /ActualText {actual} >> BDC {} Tj EMC ET",
+            Doc::utf16(thai)
+        ),
+        "",
+    );
+    let extracted = read(&doc.build());
+    for text in ["900", thai] {
+        let block = block(&extracted, text);
+        assert_eq!((block.hidden, block.suspect), (None, None), "{text}");
+    }
+}
+
+#[test]
 fn pdf_header_must_start_in_the_first_kilobyte() {
     let mut doc = Doc::new();
     doc.page(&text(10.0, 10.0, 100.0, "late header"), "");

@@ -17,8 +17,10 @@
 //! - A marked-content `/ActualText` replaces the text of the glyphs it encloses (Typst writes
 //!   one around every Thai cluster its ToUnicode map cannot express); the span is hidden when
 //!   any of its glyphs is, and suspect when any is suspect. A span whose text differs from its
-//!   glyphs' own text after `normalize_th` is `Suspect("actual_text")`: it reads, but never at
-//!   full quality, since only the file says the glyphs mean it. A span whose text or glyph
+//!   glyphs' own text after `normalize_th`, or whose glyphs do not run along one line (each
+//!   within one font size of the previous glyph's end, the boxes overlapping vertically), is
+//!   `Suspect("actual_text")`: it reads, but never at full quality, since only the file says
+//!   the glyphs mean it. A span whose text or glyph
 //!   text passes 64 KiB is neither copied nor compared: its glyphs keep their own text, suspect.
 //! - A glyph whose text repeats that of a glyph or span not hidden earlier on its line, with its
 //!   box centre inside that one's box (within 5% of the font size), adds no text: it draws over
@@ -449,6 +451,7 @@ fn apply_actual_text(
         let drawn: String = members.iter().map(|at| chars[*at].text.as_str()).collect();
         let matches = text.is_some_and(|text| {
             drawn.len() <= MAX_ACTUAL_TEXT_COMPARE
+                && one_line(chars, members)
                 && normalize_th(text).text == normalize_th(&drawn).text
         });
         let trusted = if matches {
@@ -477,6 +480,18 @@ fn apply_actual_text(
         }
     }
     Ok(())
+}
+
+/// Whether a span's glyphs, in painting order, run along one line: each starts within one font
+/// size of where the one before it ends, and their boxes overlap vertically. A span whose
+/// glyphs lie apart could join text no line of the page draws.
+fn one_line(chars: &[Char], members: &[usize]) -> bool {
+    members.windows(2).all(|pair| {
+        let (before, after) = (&chars[pair[0]], &chars[pair[1]]);
+        let gap = (after.origin.0 - before.end.0).hypot(after.origin.1 - before.end.1);
+        let (a, b) = (before.paint.bbox, after.paint.bbox);
+        gap <= before.size.max(after.size) && a[1] <= b[3] && b[1] <= a[3]
+    })
 }
 
 /// Whether `inner`'s centre lies in `outer`, within 5% of `outer`'s height (its font size): a
