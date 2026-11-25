@@ -2748,12 +2748,13 @@ fn string(text: &str) -> Result<String, DocError> {
 }
 
 /// Which of a sheet's cells (in row then column order) lie under a merged range other than at
-/// its top-left cell, which alone Excel draws (or, for formula ranges, holds the `f`). Two
-/// ranges that overlap are refused as `overlap`.
+/// its top-left cell, which alone Excel draws (with `top_left`, that cell too). Two ranges that
+/// overlap are refused as `overlap`.
 fn covered(
     cells: &[(u32, u32)],
     merges: &mut [Merge],
     overlap: &'static str,
+    top_left: bool,
 ) -> Result<Vec<bool>, DocError> {
     merges.sort_by_key(|merge| (merge.top, merge.left));
     // The ranges open at a row, by their left column, and when each ends.
@@ -2800,11 +2801,9 @@ fn covered(
                 ends.push(Reverse((merge.bottom, merge.left)));
             }
         }
-        under.push(
-            open.range(..=col).next_back().is_some_and(|(_, merge)| {
-                col <= merge.right && (row, col) != (merge.top, merge.left)
-            }),
-        );
+        under.push(open.range(..=col).next_back().is_some_and(|(_, merge)| {
+            col <= merge.right && (top_left || (row, col) != (merge.top, merge.left))
+        }));
     }
     Ok(under)
 }
@@ -3280,9 +3279,10 @@ impl Output<'_> {
         let positions: Vec<(u32, u32)> =
             data.cells.iter().map(|cell| (cell.row, cell.col)).collect();
         let mut merges = data.merges.clone();
-        let under = covered(&positions, &mut merges, "xlsx_merge")?;
+        let under = covered(&positions, &mut merges, "xlsx_merge", false)?;
         let mut ranges = data.formula_ranges.clone();
-        let in_range = covered(&positions, &mut ranges, "xlsx_formula_range")?;
+        // The `f` need not stand in its range's top-left cell, so every cell of it counts.
+        let in_range = covered(&positions, &mut ranges, "xlsx_formula_range", true)?;
         for (at, cell) in data.cells.iter().enumerate() {
             // A cell's work is bounded (its pieces, its formats, its capped colours): one check
             // each.
@@ -3479,8 +3479,7 @@ impl Output<'_> {
             .or_else(|| cached.clone())
             .or_else(|| cell.formula.clone())
             .unwrap_or_default();
-        // A cell of an array or data-table range other than its top-left holds no `f`, but is
-        // recalculated with it.
+        // A cell of an array or data-table range that holds no `f` is recalculated with it.
         let recalculated = self.full_calc_on_load && (cell.has_formula || in_range);
         let run_why = runs
             .as_ref()

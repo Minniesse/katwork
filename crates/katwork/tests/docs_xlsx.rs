@@ -666,6 +666,37 @@ fn array_and_data_table_ranges_are_formula_cells() {
         assert_eq!(flagged(&with(calc)), inside, "{calc}");
     }
     assert!(flagged(&with(r#"<calcPr calcId="191029"/>"#)).is_empty());
+    // The `f` may stand outside its range, or below its top-left cell: every cell of the range
+    // is flagged, the top-left one included.
+    let cell = |at: &str, f_at: &str, range: &str| {
+        let f = if at == f_at {
+            format!(r#"<f t="array" ref="{range}">1</f>"#)
+        } else {
+            String::new()
+        };
+        format!(r#"<c r="{at}">{f}<v>5</v></c>"#)
+    };
+    for (f_at, range, expected) in [
+        ("A1", "B1:B3", ["A1", "B1", "B2", "B3"]),
+        ("A2", "A1:A3", ["A1", "A2", "A3", ""]),
+    ] {
+        let rows: String = (1..=3)
+            .map(|r| {
+                let cells =
+                    cell(&format!("A{r}"), f_at, range) + &cell(&format!("B{r}"), f_at, range);
+                row(r, &cells)
+            })
+            .collect();
+        let extracted = read(
+            &Xlsx::new()
+                .sheet("S", &data(&rows))
+                .workbook_tail(r#"<calcPr calcId="191029" fullCalcOnLoad="1"/>"#),
+        );
+        let mut found = flagged(&extracted);
+        found.sort();
+        let expected: Vec<&str> = expected.into_iter().filter(|at| !at.is_empty()).collect();
+        assert_eq!(found, expected, "{f_at} {range}");
+    }
     // A range Excel could not have written is refused rather than guessed at.
     for f in [
         r#"<f t="array">1</f>"#,
