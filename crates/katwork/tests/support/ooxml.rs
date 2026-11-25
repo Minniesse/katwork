@@ -298,6 +298,8 @@ pub struct Xlsx {
     /// Workbook children before `sheets` (`workbookPr` ...) and after it (`calcPr` ...).
     head: String,
     tail: String,
+    /// Whether `calcPr` is left out when `tail` writes none.
+    no_calc: bool,
     /// The workbook part written as is.
     workbook: Option<String>,
     /// More of the workbook's relationships: (type, target, part bytes when added).
@@ -321,6 +323,7 @@ impl Xlsx {
             theme: None,
             head: String::new(),
             tail: String::new(),
+            no_calc: false,
             workbook: None,
             related: Vec::new(),
             root_rels: None,
@@ -403,6 +406,12 @@ impl Xlsx {
         self
     }
 
+    /// A workbook part with no `calcPr`, unless `workbook_tail` writes one.
+    pub fn without_calc_pr(mut self) -> Xlsx {
+        self.no_calc = true;
+        self
+    }
+
     /// The workbook part written as is.
     pub fn workbook_xml(mut self, xml: &str) -> Xlsx {
         self.workbook = Some(xml.into());
@@ -451,8 +460,15 @@ impl Xlsx {
                 )
             })
             .collect();
+        // As the current Excel saves it, so its formula caches stand, unless `tail` says how
+        // the workbook calculates or `without_calc_pr` leaves that out.
+        let calc = if self.no_calc || self.tail.contains("<calcPr") {
+            ""
+        } else {
+            r#"<calcPr calcId="191029"/>"#
+        };
         format!(
-            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="{SML}" xmlns:r="{RELATIONSHIPS}">{}<sheets>{sheets}</sheets>{}</workbook>"#,
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="{SML}" xmlns:r="{RELATIONSHIPS}">{}<sheets>{sheets}</sheets>{}{calc}</workbook>"#,
             self.head, self.tail
         )
     }

@@ -1368,8 +1368,17 @@ struct SheetEntry {
     rel_id: String,
 }
 
+/// The calculation engine of the current Excel (Microsoft 365), as it writes `calcPr@calcId`.
+/// Excel recalculates every formula of a workbook an older engine calculated, and reads a
+/// missing `calcId` as 0 ([MS-OI29500] on ECMA-376 Part 1 §18.2.2).
+const CURRENT_CALC_ID: u32 = 191_029;
+
 struct Workbook {
     date1904: bool,
+    /// Excel recalculates every formula when it opens the workbook: `fullCalcOnLoad`,
+    /// `forceFullCalc`, or a `calcId` older than the current engine's (none counts as 0). A
+    /// manual `calcMode` changes nothing, since Excel keeps the mode of the first workbook it
+    /// opened.
     full_calc_on_load: bool,
     sheets: Vec<SheetEntry>,
 }
@@ -1383,7 +1392,7 @@ impl Workbook {
         let mut walk = Walk::new(xml, WORKBOOK_NAMES);
         let mut workbook = Workbook {
             date1904: false,
-            full_calc_on_load: false,
+            full_calc_on_load: true,
             sheets: Vec::new(),
         };
         let (mut seen, mut ids, mut names) = (HashSet::new(), HashSet::new(), HashSet::new());
@@ -1438,11 +1447,18 @@ impl Workbook {
                     };
                 }
                 "calcPr" => {
-                    let [full] = walk.attrs(&start, ["fullCalcOnLoad"])?;
-                    workbook.full_calc_on_load = match full {
-                        Some(value) => boolean(&value).ok_or(bad)?,
-                        None => false,
+                    let [full, force, id] =
+                        walk.attrs(&start, ["fullCalcOnLoad", "forceFullCalc", "calcId"])?;
+                    let flag = |value: Option<String>| match value {
+                        Some(value) => boolean(&value).ok_or(bad),
+                        None => Ok(false),
                     };
+                    let id = match id {
+                        Some(value) => unsigned(&value).ok_or(bad)?,
+                        None => 0,
+                    };
+                    workbook.full_calc_on_load =
+                        flag(full)? | flag(force)? | (id < CURRENT_CALC_ID);
                 }
                 "sheet" => {
                     let [name, id, state] = walk.attrs(&start, ["name", "sheetId", "state"])?;
@@ -3443,6 +3459,7 @@ impl Output<'_> {
             .or_else(|| cached.clone())
             .or_else(|| cell.formula.clone())
             .unwrap_or_default();
+        let recalculated = self.full_calc_on_load && cell.has_formula;
         let run_why = runs
             .as_ref()
             .and_then(|runs| runs.first.filter(|_| !runs.all))
@@ -3460,12 +3477,17 @@ impl Output<'_> {
                 row_header: None,
                 col_header: None,
                 header_unit: None,
-                cache_untrusted: self.full_calc_on_load && cell.has_formula,
+                cache_untrusted: recalculated,
             },
             hidden,
             run_why,
             phonetic: rst.is_some_and(|rst| rst.phonetic),
-            suspect: matches!(date, Some(Err(_))).then_some("xlsx_date_text"),
+            // Excel shows what a recalculated formula gives, which may not be its cache.
+            suspect: if recalculated {
+                Some("xlsx_recalculated")
+            } else {
+                matches!(date, Some(Err(_))).then_some("xlsx_date_text")
+            },
         })
     }
 
