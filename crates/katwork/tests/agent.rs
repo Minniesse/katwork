@@ -3,6 +3,8 @@
     reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
 )]
 #![allow(dead_code)]
+#[path = "support/files.rs"]
+mod files;
 mod support;
 
 use async_trait::async_trait;

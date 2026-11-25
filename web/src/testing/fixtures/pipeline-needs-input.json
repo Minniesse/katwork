@@ -168,6 +168,7 @@
           "hasFinalText": false,
           "pendingQuestion": true,
           "artifactsCreated": 0,
+          "contextUntrusted": false,
           "effectsDispatched": false,
           "executorUnavailable": false
         },

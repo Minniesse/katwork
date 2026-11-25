@@ -1,5 +1,6 @@
 //! Files and read-tool fixtures: a blob directory per test, uploads, hand-built blocks and a
-//! counting fake `extract`.
+//! counting fake `extract`. Included by path (`#[path = "support/files.rs"] mod files;`), not
+//! from `support/mod.rs`, which the server's tests share.
 #![allow(dead_code, reason = "Shared by the evidence and agent tests")]
 
 use std::{
@@ -30,7 +31,7 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::Fixture;
+use crate::support::Fixture;
 
 pub const LOCK: Duration = Duration::from_secs(5);
 

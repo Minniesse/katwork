@@ -161,9 +161,17 @@ fn follows(key: &[char], fragments: &[(Vec<char>, usize)], from: usize) -> bool 
 mod tests {
     use super::*;
 
+    /// An id, its fragments with their gaps, its markers and its marker gap.
+    type Row = (
+        &'static str,
+        &'static [(&'static str, usize)],
+        &'static [&'static str],
+        usize,
+    );
+
     #[test]
     fn lexicon_matches_the_plan_table() {
-        let plan: [(&str, &[(&str, usize)], &[&str], usize); 17] = [
+        let plan: [Row; 17] = [
             (
                 "en_ignore_instructions",
                 &[("ignore", 24), ("instruction", 24)],

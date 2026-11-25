@@ -476,7 +476,7 @@ impl SourceRef {
                 _ => return Err("bad_refinement"),
             }
         }
-        if !SHAPES.iter().any(|known| *known == shape.as_slice()) {
+        if !SHAPES.contains(&shape.as_slice()) {
             return Err("unknown_chain");
         }
         let page_link = links.iter().find_map(|link| match link {

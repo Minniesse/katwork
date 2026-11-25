@@ -4,6 +4,8 @@
 )]
 //! Source refs, spans, the instruction detector and the read tools (SP2a Task 6). PDF and XLSX
 //! blocks are built by hand, so these tests do not wait for those readers.
+#[path = "support/files.rs"]
+mod files;
 #[path = "support/ooxml.rs"]
 mod ooxml;
 #[allow(dead_code)]
@@ -12,6 +14,7 @@ mod support;
 use std::{collections::HashSet, sync::Arc};
 
 use chrono::{TimeZone, Utc};
+use files::*;
 use katwork::{
     agent::{TOOL_CODES, Tool, ToolCtx, ToolDeps, ToolError, ToolOutput},
     artifacts::{
@@ -36,7 +39,7 @@ use katwork::{
 };
 use serde_json::{Value, json};
 use sqlx::{Connection, PgConnection, PgPool};
-use support::{Fixture, assert_pool_clean, cancel_sql, files::*, locks};
+use support::{Fixture, assert_pool_clean, cancel_sql, locks};
 use uuid::Uuid;
 
 const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -878,7 +881,7 @@ async fn read_file_mints_the_same_span_ids_on_reread(pool: PgPool) {
     assert_eq!(first, second);
     assert_eq!(env.spans().await, 3);
     let row = span::get_in_space_on(
-        &mut *env.pool.acquire().await.unwrap(),
+        &mut env.pool.acquire().await.unwrap(),
         &env.tenant,
         SpaceId(env.f.space),
         SpanId(first[1].parse().unwrap()),

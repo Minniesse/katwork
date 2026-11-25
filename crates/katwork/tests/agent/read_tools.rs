@@ -5,6 +5,7 @@
 //! The loop with the read tools (SP2a Task 6): effects, retries, document errors, the cache,
 //! output trust, the repeat key, the run deadline and the shared budget.
 use super::*;
+use crate::files::{self, TestDir};
 use katwork::{
     agent::ledger,
     artifacts::{
@@ -17,7 +18,6 @@ use katwork::{
     policy::{self, NextStep, PolicyInputs, Thresholds},
 };
 use sqlx::Connection;
-use support::files::{self, TestDir};
 use uuid::Uuid;
 
 /// The harness with `read_file` (over `extract`) and `list_files` registered and allowed.

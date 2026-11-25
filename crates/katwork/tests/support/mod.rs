@@ -3,7 +3,6 @@
     reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
 )]
 pub mod cancel_sql;
-pub mod files;
 mod legacy;
 pub mod locks;
 
