@@ -28,6 +28,8 @@ async fn migrations_apply_cleanly(pool: PgPool) {
     assert_eq!(
         tables,
         [
+            "artifact_versions",
+            "artifacts",
             "events",
             "jobs",
             "kat_spaces",
