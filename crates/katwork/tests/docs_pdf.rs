@@ -3285,6 +3285,27 @@ fn pdf_actual_text_is_trusted_only_when_it_matches_its_glyphs() {
             .iter()
             .all(|page| page.text_layer == TextLayer::Ok)
     );
+    // A span past the comparison cap is never compared, so it is suspect even when it matches.
+    let long = "L".repeat(70_000);
+    let file = wide_line(
+        210_000.0,
+        &format!("/Span << /ActualText ({long}) >> BDC ({long}) Tj EMC"),
+    );
+    let extracted = read(&file);
+    assert_eq!(
+        extracted
+            .blocks
+            .iter()
+            .map(|block| block.text.len())
+            .sum::<usize>(),
+        70_000
+    );
+    assert!(
+        extracted
+            .blocks
+            .iter()
+            .all(|block| block.suspect == Some("actual_text"))
+    );
 }
 
 #[test]

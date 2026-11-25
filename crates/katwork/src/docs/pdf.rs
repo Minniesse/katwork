@@ -18,7 +18,8 @@
 //!   one around every Thai cluster its ToUnicode map cannot express); the span is hidden when
 //!   any of its glyphs is, and suspect when any is suspect. A span whose text differs from its
 //!   glyphs' own text after `normalize_th` is `Suspect("actual_text")`: it reads, but never at
-//!   full quality, since only the file says the glyphs mean it.
+//!   full quality, since only the file says the glyphs mean it. So is a span whose text or
+//!   glyph text passes 64 KiB, which is not compared.
 //! - A glyph whose text repeats that of a glyph or span not hidden earlier on its line, with its
 //!   box centre inside that one's box (within 5% of the font size), adds no text: it draws over
 //!   a character already read (Typst draws a cluster's positioned mark again with the cluster's
@@ -65,6 +66,9 @@ const WORK_PER_CHECK: u64 = 1_024;
 const GLYPHS_PER_CHECK: usize = 64;
 /// Characters, line items and spans the other grouping steps handle between deadline checks.
 const ITEMS_PER_CHECK: usize = 1_024;
+/// The longest `/ActualText` or glyph text, in bytes, a span is compared over; a longer span is
+/// suspect unread. Normalizing costs about 0.2 ms per KiB, and the deadline is checked per span.
+const MAX_ACTUAL_TEXT_COMPARE: usize = 64 * 1_024;
 
 thread_local! {
     static WALKS: Cell<u64> = const { Cell::new(0) };
@@ -415,10 +419,8 @@ fn apply_actual_text(chars: &mut [Char], verdicts: &mut [Visibility]) -> Result<
             spans.entry(*id).or_default().push(at);
         }
     }
-    for (index, members) in spans.values().enumerate() {
-        if index.is_multiple_of(ITEMS_PER_CHECK) {
-            deadline::check()?;
-        }
+    for members in spans.values() {
+        deadline::check()?;
         let hidden = members.iter().find_map(|at| match verdicts[*at] {
             Visibility::Hidden(why) => Some(Visibility::Hidden(why)),
             _ => None,
@@ -431,10 +433,10 @@ fn apply_actual_text(chars: &mut [Char], verdicts: &mut [Visibility]) -> Result<
         // alone, so it never reads at full quality.
         let drawn: String = members.iter().map(|at| chars[*at].text.as_str()).collect();
         let matches = members.first().is_some_and(|first| {
-            chars[*first]
-                .actual
-                .as_ref()
-                .is_some_and(|(_, actual)| normalize_th(actual).text == normalize_th(&drawn).text)
+            chars[*first].actual.as_ref().is_some_and(|(_, actual)| {
+                actual.len().max(drawn.len()) <= MAX_ACTUAL_TEXT_COMPARE
+                    && normalize_th(actual).text == normalize_th(&drawn).text
+            })
         });
         let trusted = if matches {
             Visibility::Visible
