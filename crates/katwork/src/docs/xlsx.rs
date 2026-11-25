@@ -2225,6 +2225,9 @@ struct SheetData {
     cells: Vec<Cell>,
     columns: Vec<Column>,
     merges: Vec<Merge>,
+    /// The `ref` ranges of array formulas and data tables: only their top-left cell holds the
+    /// `f`, but a recalculation replaces every cell's value (ECMA-376 Part 1 §18.17.6.3).
+    formula_ranges: Vec<Merge>,
 }
 
 const SHEET_NAMES: &[&str] = &[
@@ -2288,6 +2291,7 @@ fn read_sheet(xml: &[u8], strings: &[Rst], limits: &DocLimits) -> Result<SheetDa
         cells: Vec::new(),
         columns: Vec::new(),
         merges: Vec::new(),
+        formula_ranges: Vec::new(),
     };
     let reference = DocError::Malformed("xlsx_cell_reference");
     let structure = DocError::Malformed("xlsx_structure");
@@ -2425,7 +2429,15 @@ fn read_sheet(xml: &[u8], strings: &[Rst], limits: &DocLimits) -> Result<SheetDa
                         if std::mem::replace(&mut open_cell.seen_formula, true) {
                             return Err(structure);
                         }
-                        let [kind, si] = walk.attrs(&start, ["t", "si"])?;
+                        let [kind, si, range] = walk.attrs(&start, ["t", "si", "ref"])?;
+                        if matches!(kind.as_deref(), Some("array" | "dataTable")) {
+                            data.formula_ranges.push(
+                                range
+                                    .as_deref()
+                                    .and_then(merge_range)
+                                    .ok_or(DocError::Malformed("xlsx_formula_range"))?,
+                            );
+                        }
                         let shared = kind.as_deref() == Some("shared");
                         let si = match (shared, si) {
                             (true, Some(si)) => Some(
@@ -2736,8 +2748,13 @@ fn string(text: &str) -> Result<String, DocError> {
 }
 
 /// Which of a sheet's cells (in row then column order) lie under a merged range other than at
-/// its top-left cell, which alone Excel draws. Two ranges that overlap are refused.
-fn covered(cells: &[(u32, u32)], merges: &mut [Merge]) -> Result<Vec<bool>, DocError> {
+/// its top-left cell, which alone Excel draws (or, for formula ranges, holds the `f`). Two
+/// ranges that overlap are refused as `overlap`.
+fn covered(
+    cells: &[(u32, u32)],
+    merges: &mut [Merge],
+    overlap: &'static str,
+) -> Result<Vec<bool>, DocError> {
     merges.sort_by_key(|merge| (merge.top, merge.left));
     // The ranges open at a row, by their left column, and when each ends.
     let mut open: BTreeMap<u32, Merge> = BTreeMap::new();
@@ -2762,7 +2779,7 @@ fn covered(cells: &[(u32, u32)], merges: &mut [Merge]) -> Result<Vec<bool>, DocE
         if before.is_some_and(|(_, other)| other.right >= merge.left)
             || after.is_some_and(|(&left, _)| left <= merge.right)
         {
-            return Err(DocError::Malformed("xlsx_merge"));
+            return Err(DocError::Malformed(overlap));
         }
         open.insert(merge.left, *merge);
         ends.push(Reverse((merge.bottom, merge.left)));
@@ -3263,7 +3280,9 @@ impl Output<'_> {
         let positions: Vec<(u32, u32)> =
             data.cells.iter().map(|cell| (cell.row, cell.col)).collect();
         let mut merges = data.merges.clone();
-        let under = covered(&positions, &mut merges)?;
+        let under = covered(&positions, &mut merges, "xlsx_merge")?;
+        let mut ranges = data.formula_ranges.clone();
+        let in_range = covered(&positions, &mut ranges, "xlsx_formula_range")?;
         for (at, cell) in data.cells.iter().enumerate() {
             // A cell's work is bounded (its pieces, its formats, its capped colours): one check
             // each.
@@ -3294,7 +3313,7 @@ impl Output<'_> {
                     }
                 }
             }
-            let made = self.cell(judge, cell, &formats, base, under[at])?;
+            let made = self.cell(judge, cell, &formats, base, under[at], in_range[at])?;
             if made.hidden.is_none() {
                 if let Some(why) = made.run_why {
                     self.warnings.push(ExtractWarning::HiddenContent {
@@ -3346,6 +3365,7 @@ impl Output<'_> {
         formats: &[u32],
         base: CellLook,
         covered: bool,
+        in_range: bool,
     ) -> Result<Made, DocError> {
         let mut styles = Vec::with_capacity(formats.len());
         for &format in formats {
@@ -3459,7 +3479,9 @@ impl Output<'_> {
             .or_else(|| cached.clone())
             .or_else(|| cell.formula.clone())
             .unwrap_or_default();
-        let recalculated = self.full_calc_on_load && cell.has_formula;
+        // A cell of an array or data-table range other than its top-left holds no `f`, but is
+        // recalculated with it.
+        let recalculated = self.full_calc_on_load && (cell.has_formula || in_range);
         let run_why = runs
             .as_ref()
             .and_then(|runs| runs.first.filter(|_| !runs.all))
