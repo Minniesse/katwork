@@ -1301,3 +1301,111 @@ fn doc_max_read_bytes_is_bounded() {
         );
     }
 }
+
+#[test]
+fn upload_limits_are_validated() {
+    let config = |name: &'static str, value: Option<&str>| {
+        Config::from_lookup(|key| {
+            if key == name {
+                value.map(str::to_owned)
+            } else {
+                lookup(key)
+            }
+        })
+    };
+    let defaults = Config::from_lookup(lookup).unwrap();
+    assert_eq!(
+        defaults.artifact_dir,
+        std::path::PathBuf::from("/var/lib/katwork/artifacts")
+    );
+    assert_eq!(defaults.upload_max_bytes, 26_214_400);
+    assert_eq!(
+        defaults.upload_max_bytes,
+        katwork::docs::DocLimits::default().max_input_bytes
+    );
+    assert_eq!(defaults.workspace_storage_bytes, 10_737_418_240);
+    assert_eq!(defaults.upload_min_bytes_per_sec, 32_768);
+    assert_eq!(
+        defaults.upload_rate_window,
+        std::time::Duration::from_millis(10_000)
+    );
+    // Empty means unset.
+    for name in [
+        "KATWORK_ARTIFACT_DIR",
+        "KATWORK_UPLOAD_MAX_BYTES",
+        "KATWORK_WORKSPACE_STORAGE_BYTES",
+        "KATWORK_UPLOAD_MIN_BYTES_PER_SEC",
+        "KATWORK_UPLOAD_RATE_WINDOW_MS",
+    ] {
+        let config = config(name, Some("")).unwrap();
+        assert_eq!(config.artifact_dir, defaults.artifact_dir);
+        assert_eq!(config.upload_max_bytes, defaults.upload_max_bytes);
+        assert_eq!(
+            config.workspace_storage_bytes,
+            defaults.workspace_storage_bytes
+        );
+        assert_eq!(
+            config.upload_min_bytes_per_sec,
+            defaults.upload_min_bytes_per_sec
+        );
+        assert_eq!(config.upload_rate_window, defaults.upload_rate_window);
+    }
+    let set = |name, value| config(name, Some(value)).unwrap();
+    assert_eq!(
+        set("KATWORK_ARTIFACT_DIR", "/srv/katwork/files").artifact_dir,
+        std::path::PathBuf::from("/srv/katwork/files")
+    );
+    assert_eq!(set("KATWORK_UPLOAD_MAX_BYTES", "1").upload_max_bytes, 1);
+    assert_eq!(
+        set("KATWORK_UPLOAD_MAX_BYTES", "26214400").upload_max_bytes,
+        26_214_400
+    );
+    assert_eq!(
+        set("KATWORK_WORKSPACE_STORAGE_BYTES", "1048576").workspace_storage_bytes,
+        1_048_576
+    );
+    // A floor of 0 turns the rate check off.
+    assert_eq!(
+        set("KATWORK_UPLOAD_MIN_BYTES_PER_SEC", "0").upload_min_bytes_per_sec,
+        0
+    );
+    assert_eq!(
+        set("KATWORK_UPLOAD_RATE_WINDOW_MS", "100").upload_rate_window,
+        std::time::Duration::from_millis(100)
+    );
+    assert_eq!(
+        set("KATWORK_UPLOAD_RATE_WINDOW_MS", "300000").upload_rate_window,
+        std::time::Duration::from_secs(300)
+    );
+    for (name, values) in [
+        (
+            "KATWORK_ARTIFACT_DIR",
+            &["relative/files", "./files", " /srv/files", "files"][..],
+        ),
+        (
+            "KATWORK_UPLOAD_MAX_BYTES",
+            &["0", "26214401", "-1", "+1", "1e3", "1,000", "1 MiB"][..],
+        ),
+        (
+            "KATWORK_WORKSPACE_STORAGE_BYTES",
+            &["0", "-1", "+1", "1e3", "18446744073709551616"][..],
+        ),
+        (
+            "KATWORK_UPLOAD_MIN_BYTES_PER_SEC",
+            &["-1", "+1", "1e3", "32k"][..],
+        ),
+        (
+            "KATWORK_UPLOAD_RATE_WINDOW_MS",
+            &["0", "99", "300001", "-1", "+100", "1e3"][..],
+        ),
+    ] {
+        for value in values {
+            let error = config(name, Some(value)).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("config_invalid ({name})"),
+                "{name}={value}"
+            );
+        }
+    }
+}

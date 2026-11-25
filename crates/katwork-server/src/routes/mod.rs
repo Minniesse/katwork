@@ -1,5 +1,6 @@
 pub(crate) mod auth;
 pub mod events;
+pub mod files;
 pub mod health;
 pub mod jobs;
 pub mod kats;

@@ -65,6 +65,19 @@ impl IntoResponse for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             KatError::LeaseLost => StatusCode::CONFLICT,
+            KatError::FileNameInvalid => StatusCode::BAD_REQUEST,
+            KatError::FileTypeUnsupported
+            | KatError::FileEncodingUnsupported
+            | KatError::OctetStreamRequired => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            KatError::TooManyUploads => StatusCode::TOO_MANY_REQUESTS,
+            KatError::UploadTooSlow => StatusCode::REQUEST_TIMEOUT,
+            KatError::StorageFull | KatError::StorageQuotaExceeded => {
+                StatusCode::INSUFFICIENT_STORAGE
+            }
+            KatError::BlobCorrupt | KatError::SpanMismatch => StatusCode::INTERNAL_SERVER_ERROR,
+            KatError::ArtifactImmutable => StatusCode::CONFLICT,
+            // A tool error; no route returns it.
+            KatError::CitationUnknown => StatusCode::BAD_REQUEST,
             KatError::ConfigInvalid { .. }
             | KatError::CommandInvalid
             | KatError::MigrationRequired

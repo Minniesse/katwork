@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod artifacts;
 pub mod auth;
 pub mod chat;
 pub mod config;

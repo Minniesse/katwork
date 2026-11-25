@@ -3,8 +3,8 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
-mkdir "$tmp/bin" "$tmp/backups"
-export KATWORK_BACKUP_DIR="$tmp/backups" PATH="$tmp/bin:$PATH"
+mkdir "$tmp/bin" "$tmp/backups" "$tmp/artifacts"
+export KATWORK_BACKUP_DIR="$tmp/backups" KATWORK_ARTIFACT_DIR="$tmp/artifacts" PATH="$tmp/bin:$PATH"
 export BACKUP_TEST_PASSWORD
 BACKUP_TEST_PASSWORD=$(openssl rand -hex 16)
 export DATABASE_URL="postgres://katwork:$BACKUP_TEST_PASSWORD@postgres:5432/restored"
@@ -54,5 +54,10 @@ for archive in "$KATWORK_BACKUP_DIR"/*.dump; do
     [ "$(cat "$archive")" = 'archive fixture' ]
     mode=$(stat -c %a "$archive" 2>/dev/null || stat -f %Lp "$archive")
     [ "$mode" = 600 ]
+    # Each dump has its files folder (empty here), of the same name.
+    [ -d "${archive%.dump}.files" ]
 done
+# No files volume: the backup fails before any dump.
+if KATWORK_ARTIFACT_DIR="$tmp/missing" "$root/scripts/compose-backup.sh" 2>/dev/null; then exit 1; fi
+[ "$(find "$KATWORK_BACKUP_DIR" -name '*.dump' | wc -l | tr -d ' ')" = 2 ]
 printf '%s\n' 'backup tests passed'

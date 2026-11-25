@@ -3,9 +3,13 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+// Ids order bytewise, as `Uuid` does and as PostgreSQL orders `uuid` values, so a sort in Rust
+// matches `ORDER BY id` (the artifact lock contract locks rows in ascending id).
 macro_rules! typed_id {
     ($($name:ident),+ $(,)?) => {$ (
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, sqlx::Type,
+        )]
         #[serde(transparent)]
         #[sqlx(transparent)]
         pub struct $name(pub Uuid);
@@ -42,7 +46,9 @@ typed_id!(
     TaskId,
     RunId,
     ToolCallRecordId,
-    ModelCallId
+    ModelCallId,
+    ArtifactId,
+    ArtifactVersionId
 );
 
 macro_rules! counter {

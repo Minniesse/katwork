@@ -1396,6 +1396,7 @@ dependencies = [
  "jsonschema",
  "katwork-thai",
  "lettre",
+ "nix",
  "percent-encoding",
  "pulldown-cmark",
  "quick-xml",
@@ -1429,6 +1430,7 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "async-stream",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "eventsource-stream",
@@ -3057,6 +3059,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",

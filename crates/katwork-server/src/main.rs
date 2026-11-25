@@ -248,17 +248,26 @@ async fn run() -> Result<(), KatError> {
                 std::time::Duration::from_secs(60),
             );
             let shutdown = core.shutdown.clone();
+            let signal = core.shutdown.clone();
             let served = katwork_server::transport::serve_with_shutdown(
                 listener,
                 build_router(AppState { core: core.clone() }),
                 transport,
                 async move {
                     shutdown_signal().await;
-                    core.shutdown.cancel();
+                    signal.cancel();
                 },
             )
             .await;
             shutdown.cancel();
+            // An upload whose client left may still be committing: wait for it as long as for
+            // the connections, so a shutdown leaves no blob without its rows.
+            if !core
+                .finish_commits(katwork_server::transport::SHUTDOWN_GRACE)
+                .await
+            {
+                tracing::warn!("upload_commit_outlived_shutdown");
+            }
             while let Some(result) = workers.join_next().await {
                 if result.is_err() {
                     tracing::error!("worker_task_failed");
