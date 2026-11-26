@@ -155,6 +155,10 @@ pub enum RefQuality {
 /// nothing here can look anything up. `quote_start..quote_end` is the quote's position in
 /// `block_text`, in code points.
 #[derive(Debug, Clone, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the plan's interface; a claim holds a handful of refs, built once per pass"
+)]
 pub enum ResolvedRef {
     Ok {
         exact: String,

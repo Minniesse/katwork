@@ -544,7 +544,8 @@ fn thai_anywhere_in_a_cited_span_blocks_the_judge() {
         vec![full(english, english)],
     );
     assert!(is_disputed(&base, &checks_of(&base)));
-    let variants: Vec<Box<dyn Fn(&mut ResolvedRef)>> = vec![
+    type Change = Box<dyn Fn(&mut ResolvedRef)>;
+    let variants: Vec<Change> = vec![
         Box::new(|r| {
             if let ResolvedRef::Ok { block_text, .. } = r {
                 block_text.push_str(" ก");
