@@ -3562,6 +3562,49 @@ fn pdf_glyphs_a_font_or_scaling_misplaces_are_not_joined() {
 }
 
 #[test]
+fn pdf_rotated_text_keeps_its_repeated_letters() {
+    // Turned or sheared text: a page-aligned box around a glyph holds the next glyph's centre,
+    // so repeated letters must be told apart by where they start along the line.
+    let turned = |degrees: f64, shown: &str| {
+        let (sin, cos) = degrees.to_radians().sin_cos();
+        format!(
+            "BT /F1 10 Tf {cos} {sin} {} {cos} 200 200 Tm ({shown}) Tj ET",
+            -sin
+        )
+    };
+    let mut cases: Vec<(String, &str)> = [25.0, 30.0, 45.0, 60.0, -45.0]
+        .into_iter()
+        .map(|degrees| (turned(degrees, "1000"), "1000"))
+        .collect();
+    cases.push((turned(30.0, "Total 1,000"), "Total 1,000"));
+    cases.push((turned(45.0, "committee"), "committee"));
+    cases.push((turned(7.0, "Hello"), "Hello"));
+    // Sheared: the baseline climbs 0.3 pt per point.
+    cases.push((
+        "BT /F1 10 Tf 1 0.3 0 1 200 200 Tm (1000) Tj ET".to_owned(),
+        "1000",
+    ));
+    // A narrow l drawn twice at one origin on a turned line (the TJ step takes its advance
+    // back) still reads once.
+    let (sin, cos) = 45f64.to_radians().sin_cos();
+    cases.push((
+        format!(
+            "BT /F1 10 Tf {cos} {sin} {} {cos} 200 200 Tm [(l) 222 (l)] TJ ET",
+            -sin
+        ),
+        "l",
+    ));
+    for (content, expected) in cases {
+        let mut doc = Doc::new();
+        doc.size = (400.0, 400.0);
+        doc.page(&content, "");
+        let extracted = read(&doc.build());
+        let block = block(&extracted, expected);
+        assert_eq!((block.hidden, block.suspect), (None, None), "{content}");
+    }
+}
+
+#[test]
 fn pdf_negative_character_spacing_does_not_reorder_glyphs() {
     // -12 Tc draws the 0 left of the 9: a viewer sees "09", so "90" must not read as one word.
     // So does -7.56 Tc, which puts the 0 2 pt left of the 9, a step back of less than half a

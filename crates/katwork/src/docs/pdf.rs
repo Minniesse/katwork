@@ -34,8 +34,10 @@
 //! - A glyph whose text repeats that of a glyph or span not hidden earlier on its line, with its
 //!   box centre inside that one's box (within 5% of the font size), adds no text: it draws over
 //!   a character already read (Typst draws a cluster's positioned mark again with the cluster's
-//!   text; some producers overprint text to embolden it). The look-back covers the last 64
-//!   glyphs of the same text on the line.
+//!   text; some producers overprint text to embolden it). On a line turned off the page's axes,
+//!   where a page-aligned box holds the next glyph too, it must instead start within half that
+//!   glyph's advance (plus 5% of its size) along the line and within 5% of its size across it.
+//!   The look-back covers the last 64 glyphs of the same text on the line.
 //! - A glyph whose advance is past three times its font size is `Suspect("glyph_width")`: its
 //!   box, which the rules test, may stand far from its ink. It is never taken for a repeat.
 //! - Ordinals count emitted blocks from 1 across the file, hidden blocks included.
@@ -577,15 +579,35 @@ fn holds(outer: [f32; 4], inner: [f32; 4]) -> bool {
     outer[0] - slack <= x && x <= outer[2] + slack && outer[1] - slack <= y && y <= outer[3] + slack
 }
 
+/// Whether `char` draws `earlier` again. On a line turned off the page's axes a page-aligned box
+/// holds the next glyph's centre, so there the glyph must start within half the earlier one's
+/// advance (plus 5% of its size) along the line and within 5% of its size across it. Upright
+/// text keeps the box test: Typst draws a cluster's mark again from a shifted origin.
+fn redraws(earlier: &Char, char: &Char) -> bool {
+    let (x, y) = earlier.direction;
+    if x.abs() < 1e-3 || y.abs() < 1e-3 {
+        return holds(earlier.text_box, char.text_box);
+    }
+    let delta = (
+        char.origin.0 - earlier.origin.0,
+        char.origin.1 - earlier.origin.1,
+    );
+    let along = delta.0 * x + delta.1 * y;
+    let across = -delta.0 * y + delta.1 * x;
+    let advance = (earlier.end.0 - earlier.origin.0).hypot(earlier.end.1 - earlier.origin.1);
+    let slack = earlier.size * 0.05;
+    along.abs() <= advance / 2.0 + slack && across.abs() <= slack
+}
+
 /// The page's glyphs as lines, in painting order.
 fn lines(chars: &[Char], verdicts: &[Visibility]) -> Result<Vec<Line>, DocError> {
     let mut lines: Vec<Line> = Vec::new();
     let mut previous: Option<&Char> = None;
     // The current line's last advancing glyph.
     let mut anchor: Option<&Char> = None;
-    // The boxes of the last `REPEAT_WINDOW` glyphs read on the current line, by text, for
-    // overprinted repeats: a bounded look-back, so a line of any length costs linear time.
-    let mut read: HashMap<&str, VecDeque<[f32; 4]>> = HashMap::new();
+    // The last `REPEAT_WINDOW` glyphs read on the current line, by text, for overprinted
+    // repeats: a bounded look-back, so a line of any length costs linear time.
+    let mut read: HashMap<&str, VecDeque<&Char>> = HashMap::new();
     for (at, (char, verdict)) in chars.iter().zip(verdicts).enumerate() {
         if at.is_multiple_of(GLYPHS_PER_CHECK) {
             deadline::check()?;
@@ -644,13 +666,13 @@ fn lines(chars: &[Char], verdicts: &[Visibility]) -> Result<Vec<Line>, DocError>
             && !char.wide
             && read
                 .get(char.text.as_str())
-                .is_some_and(|boxes| boxes.iter().any(|text_box| holds(*text_box, char.text_box)));
+                .is_some_and(|earlier| earlier.iter().any(|earlier| redraws(earlier, char)));
         if !repeat && hidden.is_none() && !char.text.is_empty() && !char.wide {
-            let boxes = read.entry(char.text.as_str()).or_default();
-            if boxes.len() == REPEAT_WINDOW {
-                boxes.pop_front();
+            let earlier = read.entry(char.text.as_str()).or_default();
+            if earlier.len() == REPEAT_WINDOW {
+                earlier.pop_front();
             }
-            boxes.push_back(char.text_box);
+            earlier.push_back(char);
         }
         let Some(line) = lines.last_mut() else {
             continue;
