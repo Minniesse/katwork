@@ -107,7 +107,8 @@ fn resolve_detail(r: &ResolvedRef) -> Value {
 
 /// The quote's code-point range in the block's current text.
 ///
-/// Keeps the stored position when the text there has the quote's `match_key`; otherwise finds
+/// Keeps the stored position when the text there, and the stored `prefix` and `suffix` around
+/// it, still have their `match_key`s; otherwise finds
 /// `prefix + exact + suffix`, then `exact` alone, each only when it occurs exactly once
 /// (overlapping occurrences count). Searching compares code points as stored, with no fuzzy step:
 /// an edited quote is `stale`, never guessed. A range never splits a grapheme cluster. A ref that
@@ -142,7 +143,17 @@ pub fn relocate(current_block_text: &str, r: &SourceRef) -> Result<(u32, u32), &
     let at_bounds = |s: usize, e: usize| s < e && e <= len && bounds[s] && bounds[e];
 
     let (start, end) = (start as usize, end as usize);
-    if at_bounds(start, end) && match_key(&chars[start..end].iter().collect::<String>()).text == key
+    // The stored position is kept only with its context, so a shift that brings another copy of
+    // the quote under it does not bind the ref to that copy.
+    let text_key = |range: std::ops::Range<usize>| -> String {
+        match_key(&chars[range].iter().collect::<String>()).text
+    };
+    if at_bounds(start, end)
+        && text_key(start..end) == key
+        && text_key(start.saturating_sub(prefix.chars().count())..start)
+            .ends_with(&match_key(prefix).text)
+        && text_key(end..(end + suffix.chars().count()).min(len))
+            .starts_with(&match_key(suffix).text)
     {
         return Ok((ordinal(start), ordinal(end)));
     }

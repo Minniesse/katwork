@@ -325,17 +325,9 @@ fn relocate_keeps_stored_position_when_text_there_has_the_same_match_key() {
     let (s, e) = cp_range(old, "นำเสนอ");
     let r = narrowed(old, s as usize, e as usize);
     let variant = "ที่ประชุมนำเสนองบ".replace("นำ", "น\u{0E4D}\u{0E32}");
-    // The variant has one more code point inside the quote; it is longer, so the stored range
-    // now cuts it: relocate must not keep a range whose text differs.
-    let got = relocate(&variant, &r);
-    if let Ok((a, b)) = got {
-        let chars: Vec<char> = variant.chars().collect();
-        let text: String = chars[a as usize..b as usize].iter().collect();
-        assert_eq!(
-            katwork_thai::match_key(&text).text,
-            katwork_thai::match_key("นำเสนอ").text
-        );
-    }
+    // The variant has one more code point inside the quote, so the stored range cuts it, and the
+    // searches compare code points as stored: stale, never a range whose text differs.
+    assert_eq!(relocate(&variant, &r), Err("stale"));
     // A text edited before the quote shifts it: the stored position no longer matches, the
     // context search finds it.
     let shifted = "ที่ \u{200B}ประชุมนำเสนองบ";
@@ -1344,6 +1336,39 @@ fn rollup_rules_table() {
     for (label, cited, checks, want_status, want_code) in rows {
         assert_eq!(roll_up(cited, &checks), (want_status, want_code), "{label}");
     }
+    // A number claim whose only ref is hidden and holds a different figure: never failed.
+    let hidden = "รายได้รวม 9,999 ล้านบาท";
+    let c = claim(
+        ClaimKind::Number,
+        "รายได้รวม 1,250 ล้านบาท",
+        vec![ok_ref(hidden, hidden, RefQuality::Hidden)],
+    );
+    let checks = checks_of(&c);
+    assert!(
+        checks
+            .iter()
+            .all(|k| k.verdict != CheckVerdict::Contradicted)
+    );
+    assert_eq!(
+        roll_up(true, &checks),
+        (ClaimStatus::Unverified, "hidden_source")
+    );
+}
+
+#[test]
+fn relocate_stored_position_needs_its_context() {
+    let old = "ยอด 1,250 รวม และยอด 1,250 สุทธิ";
+    let (first, _) = cp_range(old, "1,250");
+    let (s, e) = cp_range_nth(old, "1,250", 1);
+    let r = narrowed(old, s as usize, e as usize);
+    // Prepending exactly the distance between the copies brings the first copy under the
+    // stored range; its context differs, so the search finds the second copy.
+    let pad: String = "x".repeat((s - first) as usize);
+    let shifted = format!("{pad}{old}");
+    assert_eq!(
+        relocate(&shifted, &r),
+        Ok(cp_range_nth(&shifted, "1,250", 1))
+    );
 }
 
 #[test]
