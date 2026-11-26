@@ -24,9 +24,10 @@
 //!   is `Suspect("actual_text")`: it reads, but never at full quality, since only the file says
 //!   the glyphs mean it. In order on one line: every glyph turned as the first; each advancing
 //!   glyph at most half the smaller font size off the line of the span's last advancing glyph,
-//!   starting past that glyph's origin and within a quarter size either way of its end; a mark
-//!   or a glyph its font gives no width within a whole size of the previous glyph's end, either
-//!   way and off the line. A span whose text or glyph
+//!   starting past that glyph's origin, no more than a quarter size (or half that glyph's own
+//!   advance, if less) before its end and no more than a quarter size after it; a mark or a
+//!   glyph its font gives no width within a whole size off the line, from half a size before
+//!   to a whole size after the previous glyph's end. A span whose text or glyph
 //!   text passes 64 KiB is neither copied nor compared: its glyphs keep their own text, suspect.
 //!   Past `max_output_bytes` of span text placed in one file, the read is refused
 //!   (`TooComplex("actual_text")`).
@@ -515,10 +516,11 @@ fn advances(char: &Char) -> bool {
 
 /// Whether a span's glyphs, in painting order, run along one line in reading order: every glyph
 /// turned as the first; each advancing glyph at most half the smaller font size off the line
-/// of the span's last advancing glyph, starting past that glyph's origin and within a quarter
-/// size either way of its end (the gap past which the reader reads a space); a mark or a glyph
-/// its font gives no width within one size of the previous glyph's end, either way and off the
-/// line. A span whose glyphs stand otherwise could join text no line of the page draws.
+/// of the span's last advancing glyph, starting past that glyph's origin, no more than a quarter
+/// size (or half that glyph's own advance, if less) before its end and no more than a quarter
+/// size after it (the gap past which the reader reads a space); a mark or a glyph its font gives
+/// no width within one size off the line, from half a size before (as far back as line grouping
+/// allows) to one size after the previous glyph's end. A span whose glyphs stand otherwise could join text no line of the page draws.
 fn one_line(chars: &[Char], members: &[usize]) -> bool {
     let Some(first) = members.first().map(|at| &chars[*at]) else {
         return true;
