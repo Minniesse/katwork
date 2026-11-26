@@ -48,7 +48,7 @@ KatWork takes ideas and scope from that product only. Its code, prompts and text
 1. **Meeting minutes.** [Alpha 4] "Input: typed notes, DOCX or a supplied transcript; no audio in the alpha" becomes "Input: typed notes, DOCX, a supplied transcript, or audio. Audio comes from an upload, or from a meeting the Kat captured with recorded consent." Audio needs sub-project 11's Thai speech engine and the recording rules in §13.
 2. **Phase 3 capability pulled forward.** [Alpha 2] Scheduled browser research moves from Phase 3 into Alpha 2 through sub-project 13. The Phase 3 use cases that need it (competitor digest, and others) stay in Phase 3. Only the capability moves.
 3. **Phase 4 capability pulled forward.** [Alpha 2] Image and video generation through the model gateway (opt-in, with cost caps) moves into Alpha 2 through sub-project 12. The creative-Kat use cases stay in Phase 4.
-4. **The six templates.** [Alpha 1] No change to the six. Sub-project 3 builds the five beyond the meeting minutes, after sub-project 4, and none is cut (roadmap Q4).
+4. **The six templates.** [Alpha 1] No change to the six. The proposed schedule assumes sub-project 3 builds the five beyond the meeting minutes, after sub-project 4, and none is cut; roadmap Q4 is not settled.
 5. **A developer template** [Alpha 2] (forge, pull requests, CI findings) is a candidate use case the new scope suggests. List it under Phase 2, not as an alpha template. The forge tools themselves stay alpha scope in sub-project 12; only a template built on them would wait.
 6. **Official letter and memo template.** [Alpha 2] Add a seventh template: Thai official letters and memos in the official form, with a register check and the template's declared date era and digit form. It moves forward from Phase 3's "official memo factory" (roadmap Q26).
 
@@ -184,4 +184,4 @@ The official letter and memo template (roadmap Q26) is in §8 above and is count
 
 ## Decisions
 
-The founder's answers behind these changes are in the roadmap's "Decisions" section. Alpha 1 is the spec as written, re-dated, plus two additions: the streamed Craft desktop (Q3) and the six claim-carrying differentiation proposals (Q27). Three questions offered no recommendation and are still open: Q5 (design partners), part of Q6 (after-the-alpha mapping) and Q7 (plan-item closure). None of them changes a line above.
+The founder's answers behind these changes are in the roadmap's "Decisions" section. Alpha 1 is the spec as written, re-dated, plus two additions: the streamed Craft desktop (Q3) and the six claim-carrying differentiation proposals (Q27). Five questions offered no recommendation and are still open: Q2 (routing before memory), Q4 (templates), Q5 (design partners), part of Q6 (after-the-alpha mapping) and Q7 (plan-item closure). None of them changes a line above.

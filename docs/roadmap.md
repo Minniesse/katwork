@@ -57,8 +57,8 @@ Two sources give the order.
 **How plans are written.** The founder decided (2026-11-25) that the plans for 2b, 2c and 3 are written and reviewed while 2a builds, and that each later plan is written one wave ahead of its build. This is process, not scope.
 
 **Where the two sources conflict.** Some dependencies run against the §19 order or the §17 weeks:
-- Sub-project 4 carries a recall tool and a memory byte cap (§19 item 4), which need 2c's memory, but §17 runs routing in the weeks of 2026-11-23 and 2026-11-30, before 2c in the week of 2026-12-28. Decided with the re-plan: 4 waits for 2c (Q2).
-- Sub-project 3's templates need teams (§8) and so sub-project 4's lead-Kat planning and delegation, and the research brief needs saved web spans, which arrive with 2b; §19 lists sub-project 3 before 4. Decided with the re-plan: 3's template tasks come after 4 (Q4).
+- Sub-project 4 carries a recall tool and a memory byte cap (§19 item 4), which need 2c's memory, but §17 runs routing in the weeks of 2026-11-23 and 2026-11-30, before 2c in the week of 2026-12-28. Not settled (Q2); the proposed schedule assumes 4 waits for 2c.
+- Sub-project 3's templates need teams (§8) and so sub-project 4's lead-Kat planning and delegation, and the research brief needs saved web spans, which arrive with 2b; §19 lists sub-project 3 before 4. Not settled (Q4); the proposed schedule assumes 3's template tasks come after 4.
 
 Sub-project 4's Stage 0 also sends approval callbacks to sub-project 3's approval host and resumes `needs_input` jobs from it (§6.2). That fits both sources: §19 lists 3 before 4, and §17 puts the approval host in the week of 2026-11-16, before Stage 0 in the week of 2026-11-23.
 
@@ -180,7 +180,7 @@ Both feed ADR-0009's kill criteria for switching the code tier to gVisor. KatsAg
 
 This list is not complete; §19 item 3 has the full set of carried requirements.
 
-All six templates in spec §8 are alpha goals (§1.1 goal 8), and §18's cut order names none of them. §19 item 3 gives templates to this sub-project, while the 2a plan builds the meeting-minutes template and §17 puts the HA rubric pack in the hardening week of 2027-01-04. Decided with the re-plan (Q4): sub-project 3 builds the other five, in template tasks that come after sub-project 4, and no template is cut.
+All six templates in spec §8 are alpha goals (§1.1 goal 8), and §18's cut order names none of them. §19 item 3 gives templates to this sub-project, while the 2a plan builds the meeting-minutes template and §17 puts the HA rubric pack in the hardening week of 2027-01-04. Not settled (Q4). The proposed schedule assumes sub-project 3 builds the other five, in template tasks that come after sub-project 4, and none is cut.
 
 **Depends on:** 2a (the evidence verifier, evidence reports and trust flags; a scanned Thai PDF goes through OCR in the §15 fidelity gates). Its templates also need sub-project 4's lead-Kat planning and delegation for their teams (§8), and the research brief needs saved web spans from 2b (Q4).
 
@@ -439,8 +439,8 @@ How to read these counts:
 - **Alpha 1** is the spec as written, plus the claim-carrying differentiation proposals. Its sub-projects depend only on each other:
   - 2b needs 2a's artifact store (Task 2, merged), and 2c needs `normalize_th` (Task 1, merged).
   - 3 needs 2a's evidence verifier, evidence reports and trust flags. It starts when 2a is 34 of 39 tasks merged.
-  - 4 needs 3 and 2c (Q2). 5 needs 3 and 4. 6 needs 3, 4 and 2b. 7 needs 2a's Craft track, 3 and 2b.
-  - Sub-project 3's templates need sub-project 4's planning and delegation, and the research brief needs 2b's saved web spans. So sub-project 3 is split (Q4): its gates and policy come before 4, and its template tasks come after 4.
+  - 4 needs 3 and 2c (the schedule's assumption; Q2 is not settled). 5 needs 3 and 4. 6 needs 3, 4 and 2b. 7 needs 2a's Craft track, 3 and 2b.
+  - Sub-project 3's templates need sub-project 4's planning and delegation, and the research brief needs 2b's saved web spans. So the proposed schedule splits sub-project 3, an assumption while Q4 is not settled: its gates and policy come before 4, and its template tasks come after 4.
 - **Alpha 2** is the platform layer the other new areas use.
   - Connectors (12) need 3 and 2b. Routines (13) need 12. Team admin (14) needs 12 and the admin pages from the additions to 6.
   - The additions to 2b, 2c, 3 and 4, the review-queue view and admin pages, and 7's reusable virtual display are here, because sub-projects 9, 10 and 14 build on them.
@@ -516,7 +516,7 @@ One method gives every row. Take the schedule above, built at a nominal 4 tasks 
 |---|---|---|
 | 1.1 (SP2a's average) | week of 2030-09-02 | week of 2035-01-15 |
 | 2 | week of 2029-01-01 | week of 2031-05-26 |
-| 4 (SP2a's best week; the approved target) | week of 2027-12-27 | week of 2029-03-05 |
+| 4 (SP2a's best week; the proposed target) | week of 2027-12-27 | week of 2029-03-05 |
 
 **What else moves the dates:**
 - Founder gates: plan approvals, the legal reads (Q11, Q12), and the design-partner annex (Q5, not yet settled).
@@ -660,14 +660,12 @@ The decisions also place two adopted capabilities after the last alpha wave:
 
 On 2026-11-26 the founder approved this re-plan and took the recommended answer to every question that offered one. The answers below are paraphrased. The text above already applies them. The dates stay proposed targets, to be re-forecast at the pace review in the week of 2027-01-25.
 
-Four questions offered no recommended answer (Q2, Q4, Q5, Q7), and one did only in part (Q6). Where the approved schedule already embodies an answer, it is recorded as taken with the plan. The rest are listed after the table, because approving the re-plan does not settle them.
+Four questions offered no recommended answer (Q2, Q4, Q5, Q7), and one did only in part (Q6). They are listed after the table, because approving the re-plan does not settle them.
 
 | Q | Question | Answer taken |
 |---|---|---|
 | 1 | The alpha dates | The staged-alpha dates in "Re-plan: staged alphas" are approved as targets, at a nominal 4 merged tasks a week, and re-forecast at the pace review (week of 2027-01-25). |
-| 2 | Routing before memory | Taken with the approved schedule: sub-project 4 waits for 2c, so the recall tool and the memory byte cap build on 2c's memory. |
 | 3 | Sub-project 7 and the alpha | Sub-project 7 is in Alpha 1. The "streamed Craft desktop" non-goal is removed for Alpha 1. |
-| 4 | Templates | Taken with the approved schedule: all five remaining templates are built in sub-project 3, by its template tasks, which come after sub-project 4. No template is cut. |
 | 6 | After the alpha (in part) | The new scope is placed in Alphas 2 to 4. Scheduled browser research (Phase 3) arrives with sub-project 13, and image and video generation (Phase 4) with sub-project 12, both in Alpha 2. |
 | 8 | Sub-project split | Six new sub-projects, 9 to 14. |
 | 9 | Payment rails | Each install brings its own payment provider account and keys, in Alpha 3. Installs without a provider fall back to checkouts that a person pays. |
@@ -686,7 +684,7 @@ Four questions offered no recommended answer (Q2, Q4, Q5, Q7), and one did only 
 | 22 | An early look at the new scope | No early slice before Alpha 1. |
 | 23 | Private worker pools | The alpha waves stay single-host. Private pools come after the last alpha wave. |
 | 24 | A phone as a tool host | Mobile is notifications only in the alpha waves (Q16), so a phone as a tool host comes after the last alpha wave. |
-| 25 | Choices a Kat makes for you | Allowed only for reversible choices inside a job, listed with their reason on the completion receipt and the approval card. A template may forbid them. They are never allowed for a clarifying question, for anything outward or destructive, or for anything that changes a claim's source. This needs a §6.4 amendment, built in sub-project 3 in Alpha 2 (1 task). |
+| 25 | Choices a Kat makes for you | Allowed only for reversible choices inside a job, listed with their reason on the completion receipt and the approval card. A template may forbid them. They are never allowed for a clarifying question, for anything outward or destructive, or for anything that changes a claim's source. This needs a §6.4 amendment, built in sub-project 3 in Alpha 2 (1 task, estimate). |
 | 26 | An official letter and memo template | It moves into Alpha 2, in sub-project 3 (4 tasks, estimate). |
 | 27 | The differentiation proposals | All fourteen are accepted. DP1, DP2, DP4, DP6, DP7 and DP11 (12 tasks) are in Alpha 1. The other eight (17 tasks) are in Alpha 2. |
 | 28 | A second browser automation runtime | 2b's plan considers one only if it finds a need that chromiumoxide cannot meet, in Alpha 2. It is not counted in the estimates. |
@@ -695,6 +693,8 @@ Four questions offered no recommended answer (Q2, Q4, Q5, Q7), and one did only 
 
 These offered no recommended answer, so approving the re-plan does not decide them. Each needs its own founder answer before the plan it affects.
 
+- **Q2, routing before memory.** Whether sub-project 4 waits for 2c, builds the recall tool and memory byte cap after 2c lands, or 2c moves earlier. The proposed schedule assumes sub-project 4 waits for 2c.
+- **Q4, templates.** Which sub-project builds each remaining template, and how their dependencies on later sub-projects are handled. The proposed schedule assumes the remaining templates are built in sub-project 3, after sub-project 4, and none is cut.
 - **Q5, design partners.** Who the partners are, and when the data annex (§15) is signed. This is needed before the Alpha 1 dry runs (proposed week of 2027-12-06).
 - **Q6, after the alpha (the rest).** How the Phase 2 to 4 use cases (§8), the Enterprise features (§16) and KatsAgentOS (§14) map onto sub-projects, and in what order relative to federation.
 - **Q7, plan-item closure.** Whether §6.4's plan-item closure belongs to sub-project 4 or sub-project 3. This is needed before either plan is approved.
