@@ -299,10 +299,6 @@ fn extract_refuses_kinds_whose_readers_come_later() {
     let read = docs::extract(MediaKind::Xlsx, &workbook, &limits()).unwrap();
     assert_eq!(text(&read), "x");
     assert_eq!(
-        docs::extract(MediaKind::Pdf, b"%PDF-1.7", &limits()),
-        Err(DocError::Unsupported("pdf"))
-    );
-    assert_eq!(
         docs::extract(MediaKind::Image, b"\x89PNG", &limits()),
         Err(DocError::Unsupported("image"))
     );

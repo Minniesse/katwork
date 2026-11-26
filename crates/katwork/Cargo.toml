@@ -49,6 +49,10 @@ regex-syntax.workspace = true
 zip.workspace = true
 quick-xml.workspace = true
 crc32fast.workspace = true
+flate2.workspace = true
+lopdf.workspace = true
+pdf-extract.workspace = true
+weezl.workspace = true
 
 # The XLSX reader: number formats rounded in decimal (header units use katwork-thai, above).
 rust_decimal.workspace = true
@@ -60,7 +64,6 @@ nix = { version = "0.31", default-features = false, features = ["fs"] }
 [dev-dependencies]
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util", "io-util"] }
-flate2.workspace = true
 
 # A workbook written by another writer, for the XLSX reader's tests.
 rust_xlsxwriter = { version = "=0.101.0", default-features = false }

@@ -8,6 +8,8 @@
 //! `cargo test --release -p katwork --test docs_heap -- --ignored --nocapture`
 #[path = "support/ooxml.rs"]
 mod ooxml;
+#[path = "support/pdf_build.rs"]
+mod pdf_build;
 
 use std::{
     sync::Arc,
@@ -600,6 +602,69 @@ fn floods() -> Vec<Flood> {
             },
         },
     ]
+}
+
+/// A PDF `/ActualText` span costs its text once, not once per glyph: one span of 1 MiB over
+/// 1,000 glyphs, fewer than the walk reads between two budget checks, stays far under a 256 MiB
+/// budget (a copy per glyph held 1 GiB before the first check).
+#[test]
+fn a_pdf_actual_text_span_is_held_once() {
+    let mut doc = pdf_build::Doc::new();
+    doc.size = (5_000.0, 50.0);
+    let actual = "A".repeat(1 << 20);
+    let glyphs = "x".repeat(1_000);
+    doc.page(
+        &format!(
+            "BT /F1 4 Tf 10 20 Td /Span << /ActualText ({actual}) >> BDC ({glyphs}) Tj EMC ET"
+        ),
+        "",
+    );
+    let bytes = doc.build();
+    let started = Instant::now();
+    let (result, peak) = heap::measure(|| {
+        deadline::scope(started + Duration::from_secs(60), None, 256 << 20, || {
+            docs::extract(MediaKind::Pdf, &bytes, &DocLimits::default()).map(drop)
+        })
+    });
+    assert!(peak < 64 << 20, "peak {peak} ({result:?})");
+    assert_eq!(result, Ok(()));
+}
+
+/// Many `/ActualText` spans under 64 KiB, all naming one 60 KiB property list: the read stops at
+/// its budget while it makes blocks of their text (each code point of a block holds a box, so
+/// 1,024 such spans between two checks held 1.7 GiB), and the spans' text stops at
+/// `max_output_bytes` in all.
+#[test]
+fn many_pdf_actual_text_spans_stay_within_the_budget() {
+    let pdf = |spans: usize| {
+        let mut doc = pdf_build::Doc::new();
+        doc.size = (50_000.0, 50.0);
+        let properties = doc.add(format!("<< /ActualText ({}) >>", "A".repeat(60 << 10)));
+        doc.page(
+            &format!(
+                "BT /F1 4 Tf 10 20 Td {} ET",
+                "/Span /P0 BDC (x) Tj EMC ".repeat(spans)
+            ),
+            &format!("/Properties << /P0 {properties} 0 R >>"),
+        );
+        doc.build()
+    };
+    let read = |bytes: &[u8], budget: u64| {
+        let started = Instant::now();
+        heap::measure(|| {
+            deadline::scope(started + Duration::from_secs(120), None, budget, || {
+                docs::extract(MediaKind::Pdf, bytes, &DocLimits::default()).map(drop)
+            })
+        })
+    };
+    // 12 MiB of span text, under the output cap: the budget stops it.
+    let (result, peak) = read(&pdf(200), 64 << 20);
+    assert_eq!(result, Err(DocError::TooComplex("memory")));
+    assert!(peak < 96 << 20, "peak {peak}");
+    // 53 MiB of span text, past the output cap, under the default budget.
+    let (result, peak) = read(&pdf(900), 1 << 30);
+    assert_eq!(result, Err(DocError::TooComplex("actual_text")));
+    assert!(peak < 256 << 20, "peak {peak}");
 }
 
 /// A read as the pool runs it, its peak live bytes and how long it took.
