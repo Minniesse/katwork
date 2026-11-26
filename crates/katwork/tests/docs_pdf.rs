@@ -3497,6 +3497,71 @@ fn pdf_actual_text_over_ordinary_spacing_and_thai_marks_is_trusted() {
 }
 
 #[test]
+fn pdf_glyphs_a_font_or_scaling_misplaces_are_not_joined() {
+    // `/D` draws code 32 as a 9 (its text "9"): Tc and Tw on it are not a word space. `/Z`
+    // gives the digits no width. Each row's glyphs are overprinted or set far apart, so they
+    // never read as one figure: with a span it is suspect, and (where `plain`) without one the
+    // reader does not join them either.
+    let rows = [
+        ("BT /D 10 Tf 100 Tc 40 200 Td ( 0) Tj ET", "90", true),
+        ("BT /D 10 Tf 100 Tw 40 200 Td ( 0) Tj ET", "90", true),
+        ("BT /D 10 Tf -5.46 Tc 40 200 Td ( 00) Tj ET", "900", true),
+        (
+            "BT /F1 10 Tf 40 Tz 40 200 Td [(9) 550 (0) 550 (0)] TJ ET",
+            "900",
+            false,
+        ),
+        (
+            "BT /F1 10 Tf 40 Tz -5.5 Tc 40 200 Td (900) Tj ET",
+            "900",
+            false,
+        ),
+        ("BT /Z 10 Tf -10 Tc 60 200 Td (900) Tj ET", "900", true),
+        (
+            "BT /Z 10 Tf 60 200 Td [(9) 1000 (0) 1000 (0)] TJ ET",
+            "900",
+            true,
+        ),
+    ];
+    for (shown, word, plain) in rows {
+        for with_span in [true, false] {
+            if !with_span && !plain {
+                continue;
+            }
+            let mut doc = Doc::new();
+            doc.size = (400.0, 300.0);
+            let nine = doc.add(
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << /Type /Encoding \
+                 /BaseEncoding /WinAnsiEncoding /Differences [32 /nine] >> >>",
+            );
+            let widths = "556 ".repeat(16) + &"0 ".repeat(10) + &"556 ".repeat(69);
+            let zero = doc.add(format!(
+                "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding \
+                 /FirstChar 32 /LastChar 126 /Widths [{widths}] >>"
+            ));
+            let content = if with_span {
+                format!("/Span << /ActualText ({word}) >> BDC {shown} EMC")
+            } else {
+                shown.to_owned()
+            };
+            doc.page(
+                &format!("BT /F1 10 Tf 10 200 Td (Total) Tj ET {content}"),
+                &format!("/Font << /D {nine} 0 R /Z {zero} 0 R >>"),
+            );
+            let extracted = read(&doc.build());
+            assert!(
+                extracted
+                    .blocks
+                    .iter()
+                    .all(|block| !block.text.contains(word) || block.suspect.is_some()),
+                "{shown} (span: {with_span}): {:?}",
+                texts(&extracted)
+            );
+        }
+    }
+}
+
+#[test]
 fn pdf_negative_character_spacing_does_not_reorder_glyphs() {
     // -12 Tc draws the 0 left of the 9: a viewer sees "09", so "90" must not read as one word.
     // So does -7.56 Tc, which puts the 0 2 pt left of the 9, a step back of less than half a

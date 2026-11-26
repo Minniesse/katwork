@@ -10,7 +10,7 @@
 //!   more than half the font size along it, or turns, or when it advances and starts before the
 //!   origin of the line's last advancing character; a mark, or a character its font gives no
 //!   width, stays on its line within one font size. A gap wider than a quarter of the font size
-//!   reads as one U+0020, never beside a combining mark.
+//!   reads as one U+0020, never before a combining mark (one can follow a mark).
 //! - Lines join one block while the vertical gap between them is at most half the earlier
 //!   line's height; a new page starts a block; lines are joined with U+000A.
 //! - Hidden characters leave their line: each run of them (spaces between two hidden characters
@@ -277,8 +277,11 @@ impl OutputDev for Collector<'_> {
         let origin = apply(&glyph.trm, 0.0, 0.0);
         // The glyph's own advance, without character spacing (`Tc`), which can draw the next
         // glyph anywhere along the line; word spacing (`Tw`), which only a single-byte space
-        // carries, stays.
-        let word_space = glyph.code == 32 && !glyph.font.composite;
+        // carries, stays, if the code draws white space (a font may draw code 32 as a digit).
+        let word_space = glyph.code == 32
+            && !glyph.font.composite
+            && !glyph.text.is_empty()
+            && glyph.text.chars().all(char::is_whitespace);
         let end = apply(
             &glyph.trm,
             glyph.width * glyph.font_size + if word_space { glyph.spacing } else { 0.0 },
@@ -522,6 +525,7 @@ fn one_line(chars: &[Char], members: &[usize]) -> bool {
     };
     let dot = |v: (f64, f64), w: (f64, f64)| v.0 * w.0 + v.1 * w.1;
     let cross = |v: (f64, f64), w: (f64, f64)| v.0 * w.1 - v.1 * w.0;
+    let advance = |char: &Char| (char.end.0 - char.origin.0).hypot(char.end.1 - char.origin.1);
     // The last glyph that advanced: an advancing glyph is placed after it, whatever marks sit
     // between them.
     let mut anchor: Option<&Char> = None;
@@ -543,13 +547,16 @@ fn one_line(chars: &[Char], members: &[usize]) -> bool {
             in_line
                 && cross(from.direction, from_end).abs() <= size / 2.0
                 && dot(from_origin, from.direction) > 0.0
-                && (-size / 4.0..=size / 4.0).contains(&along)
+                // A glyph scaled narrower than half a quarter size may step back only half its
+                // own advance.
+                && (-(size / 4.0).min(advance(from) / 2.0)..=size / 4.0).contains(&along)
         } else {
             let size = before.size.min(after.size);
             let from_end = (after.origin.0 - before.end.0, after.origin.1 - before.end.1);
+            // No further back than line grouping allows, so a span never joins what it splits.
             in_line
                 && cross(before.direction, from_end).abs() <= size
-                && dot(from_end, before.direction).abs() <= size
+                && (-size / 2.0..=size).contains(&dot(from_end, before.direction))
         };
         if !fits {
             return false;
