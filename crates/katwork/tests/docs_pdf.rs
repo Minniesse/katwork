@@ -3350,6 +3350,104 @@ fn pdf_actual_text_is_trusted_only_over_one_line_of_adjacent_glyphs() {
 }
 
 #[test]
+fn pdf_actual_text_over_glyphs_out_of_line_order_is_suspect() {
+    // Each span's text is its glyphs' text in painting order, but a viewer reads the glyphs in
+    // another order or on another line, so the span is never trusted.
+    let total = "BT /F1 10 Tf 10 200 Td (Total) Tj ET\n";
+    let span = |actual: &str, glyphs: &str| {
+        format!("{total}/Span << /ActualText ({actual}) >> BDC\n{glyphs}\nEMC")
+    };
+    let cases = [
+        // Drawn right to left, squeezed: a viewer sees "21".
+        span(
+            "12",
+            "BT /F1 10 Tf 85 Tz 44.73 200 Td (1) Tj ET BT /F1 10 Tf 85 Tz 40 200 Td (2) Tj ET",
+        ),
+        // A narrow step back, less than half a font size.
+        span(
+            "12",
+            "BT /F1 10 Tf 50 Tz 60 200 Td (1) Tj ET BT /F1 10 Tf 50 Tz 58 200 Td (2) Tj ET",
+        ),
+        // A narrow l (2.22 pt) and an i drawn 0.2 pt left of it: near its end, before its origin.
+        span(
+            "li",
+            "BT /F1 10 Tf 60 200 Td (l) Tj ET BT /F1 10 Tf 59.8 200 Td (i) Tj ET",
+        ),
+        // The second glyph 2 pt after the first's origin, over most of its width.
+        span(
+            "12",
+            "BT /F1 10 Tf 40 200 Td (1) Tj ET BT /F1 10 Tf 42 200 Td (2) Tj ET",
+        ),
+        // The second glyph right after the first's end, 8 pt lower.
+        span(
+            "900",
+            "BT /F1 10 Tf 40 200 Td (9) Tj ET BT /F1 10 Tf 45.56 192 Td (00) Tj ET",
+        ),
+        // A line break with leading under the font size.
+        span("900", "BT /F1 10 Tf 8 TL 40 200 Td (9) Tj T* (00) Tj ET"),
+        // The second glyph turned to run down the page.
+        span(
+            "900",
+            "BT /F1 10 Tf 40 200 Td (9) Tj ET BT /F1 10 Tf 0 -1 1 0 45.56 200 Tm (00) Tj ET",
+        ),
+        // Three glyphs at one origin: one overprinted glyph.
+        span(
+            "900",
+            "BT /F1 10 Tf 40 200 Td (9) Tj ET BT /F1 10 Tf 40 200 Td (0) Tj ET \
+             BT /F1 10 Tf 40 200 Td (0) Tj ET",
+        ),
+    ];
+    for (index, content) in cases.iter().enumerate() {
+        let mut doc = Doc::new();
+        doc.page(content, "");
+        let extracted = read(&doc.build());
+        let joined: Vec<_> = extracted
+            .blocks
+            .iter()
+            .filter(|block| {
+                ["12", "900", "li"]
+                    .iter()
+                    .any(|text| block.text.contains(text))
+            })
+            .collect();
+        assert!(!joined.is_empty(), "case {index}: {:?}", texts(&extracted));
+        for block in joined {
+            assert_eq!(
+                (block.hidden, block.suspect),
+                (None, Some("actual_text")),
+                "case {index}: {:?}",
+                texts(&extracted)
+            );
+        }
+    }
+}
+
+#[test]
+fn pdf_negative_character_spacing_does_not_reorder_glyphs() {
+    // -12 Tc draws the 0 left of the 9: a viewer sees "09", so "90" must not read as one word.
+    // So does -7.56 Tc, which puts the 0 2 pt left of the 9, a step back of less than half a
+    // font size.
+    for spacing in ["-12", "-7.56"] {
+        let mut doc = Doc::new();
+        doc.page(
+            &format!(
+                "BT /F1 10 Tf 10 200 Td (Total) Tj ET BT /F1 10 Tf {spacing} Tc 40 200 Td (90) Tj ET"
+            ),
+            "",
+        );
+        let extracted = read(&doc.build());
+        assert!(
+            extracted
+                .blocks
+                .iter()
+                .all(|block| !block.text.contains("90") || block.suspect.is_some()),
+            "{spacing}: {:?}",
+            texts(&extracted)
+        );
+    }
+}
+
+#[test]
 fn pdf_header_must_start_in_the_first_kilobyte() {
     let mut doc = Doc::new();
     doc.page(&text(10.0, 10.0, 100.0, "late header"), "");

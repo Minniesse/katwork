@@ -5,8 +5,10 @@
 //! Fixed rules of version 1 (a change is a new version):
 //! - Reading order is the content stream's painting order; nothing is sorted by position.
 //! - A character starts a new line when its baseline moves by more than half the font size
-//!   across the line's direction, moves back by more than half the font size along it, or turns;
-//!   a character with no advance (a Thai mark) stays on its line within one font size. A gap
+//!   across the line's direction, moves back by more than half the font size along it, or turns,
+//!   or when it advances and starts before the origin of the advancing character before it (a
+//!   negative `Tc` drawing it to that one's left); a character with no advance (a Thai mark)
+//!   stays on its line within one font size. A gap
 //!   wider than a quarter of the font size reads as one U+0020, never beside a combining mark.
 //! - Lines join one block while the vertical gap between them is at most half the earlier
 //!   line's height; a new page starts a block; lines are joined with U+000A.
@@ -17,11 +19,15 @@
 //! - A marked-content `/ActualText` replaces the text of the glyphs it encloses (Typst writes
 //!   one around every Thai cluster its ToUnicode map cannot express); the span is hidden when
 //!   any of its glyphs is, and suspect when any is suspect. A span whose text differs from its
-//!   glyphs' own text after `normalize_th`, or whose glyphs do not run along one line (each
-//!   within one font size of the previous glyph's end, the boxes overlapping vertically), is
-//!   `Suspect("actual_text")`: it reads, but never at full quality, since only the file says
-//!   the glyphs mean it. A span whose text or glyph
+//!   glyphs' own text after `normalize_th`, or whose glyphs do not run along one line in order,
+//!   is `Suspect("actual_text")`: it reads, but never at full quality, since only the file says
+//!   the glyphs mean it. In order on one line: every glyph turned as the first; each next glyph
+//!   at most half the smaller font size off the line and starting past the previous glyph's
+//!   origin, from a quarter size before to one size after its end (a mark or a glyph with no
+//!   advance: a whole size off the line and either way of the end). A span whose text or glyph
 //!   text passes 64 KiB is neither copied nor compared: its glyphs keep their own text, suspect.
+//!   Past `max_output_bytes` of span text placed in one file, the read is refused
+//!   (`TooComplex("actual_text")`).
 //! - A glyph whose text repeats that of a glyph or span not hidden earlier on its line, with its
 //!   box centre inside that one's box (within 5% of the font size), adds no text: it draws over
 //!   a character already read (Typst draws a cluster's positioned mark again with the cluster's
@@ -420,11 +426,14 @@ fn is_mark(c: char) -> bool {
 
 /// Replaces each `/ActualText` span's glyph texts with its text, on its first glyph, and gives
 /// every glyph of the span the span's verdict. A span past `MAX_ACTUAL_TEXT_COMPARE` keeps its
-/// glyphs' own text and is suspect.
+/// glyphs' own text and is suspect. `placed` counts the span text placed in the file so far; past
+/// its cap the read is refused, since one short property list can be named by any number of
+/// spans.
 fn apply_actual_text(
     chars: &mut [Char],
     actual: &HashMap<u32, Option<String>>,
     verdicts: &mut [Visibility],
+    (placed, cap): (&mut u64, u64),
 ) -> Result<(), DocError> {
     let mut spans: HashMap<u32, Vec<usize>> = HashMap::new();
     for (at, char) in chars.iter().enumerate() {
@@ -438,6 +447,10 @@ fn apply_actual_text(
     for (id, members) in &spans {
         deadline::check()?;
         let text = actual.get(id).and_then(Option::as_deref);
+        *placed = placed.saturating_add(text.map_or(0, |text| text.len() as u64));
+        if *placed > cap {
+            return Err(DocError::TooComplex("actual_text"));
+        }
         let hidden = members.iter().find_map(|at| match verdicts[*at] {
             Visibility::Hidden(why) => Some(Visibility::Hidden(why)),
             _ => None,
@@ -482,15 +495,40 @@ fn apply_actual_text(
     Ok(())
 }
 
-/// Whether a span's glyphs, in painting order, run along one line: each starts within one font
-/// size of where the one before it ends, and their boxes overlap vertically. A span whose
-/// glyphs lie apart could join text no line of the page draws.
+/// Whether a span's glyphs, in painting order, run along one line in reading order: every glyph
+/// turned as the first; each next glyph at most half the smaller font size off the line, as
+/// for a new line (a mark or a glyph with no advance a whole size), starting past the previous glyph's
+/// origin and within a quarter size before to one size after its end (a mark or a glyph with no
+/// advance within one size either way of the end). A span whose glyphs stand otherwise could
+/// join text no line of the page draws.
 fn one_line(chars: &[Char], members: &[usize]) -> bool {
+    let Some(first) = members.first().map(|at| &chars[*at]) else {
+        return true;
+    };
     members.windows(2).all(|pair| {
         let (before, after) = (&chars[pair[0]], &chars[pair[1]]);
-        let gap = (after.origin.0 - before.end.0).hypot(after.origin.1 - before.end.1);
-        let (a, b) = (before.paint.bbox, after.paint.bbox);
-        gap <= before.size.max(after.size) && a[1] <= b[3] && b[1] <= a[3]
+        let dot = |v: (f64, f64), w: (f64, f64)| v.0 * w.0 + v.1 * w.1;
+        let cross = |v: (f64, f64), w: (f64, f64)| v.0 * w.1 - v.1 * w.0;
+        let size = before.size.min(after.size);
+        let direction = before.direction;
+        let from_end = (after.origin.0 - before.end.0, after.origin.1 - before.end.1);
+        let from_origin = (
+            after.origin.0 - before.origin.0,
+            after.origin.1 - before.origin.1,
+        );
+        let along = dot(from_end, direction);
+        let across = cross(direction, from_end).abs();
+        let loose = after.text.chars().next().is_some_and(is_mark)
+            || (after.end.0 - after.origin.0).hypot(after.end.1 - after.origin.1) < 1e-6;
+        let in_line = dot(first.direction, after.direction) >= 0.95;
+        if loose {
+            in_line && across <= size && along.abs() <= size
+        } else {
+            in_line
+                && across <= size / 2.0
+                && dot(from_origin, direction) > 0.0
+                && (-size / 4.0..=size).contains(&along)
+        }
     })
 }
 
@@ -538,7 +576,18 @@ fn lines(chars: &[Char], verdicts: &[Visibility]) -> Result<Vec<Line>, DocError>
                 } else {
                     across.abs() > size / 2.0
                 };
-                let broke = turned || off_line || along < -size / 2.0;
+                // An advancing glyph drawn before the previous advancing glyph's origin is out
+                // of order (a mark is placed freely over its base).
+                let advances = |glyph: &Char| {
+                    (glyph.end.0 - glyph.origin.0).hypot(glyph.end.1 - glyph.origin.1) >= 1e-6
+                        && !glyph.text.chars().next().is_some_and(is_mark)
+                };
+                let behind = advances(char)
+                    && advances(before)
+                    && (char.origin.0 - before.origin.0) * before.direction.0
+                        + (char.origin.1 - before.origin.1) * before.direction.1
+                        < 0.0;
+                let broke = turned || off_line || behind || along < -size / 2.0;
                 space = !broke
                     && along > size / 4.0
                     && !mark
@@ -705,8 +754,11 @@ fn assemble_block(block: &mut [Line]) -> Result<Assembled, DocError> {
         let mut cut = false;
         let mut run_open = false;
         for item in &line.items {
-            handled += 1;
-            if handled.is_multiple_of(ITEMS_PER_CHECK) {
+            // An item's text costs a box and a line per code point: long items (span text)
+            // count by their length, so a check comes at least every `ITEMS_PER_CHECK` bytes.
+            handled += 1 + item.text.len();
+            if handled >= ITEMS_PER_CHECK {
+                handled = 0;
                 deadline::check()?;
             }
             match item.hidden {
@@ -925,6 +977,8 @@ pub(crate) fn read(bytes: &[u8], limits: &DocLimits) -> Result<Extracted, DocErr
         ordinal: 0,
     };
     let mut pages = Vec::with_capacity(report.pages.len());
+    // Bytes of `/ActualText` placed into the text so far: a span's text is copied for each use.
+    let mut span_text = 0u64;
     for (info, mut scene) in report.pages.iter().zip(scenes) {
         deadline::check()?;
         let mut page = PageInfo {
@@ -942,7 +996,12 @@ pub(crate) fn read(bytes: &[u8], limits: &DocLimits) -> Result<Extracted, DocErr
                 *verdict = Visibility::Suspect("glyph_width");
             }
         }
-        apply_actual_text(&mut scene.chars, &scene.actual, &mut verdicts)?;
+        apply_actual_text(
+            &mut scene.chars,
+            &scene.actual,
+            &mut verdicts,
+            (&mut span_text, limits.max_output_bytes),
+        )?;
         let shown = |verdict: &Visibility| !matches!(verdict, Visibility::Hidden(_));
         let unmapped_font = scene
             .chars
