@@ -10,7 +10,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::lease::{self, ClaimedTask, HeartbeatStatus};
 use crate::{
-    agent::{Limits, RunAbort, RunEnv, RunFacts, RunInput, StopReason, ToolRegistry, run},
+    agent::{
+        Limits, RunAbort, RunEnv, RunFacts, RunInput, StopReason, ToolDeps, ToolRegistry, run,
+    },
     chat::thread,
     events::PgEventSink,
     fence::Fence,
@@ -282,7 +284,7 @@ async fn execute(
             epoch: c.lease_epoch,
         }),
     );
-    let tools = ToolRegistry::builtin();
+    let tools = ToolRegistry::standard(&ToolDeps::from_core(core));
     run::execute_with_interruption(
         &RunEnv {
             lock_timeout: core.config.lock_timeout,

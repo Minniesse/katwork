@@ -1,0 +1,52 @@
+{
+  "type": "SpecificResource",
+  "source": "urn:katwork:artifact:01928c3e-0000-7000-8000-000000000001:v1",
+  "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "extractor": {
+    "name": "pdf-text",
+    "version": 1
+  },
+  "quality": {
+    "generated": false,
+    "hidden": false,
+    "instructionLike": false,
+    "suspectTextLayer": false
+  },
+  "selector": {
+    "type": "FragmentSelector",
+    "conformsTo": "https://www.rfc-editor.org/rfc/rfc8118",
+    "value": "page=3",
+    "refinedBy": [
+      {
+        "type": "FragmentSelector",
+        "conformsTo": "urn:katwork:selector:block:v1",
+        "value": "ordinal=42",
+        "refinedBy": [
+          {
+            "type": "TextQuoteSelector",
+            "exact": "รายได้รวม 1,250 ล้านบาท",
+            "prefix": "ปี 2567 ",
+            "suffix": " เพิ่มขึ้น"
+          },
+          {
+            "type": "TextPositionSelector",
+            "start": 8,
+            "end": 31
+          }
+        ]
+      }
+    ]
+  },
+  "boxes": [
+    {
+      "page": 3,
+      "rect": [
+        72.0,
+        410.5,
+        301.2,
+        424.0
+      ]
+    }
+  ],
+  "page": 3
+}

@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    agent::{RunFacts, StopReason, ToolCallState},
+    agent::{OutputTrust, RunFacts, StopReason, ToolCallState},
     events::{DecisionEvent, KatworkEvent},
     ids::JobId,
-    types::{JobStatus, ReasonCode, SideEffect},
+    types::{JobStatus, ReasonCode},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +68,12 @@ pub struct PolicyInputs {
     pub tool_calls: u32,
     pub effects_dispatched: bool,
     pub synthetic: bool,
+    /// The run read content no person of the workspace wrote: a call whose output is
+    /// `Untrusted` succeeded (U4). Refused, unfinished and failed calls returned only a code.
+    /// `decide` does not read it; it is SP3's seam for taint-aware approvals. Decision events
+    /// stored before it existed replay as false.
+    #[serde(default)]
+    pub context_untrusted: bool,
 }
 
 impl PolicyInputs {
@@ -79,11 +85,16 @@ impl PolicyInputs {
             pending_question: facts.pending_question.is_some(),
             artifacts_created: facts.artifacts_created,
             tool_calls: u32::try_from(facts.tool_calls.len()).unwrap_or(u32::MAX),
-            // Unknown effects fail closed; only a known Read or refused call is safe to repeat.
+            // Unknown effects fail closed; only a known read or a refused call is safe to repeat.
             effects_dispatched: facts.tool_calls.iter().any(|call| {
-                call.side_effect != Some(SideEffect::Read) && call.state != ToolCallState::Refused
+                call.side_effect.is_none_or(|e| e.changes_state())
+                    && call.state != ToolCallState::Refused
             }),
             synthetic: facts.synthetic,
+            context_untrusted: facts.tool_calls.iter().any(|call| {
+                call.state == ToolCallState::Succeeded
+                    && call.output_trust == OutputTrust::Untrusted
+            }),
         }
     }
 }

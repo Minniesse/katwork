@@ -1,4 +1,5 @@
-use super::{Tool, builtin};
+use super::{Tool, ToolDeps, builtin};
+use crate::artifacts::tools::{ListFiles, ReadFile};
 use std::{
     collections::{BTreeMap, btree_map::Entry},
     sync::Arc,
@@ -40,6 +41,17 @@ impl ToolRegistry {
         registry
             .register(Arc::new(builtin::AskUser))
             .expect("distinct built-in names");
+        registry
+    }
+    /// `builtin()` plus the document tools; later tasks add theirs here.
+    pub fn standard(deps: &ToolDeps) -> Self {
+        let mut registry = Self::builtin();
+        registry
+            .register(Arc::new(ListFiles))
+            .expect("distinct standard names");
+        registry
+            .register(Arc::new(ReadFile::new(deps.clone())))
+            .expect("distinct standard names");
         registry
     }
 }

@@ -117,6 +117,8 @@ async fn expired_lease_during_kat_lock_must_not_authorize_write(pool: PgPool) {
         computer: None,
         pool: pool.clone(),
         cancel: h.input.cancel.clone(),
+        deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        budget: RunBudget::new(200_000),
     };
     let mut blocker = pool.begin().await.unwrap();
     sqlx::query("SELECT id FROM kats WHERE id=$1 FOR NO KEY UPDATE")

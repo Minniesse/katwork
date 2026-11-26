@@ -5,6 +5,7 @@ use sqlx::PgPool;
 use crate::{
     artifacts::{
         BlobStore, LocalBlobStore, blob,
+        tools::ExtractCache,
         uploads::{UPLOADS_AT_ONCE, UPLOADS_PER_PERSON, UploadLimiter},
     },
     config::Config,
@@ -21,6 +22,8 @@ pub struct Core {
     pub registry: Arc<Registry>,
     pub mailer: Arc<dyn crate::auth::mailer::Mailer>,
     pub docs: Arc<DocPool>,
+    /// `read_file`'s extraction cache, shared by every run of this process.
+    pub extract_cache: Arc<ExtractCache>,
     pub blobs: Arc<dyn BlobStore>,
     pub uploads: Arc<UploadLimiter>,
     /// The upload commits running in tasks of their own, which a client that leaves cannot
@@ -58,6 +61,7 @@ impl Core {
             config,
             registry,
             mailer,
+            extract_cache: Arc::new(ExtractCache::new(docs.limits().cache_bytes)),
             docs,
             blobs,
             uploads: Arc::new(UploadLimiter::new(UPLOADS_AT_ONCE, UPLOADS_PER_PERSON)),
@@ -87,7 +91,9 @@ impl Core {
     }
 
     /// Replaces the document pool (tests use small call timeouts).
+    /// The extraction cache is rebuilt with the new pool's `cache_bytes`.
     pub fn with_docs(mut self, docs: Arc<DocPool>) -> Self {
+        self.extract_cache = Arc::new(ExtractCache::new(docs.limits().cache_bytes));
         self.docs = docs;
         self
     }
