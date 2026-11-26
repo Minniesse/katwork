@@ -1400,8 +1400,7 @@ fn predict(input: Capped, params: Option<&Dictionary>, cap: u64) -> Result<Cappe
             }
         }
         10..=15 => {
-            // No row is longer than the data, whatever `/Columns` says.
-            let mut previous = vec![0u8; row.min(data.len())];
+            let mut previous = vec![0u8; row];
             for line in data.chunks(row + 1) {
                 deadline::check()?;
                 let (&kind, encoded) = line
