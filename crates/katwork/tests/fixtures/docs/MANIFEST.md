@@ -46,3 +46,11 @@ checks that the committed seeds are exactly the files listed, with these hashes.
 | `text/odd-utf16.txt` | `c95a4fead577ca197f1094206aeb3263c8b553f5c4e89a00354f1db980c49657` | UTF-16 with an odd byte count |
 | `text/lone-surrogate.txt` | `7dede2c66266f92ce35bf21a950f202c75633079eca964654959a3c611acaaa6` | UTF-16 with a lone surrogate |
 | `text/nul.txt` | `59b271ae1bbcb1d31d41929817f4b16fb439eb4f31520b5ad1d5ce98920a7138` | a NUL character |
+| `xlsx/minimal.xlsx` | `86ace5dbb1fd2f8b3eaab5d1bfa97270089a42d91254738e90a36305ac15dd7a` | one sheet of one inline string |
+| `xlsx/styled.xlsx` | `3301e35a41c7cc09a4c84fb9f19bfda34162bc1bfb7eafd0bcfd8a9bfe835890` | styles, shared strings with runs, a theme, number formats and white, tiny and empty-format cells |
+| `xlsx/hidden.xlsx` | `e4159f4e5512d0583d7a808229019b7956f5719d5c880d7ba8afa2b4ae62b9f1` | hidden and very hidden sheets, a hidden row, columns hidden in both tag forms, and a merged range |
+| `xlsx/formulas.xlsx` | `530de5546df851c5030d18046593914cd34c27cb4aeb7431f6f514147f3f19a2` | a 1904 workbook that recalculates on load, with shared formulas, every cell type and escapes |
+| `xlsx/prefixed.xlsx` | `0fab3942936bc6394f9f73b592dfe39ad73315105a8714b4aa12fe27907c7e1f` | SpreadsheetML under a prefix, with an external link and macros the reader warns about |
+| `xlsx/strict.xlsx` | `a71085b8e1cb06d1b8d8453c269de48a9651a3bc857e80c9629f44f9aada1e39` | a Strict SpreadsheetML workbook |
+| `xlsx/huge-numbers.xlsx` | `bac2ca9a643281b01c03cadbaf88d236b58675b30100eeccb6875a434549abce` | numbers too large for a decimal at their format's decimals, under built-in ids 2 and 4 and custom formats |
+| `xlsx/volatile.xlsx` | `3fffd665249d57b5c93351b2594f97463c1c03cabb5fa5bfe9de18568ecd3fc5` | volatile formulas, their dependents across sheets and names, an array and a data table, structured and 3-D references |

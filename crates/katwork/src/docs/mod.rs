@@ -11,6 +11,7 @@ pub mod deadline;
 mod docx;
 pub mod heap;
 pub mod limits;
+pub mod numfmt;
 pub mod package;
 pub mod pdf;
 pub mod pdf_guard;
@@ -19,6 +20,7 @@ pub mod pdf_visibility;
 pub mod pool;
 mod text;
 pub mod watchdog;
+pub mod xlsx;
 pub mod xml_guard;
 
 pub use limits::DocLimits;
@@ -91,12 +93,18 @@ impl ExtractorId {
         name: Cow::Borrowed("docx-accepted"),
         version: 1,
     };
+    pub const XLSX: ExtractorId = ExtractorId {
+        name: Cow::Borrowed("xlsx-cached"),
+        version: 1,
+    };
     pub const PDF: ExtractorId = ExtractorId {
         name: Cow::Borrowed("pdf-text"),
         version: 1,
     };
 }
 
+/// The XLSX reader's id, under the name the SP2a plan gives it.
+pub const XLSX: ExtractorId = ExtractorId::XLSX;
 /// The PDF reader's extractor (`ExtractorId::PDF`).
 pub const PDF: ExtractorId = ExtractorId::PDF;
 
@@ -277,7 +285,7 @@ pub fn extract(kind: MediaKind, bytes: &[u8], limits: &DocLimits) -> Result<Extr
     match kind {
         MediaKind::Text => text::read(bytes, limits),
         MediaKind::Docx => docx::read(bytes, limits),
-        MediaKind::Xlsx => Err(DocError::Unsupported("xlsx")),
+        MediaKind::Xlsx => xlsx::read(bytes, limits),
         MediaKind::Pdf => pdf::read(bytes, limits),
         MediaKind::Image => Err(DocError::Unsupported("image")),
     }

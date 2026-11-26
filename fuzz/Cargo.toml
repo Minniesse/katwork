@@ -44,3 +44,10 @@ path = "fuzz_targets/pdf.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "xlsx"
+path = "fuzz_targets/xlsx.rs"
+test = false
+doc = false
+bench = false
