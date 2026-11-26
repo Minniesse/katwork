@@ -279,7 +279,7 @@ This repo calls that product "a competing desktop agent" and does not name it. K
 
 The capability areas are: agent tools and planning; computer use and the browser; personal data, voice, phone calls and meetings; commerce, payments and a vault; connectors, plugins and MCP; teams, sharing and admin; automations and the chat shell.
 
-The rulings settle scope and the wave structure. They do not settle how each area is built, which spec sections change, or the questions listed at the end (Q8 to Q24). Sub-projects 9 to 14 below are this re-plan's proposal for where the new scope goes; the founder may merge or split them (Q8). Nothing in them is built before its plan is approved.
+The rulings settle scope and the wave structure. They do not settle how each area is built, which spec sections change, or the questions listed at the end (Q8 to Q26). Sub-projects 9 to 14 below are this re-plan's proposal for where the new scope goes; the founder may merge or split them (Q8). Nothing in them is built before its plan is approved.
 
 Some parts of the competing product run against KatWork's spec or ADRs, for example a browser that hides that it is automated, or link previews in chat. "All" adopts every capability area, but whether those particular designs are adopted is not settled; each is an open question with a recommended option (Q18 to Q21).
 
@@ -490,9 +490,58 @@ The 1.1 and 2 rows use the same order. Their later-wave dates are the remaining 
 
 ## Differentiation
 
-The founder asked on 2026-11-26 for KatWork to outperform other products, through research into what people want and need, across many fields. A research wave is running on office work, trust and delegation, the Thai context, and complaints about competing products. Its findings feed each sub-project's plan.
+The founder asked on 2026-11-26 for KatWork to outperform other products, through research into what people want and need, across many fields. A first research wave read published studies on office work, trust and delegation with AI, and the Thai work context, and coded public complaints about AI tools in English and Thai. Its findings feed each sub-project's plan. Nothing here changes the scope or the dates above. A finding that would change scope comes to the founder as a proposal.
 
-This section is a placeholder. It does not change any scope or date above; any finding that would change scope comes to the founder as a proposal.
+**Limits of the evidence.**
+- Every count comes from one coder.
+- The Thai first-person voice is thin: a few dozen public forum posts, with no replies.
+- No source measures willingness to pay.
+- Satisfied users rarely post.
+
+The ranking is therefore ordinal, and needs that sit next to each other should be read as ties.
+
+### Unmet needs, ranked
+
+The order follows how many independent sources support each need, how intense the complaints are, and how close the need is to KatWork's mission.
+
+| # | What people need | KatWork's design response | Owner |
+|---|---|---|---|
+| 1 | **No silent wrong numbers.** Wrong output that looks right is the most damaging failure and the least noticed. People want every figure checked against a source they can open. | Every number, date and quote in a draft is marked passed, failed or unverified. A "check these first" list opens the report, and the missing-evidence list sits on the cover. A failed or unverified claim blocks acceptance of any section the template marks as required evidence. Seeded-defect test worlds cover every alpha template. | 2a (verifier), 3 (acceptance, test worlds), 6 |
+| 2 | **Data stays in the building.** People want a plain answer to "where does my file go". This is a top fear in organisations, and PDPA enforcement is real. | One screen per Space showing which model providers see it, what each outbound model call sent, and what never leaves. A personal-data flag on a folder sends its jobs to a local model. A redaction check runs before any outward send. An offline-install test runs in CI. | 1, 2b (egress gateway), 3 (redaction), 6 |
+| 3 | **Review that costs less than redoing the work.** Checking AI output often eats the time it saved. | Claims ordered by risk: failed first, then unverified, with passed claims collapsed to a count. One click opens the source at the exact span, highlighted. Reviewer minutes per deliverable are logged from use, not taken from surveys. | 2a (evidence card), 6 |
+| 4 | **Right in the person's own file and template, including Thai print.** Spreadsheets and slides come out worst, and Thai numerals, tone marks and fonts break. | The deliverable opens in the office's own template, reads back, and prints the same on two renderers. Each template declares its date era (Buddhist or Common) and digit form (Thai or Arabic), and a check fails mixed forms. | 2a (writers), 3 (template fill, render check) |
+| 5 | **Approvals that catch errors.** Approval prompts decay into rubber stamps, and blame lands on the nearest person. | Approval cards offer approve, approve with a comment, unsure, and decline. High-risk claims ask the reviewer to open the cited span first. Each job has a budget of cards. The audit row stores exactly what the card showed. Seal-and-initial is an approval type. An alarm fires when approvals become too fast and too uniform. | 3, 5 (cards per channel), 6 |
+| 6 | **An honest "done".** Agents claim completion they did not achieve. | A completion receipt generated from the job log covers inputs read against the input list, checks run and not run, what was tried and rejected, stops and their reasons, and time and tokens from the model-call records. A skipped file or a run that matched zero records is a failed check. | 1 (records), 3 (completion record), 2a (reader coverage) |
+| 7 | **Staying in control.** People want partnership, not full automation. | A clarifying card when the brief lacks audience, template or period. A stop that works within seconds. Take-over of a Kat's browser or app. Redo of one section without restarting. Every outward or destructive action waits as a Proposal. | 3, 4, 6, 2b |
+| 8 | **Thai official-document correctness.** This covers Buddhist-Era dates, numerals, register, the official letter form, and scanned input. | Official letter and memo forms with a register check. OCR lines below confidence are flagged, not trusted. Pulling an official memo template from Phase 3 forward is a founder question (Q26). | 2a (`katwork-thai`, OCR), 3, 4 |
+| 9 | **Reconcile across files and show only the exceptions; the same figure everywhere.** | Reconciliation results in two parts: matched (collapsed) and exceptions (both sources side by side). In a pack, every output draws each figure from one verified fact. | 3 (monthly pack), 2a (cell facts) |
+| 10 | **Predictable cost.** People want an estimate first, no silent burn, and no silent switch to a weaker model. | An estimate of tokens and time before a team job, and the running cost during it. A per-workspace cap. A model without a price shows "unpriced", never zero. No silent model downgrade. | 1 (gateway), 4, 6 |
+| 11 | **Memory of facts and decisions, with their reasons, across a long job.** | A fact register and a decision log (decision, reason, rejected options, who, when) that later tasks and jobs reuse. Space memory accepts an entry only through a person or a policy. | 2c, 2a, 4 |
+| 12 | **An easy start for non-technical staff.** | A chat-first first run (LINE too), with one visible next action. The 3D office optional. A one-page glossary. | 6, 5 |
+
+### Five claims to test and publish
+
+These are targets, not measurements. KatWork will test each in its own CI or in a timed internal run, and publish both the method and the result.
+
+1. On KatBench's seeded-defect worlds, no planted wrong figure, unit mix or date-era swap is ever marked as passed.
+2. A reviewer opens the exact source span behind any claim in under 10 seconds.
+3. A job's completion receipt is generated from its log, and no statement in it is contradicted by that log. Skipped files and zero-match runs fail.
+4. An offline install makes zero outbound connections, and no outward action runs without a person approving that exact action.
+5. Every figure in a monthly pack is identical across all its outputs, and Thai dates and numerals follow the template's declared form with zero violations.
+
+Claims about how reviewers behave, for example their catch rate with and without the proof panel, need real reviewers. They are design-partner measurements in the dry runs, not launch claims.
+
+### Adopted areas the evidence does not yet support
+
+The research found no supporting evidence for these areas, and some evidence of risk: privacy fears, reluctance to hand over credentials, and third-party consent. They are **kept per the founder's ruling; evidence to gather**. None is dropped. Each already sits in a late wave and behind its legal read.
+
+| Area | Wave | Evidence to gather |
+|---|---|---|
+| Payments (sub-project 10) | Alpha 3 | Whether offices want Kats to pay, and for what; the rails question (Q9) |
+| Outbound phone calls (sub-project 11) | Alpha 4 | Office demand; the Thai legal read (Q11) |
+| Local desktop control (sub-project 9) | Alpha 3 | Which tasks people would hand over on their own computer |
+| Personal data from apps on a person's own computer (sub-project 9) | Alpha 3 | Demand among LINE-first and Windows users (Q13) |
+| Teach recording (additions to 2b) | Alpha 2 | Whether people would record tasks, and the recording rules |
 
 ## Alpha (#138)
 
@@ -592,3 +641,5 @@ The rulings settle that all of the new scope is product scope, delivered in alph
 22. **An early look at the new scope.** In the proposed order, the new sub-projects come after Alpha 1 (builds from the week of 2027-12-13). Does the founder want an early demo slice of one of them, for example voice chat or one connector, before the core is done? Recommended: no. The core sub-projects are dependencies of all of them, and an early slice would take builder weeks from them.
 23. **Private worker pools.** The competing product can run its agents on a customer's own pool of machines. For KatWork that means multi-host scheduling, a §1.2 non-goal. Recommended: keep the single-host alpha and place private pools after it, because they are a hosting mode, not a capability a person uses. This needs the founder's ruling, because the rulings make it product scope.
 24. **A phone as a tool host.** The competing product can use a person's phone for photos, location and similar tools. Recommended: include it in sub-project 9 after the desktop companion, with photos and location behind PDPA grants (§13). If Q16 keeps mobile to notifications only, this moves after the last alpha wave, which needs the founder's ruling.
+25. **Choices a Kat makes for you.** Another pattern from the research lets an agent pick a default when it would otherwise wait, record why, and let the person review it later. Spec §6.4 says "a timeout never picks defaults" for clarifying questions, so this conflicts with the spec as written. Recommended: allow it only for reversible choices inside a job, for example which of two sheet names is the budget. Each such choice is listed on the completion receipt and the approval card, with its reason, and a template may forbid it. Never allow it for a clarifying question (audience, period, template, recipient), for anything outward or destructive, or for anything that changes a claim's source. This is a proposal, not a decision.
+26. **An official letter and memo template in an alpha.** Thai official-document correctness is a ranked need (see "Differentiation"), but the official memo factory is a Phase 3 use case (§8). Should a letter and memo template move into an alpha wave? Recommended: yes, into Alpha 2. It reuses the template engine and `katwork-thai`, and its date and numeral checks are claim 5.

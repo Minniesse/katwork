@@ -2,7 +2,7 @@
 
 - Status: Proposed (2026-11-26). Every change below is a proposal for the founder. None is applied to `katwork-design.md` until the founder approves it.
 - Decision owner: Founder
-- Roadmap: `docs/roadmap.md` (sub-projects 9 to 14, "Additions to existing sub-projects", "Re-plan: staged alphas", and open questions Q8 to Q24)
+- Roadmap: `docs/roadmap.md` (sub-projects 9 to 14, "Additions to existing sub-projects", "Re-plan: staged alphas", and open questions Q8 to Q26)
 
 ## Why
 
@@ -159,4 +159,4 @@ A connector-credentials ADR is also needed, before Alpha 2. It decides whose cre
 
 ## Open questions
 
-The founder's questions for this amendment are in the roadmap, Q1 and Q8 to Q24, each with a recommended option. Roadmap Q3 (sub-project 7 and the alpha) also decides §1.2 item 4 above. No change tagged Alpha 1 adds scope: Alpha 1 is the spec as written, re-dated.
+The founder's questions for this amendment are in the roadmap, Q1 and Q8 to Q26, each with a recommended option. Roadmap Q3 (sub-project 7 and the alpha) also decides §1.2 item 4 above. No change tagged Alpha 1 adds scope: Alpha 1 is the spec as written, re-dated.
