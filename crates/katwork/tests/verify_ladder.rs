@@ -168,7 +168,11 @@ fn resolve_quality_table() {
             CheckVerdict::Inconclusive,
             "source_generated",
         ),
-        (RefQuality::Hidden, CheckVerdict::Inconclusive, "hidden_source"),
+        (
+            RefQuality::Hidden,
+            CheckVerdict::Inconclusive,
+            "hidden_source",
+        ),
         (
             RefQuality::InstructionLike,
             CheckVerdict::Inconclusive,
@@ -179,7 +183,11 @@ fn resolve_quality_table() {
             CheckVerdict::Inconclusive,
             "suspect_text_layer",
         ),
-        (RefQuality::Deleted, CheckVerdict::Inconclusive, "source_deleted"),
+        (
+            RefQuality::Deleted,
+            CheckVerdict::Inconclusive,
+            "source_deleted",
+        ),
         (
             ocr(Some(0.99), None, false),
             CheckVerdict::Inconclusive,
@@ -190,7 +198,11 @@ fn resolve_quality_table() {
             CheckVerdict::Inconclusive,
             "ocr_low_confidence",
         ),
-        (ocr(Some(0.9), None, true), CheckVerdict::Supported, "checked"),
+        (
+            ocr(Some(0.9), None, true),
+            CheckVerdict::Supported,
+            "checked",
+        ),
     ];
     for (quality, verdict, code) in rows {
         let label = format!("{quality:?}");
@@ -224,7 +236,10 @@ fn ocr_resolve_boundaries() {
     assert_eq!(code(ocr(Some(0.1), Some(0.9), true)), "checked");
     assert_eq!(code(ocr(None, None, true)), "ocr_low_confidence");
     assert_eq!(code(ocr(Some(f32::NAN), None, true)), "ocr_low_confidence");
-    assert_eq!(code(ocr(Some(f32::NAN), Some(f32::NAN), true)), "ocr_low_confidence");
+    assert_eq!(
+        code(ocr(Some(f32::NAN), Some(f32::NAN), true)),
+        "ocr_low_confidence"
+    );
     assert_eq!(code(ocr(Some(0.99), Some(0.99), false)), "ocr_unaligned");
     // OCR detail holds the scores as strings, never as floats.
     let out = check_resolve(&[ok_ref("a", "a", ocr(Some(0.6), None, true))]);
@@ -264,7 +279,10 @@ fn hostile_span_cannot_make_a_true_claim_fail() {
     let c = claim(
         ClaimKind::Quote,
         "The board approved the budget",
-        vec![full(good, good), ok_ref(hostile, hostile, RefQuality::Hidden)],
+        vec![
+            full(good, good),
+            ok_ref(hostile, hostile, RefQuality::Hidden),
+        ],
     );
     let checks = checks_of(&c);
     assert!(
@@ -273,8 +291,15 @@ fn hostile_span_cannot_make_a_true_claim_fail() {
             .all(|k| k.ref_ordinal != Some(1) || k.method == CheckMethod::Resolve),
         "the hidden ref was compared: {checks:?}"
     );
-    assert!(checks.iter().all(|k| k.verdict != CheckVerdict::Contradicted));
-    assert_eq!(roll_up(true, &checks), (ClaimStatus::Unverified, "hidden_source"));
+    assert!(
+        checks
+            .iter()
+            .all(|k| k.verdict != CheckVerdict::Contradicted)
+    );
+    assert_eq!(
+        roll_up(true, &checks),
+        (ClaimStatus::Unverified, "hidden_source")
+    );
 }
 
 // ---------------------------------------------------------------- relocate
@@ -337,13 +362,14 @@ fn relocate_ambiguous_context_is_stale() {
     let block = "ยอด 1,250 รวม";
     let (s, e) = cp_range(block, "1,250");
     let r = narrowed(block, s as usize, e as usize);
-    let twice = format!("{block} | {block}");
+    // Shifted, so the stored position no longer holds the quote.
+    let twice = format!("xx{block} | {block}");
     assert_eq!(relocate(&twice, &r), Err("stale"));
 }
 
 #[test]
 fn relocate_overlapping_exact_occurrences_count_as_two() {
-    let r = narrowed("xaay", 1, 3);
+    let r = narrowed("xyzaaw", 3, 5);
     // Context gone, and "aa" occurs twice (overlapping) in "aaa".
     assert_eq!(relocate("aaa", &r), Err("stale"));
     assert_eq!(relocate("b aa c", &r), Ok((2, 4)));
@@ -481,7 +507,10 @@ fn paraphrase_is_inconclusive_and_disputed_for_english() {
     );
     let checks = checks_of(&c);
     assert!(is_disputed(&c, &checks));
-    assert_eq!(roll_up(true, &checks), (ClaimStatus::Unverified, "paraphrase"));
+    assert_eq!(
+        roll_up(true, &checks),
+        (ClaimStatus::Unverified, "paraphrase")
+    );
 }
 
 #[test]
@@ -579,14 +608,22 @@ fn instruction_like_ref_caps_and_is_never_disputed() {
 #[test]
 fn fact_with_a_quantity_skips_containment() {
     let source = "รายได้รวม 1,300 ล้าน";
-    let c = claim(ClaimKind::Fact, "รายได้รวม 1,300 ล้าน", vec![full(source, source)]);
+    let c = claim(
+        ClaimKind::Fact,
+        "รายได้รวม 1,300 ล้าน",
+        vec![full(source, source)],
+    );
     assert!(check_quote(&c, &Ctx::default()).is_empty());
 }
 
 #[test]
 fn quote_claim_with_a_year_goes_to_task_11_but_an_ordinal_does_not() {
     let source = "ที่ประชุมปี 2567 อนุมัติ วาระที่ 3 อนุมัติ";
-    let c = claim(ClaimKind::Quote, "ที่ประชุมปี 2567 อนุมัติ", vec![full(source, source)]);
+    let c = claim(
+        ClaimKind::Quote,
+        "ที่ประชุมปี 2567 อนุมัติ",
+        vec![full(source, source)],
+    );
     assert!(check_quote(&c, &Ctx::default()).is_empty());
     let c = claim(ClaimKind::Quote, "วาระที่ 3 อนุมัติ", vec![full(source, source)]);
     let out = check_quote(&c, &Ctx::default());
@@ -771,7 +808,14 @@ fn longest_match_wins_and_matches_do_not_overlap() {
 #[test]
 fn english_words_are_whole_words() {
     use Meaning::*;
-    for text in ["nothing", "another", "overview", "notable", "cannot", "I said no."] {
+    for text in [
+        "nothing",
+        "another",
+        "overview",
+        "notable",
+        "cannot",
+        "I said no.",
+    ] {
         assert_eq!(qualifier::find(text), set(&[]), "{text:?}");
     }
     assert_eq!(qualifier::find("under-budget"), set(&[Lt]));
@@ -784,7 +828,15 @@ fn english_words_are_whole_words() {
 #[test]
 fn apostrophes() {
     use Meaning::*;
-    for text in ["didn't", "didn\u{2019}t", "DIDN'T", "n't", "can't", "won't", "'not'"] {
+    for text in [
+        "didn't",
+        "didn\u{2019}t",
+        "DIDN'T",
+        "n't",
+        "can't",
+        "won't",
+        "'not'",
+    ] {
         assert_eq!(qualifier::find(text), set(&[Neg]), "{text:?}");
     }
 }
@@ -868,7 +920,10 @@ fn window_is_ten_code_points_and_clamped() {
     let r = full("01", block);
     assert_eq!(qualifier::window(&r).as_deref(), Some("0123456789ab"));
     let r = full("89", block);
-    assert_eq!(qualifier::window(&r).as_deref(), Some("0123456789abcdefghij"));
+    assert_eq!(
+        qualifier::window(&r).as_deref(),
+        Some("0123456789abcdefghij")
+    );
     let bad = ResolvedRef::Ok {
         exact: "x".into(),
         block_text: "abc".into(),
@@ -879,7 +934,10 @@ fn window_is_ten_code_points_and_clamped() {
         quality: RefQuality::Full,
     };
     assert_eq!(qualifier::window(&bad).as_deref(), Some("abc"));
-    assert_eq!(qualifier::window(&ResolvedRef::Stale { code: "stale" }), None);
+    assert_eq!(
+        qualifier::window(&ResolvedRef::Stale { code: "stale" }),
+        None
+    );
     // Code points, not bytes.
     let block = "ที่ประชุมไม่อนุมัติงบประมาณ";
     let r = full("อนุมัติ", block);
@@ -917,7 +975,11 @@ fn window_cut_mid_word_does_not_invent_or_hide_a_qualifier() {
     // The window edge falls inside "cannot": the whole word is read, and "cannot" is not in the
     // lexicon, so nothing is invented.
     let block = "The board cannot fully approve it";
-    let c = claim(ClaimKind::Quote, "approve it", vec![full("approve it", block)]);
+    let c = claim(
+        ClaimKind::Quote,
+        "approve it",
+        vec![full("approve it", block)],
+    );
     assert!(check_qualifiers(&c).is_empty());
     // The edge falls inside "didn't": the whole word is read, so the negation is not hidden.
     let block = "The board didn't fully approve the budget";
@@ -932,7 +994,11 @@ fn window_cut_mid_word_does_not_invent_or_hide_a_qualifier() {
 #[test]
 fn claim_and_window_with_a_repeated_negation_compare_as_sets() {
     let block = "the board did not not approve";
-    let c = claim(ClaimKind::Quote, "not approve", vec![full("approve", block)]);
+    let c = claim(
+        ClaimKind::Quote,
+        "not approve",
+        vec![full("approve", block)],
+    );
     assert!(check_qualifiers(&c).is_empty());
 }
 
@@ -943,7 +1009,10 @@ fn qualifier_check_is_per_ref() {
     let c = claim(
         ClaimKind::Quote,
         "approved the budget",
-        vec![full("approved the budget", a), full("approved the budget", b)],
+        vec![
+            full("approved the budget", a),
+            full("approved the budget", b),
+        ],
     );
     let out = check_qualifiers(&c);
     assert_eq!(out.len(), 1);
@@ -1016,14 +1085,20 @@ fn rollup_rules_table() {
         (
             "rule 1 qualifier by method",
             true,
-            vec![sup.clone(), o(M::Qualifier, V::Contradicted, B::None, "qualifier_mismatch")],
+            vec![
+                sup.clone(),
+                o(M::Qualifier, V::Contradicted, B::None, "qualifier_mismatch"),
+            ],
             ClaimStatus::Failed,
             "qualifier_mismatch",
         ),
         (
             "rule 1 human",
             true,
-            vec![sup.clone(), o(M::Human, V::Contradicted, B::None, "needs_review")],
+            vec![
+                sup.clone(),
+                o(M::Human, V::Contradicted, B::None, "needs_review"),
+            ],
             ClaimStatus::Failed,
             "needs_review",
         ),
@@ -1033,7 +1108,12 @@ fn rollup_rules_table() {
             vec![
                 sup.clone(),
                 o(M::Number, V::Supported, B::Exact, "checked"),
-                o(M::AmountWords, V::Contradicted, B::None, "amount_words_mismatch"),
+                o(
+                    M::AmountWords,
+                    V::Contradicted,
+                    B::None,
+                    "amount_words_mismatch",
+                ),
             ],
             ClaimStatus::Failed,
             "amount_words_mismatch",
@@ -1102,7 +1182,10 @@ fn rollup_rules_table() {
         (
             "rule 5 derived",
             true,
-            vec![sup.clone(), o(M::Arithmetic, V::Supported, B::Derived, "checked")],
+            vec![
+                sup.clone(),
+                o(M::Arithmetic, V::Supported, B::Derived, "checked"),
+            ],
             ClaimStatus::Passed,
             "checked",
         ),
@@ -1167,14 +1250,20 @@ fn rollup_rules_table() {
         (
             "rule 5 needs exact or derived",
             true,
-            vec![sup.clone(), o(M::Number, V::Supported, B::Judged, "checked")],
+            vec![
+                sup.clone(),
+                o(M::Number, V::Supported, B::Judged, "checked"),
+            ],
             ClaimStatus::Unverified,
             "needs_review",
         ),
         (
             "rule 5 basis none is not support",
             true,
-            vec![sup.clone(), o(M::AmountWords, V::Supported, B::None, "checked")],
+            vec![
+                sup.clone(),
+                o(M::AmountWords, V::Supported, B::None, "checked"),
+            ],
             ClaimStatus::Unverified,
             "needs_review",
         ),
@@ -1243,14 +1332,16 @@ fn rollup_rules_table() {
             ClaimStatus::Unverified,
             "paraphrase",
         ),
-        ("rule 9 empty", true, vec![], ClaimStatus::Unverified, "needs_review"),
+        (
+            "rule 9 empty",
+            true,
+            vec![],
+            ClaimStatus::Unverified,
+            "needs_review",
+        ),
     ];
     for (label, cited, checks, want_status, want_code) in rows {
-        assert_eq!(
-            roll_up(cited, &checks),
-            (want_status, want_code),
-            "{label}"
-        );
+        assert_eq!(roll_up(cited, &checks), (want_status, want_code), "{label}");
     }
 }
 
@@ -1263,8 +1354,15 @@ fn hidden_number_ref_that_disagrees_is_unverified_never_failed() {
         vec![ok_ref(hidden, hidden, RefQuality::Hidden)],
     );
     let checks = checks_of(&c);
-    assert!(checks.iter().all(|k| k.verdict != CheckVerdict::Contradicted));
-    assert_eq!(roll_up(true, &checks), (ClaimStatus::Unverified, "hidden_source"));
+    assert!(
+        checks
+            .iter()
+            .all(|k| k.verdict != CheckVerdict::Contradicted)
+    );
+    assert_eq!(
+        roll_up(true, &checks),
+        (ClaimStatus::Unverified, "hidden_source")
+    );
 }
 
 #[test]
@@ -1293,10 +1391,20 @@ fn pool() -> Vec<CheckOutcome> {
         o(M::Date, V::Inconclusive, B::None, "date_ambiguous"),
         o(M::Cell, V::Inconclusive, B::None, "cell_cache_untrusted"),
         o(M::Arithmetic, V::Supported, B::Derived, "checked"),
-        o(M::Arithmetic, V::Contradicted, B::Derived, "arithmetic_mismatch"),
+        o(
+            M::Arithmetic,
+            V::Contradicted,
+            B::Derived,
+            "arithmetic_mismatch",
+        ),
         o(M::Arithmetic, V::Inconclusive, B::None, "operand_missing"),
         o(M::AmountWords, V::Supported, B::None, "checked"),
-        o(M::AmountWords, V::Contradicted, B::None, "amount_words_mismatch"),
+        o(
+            M::AmountWords,
+            V::Contradicted,
+            B::None,
+            "amount_words_mismatch",
+        ),
         o(M::Human, V::Supported, B::Exact, "checked"),
         o(M::Human, V::Unsupported, B::None, "needs_review"),
     ]
@@ -1385,7 +1493,12 @@ fn advisory_checks_never_change_the_rollup() {
         M::Judge,
         M::Human,
     ];
-    let verdicts = [V::Supported, V::Unsupported, V::Contradicted, V::Inconclusive];
+    let verdicts = [
+        V::Supported,
+        V::Unsupported,
+        V::Contradicted,
+        V::Inconclusive,
+    ];
     let bases = [B::Exact, B::Derived, B::Judged, B::None];
     let all = combos(&pool());
     for checks in &all {
@@ -1410,15 +1523,30 @@ fn roll_up_never_reads_advisory_even_for_resolve_checks() {
     let quote_ok = o(M::Quote, V::Supported, B::Exact, "checked");
     let base = vec![sup.clone(), quote_ok.clone()];
     let mut with = base.clone();
-    with.push(advisory(o(M::Resolve, V::Inconclusive, B::None, "hidden_source")));
+    with.push(advisory(o(
+        M::Resolve,
+        V::Inconclusive,
+        B::None,
+        "hidden_source",
+    )));
     assert_eq!(roll_up(true, &with), (ClaimStatus::Passed, "checked"));
     let mut with = base.clone();
-    with.push(advisory(o(M::Number, V::Contradicted, B::Exact, "number_mismatch")));
+    with.push(advisory(o(
+        M::Number,
+        V::Contradicted,
+        B::Exact,
+        "number_mismatch",
+    )));
     assert_eq!(roll_up(true, &with), (ClaimStatus::Passed, "checked"));
     assert_eq!(flags(&with), vec![FLAG_AI_POSSIBLE_MISMATCH]);
     // An advisory judge is advisory first: it does not hold the claim at unverified.
     let mut with = base.clone();
-    with.push(advisory(o(M::Judge, V::Supported, B::Judged, "judged_supported")));
+    with.push(advisory(o(
+        M::Judge,
+        V::Supported,
+        B::Judged,
+        "judged_supported",
+    )));
     assert_eq!(roll_up(true, &with), (ClaimStatus::Passed, "checked"));
 }
 
@@ -1427,14 +1555,58 @@ fn flags_table() {
     let flag = vec![FLAG_AI_POSSIBLE_MISMATCH];
     let none: Vec<&str> = vec![];
     let rows: Vec<(Vec<CheckOutcome>, &Vec<&str>)> = vec![
-        (vec![advisory(o(M::Number, V::Contradicted, B::Exact, "number_mismatch"))], &flag),
-        (vec![advisory(o(M::Quote, V::Unsupported, B::None, "needs_review"))], &flag),
-        (vec![o(M::Judge, V::Contradicted, B::Judged, "judge_contradicted")], &flag),
-        (vec![o(M::Judge, V::Unsupported, B::Judged, "judge_unsupported")], &none),
-        (vec![o(M::Judge, V::Supported, B::Judged, "judged_supported")], &none),
-        (vec![advisory(o(M::Quote, V::Supported, B::Exact, "checked"))], &none),
-        (vec![advisory(o(M::Quote, V::Inconclusive, B::None, "paraphrase"))], &none),
-        (vec![o(M::Number, V::Contradicted, B::Exact, "number_mismatch")], &none),
+        (
+            vec![advisory(o(
+                M::Number,
+                V::Contradicted,
+                B::Exact,
+                "number_mismatch",
+            ))],
+            &flag,
+        ),
+        (
+            vec![advisory(o(
+                M::Quote,
+                V::Unsupported,
+                B::None,
+                "needs_review",
+            ))],
+            &flag,
+        ),
+        (
+            vec![o(
+                M::Judge,
+                V::Contradicted,
+                B::Judged,
+                "judge_contradicted",
+            )],
+            &flag,
+        ),
+        (
+            vec![o(M::Judge, V::Unsupported, B::Judged, "judge_unsupported")],
+            &none,
+        ),
+        (
+            vec![o(M::Judge, V::Supported, B::Judged, "judged_supported")],
+            &none,
+        ),
+        (
+            vec![advisory(o(M::Quote, V::Supported, B::Exact, "checked"))],
+            &none,
+        ),
+        (
+            vec![advisory(o(
+                M::Quote,
+                V::Inconclusive,
+                B::None,
+                "paraphrase",
+            ))],
+            &none,
+        ),
+        (
+            vec![o(M::Number, V::Contradicted, B::Exact, "number_mismatch")],
+            &none,
+        ),
         (
             vec![
                 advisory(o(M::Number, V::Contradicted, B::Exact, "number_mismatch")),
@@ -1456,8 +1628,18 @@ fn is_disputed_table() {
     let sup = o(M::Resolve, V::Supported, B::None, "checked");
     let open = |code| o(M::Quote, V::Inconclusive, B::None, code);
     let rows: Vec<(&str, ClaimInput, Vec<CheckOutcome>, bool)> = vec![
-        ("paraphrase", base.clone(), vec![sup.clone(), open("paraphrase")], true),
-        ("needs_judge", base.clone(), vec![sup.clone(), open("needs_judge")], true),
+        (
+            "paraphrase",
+            base.clone(),
+            vec![sup.clone(), open("paraphrase")],
+            true,
+        ),
+        (
+            "needs_judge",
+            base.clone(),
+            vec![sup.clone(), open("needs_judge")],
+            true,
+        ),
         (
             "subject_not_in_source",
             base.clone(),
@@ -1598,14 +1780,23 @@ fn check_outcome_wire_names_match_serde() {
         assert_eq!(serde_json::to_value(m).unwrap(), json!(m.wire()));
     }
     assert_eq!(M::AmountWords.wire(), "amount_words");
-    for v in [V::Supported, V::Unsupported, V::Contradicted, V::Inconclusive] {
+    for v in [
+        V::Supported,
+        V::Unsupported,
+        V::Contradicted,
+        V::Inconclusive,
+    ] {
         assert_eq!(serde_json::to_value(v).unwrap(), json!(v.wire()));
     }
     for b in [B::Exact, B::Derived, B::Judged, B::None] {
         assert_eq!(serde_json::to_value(b).unwrap(), json!(b.wire()));
     }
     assert_eq!(B::None.wire(), "none");
-    for s in [ClaimStatus::Passed, ClaimStatus::Failed, ClaimStatus::Unverified] {
+    for s in [
+        ClaimStatus::Passed,
+        ClaimStatus::Failed,
+        ClaimStatus::Unverified,
+    ] {
         assert_eq!(serde_json::to_value(s).unwrap(), json!(s.wire()));
     }
     use Meaning::*;
