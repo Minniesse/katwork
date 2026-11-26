@@ -30,7 +30,7 @@ KatWork takes ideas and scope from that product only. Its code, prompts and text
 2. **"A hosted cloud offering."** Payments and credits may need a KatWork-run service. Proposal: keep this non-goal, and use payment rails that each install brings (roadmap Q9 and Q10). If the founder chooses a KatWork-run payment service, this line changes.
 3. **"Native Linux binaries inside a Kat's computer."** A full shell, stdio MCP servers and plugin commands would break this. Proposal: keep it. Stdio MCP servers and plugin commands run as pinned containers outside agentOS, and a full shell waits for KatsAgentOS (roadmap Q17).
 4. **"A streamed desktop for the Craft apps"** waits for sub-project 7. Local computer use, screen recording and the general desktop on 2b's GUI tier all need the virtual display that sub-project 7 builds. Proposal: if the founder makes sub-project 7 alpha scope (roadmap Q3), remove this line.
-5. **"High availability or multi-host scheduling."** Private worker pools would need multi-host scheduling. Proposal: keep the non-goal. Private pools stay after the alpha, because they are a hosting mode, not a capability a person uses.
+5. **"High availability or multi-host scheduling."** Private worker pools would need multi-host scheduling. Proposal: keep the non-goal. Whether private pools still come before the alpha is a founder question (roadmap Q23).
 6. **New non-goals, proposed** (each is an open question, roadmap Q18 to Q21):
    - Browser stealth that hides that a Kat's browser is automated.
    - Egress through a person's own machine.
@@ -44,7 +44,7 @@ KatWork takes ideas and scope from that product only. Its code, prompts and text
 2. **Phase 3 capability pulled forward.** Scheduled browser research moves from Phase 3 into the alpha through sub-project 13. The Phase 3 use cases that need it (competitor digest, and others) stay in Phase 3. Only the capability moves.
 3. **Phase 4 capability pulled forward.** Image and video generation through the model gateway (opt-in, with cost caps) moves into the alpha through sub-project 12. The creative-Kat use cases stay in Phase 4.
 4. **The six templates.** No change. The new scope adds no template, and §18's cut order still names none (roadmap Q4).
-5. **A developer template** (forge, pull requests, CI findings) is a candidate use case the new scope suggests. Proposal: list it under Phase 2, not as a seventh alpha template.
+5. **A developer template** (forge, pull requests, CI findings) is a candidate use case the new scope suggests. Proposal: list it under Phase 2, not as a seventh alpha template. The forge tools themselves stay alpha scope in sub-project 12; only a template built on them would wait.
 
 ## §10 Office views
 
@@ -53,7 +53,7 @@ KatWork takes ideas and scope from that product only. Its code, prompts and text
 3. **Shells.** The Tauri desktop shell gains the companion features: a tray, notifications, a capture overlay and element picking. A URL scheme, if any, uses a typed route table: nothing is sent automatically, and tokens travel in the fragment.
 4. **Computer panel.** It can show a general Linux desktop (2b's GUI tier) as well as a browser or a Craft app.
 5. **Tool-result cards.** If the founder adopts them (roadmap Q20), they render in a sandboxed frame with no network, and a callback runs only after a person acts. This changes ADR-0010.
-6. **"View off."** If an admin can hide a Kat's screen, the activity log and the take-over path stay on (roadmap Q21).
+6. **Hiding a Kat's screen.** If an admin can hide a Kat's screen, the activity log and the take-over path stay on (roadmap Q21).
 7. **Kat creation.** Kat creation gains avatars and template browsing. A system-prompt override is logged in the audit log.
 
 ## §11 Channels, memory, models
@@ -67,11 +67,11 @@ KatWork takes ideas and scope from that product only. Its code, prompts and text
 
 ## §13 Security and privacy
 
-1. **Isolation.** Add the companion as a new execution target that is not a Kat computer. It verifies each approval locally against the signed proposal digest, and it never accepts an "approved" flag from the server. Its privileges sit in a separate helper (companion trust-model ADR). ADR-0009's kill criteria do not cover it; it needs its own conformance test.
+1. **Isolation.** Add the companion as a new execution target that is not a Kat computer. Proposal: it checks each approval itself, for example against a signed proposal digest, and does not accept an "approved" flag from the server. Its privileges sit in a separate helper (companion trust-model ADR). ADR-0009's kill criteria do not cover it; it needs its own conformance test.
 2. **Inputs as untrusted.** Add trigger-delivered text, inbound SMS and mail, meeting transcripts, connector and MCP results, shared memory and skills, and teach recordings to the list of untrusted sources. Each gets a trust flag on its tool calls and a carrier in KatBench-Inject. A run that read them cannot hold an outward tool without a person.
 3. **Deletion.** Extend the purge to recordings (audio, screen and teach recordings), transcripts, voice memos, and personal data read through the companion. Add a retention limit for recordings (recording-retention ADR).
 4. **Consent.** Add a consent record for each recording of another person and each call to a third party. No call and no live meeting capture runs until the legal read passes (roadmap Q11).
-5. **Payments.** Card data is stored as write-only vault fields; the model never sees card numbers. Every payment is a Proposal with amount, merchant and recipient, and spend limits are checked in code. A payment whose result is unknown is recorded as "unconfirmed".
+5. **Payments.** Card data is stored as write-only vault fields; the model never sees card numbers. Every payment is a Proposal with amount, merchant and recipient, and spend limits are checked in code. A payment whose result KatWork cannot confirm is recorded with its own outcome, separate from success and failure.
 6. **Sending as a person.** Every send on a person's behalf is a Proposal and is checked after sending. A standing grant, if the founder allows one (roadmap Q21), is bound to one recipient and content class and capped.
 7. **Clipboard.** Clipboard transfer into or out of a Kat's computer is explicit and logged.
 8. **Browser.** Dialogs in a Kat's browser go to the person or fail. They are never accepted automatically. Credential fill clears the fields and hands over to the person when it fails.
@@ -92,7 +92,7 @@ These are smaller and are listed so that nothing is missed:
 - **§4 Domain model:** routines and triggers; connectors and their credentials; skills and versions; roles beyond admin and member; version numbers on tracked tasks for conflict detection; payment instruments and orders.
 - **§5.2 Services:** a companion relay, the speech engine, the connector runtime (pinned containers for stdio MCP and plugin commands), and the routine trigger endpoint.
 - **§6.4:** rooms where Kats talk to each other, with cost and loop rules. The 5-task, 3-level DAG limit still holds.
-- **§6.5 Approvals:** new action types: `pay`, `message-on-behalf` and `record`. Add a `pending_external` state, typed denial reasons and a "why this paused" line. Bulk approval covers only identical requests, never outward or destructive ones. A second factor for payments.
+- **§6.5 Approvals:** new action types: `pay`, `message-on-behalf` and `record`. Add a `pending_external` state, typed denial reasons, and a line on each approval card explaining why the job stopped. Bulk approval covers only identical requests, never outward or destructive ones. A second factor for payments.
 - **§7.2:** a disclosure card before sharing a Kat, listing what travels with it.
 - **§9:** the general desktop on the GUI tier, teach recording, screen recording, and the vault's card and contact fields.
 - **§17:** replace the week table with the re-plan's table once the founder approves a date.
@@ -109,7 +109,7 @@ Each paragraph states the problem only. The ADR makes the decision, and the foun
 
 Today every place a Kat acts is a server-side computer that KatWork isolates and controls (ADR-0009). A companion on a person's own computer reverses that. The person's files, apps, messages and accounts are in reach, and the host is not KatWork's. The ADR must settle several things:
 - what the companion may do, and how a person grants and revokes each capability;
-- how the companion proves to itself that an action was approved: a signed proposal digest it checks locally, not a flag from the server;
+- how the companion confirms that an action was approved, and whether it may rely on the server's word for it or must check something it can verify itself, such as a signed proposal digest;
 - how its privileges are split across separate helpers;
 - what happens when the server is compromised or unreachable;
 - which conformance test stands in for ADR-0009's kill criteria on a host KatWork does not own.
@@ -136,9 +136,9 @@ Voice chat, dictation, phone calls and meeting capture all need speech-to-text a
 Kats paying for things need instruments, limits and records. A self-hosted install has no merchant relationship, card-issuing account or payment processor of its own. The ADR must settle several things:
 - which rails an install uses (roadmap Q9);
 - how instruments are stored and shown to Kats without exposing card data to a model;
-- how spend limits and price anchors are checked in code;
+- how spend limits and expected prices are checked in code;
 - what second factor approves a payment;
-- how an unknown result ("unconfirmed") is recorded and resolved;
+- how a payment with an unknown result is recorded and resolved;
 - what happens to refunds and disputes.
 
 ### Recording retention and PDPA
@@ -155,4 +155,4 @@ A connector-credentials ADR is also needed. It decides whose credential a connec
 
 ## Open questions
 
-The founder's questions for this amendment are in the roadmap, Q1 and Q8 to Q22, each with a recommended option. Roadmap Q3 (sub-project 7 and the alpha) now also decides §1.2 item 4 above.
+The founder's questions for this amendment are in the roadmap, Q1 and Q8 to Q24, each with a recommended option. Roadmap Q3 (sub-project 7 and the alpha) now also decides §1.2 item 4 above.

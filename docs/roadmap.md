@@ -27,8 +27,8 @@ Two sizes are counted from approved plans. The sub-project 1 plan has 17 task he
 | 3 | Gates and policy | #132 | Not planned | L (estimate) | Not written |
 | 4 | Routing | #133 | Not planned | M (estimate) | Not written |
 | 5 | Channels | #134 | Not planned | M (estimate) | Not written |
-| 6 | Views and shells | #135 | Not planned | M (estimate) | Not written |
-| 7 | Craft integration beyond 2a | #136 | Not planned | M to L (estimate) | Not written |
+| 6 | Views and shells | #135 | Not planned | L (estimate, with the additions) | Not written |
+| 7 | Craft integration beyond 2a | #136 | Not planned | L (estimate, with the additions) | Not written |
 | 8 | Federation, after the alpha | #137 | Not planned | L (estimate) | Not written |
 | 9 | Companion (proposed) | None yet | Not planned | L (estimate) | Not written |
 | 10 | Spend (proposed) | None yet | Not planned | M (estimate) | Not written |
@@ -36,7 +36,7 @@ Two sizes are counted from approved plans. The sub-project 1 plan has 17 task he
 | 12 | Connectors and plugins (proposed) | None yet | Not planned | L (estimate) | Not written |
 | 13 | Routines (proposed) | None yet | Not planned | M (estimate) | Not written |
 | 14 | Team admin (proposed) | None yet | Not planned | M (estimate) | Not written |
-| Alpha | Public alpha release | #138 | Not started | S to M (estimate) | Not written |
+| Alpha | Public alpha release | #138 | Not started | S (estimate) | Not written |
 
 Sub-projects 9 to 14 are proposed by this re-plan. They get tracking issues once the founder approves them. Their sizes and the larger sizes of the existing sub-projects are in "Re-plan" below.
 
@@ -278,7 +278,7 @@ This repo calls that product "a competing desktop agent" and does not name it. K
 
 The capability areas are: agent tools and planning; computer use and the browser; personal data, voice, phone calls and meetings; commerce, payments and a vault; connectors, plugins and MCP; teams, sharing and admin; automations and the chat shell.
 
-The rulings settle scope and placement. They do not settle how each area is built, which spec sections change, or the questions listed at the end (Q8 to Q22). Sub-projects 9 to 14 below are this re-plan's proposal for where the new scope goes; the founder may merge or split them (Q8). Nothing in them is built before its plan is approved.
+The rulings settle scope and placement. They do not settle how each area is built, which spec sections change, or the questions listed at the end (Q8 to Q24). Sub-projects 9 to 14 below are this re-plan's proposal for where the new scope goes; the founder may merge or split them (Q8). Nothing in them is built before its plan is approved.
 
 Some parts of the competing product run against KatWork's spec or ADRs, for example a browser that hides that it is automated, or link previews in chat. "All" adopts every capability area, but whether those particular designs are adopted is not settled; each is an open question with a recommended option (Q18 to Q21).
 
@@ -291,10 +291,10 @@ Some parts of the competing product run against KatWork's spec or ADRs, for exam
 - Personal-data tools on that computer: messages, mail, notes, reminders, calendar, contacts, photos and location, each behind its own grant and each outward send a Proposal (§6.5).
 - Desktop notifications, a tray, a capture overlay and element picking, built into the Tauri shell from sub-project 6.
 
-**Rules this sub-project carries:**
-- The companion verifies every approval locally against a signed proposal digest. It never trusts a flag from the server that says "approved".
+**Rules proposed for its plan and the companion trust-model ADR** (not decided):
+- The companion checks every approval itself, for example against a signed proposal digest, instead of trusting a flag from the server.
 - Its privileges sit in a separate helper with only the permissions each part needs.
-- Every send on a person's behalf is checked after sending, and an unknown result is reported as "may have been sent", never as sent or failed.
+- Every send on a person's behalf is checked after sending. When KatWork cannot tell whether a message went out, it says so, instead of reporting it as sent or as failed.
 
 **Depends on:** sub-project 3 (approvals and the proposal digest), sub-project 6 (the Tauri shell), 2b (the `Computer` contract), and the companion trust-model ADR.
 
@@ -305,10 +305,12 @@ Some parts of the competing product run against KatWork's spec or ADRs, for exam
 **Scope:**
 - Payment instruments for Kats, for example one-time or limited cards, on rails the founder picks (Q9).
 - `pay` action parameters: amount, currency, merchant and recipient.
-- Spend limits per Kat, per Space and per day, and an optional price anchor. These are deterministic gates in code; no model decides a payment.
+- Spend limits per Kat, per Space and per day, and an optional expected price that a payment may not exceed by more than a set margin. These are deterministic gates in code; no model decides a payment.
 - A second factor for approving payments, for example a passkey.
 - Card storage in the per-Kat vault from 2b, as write-only fields.
-- Order and receipt records, with an "unconfirmed" outcome distinct from success and failure.
+- A hardware security key or passkey on the person's own device for approving payments, after a threat model (with sub-project 9).
+- Adding cards by scanning them, and importing entries from a password manager.
+- Order and receipt records. A payment whose result KatWork cannot confirm gets its own outcome, separate from success and failure.
 - Credits, top-ups and usage limits, if the founder places them in this edition (Q10).
 
 **Depends on:** sub-project 3 (action types and gates), 2b (the vault), sub-project 12 (merchant and travel connectors), and the payments ADR.
@@ -351,7 +353,7 @@ Some parts of the competing product run against KatWork's spec or ADRs, for exam
 - Chained prompts, retries, and validation when a routine is turned on.
 - Scheduled browser research (Phase 3's capability, pulled forward).
 
-**Rule:** text a trigger delivers is untrusted (ADR-0010). A routine started by a webhook or a message never holds an outward tool without a person.
+**Rule proposed for its plan** (not decided): text a trigger delivers is untrusted (ADR-0010). A routine started by a webhook or a message never holds an outward tool without a person.
 
 **Depends on:** sub-project 3, sub-project 5 (channel triggers) and sub-project 12 (connector triggers).
 
@@ -372,12 +374,12 @@ Some parts of the competing product run against KatWork's spec or ADRs, for exam
 
 ### Additions to existing sub-projects
 
-- **2b Kat computers:** a general Linux desktop on the GUI tier, with take-over; teach recording (a person records a task and the Kat proposes steps, reviewed before use); screen recording; the egress gateway failing closed when its policy cannot refresh, and an applied status per Kat; card and contact entries in the vault as write-only fields, and typed secret requests; credential fill that clears the fields and hands over to the person when it fails; browser dialogs shown to the person, never accepted automatically; clipboard transfer that is explicit and logged; idle pause, then parking when nobody is present.
+- **2b Kat computers:** Playwright as an alternative browser runtime, if the plan finds it needed beside chromiumoxide; a general Linux desktop on the GUI tier, with take-over; teach recording (a person records a task and the Kat proposes steps, reviewed before use); screen recording; the egress gateway failing closed when its policy cannot refresh, and an applied status per Kat; card and contact entries in the vault as write-only fields, and typed secret requests; credential fill that clears the fields and hands over to the person when it fails; browser dialogs shown to the person, never accepted automatically; clipboard transfer that is explicit and logged; idle pause, then parking when nobody is present.
 - **2c Memory:** a review queue for shared memory and for skills; Kat-authored skills with version history, review and revert; untrusted shared memory flagged as such.
-- **3 Gates and policy:** new action types (`pay`, `message-on-behalf`, `record`); spend limits and the payment second factor (with sub-project 10); typed denial reasons returned to the Kat; an admin command denylist; approval rules per person and per team, where "ask first" always wins; bulk approval only for identical requests and never for outward or destructive actions; harness hooks before and after tool calls; a `pending_external` state distinct from an error; data-use preconditions per connector; a "why this paused" line on every approval card.
+- **3 Gates and policy:** new action types (`pay`, `message-on-behalf`, `record`); spend limits and the payment second factor (with sub-project 10); typed denial reasons returned to the Kat; an admin command denylist; approval rules per person and per team, where a rule that requires asking a person always overrides a rule that allows an action; bulk approval only for identical requests and never for outward or destructive actions; harness hooks before and after tool calls; a `pending_external` state distinct from an error; data-use preconditions per connector; a line on every approval card that explains why the job stopped for approval.
 - **4 Routing:** rooms where Kats talk to each other, with cost and loop rules; questions a Kat asks while it keeps working (this changes ADR-0002's resume model and needs an ADR note); version conflicts on tracked tasks; goal continuation.
 - **5 Channels:** SMS and inbound mail adapters (a Kat's own number and address); notifications; a clear install state for each channel app.
-- **6 Views and shells:** the review-queue view; admin pages; the desktop shell features listed in sub-project 9; a shared canvas; voice controls; Kat creation with avatars and template browsing; a sandboxed renderer for tool-result cards, if the founder adopts them (Q20).
+- **6 Views and shells:** onboarding, Thai and English first with more locales by demand, and in-app notices for outages and updates; chat with several people and Kats in one thread, maths and chart rendering, and presentations in chat (within ADR-0010's plain-text rule); the review-queue view; admin pages; the desktop shell features listed in sub-project 9; a shared canvas; voice controls; Kat creation with avatars and template browsing; a sandboxed renderer for tool-result cards, if the founder adopts them (Q20).
 - **7 Craft beyond 2a:** the virtual display and UI plane that local computer use, screen recording and the general desktop also need. This is why Q3 now affects the new scope.
 
 ## Re-plan
@@ -467,9 +469,11 @@ The schedule assumes:
 | 2028-04-17 | Sub-projects 10 and 13 done. Sub-project 9 (companion) starts. |
 | 2028-06-05 | Sub-project 14 done. Sub-project 11 (voice and meetings) starts. |
 | 2028-07-31 | Sub-project 9 done. |
-| 2028-08-28 | Sub-project 11 done. Alpha release work: hardening (kill-switch, replay and fidelity gates), demo mode, docs. |
+| 2028-08-28 | Alpha release work starts beside the end of sub-project 11: hardening (kill-switch, replay and fidelity gates), demo mode, docs. |
+| 2028-09-04 | Sub-project 11 done. |
 | 2028-09-25 | Design-partner dry runs. |
-| 2028-10-02 | Fixes from the partners. Licence review. Release candidate. |
+| 2028-10-02 | Fixes from the partners. |
+| 2028-10-09 | Licence review. Release candidate. |
 | 2028-10-16 | **Public alpha, proposed. Founder approval needed.** |
 
 **What moves the date:**
@@ -481,7 +485,7 @@ The schedule assumes:
 
 ## Differentiation
 
-The founder asked on 2026-11-26 for KatWork to outperform other products, through research into what people want and need, across many fields. A research wave is running on office work, trust and delegation, the Thai context, and complaints about competing products. Its findings feed each sub-project's plan: every plan written after the synthesis lands states which findings it answers.
+The founder asked on 2026-11-26 for KatWork to outperform other products, through research into what people want and need, across many fields. A research wave is running on office work, trust and delegation, the Thai context, and complaints about competing products. Its findings feed each sub-project's plan.
 
 This section is a placeholder. It does not change any scope or date above; any finding that would change scope comes to the founder as a proposal.
 
@@ -573,5 +577,7 @@ The two rulings settle that all of the new scope is in the alpha. They do not se
 18. **Stealth browsing and egress through a person's machine.** The competing product disguises its browser as a person's and can route traffic out through the user's home connection. Both conflict with ADR-0009's single egress gateway and with Web Bot Auth signing. Recommended: do not adopt either. Record both as rejected alternatives in ADR-0009.
 19. **Telemetry.** The competing product sends telemetry by default. §13 says no telemetry unless an admin turns it on. Recommended: keep §13 as written.
 20. **Link previews and rich cards from tool results.** ADR-0010 renders model text as plain text, with no link previews and nothing fetched from a reply. Recommended: no link previews. Tool-result cards only in a sandboxed renderer with no network, with an ADR-0010 amendment, in sub-project 6.
-21. **Unattended actions.** Standing grants to send as a person, an admin "view off" that hides what a Kat does, and a model classifier that approves actions on its own all appear in the competing product. Recommended: standing grants only bound to one recipient and content class, with caps. "View off" keeps the activity log and the take-over path. A classifier may narrow permissions but never approve; code decides (§5.1, ADR-0010).
+21. **Unattended actions.** Standing grants to send as a person, an admin switch that hides a Kat's screen while it works, and a model classifier that approves actions on its own all appear in the competing product. Recommended: standing grants only bound to one recipient and content class, with caps. Hiding the screen keeps the activity log and the take-over path. A classifier may narrow permissions but never approve; code decides (§5.1, ADR-0010).
 22. **An early look at the new scope.** In the proposed order, the new sub-projects come last (from 2028-02). Does the founder want an early demo slice of one of them, for example voice chat or one connector, before the core is done? Recommended: no. The core sub-projects are dependencies of all of them, and an early slice would take builder weeks from them.
+23. **Private worker pools.** The competing product can run its agents on a customer's own pool of machines. For KatWork that means multi-host scheduling, a §1.2 non-goal. Recommended: keep the single-host alpha and place private pools after it, because they are a hosting mode, not a capability a person uses. This needs the founder's ruling, because "All before the alpha" covers it.
+24. **A phone as a tool host.** The competing product can use a person's phone for photos, location and similar tools. Recommended: include it in sub-project 9 after the desktop companion, with photos and location behind PDPA grants (§13). If Q16 keeps mobile to notifications only, this moves after the alpha, which needs the founder's ruling.
