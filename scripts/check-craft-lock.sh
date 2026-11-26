@@ -13,8 +13,8 @@
 set -u
 
 APPS="wordcraft gridcraft pdfcraft deckcraft designcraft vectorcraft figcraft photocraft lightcraft cadcraft filmcraft effectcraft soundcraft katwork-bridge"
-# The features each fork's KatWork build must leave off (Task 13; the last three are the fork PRs' extra gates).
-GATES="plugin-hosts js collab plugins network model-download font-download self-update scripting"
+# The features each fork's KatWork build must leave off (Task 13; all after model-download are the fork PRs' extra gates, R44 and the founder rulings).
+GATES="plugin-hosts js collab plugins network model-download font-download self-update scripting heic"
 # Apps whose Thai gate test must be pinned (Tasks 18-22 each add theirs).
 REQUIRE_THAI_GATE=""
 
