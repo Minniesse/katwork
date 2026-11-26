@@ -3245,7 +3245,9 @@ fn pdf_glyph_width_far_past_the_font_size_is_suspect() {
         &format!("/Font << /W {wide} 0 R >>"),
     );
     let extracted = read(&doc.build());
-    let word = block(&extracted, "CLIPWORDS");
+    // Lines follow each glyph's own advance, not Tc: each letter starts 595 pt behind the end
+    // of the one before, so each reads on a line of its own.
+    let word = block(&extracted, "C\nL\nI\nP\nW\nO\nR\nD\nS");
     assert_eq!((word.hidden, word.suspect), (None, Some("glyph_width")));
     assert_eq!(block(&extracted, "CONTROL").suspect, None);
 }
@@ -3383,6 +3385,22 @@ fn pdf_actual_text_over_glyphs_out_of_line_order_is_suspect() {
             "900",
             "BT /F1 10 Tf 40 200 Td (9) Tj ET BT /F1 10 Tf 45.56 192 Td (00) Tj ET",
         ),
+        // -5.56 Tc takes the 9's advance away, and the TJ step draws the 0 10 pt to its left.
+        span("90", "BT /F1 10 Tf -5.56 Tc 60 200 Td [(9) 1000 (0)] TJ ET"),
+        // -5.56 Tc again, and the 2 drawn 3 pt left of the 1's origin: the 2 still has an
+        // advance of its own, so it is not placed as freely as a mark.
+        span("12", "BT /F1 10 Tf -5.56 Tc 40 200 Td [(1) 300 (2)] TJ ET"),
+        // -5.46 Tc overprints three glyphs 0.1 pt apart.
+        span("900", "BT /F1 10 Tf -5.46 Tc 40 200 Td (900) Tj ET"),
+        // Gaps of 7 and 9.8 pt after the 1, which the reader reads as a space.
+        span(
+            "12",
+            "BT /F1 10 Tf 40 200 Td (1) Tj ET BT /F1 10 Tf 52.56 200 Td (2) Tj ET",
+        ),
+        span(
+            "12",
+            "BT /F1 10 Tf 40 200 Td (1) Tj ET BT /F1 10 Tf 55.4 200 Td (2) Tj ET",
+        ),
         // A line break with leading under the font size.
         span("900", "BT /F1 10 Tf 8 TL 40 200 Td (9) Tj T* (00) Tj ET"),
         // The second glyph turned to run down the page.
@@ -3405,7 +3423,7 @@ fn pdf_actual_text_over_glyphs_out_of_line_order_is_suspect() {
             .blocks
             .iter()
             .filter(|block| {
-                ["12", "900", "li"]
+                ["12", "90", "li"]
                     .iter()
                     .any(|text| block.text.contains(text))
             })
@@ -3423,16 +3441,81 @@ fn pdf_actual_text_over_glyphs_out_of_line_order_is_suspect() {
 }
 
 #[test]
+fn pdf_actual_text_over_a_negative_width_glyph_is_suspect() {
+    // A 1 whose /Widths entry is -556 ends 5.56 pt left of its origin; the 2 drawn 1 pt right of
+    // the 1 overprints it.
+    let mut doc = Doc::new();
+    let widths = "556 ".repeat(17) + "-556 " + &"556 ".repeat(77);
+    let font = doc.add(format!(
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding /FirstChar 32 /LastChar 126 /Widths [{widths}] >>"
+    ));
+    doc.page(
+        "BT /F1 10 Tf 10 200 Td (Total) Tj ET /Span << /ActualText (12) >> BDC \
+         BT /N 10 Tf 40 200 Td (1) Tj ET BT /F1 10 Tf 41 200 Td (2) Tj ET EMC",
+        &format!("/Font << /N {font} 0 R >>"),
+    );
+    let extracted = read(&doc.build());
+    for block in extracted
+        .blocks
+        .iter()
+        .filter(|block| block.text.contains("12"))
+    {
+        assert_eq!(
+            block.suspect,
+            Some("actual_text"),
+            "{:?}",
+            texts(&extracted)
+        );
+    }
+}
+
+#[test]
+fn pdf_actual_text_over_ordinary_spacing_and_thai_marks_is_trusted() {
+    // Word spacing widens the space glyph only; a Thai nikhahit with no advance sits at the pen,
+    // where the next vowel starts too.
+    let kam = "\u{E01}\u{E4D}\u{E32}";
+    let nam = "\u{E19}\u{E49}\u{E4D}\u{E32}";
+    let actual = |text: &str| Doc::utf16(text).replacen('<', "<FEFF", 1);
+    let mut doc = Doc::new();
+    doc.page(
+        &format!(
+            "BT /F1 10 Tf 5 Tw 10 200 Td /Span << /ActualText (TO PAY) >> BDC (TO PAY) Tj EMC ET\n\
+             BT /U 10 Tf 10 150 Td /Span << /ActualText {} >> BDC {} Tj EMC ET\n\
+             BT /U 10 Tf 10 100 Td /Span << /ActualText {} >> BDC {} Tj EMC ET",
+            actual("\u{E01}\u{E33}"),
+            Doc::utf16(kam),
+            actual("\u{E19}\u{E49}\u{E33}"),
+            Doc::utf16(nam),
+        ),
+        "",
+    );
+    let extracted = read(&doc.build());
+    for text in ["TO PAY", "\u{E01}\u{E33}", "\u{E19}\u{E49}\u{E33}"] {
+        let block = block(&extracted, text);
+        assert_eq!((block.hidden, block.suspect), (None, None), "{text}");
+    }
+}
+
+#[test]
 fn pdf_negative_character_spacing_does_not_reorder_glyphs() {
     // -12 Tc draws the 0 left of the 9: a viewer sees "09", so "90" must not read as one word.
     // So does -7.56 Tc, which puts the 0 2 pt left of the 9, a step back of less than half a
     // font size.
-    for spacing in ["-12", "-7.56"] {
+    // With no span either: -5.56 Tc and a TJ step draw "21" and "009", and +100 Tc sets the
+    // 1 and the 2 106 pt apart.
+    for (shown, word) in [
+        ("-12 Tc 40 200 Td (90) Tj", "90"),
+        ("-7.56 Tc 40 200 Td (90) Tj", "90"),
+        ("-5.56 Tc 50 200 Td [(1) 450 (2)] TJ", "12"),
+        ("-5.56 Tc 60 200 Td [(9) 450 (0) 450 (0)] TJ", "900"),
+        ("100 Tc 40 200 Td (12) Tj", "12"),
+        // An i drawn 0.2 pt left of the narrow l before it, less than half a size back.
+        ("60 200 Td [(l) 242 (i)] TJ", "li"),
+    ] {
         let mut doc = Doc::new();
+        doc.size = (400.0, 300.0);
         doc.page(
-            &format!(
-                "BT /F1 10 Tf 10 200 Td (Total) Tj ET BT /F1 10 Tf {spacing} Tc 40 200 Td (90) Tj ET"
-            ),
+            &format!("BT /F1 10 Tf 10 200 Td (Total) Tj ET BT /F1 10 Tf {shown} ET"),
             "",
         );
         let extracted = read(&doc.build());
@@ -3440,8 +3523,8 @@ fn pdf_negative_character_spacing_does_not_reorder_glyphs() {
             extracted
                 .blocks
                 .iter()
-                .all(|block| !block.text.contains("90") || block.suspect.is_some()),
-            "{spacing}: {:?}",
+                .all(|block| !block.text.contains(word) || block.suspect.is_some()),
+            "{shown}: {:?}",
             texts(&extracted)
         );
     }

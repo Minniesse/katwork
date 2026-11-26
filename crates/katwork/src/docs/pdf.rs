@@ -4,12 +4,13 @@
 //!
 //! Fixed rules of version 1 (a change is a new version):
 //! - Reading order is the content stream's painting order; nothing is sorted by position.
-//! - A character starts a new line when its baseline moves by more than half the font size
-//!   across the line's direction, moves back by more than half the font size along it, or turns,
-//!   or when it advances and starts before the origin of the advancing character before it (a
-//!   negative `Tc` drawing it to that one's left); a character with no advance (a Thai mark)
-//!   stays on its line within one font size. A gap
-//!   wider than a quarter of the font size reads as one U+0020, never beside a combining mark.
+//! - Steps are measured from each glyph's own advance, without character spacing (`Tc`); word
+//!   spacing (`Tw`) on a single-byte space stays. A character starts a new line when its
+//!   baseline moves by more than half the font size across the line's direction, moves back by
+//!   more than half the font size along it, or turns, or when it advances and starts before the
+//!   origin of the line's last advancing character; a mark, or a character its font gives no
+//!   width, stays on its line within one font size. A gap wider than a quarter of the font size
+//!   reads as one U+0020, never beside a combining mark.
 //! - Lines join one block while the vertical gap between them is at most half the earlier
 //!   line's height; a new page starts a block; lines are joined with U+000A.
 //! - Hidden characters leave their line: each run of them (spaces between two hidden characters
@@ -21,10 +22,11 @@
 //!   any of its glyphs is, and suspect when any is suspect. A span whose text differs from its
 //!   glyphs' own text after `normalize_th`, or whose glyphs do not run along one line in order,
 //!   is `Suspect("actual_text")`: it reads, but never at full quality, since only the file says
-//!   the glyphs mean it. In order on one line: every glyph turned as the first; each next glyph
-//!   at most half the smaller font size off the line and starting past the previous glyph's
-//!   origin, from a quarter size before to one size after its end (a mark or a glyph with no
-//!   advance: a whole size off the line and either way of the end). A span whose text or glyph
+//!   the glyphs mean it. In order on one line: every glyph turned as the first; each advancing
+//!   glyph at most half the smaller font size off the line of the span's last advancing glyph,
+//!   starting past that glyph's origin and within a quarter size either way of its end; a mark
+//!   or a glyph its font gives no width within a whole size of the previous glyph's end, either
+//!   way and off the line. A span whose text or glyph
 //!   text passes 64 KiB is neither copied nor compared: its glyphs keep their own text, suspect.
 //!   Past `max_output_bytes` of span text placed in one file, the read is refused
 //!   (`TooComplex("actual_text")`).
@@ -108,6 +110,8 @@ struct Char {
     unmapped_font: bool,
     /// Its advance is past `MAX_GLYPH_ADVANCE` times its font size.
     wide: bool,
+    /// The font gives it no advance of its own (a mark placed over its base, as a rule).
+    zero_width: bool,
 }
 
 #[derive(Default)]
@@ -271,9 +275,13 @@ impl OutputDev for Collector<'_> {
         let order = self.next_order();
         let groups = self.groups(glyph.groups);
         let origin = apply(&glyph.trm, 0.0, 0.0);
+        // The glyph's own advance, without character spacing (`Tc`), which can draw the next
+        // glyph anywhere along the line; word spacing (`Tw`), which only a single-byte space
+        // carries, stays.
+        let word_space = glyph.code == 32 && !glyph.font.composite;
         let end = apply(
             &glyph.trm,
-            glyph.width * glyph.font_size + glyph.spacing,
+            glyph.width * glyph.font_size + if word_space { glyph.spacing } else { 0.0 },
             0.0,
         );
         let along = (glyph.trm.m11.hypot(glyph.trm.m12)).max(f64::MIN_POSITIVE);
@@ -317,6 +325,7 @@ impl OutputDev for Collector<'_> {
             size,
             unmapped_font: !font.has_to_unicode && (font.composite || !glyph.text.is_ascii()),
             wide: glyph.width.abs() > MAX_GLYPH_ADVANCE,
+            zero_width: glyph.width.abs() < 1e-9,
         });
         Ok(())
     }
@@ -495,41 +504,59 @@ fn apply_actual_text(
     Ok(())
 }
 
+/// Whether a glyph advances the pen by its own width: not a mark, which is placed over its base,
+/// and not a glyph its font gives no width.
+fn advances(char: &Char) -> bool {
+    !char.zero_width && !char.text.chars().next().is_some_and(is_mark)
+}
+
 /// Whether a span's glyphs, in painting order, run along one line in reading order: every glyph
-/// turned as the first; each next glyph at most half the smaller font size off the line, as
-/// for a new line (a mark or a glyph with no advance a whole size), starting past the previous glyph's
-/// origin and within a quarter size before to one size after its end (a mark or a glyph with no
-/// advance within one size either way of the end). A span whose glyphs stand otherwise could
-/// join text no line of the page draws.
+/// turned as the first; each advancing glyph at most half the smaller font size off the line
+/// of the span's last advancing glyph, starting past that glyph's origin and within a quarter
+/// size either way of its end (the gap past which the reader reads a space); a mark or a glyph
+/// its font gives no width within one size of the previous glyph's end, either way and off the
+/// line. A span whose glyphs stand otherwise could join text no line of the page draws.
 fn one_line(chars: &[Char], members: &[usize]) -> bool {
     let Some(first) = members.first().map(|at| &chars[*at]) else {
         return true;
     };
-    members.windows(2).all(|pair| {
-        let (before, after) = (&chars[pair[0]], &chars[pair[1]]);
-        let dot = |v: (f64, f64), w: (f64, f64)| v.0 * w.0 + v.1 * w.1;
-        let cross = |v: (f64, f64), w: (f64, f64)| v.0 * w.1 - v.1 * w.0;
-        let size = before.size.min(after.size);
-        let direction = before.direction;
-        let from_end = (after.origin.0 - before.end.0, after.origin.1 - before.end.1);
-        let from_origin = (
-            after.origin.0 - before.origin.0,
-            after.origin.1 - before.origin.1,
-        );
-        let along = dot(from_end, direction);
-        let across = cross(direction, from_end).abs();
-        let loose = after.text.chars().next().is_some_and(is_mark)
-            || (after.end.0 - after.origin.0).hypot(after.end.1 - after.origin.1) < 1e-6;
-        let in_line = dot(first.direction, after.direction) >= 0.95;
-        if loose {
-            in_line && across <= size && along.abs() <= size
-        } else {
-            in_line
-                && across <= size / 2.0
-                && dot(from_origin, direction) > 0.0
-                && (-size / 4.0..=size).contains(&along)
+    let dot = |v: (f64, f64), w: (f64, f64)| v.0 * w.0 + v.1 * w.1;
+    let cross = |v: (f64, f64), w: (f64, f64)| v.0 * w.1 - v.1 * w.0;
+    // The last glyph that advanced: an advancing glyph is placed after it, whatever marks sit
+    // between them.
+    let mut anchor: Option<&Char> = None;
+    let mut before = first;
+    for after in members.iter().skip(1).map(|at| &chars[*at]) {
+        if advances(before) {
+            anchor = Some(before);
         }
-    })
+        let in_line = dot(first.direction, after.direction) >= 0.95;
+        let fits = if advances(after) {
+            let from = anchor.unwrap_or(before);
+            let size = from.size.min(after.size);
+            let from_end = (after.origin.0 - from.end.0, after.origin.1 - from.end.1);
+            let from_origin = (
+                after.origin.0 - from.origin.0,
+                after.origin.1 - from.origin.1,
+            );
+            let along = dot(from_end, from.direction);
+            in_line
+                && cross(from.direction, from_end).abs() <= size / 2.0
+                && dot(from_origin, from.direction) > 0.0
+                && (-size / 4.0..=size / 4.0).contains(&along)
+        } else {
+            let size = before.size.min(after.size);
+            let from_end = (after.origin.0 - before.end.0, after.origin.1 - before.end.1);
+            in_line
+                && cross(before.direction, from_end).abs() <= size
+                && dot(from_end, before.direction).abs() <= size
+        };
+        if !fits {
+            return false;
+        }
+        before = after;
+    }
+    true
 }
 
 /// Whether `inner`'s centre lies in `outer`, within 5% of `outer`'s height (its font size): a
@@ -545,6 +572,8 @@ fn holds(outer: [f32; 4], inner: [f32; 4]) -> bool {
 fn lines(chars: &[Char], verdicts: &[Visibility]) -> Result<Vec<Line>, DocError> {
     let mut lines: Vec<Line> = Vec::new();
     let mut previous: Option<&Char> = None;
+    // The current line's last advancing glyph.
+    let mut anchor: Option<&Char> = None;
     // The boxes of the last `REPEAT_WINDOW` glyphs read on the current line, by text, for
     // overprinted repeats: a bounded look-back, so a line of any length costs linear time.
     let mut read: HashMap<&str, VecDeque<[f32; 4]>> = HashMap::new();
@@ -568,25 +597,21 @@ fn lines(chars: &[Char], verdicts: &[Visibility]) -> Result<Vec<Line>, DocError>
                 let turned = before.direction.0 * char.direction.0
                     + before.direction.1 * char.direction.1
                     < 0.95;
-                let zero_advance =
-                    (char.end.0 - char.origin.0).hypot(char.end.1 - char.origin.1) < 1e-6;
+                let zero_advance = char.zero_width;
                 let mark = char.text.chars().next().is_some_and(is_mark);
                 let off_line = if zero_advance || mark {
                     across.abs() > size
                 } else {
                     across.abs() > size / 2.0
                 };
-                // An advancing glyph drawn before the previous advancing glyph's origin is out
-                // of order (a mark is placed freely over its base).
-                let advances = |glyph: &Char| {
-                    (glyph.end.0 - glyph.origin.0).hypot(glyph.end.1 - glyph.origin.1) >= 1e-6
-                        && !glyph.text.chars().next().is_some_and(is_mark)
-                };
+                // An advancing glyph drawn before the origin of the line's last advancing glyph
+                // is out of order (a mark is placed freely over its base).
                 let behind = advances(char)
-                    && advances(before)
-                    && (char.origin.0 - before.origin.0) * before.direction.0
-                        + (char.origin.1 - before.origin.1) * before.direction.1
-                        < 0.0;
+                    && anchor.is_some_and(|anchor: &Char| {
+                        (char.origin.0 - anchor.origin.0) * anchor.direction.0
+                            + (char.origin.1 - anchor.origin.1) * anchor.direction.1
+                            < 0.0
+                    });
                 let broke = turned || off_line || behind || along < -size / 2.0;
                 space = !broke
                     && along > size / 4.0
@@ -602,6 +627,7 @@ fn lines(chars: &[Char], verdicts: &[Visibility]) -> Result<Vec<Line>, DocError>
                 rect: None,
             });
             read.clear();
+            anchor = None;
         }
         // A wide glyph's box says nothing of where its ink is: it is never a repeat, and no
         // later glyph is one of it.
@@ -640,6 +666,9 @@ fn lines(chars: &[Char], verdicts: &[Visibility]) -> Result<Vec<Line>, DocError>
             bbox: Some(char.paint.bbox),
         });
         previous = Some(char);
+        if advances(char) {
+            anchor = Some(char);
+        }
     }
     Ok(lines)
 }
