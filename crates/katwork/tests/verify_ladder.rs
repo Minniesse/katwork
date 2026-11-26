@@ -361,9 +361,10 @@ fn relocate_ambiguous_context_is_stale() {
 
 #[test]
 fn relocate_overlapping_exact_occurrences_count_as_two() {
-    let r = narrowed("xyzaaw", 3, 5);
-    // Context gone, and "aa" occurs twice (overlapping) in "aaa".
-    assert_eq!(relocate("aaa", &r), Err("stale"));
+    // A quote stored without context: the whole block was "aa".
+    let r = narrowed("aa", 0, 2);
+    // "aa" occurs twice (overlapping) in "baaa" and the stored range holds "ba".
+    assert_eq!(relocate("baaa", &r), Err("stale"));
     assert_eq!(relocate("b aa c", &r), Ok((2, 4)));
 }
 
@@ -384,7 +385,8 @@ fn relocate_empty_exact_is_stale() {
 #[test]
 fn relocate_position_outside_the_block_does_not_panic() {
     let r = narrowed("the budget was approved", 4, 10);
-    assert_eq!(relocate("budget", &r), Ok((0, 6)));
+    // The context is gone on both sides: stale, never the bare quote.
+    assert_eq!(relocate("budget", &r), Err("stale"));
     assert_eq!(relocate("", &r), Err("stale"));
     let mut bad = r.clone();
     if let Selector::FragmentSelector { refined_by, .. } = &mut bad.selector
@@ -393,7 +395,7 @@ fn relocate_position_outside_the_block_does_not_panic() {
         *start = 50;
         *end = 3;
     }
-    assert_eq!(relocate("x budget", &bad), Ok((2, 8)));
+    assert_eq!(relocate("x the budget was approved", &bad), Ok((6, 12)));
     assert_eq!(relocate("x", &bad), Err("stale"));
 }
 
@@ -461,17 +463,19 @@ fn relocate_malformed_chain_is_stale() {
 #[test]
 fn quote_variants_match_after_normalization() {
     // Tone order: tone mark before an above vowel in the claim, after it in the source.
-    let source = "ที่ประชุมอนุมัติให้ดำเนินการต่อ";
+    // Each claim is a whole cited quote, written differently: a Thai claim cut from the middle of
+    // a Thai run is a paraphrase (`containment_needs_whole_words_and_numbers`).
+    let block = "ที่ประชุมอนุมัติ ให้ดำเนินการ ต่อไป";
     let rows = [
         // Tone mark (U+0E48) typed before the above vowel (U+0E35) of ที่.
-        "\u{0E17}\u{0E48}\u{0E35}ประชุมอนุมัติ".to_string(),
+        ("\u{0E17}\u{0E48}\u{0E35}ประชุมอนุมัติ", "ที่ประชุมอนุมัติ"),
         // Decomposed SARA AM: nikhahit + aa.
-        "ให้ด\u{0E4D}\u{0E32}เนินการ".to_string(),
+        ("ให้ด\u{0E4D}\u{0E32}เนินการ", "ให้ดำเนินการ"),
         // A ZWSP inside the claim.
-        "อนุมัติ\u{200B}ให้".to_string(),
+        ("ที่ประชุมอนุ\u{200B}มัติ", "ที่ประชุมอนุมัติ"),
     ];
-    for text in rows {
-        let c = claim(ClaimKind::Quote, &text, vec![full(source, source)]);
+    for (text, exact) in rows {
+        let c = claim(ClaimKind::Quote, text, vec![full(exact, block)]);
         let out = check_quote(&c, &Ctx::default());
         assert_eq!(out.len(), 1, "{text:?}");
         assert_eq!(
@@ -801,19 +805,18 @@ fn longest_match_wins_and_matches_do_not_overlap() {
 #[test]
 fn english_words_are_whole_words() {
     use Meaning::*;
-    for text in [
-        "nothing",
-        "another",
-        "overview",
-        "notable",
-        "cannot",
-        "I said no.",
-    ] {
+    for text in ["nothing", "another", "overview", "notable", "cannot"] {
         assert_eq!(qualifier::find(text), set(&[]), "{text:?}");
     }
     assert_eq!(qualifier::find("under-budget"), set(&[Lt]));
     assert_eq!(qualifier::find("No, the board approved"), set(&[Neg]));
-    assert_eq!(qualifier::find("No.5"), set(&[]));
+    // "No." is the abbreviation only before a number ("No. 5", "No.5"); elsewhere it is "no".
+    for text in ["No. 5", "No.5", "no. 12 approved"] {
+        assert_eq!(qualifier::find(text), set(&[]), "{text:?}");
+    }
+    for text in ["I said no.", "No. The board refused", "no.x", "No. five"] {
+        assert_eq!(qualifier::find(text), set(&[Neg]), "{text:?}");
+    }
     // A Thai letter ends an English word.
     assert_eq!(qualifier::find("notอนุมัติ"), set(&[Neg]));
 }
@@ -939,12 +942,17 @@ fn window_is_ten_code_points_and_clamped() {
 }
 
 #[test]
-fn negation_exactly_ten_code_points_before_the_quote_is_seen_eleven_is_not() {
+fn negation_reaching_into_the_window_is_seen_one_wholly_outside_is_not() {
     // "ไม่" is three code points; seven filler code points put its start ten before the quote.
     let seen = "ไม่กขคงจฉชอนุมัติ";
     let c = claim(ClaimKind::Quote, "อนุมัติ", vec![full("อนุมัติ", seen)]);
     assert_eq!(check_qualifiers(&c).len(), 1);
-    let unseen = "ไม่กขคงจฉชซอนุมัติ";
+    // Eight fillers: the window edge cuts "ไม่" after its first code point; it is read whole.
+    let cut = "ไม่กขคงจฉชซอนุมัติ";
+    let c = claim(ClaimKind::Quote, "อนุมัติ", vec![full("อนุมัติ", cut)]);
+    assert_eq!(check_qualifiers(&c).len(), 1);
+    // Ten fillers: "ไม่" ends where the window starts, wholly outside it.
+    let unseen = "ไม่กขคงจฉชซฌญอนุมัติ";
     let c = claim(ClaimKind::Quote, "อนุมัติ", vec![full("อนุมัติ", unseen)]);
     assert!(check_qualifiers(&c).is_empty());
 }
@@ -985,11 +993,24 @@ fn window_cut_mid_word_does_not_invent_or_hide_a_qualifier() {
 }
 
 #[test]
-fn claim_and_window_with_a_repeated_negation_compare_as_sets() {
+fn repeated_negation_is_counted_not_cancelled() {
+    // Qualifiers compare as counts per meaning: "not not approve" is not "not approve" (this
+    // replaces the set comparison, under which a doubled negation cancelled out).
     let block = "the board did not not approve";
     let c = claim(
         ClaimKind::Quote,
         "not approve",
+        vec![full("approve", block)],
+    );
+    let out = check_qualifiers(&c);
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        out[0].detail,
+        json!({"claim": ["neg"], "source": ["neg", "neg"]})
+    );
+    let c = claim(
+        ClaimKind::Quote,
+        "not not approve",
         vec![full("approve", block)],
     );
     assert!(check_qualifiers(&c).is_empty());
@@ -1183,11 +1204,11 @@ fn rollup_rules_table() {
             "checked",
         ),
         (
-            "rule 5 human",
+            "rule 5 a person's support does not pass a claim yet",
             true,
             vec![sup.clone(), o(M::Human, V::Supported, B::Exact, "checked")],
-            ClaimStatus::Passed,
-            "checked",
+            ClaimStatus::Unverified,
+            "needs_review",
         ),
         (
             "rule 5 a second ref's paraphrase does not block",
@@ -1904,4 +1925,121 @@ fn every_code_is_listed_in_codes() {
     ] {
         assert!(CODES.contains(&code), "{code}");
     }
+}
+
+// ---------------------------------------------------------------- fix round 1
+
+#[test]
+fn containment_needs_whole_words_and_numbers() {
+    let quote = |c: &ClaimInput| check_quote(c, &Ctx::default());
+    // A hit that cuts a word or a number is a paraphrase.
+    for (text, exact) in [
+        ("approved", "The board disapproved it"),
+        ("now here", "The plan is nowhere"),
+        ("possible", "It is impossible"),
+        ("board", "the board's plan"),
+        // A Thai claim whose end falls inside a Thai run: no segmenter, so a paraphrase.
+        ("ประชุมอนุมัติ", "ที่ประชุมอนุมัติงบ"),
+    ] {
+        let c = claim(ClaimKind::Quote, text, vec![full(exact, exact)]);
+        let out = quote(&c);
+        assert_eq!(out.len(), 1, "{text:?} in {exact:?}");
+        assert_eq!(
+            (out[0].verdict, out[0].code),
+            (CheckVerdict::Inconclusive, "paraphrase"),
+            "{text:?} in {exact:?}"
+        );
+    }
+    // A cut number never passes, whichever check takes it.
+    for (text, exact) in [("No. 1", "See No. 12"), ("ข้อ ๑", "ตาม ข้อ ๑๒")]
+    {
+        let c = claim(ClaimKind::Quote, text, vec![full(exact, exact)]);
+        assert!(
+            quote(&c)
+                .iter()
+                .all(|k| k.verdict != CheckVerdict::Supported),
+            "{text:?} in {exact:?}"
+        );
+        assert_ne!(status(&c).0, ClaimStatus::Passed, "{text:?} in {exact:?}");
+    }
+    // Whole words, numbers and Thai runs bounded by a space or the quote's ends pass.
+    for (text, exact) in [
+        ("approved", "The board approved it"),
+        ("approved", "approved."),
+        ("ข้อ ๑", "ตาม ข้อ ๑ และ"),
+        ("อนุมัติ", "ไม่ อนุมัติ"),
+        ("The board", "The\nboard"),
+    ] {
+        let c = claim(ClaimKind::Quote, text, vec![full(exact, exact)]);
+        let out = quote(&c);
+        assert_eq!(out.len(), 1, "{text:?} in {exact:?}");
+        assert_eq!(
+            out[0].verdict,
+            CheckVerdict::Supported,
+            "{text:?} in {exact:?}"
+        );
+    }
+}
+
+#[test]
+fn entry_cut_by_the_window_edge_is_read_whole() {
+    // "ไม่เกิน" cut to "่เกิน" by the left edge would read as "เกิน" (Gt) and match the claim.
+    let block = "ไม่เกินกขคงจอนุมัติ";
+    let c = claim(ClaimKind::Quote, "เกิน อนุมัติ", vec![full("อนุมัติ", block)]);
+    let out = check_qualifiers(&c);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].detail, json!({"claim": ["gt"], "source": ["le"]}));
+    // "no more than" cut to "more than" by the left edge.
+    let block = "no more than xbudget";
+    let c = claim(
+        ClaimKind::Quote,
+        "more than budget",
+        vec![full("budget", block)],
+    );
+    let out = check_qualifiers(&c);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].detail, json!({"claim": ["gt"], "source": ["le"]}));
+    // A negation cut by the right edge.
+    let block = "อนุมัติกขคงจฉชซฌไม่";
+    let c = claim(ClaimKind::Quote, "อนุมัติ", vec![full("อนุมัติ", block)]);
+    assert_eq!(check_qualifiers(&c).len(), 1);
+}
+
+#[test]
+fn relocate_with_its_context_gone_is_stale_not_bound_to_another_copy() {
+    let old = "ยอดรวม 1,250 บาท และยอดสุทธิ 1,250 บาทถ้วน";
+    let (s, e) = cp_range_nth(old, "1,250", 1);
+    let r = narrowed(old, s as usize, e as usize);
+    // The cited copy was edited away; the other copy is now the only "1,250".
+    let edited = "ยอดรวม 1,250 บาท และยอดสุทธิ 1,260 บาทถ้วน";
+    assert_eq!(relocate(edited, &r), Err("stale"));
+}
+
+#[test]
+fn relocate_one_side_of_context_is_enough() {
+    let old = "ยอดรวม 1,250 บาท และยอดสุทธิ 1,250 บาทถ้วน";
+    let (s, e) = cp_range_nth(old, "1,250", 1);
+    let r = narrowed(old, s as usize, e as usize);
+    // Text after the quote changed; its prefix still binds it to the second copy.
+    let edited = "หมายเหตุ ยอดรวม 1,250 บาท และยอดสุทธิ 1,250 บาท (แก้ไข)";
+    assert_eq!(relocate(edited, &r), Ok(cp_range_nth(edited, "1,250", 1)));
+}
+
+#[test]
+fn qualifiers_pair_with_the_next_quantity_for_task_11() {
+    use Meaning::*;
+    let text = "ไม่เกิน 1,250 ล้านบาท และอย่างน้อย 30 คน";
+    let pairs = qualifier::pair_with_numbers(text, &Ctx::default()).unwrap();
+    let got: Vec<_> = pairs.iter().map(|(q, n)| (q.meaning, *n)).collect();
+    assert_eq!(got, vec![(Le, Some(0)), (Ge, Some(1))]);
+    let chars: Vec<char> = text.chars().collect();
+    let first: String = chars[pairs[0].0.start as usize..pairs[0].0.end as usize]
+        .iter()
+        .collect();
+    assert_eq!(first, "ไม่เกิน");
+    let pairs = qualifier::pair_with_numbers("not approved", &Ctx::default()).unwrap();
+    assert_eq!(pairs.len(), 1);
+    assert_eq!((pairs[0].0.meaning, pairs[0].1), (Neg, None));
+    let long = "a".repeat(MAX_SCAN_CODE_POINTS + 1);
+    assert!(qualifier::pair_with_numbers(&long, &Ctx::default()).is_err());
 }

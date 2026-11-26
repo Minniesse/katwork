@@ -17,6 +17,15 @@ fn is_judge(c: &CheckOutcome) -> bool {
     c.method == CheckMethod::Judge
 }
 
+/// A check whose exact or derived support can pass a claim (rule 5): not a judge, not a resolve
+/// check, and not a person's check, which sub-project 3 has yet to define.
+fn counts_as_support(c: &CheckOutcome) -> bool {
+    !matches!(
+        c.method,
+        CheckMethod::Judge | CheckMethod::Resolve | CheckMethod::Human
+    )
+}
+
 fn exact_or_derived(c: &CheckOutcome) -> bool {
     c.verdict == CheckVerdict::Supported && matches!(c.basis, Basis::Exact | Basis::Derived)
 }
@@ -26,7 +35,7 @@ fn exact_or_derived(c: &CheckOutcome) -> bool {
 /// 2. not cited: `uncited`;
 /// 3. a `Resolve` check not `Supported`: its code;
 /// 4. a non-judge `Unsupported`: its code;
-/// 5. a non-judge, non-resolve check `Supported` with an exact or derived basis, no
+/// 5. a non-judge, non-resolve, non-human check `Supported` with an exact or derived basis, no
 ///    `Inconclusive` qualifier, number, date, cell or arithmetic check, and no judge
 ///    `Contradicted` or `Unsupported`: `Passed`, `checked`;
 /// 6. to 8. a judge `Contradicted`, `Unsupported`, `Supported`: `judge_contradicted`,
@@ -62,7 +71,7 @@ pub fn roll_up(cited: bool, checks: &[CheckOutcome]) -> (ClaimStatus, &'static s
     let judge = |verdict| checks.clone().any(|c| is_judge(c) && c.verdict == verdict);
     let supported = checks
         .clone()
-        .any(|c| !is_judge(c) && c.method != CheckMethod::Resolve && exact_or_derived(c));
+        .any(|c| counts_as_support(c) && exact_or_derived(c));
     let blocking = checks.clone().any(|c| {
         c.verdict == Inconclusive
             && matches!(

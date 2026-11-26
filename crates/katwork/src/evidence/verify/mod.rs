@@ -35,7 +35,8 @@ pub enum CheckMethod {
     Arithmetic,
     AmountWords,
     Judge,
-    /// Reserved for sub-project 3; nothing produces it yet. `roll_up` treats it as deterministic.
+    /// Reserved for sub-project 3; nothing produces it yet. Its `Contradicted` and `Unsupported`
+    /// lower a claim like a deterministic check's, but its support never passes one.
     Human,
 }
 

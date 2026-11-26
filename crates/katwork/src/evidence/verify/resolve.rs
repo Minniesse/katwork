@@ -108,8 +108,9 @@ fn resolve_detail(r: &ResolvedRef) -> Value {
 /// The quote's code-point range in the block's current text.
 ///
 /// Keeps the stored position when the text there, and the stored `prefix` and `suffix` around
-/// it, still have their `match_key`s; otherwise finds
-/// `prefix + exact + suffix`, then `exact` alone, each only when it occurs exactly once
+/// it, still have their `match_key`s; otherwise finds `prefix + exact + suffix`, then
+/// `prefix + exact`, then `exact + suffix` (`exact` alone only for a quote stored without
+/// context), each only when it occurs exactly once
 /// (overlapping occurrences count). Searching compares code points as stored, with no fuzzy step:
 /// an edited quote is `stale`, never guessed. A range never splits a grapheme cluster. A ref that
 /// was never narrowed cites the whole block. Anything else, a malformed chain included, is
@@ -159,17 +160,27 @@ pub fn relocate(current_block_text: &str, r: &SourceRef) -> Result<(u32, u32), &
     }
 
     let exact: Vec<char> = exact.chars().collect();
-    let prefix_len = prefix.chars().count();
-    let context: Vec<char> = prefix
-        .chars()
-        .chain(exact.iter().copied())
-        .chain(suffix.chars())
-        .collect();
-    let found = unique_hit(&chars, &context, |hit| {
-        at_bounds(hit + prefix_len, hit + prefix_len + exact.len())
-    })
-    .map(|hit| hit + prefix_len)
-    .or_else(|| unique_hit(&chars, &exact, |hit| at_bounds(hit, hit + exact.len())));
+    let prefix: Vec<char> = prefix.chars().collect();
+    let suffix: Vec<char> = suffix.chars().collect();
+    let join = |before: &[char], after: &[char]| -> Vec<char> {
+        before.iter().chain(&exact).chain(after).copied().collect()
+    };
+    // The quote with its whole context, then with the context of one side; the quote alone only
+    // when it was stored without context. A ref whose context is gone is stale, never bound to
+    // another copy of its quote.
+    let mut tries: Vec<(Vec<char>, usize)> = vec![(join(&prefix, &suffix), prefix.len())];
+    if !prefix.is_empty() {
+        tries.push((join(&prefix, &[]), prefix.len()));
+    }
+    if !suffix.is_empty() {
+        tries.push((join(&[], &suffix), 0));
+    }
+    let found = tries.iter().find_map(|(needle, offset)| {
+        unique_hit(&chars, needle, |hit| {
+            at_bounds(hit + offset, hit + offset + exact.len())
+        })
+        .map(|hit| hit + offset)
+    });
     match found {
         Some(s) => Ok((ordinal(s), ordinal(s + exact.len()))),
         None => Err(STALE),
@@ -231,10 +242,25 @@ fn grapheme_bounds(text: &str, len: usize) -> Vec<bool> {
 }
 
 /// The one start of `needle` in `hay` that `accept` takes, or `None` when there is none or more
-/// than one. Knuth-Morris-Pratt, so hostile text costs linear time; overlapping hits count.
+/// than one. Overlapping hits count.
 fn unique_hit(hay: &[char], needle: &[char], accept: impl Fn(usize) -> bool) -> Option<usize> {
+    let mut found = None;
+    let mut unique = true;
+    each_hit(hay, needle, |hit| {
+        if accept(hit) {
+            unique = found.is_none();
+            found = Some(hit);
+        }
+        unique
+    });
+    if unique { found } else { None }
+}
+
+/// Calls `on_hit` with each start of `needle` in `hay`, overlapping hits included, until it
+/// returns false. Knuth-Morris-Pratt, so hostile text costs linear time.
+pub(super) fn each_hit(hay: &[char], needle: &[char], mut on_hit: impl FnMut(usize) -> bool) {
     if needle.is_empty() || needle.len() > hay.len() {
-        return None;
+        return;
     }
     let mut fail = vec![0usize; needle.len()];
     let mut k = 0;
@@ -247,7 +273,6 @@ fn unique_hit(hay: &[char], needle: &[char], accept: impl Fn(usize) -> bool) -> 
         }
         fail[i] = k;
     }
-    let mut found = None;
     let mut k = 0;
     for (i, c) in hay.iter().enumerate() {
         while k > 0 && *c != needle[k] {
@@ -257,15 +282,10 @@ fn unique_hit(hay: &[char], needle: &[char], accept: impl Fn(usize) -> bool) -> 
             k += 1;
         }
         if k == needle.len() {
-            let hit = i + 1 - needle.len();
-            if accept(hit) {
-                if found.is_some() {
-                    return None;
-                }
-                found = Some(hit);
+            if !on_hit(i + 1 - needle.len()) {
+                return;
             }
             k = fail[k - 1];
         }
     }
-    found
 }

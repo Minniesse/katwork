@@ -1,9 +1,9 @@
 //! Qualifiers: negations and comparators must mean the same in the claim and around its quote,
 //! so "อนุมัติงบประมาณ" quoted from "ไม่อนุมัติงบประมาณ" cannot pass (ADR-0007).
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
-use katwork_thai::{match_key, normalize_th};
+use katwork_thai::{Ctx, NumberRole, TooLong, find_numbers, match_key, normalize_th};
 use serde::Serialize;
 use serde_json::json;
 
@@ -13,6 +13,10 @@ use super::{
 
 /// Code points of block text read on each side of a quote.
 const WINDOW: usize = 10;
+
+/// Code points read past each window edge, so a lexicon entry that straddles an edge is read
+/// whole: twice the longest entry, which leaves room for invisible characters inside it.
+const REACH: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -132,19 +136,44 @@ static LEXICON: LazyLock<Lexicon> = LazyLock::new(|| {
     }
 });
 
+/// One qualifier found in a text, at code points `start..end` of that text (widened to whole
+/// grapheme clusters).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qualifier {
+    pub meaning: Meaning,
+    pub start: u32,
+    pub end: u32,
+}
+
 /// The qualifiers in a text: a left-to-right, longest-match-first, non-overlapping scan. Thai
 /// entries match as substrings of `match_key(text)`; English entries as whole lowercased words
 /// or word sequences of `normalize_th(text)`.
 pub fn find(text: &str) -> BTreeSet<Meaning> {
-    let mut found = BTreeSet::new();
-    thai_scan(&match_key(text).text, &mut found);
-    english_scan(&normalize_th(text).text, &mut found);
+    spans(text).iter().map(|q| q.meaning).collect()
+}
+
+/// Every qualifier of [`find`] with its place in `text`, in text order.
+pub fn spans(text: &str) -> Vec<Qualifier> {
+    let mut found = thai_scan(text);
+    found.extend(english_scan(text));
+    found.sort_by_key(|q| (q.start, q.end));
     found
 }
 
-fn thai_scan(key: &str, found: &mut BTreeSet<Meaning>) {
+/// How often each meaning occurs, so a doubled negation does not cancel out against one.
+fn counts(found: &[Qualifier]) -> BTreeMap<Meaning, usize> {
+    let mut counts = BTreeMap::new();
+    for q in found {
+        *counts.entry(q.meaning).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn thai_scan(text: &str) -> Vec<Qualifier> {
     let lexicon = &*LEXICON;
-    let chars: Vec<char> = key.chars().collect();
+    let key = match_key(text);
+    let chars: Vec<char> = key.text.chars().collect();
+    let mut found = Vec::new();
     let mut i = 0;
     while i < chars.len() {
         let hit = lexicon
@@ -155,19 +184,28 @@ fn thai_scan(key: &str, found: &mut BTreeSet<Meaning>) {
             Some((entry, meaning)) => {
                 let budget = *meaning == Meaning::Approx && chars[..i].ends_with(&lexicon.budget);
                 if !budget {
-                    found.insert(*meaning);
+                    let range = key.original_range(i, i + entry.len());
+                    found.push(Qualifier {
+                        meaning: *meaning,
+                        start: range.start,
+                        end: range.end,
+                    });
                 }
                 i += entry.len();
             }
             None => i += 1,
         }
     }
+    found
 }
 
 struct Word {
     text: String,
-    /// The code point right after the word, if any.
-    next: Option<char>,
+    /// Code points of the normalized text the word (apostrophes trimmed) spans.
+    start: usize,
+    end: usize,
+    /// A `.` right after the word, then an optional space and a digit: "No. 5".
+    before_numbered_dot: bool,
 }
 
 /// A letter of an English word: ASCII letters and digits, Latin letters up to U+024F and the
@@ -181,6 +219,7 @@ fn is_word_char(c: char) -> bool {
 /// The words of a normalized text, with apostrophes trimmed from their ends.
 fn words(text: &str) -> Vec<Word> {
     let chars: Vec<char> = text.chars().collect();
+    let digit_at = |at: usize| chars.get(at).is_some_and(char::is_ascii_digit);
     let mut out = Vec::new();
     let mut i = 0;
     while i < chars.len() {
@@ -188,25 +227,43 @@ fn words(text: &str) -> Vec<Word> {
             i += 1;
             continue;
         }
-        let start = i;
+        let mut start = i;
         while i < chars.len() && is_word_char(chars[i]) {
             i += 1;
         }
-        let word: String = chars[start..i].iter().collect();
-        let trimmed = word.trim_matches('\'');
-        if !trimmed.is_empty() {
+        let mut end = i;
+        while start < end && chars[start] == '\'' {
+            start += 1;
+        }
+        while end > start && chars[end - 1] == '\'' {
+            end -= 1;
+        }
+        if start < end {
             out.push(Word {
-                text: trimmed.to_string(),
-                next: chars.get(i).copied(),
+                text: chars[start..end].iter().collect(),
+                start,
+                end,
+                before_numbered_dot: chars.get(i) == Some(&'.')
+                    && (digit_at(i + 1) || (chars.get(i + 1) == Some(&' ') && digit_at(i + 2))),
             });
         }
     }
     out
 }
 
-fn english_scan(normalized: &str, found: &mut BTreeSet<Meaning>) {
+fn english_scan(text: &str) -> Vec<Qualifier> {
     let lexicon = &*LEXICON;
-    let words = words(normalized);
+    let normalized = normalize_th(text);
+    let words = words(&normalized.text);
+    let mut found = Vec::new();
+    let mut push = |meaning, first: &Word, last: &Word| {
+        let range = normalized.original_range(first.start, last.end);
+        found.push(Qualifier {
+            meaning,
+            start: range.start,
+            end: range.end,
+        });
+    };
     let mut i = 0;
     while i < words.len() {
         let hit = lexicon.english.iter().find(|(entry, _)| {
@@ -214,19 +271,39 @@ fn english_scan(normalized: &str, found: &mut BTreeSet<Meaning>) {
                 return false;
             };
             let same = run.iter().zip(entry).all(|(w, e)| w.text == *e);
-            // "No." (as in "No. 5") is not a negation.
-            same && !(entry.len() == 1 && entry[0] == "no" && run[0].next == Some('.'))
+            // "No." before a number (as in "No. 5") abbreviates "number"; it is not a negation.
+            same && !(entry.len() == 1 && entry[0] == "no" && run[0].before_numbered_dot)
         });
         if let Some((entry, meaning)) = hit {
-            found.insert(*meaning);
+            push(*meaning, &words[i], &words[i + entry.len() - 1]);
             i += entry.len();
             continue;
         }
         if words[i].text.ends_with("n't") {
-            found.insert(Meaning::Neg);
+            push(Meaning::Neg, &words[i], &words[i]);
         }
         i += 1;
     }
+    found
+}
+
+/// Each qualifier of `text` in order, with the index in `find_numbers(text, ctx)` of the first
+/// `Quantity` that starts at or after its end: the figure it most likely qualifies (for Task 11's
+/// number check).
+pub fn pair_with_numbers(
+    text: &str,
+    ctx: &Ctx,
+) -> Result<Vec<(Qualifier, Option<usize>)>, TooLong> {
+    let numbers = find_numbers(text, ctx)?;
+    Ok(spans(text)
+        .into_iter()
+        .map(|q| {
+            let next = numbers
+                .iter()
+                .position(|n| n.value.role == NumberRole::Quantity && n.start >= q.end);
+            (q, next)
+        })
+        .collect())
 }
 
 /// For an `Ok` ref, the 10 code points of `block_text` before `quote_start`, the quote, and the
@@ -266,10 +343,12 @@ fn in_raw_word(c: char) -> bool {
         || (c.is_alphanumeric() && !('\u{0E00}'..='\u{0E7F}').contains(&c))
 }
 
-/// [`window`], with an edge that falls inside an English word moved outward to the word's end,
-/// so a cut word is read whole: "cannot" cut to "not" invents no negation, and "didn't" cut to
-/// "n't" or "'t" hides none.
-fn checked_window(r: &ResolvedRef) -> Option<String> {
+/// The qualifiers [`check_qualifiers`] reads around a ref: those of [`window`], plus any entry
+/// that straddles a window edge, read whole. An edge inside an English word moves outward to the
+/// word's end ("cannot" cut to "not" invents no negation, "didn't" cut to "n't" hides none), and
+/// the text up to [`REACH`] code points past each edge is scanned too, so "ไม่" cut to "่" or
+/// "ไม่เกิน" cut to "เกิน" is still read as written.
+fn window_qualifiers(r: &ResolvedRef) -> Option<Vec<Qualifier>> {
     let (chars, mut lo, mut hi) = window_range(r)?;
     if lo > 0 && in_raw_word(chars[lo]) {
         while lo > 0 && in_raw_word(chars[lo - 1]) {
@@ -281,24 +360,37 @@ fn checked_window(r: &ResolvedRef) -> Option<String> {
             hi += 1;
         }
     }
-    Some(chars[lo..hi].iter().collect())
+    let from = lo.saturating_sub(REACH);
+    let to = hi.saturating_add(REACH).min(chars.len());
+    let text: String = chars[from..to].iter().collect();
+    let (lo, hi) = (lo - from, hi - from);
+    Some(
+        spans(&text)
+            .into_iter()
+            .filter(|q| q.end as usize > lo && (q.start as usize) < hi)
+            .collect(),
+    )
 }
 
-fn names(set: &BTreeSet<Meaning>) -> Vec<&'static str> {
-    set.iter().map(|m| m.wire()).collect()
+fn names(counts: &BTreeMap<Meaning, usize>) -> Vec<&'static str> {
+    counts
+        .iter()
+        .flat_map(|(m, n)| std::iter::repeat_n(m.wire(), *n))
+        .collect()
 }
 
 /// For a cited claim, one `Qualifier` check, `Inconclusive`, `qualifier_mismatch`, per
-/// full-quality ref whose window's qualifiers differ from the claim's; nothing when they are
-/// equal. Runs for every cited claim, numbers and dates included.
+/// full-quality ref whose window holds a different count of any qualifier than the claim (so
+/// "not not approved" does not match "not approved"); nothing when the counts are equal. Runs for
+/// every cited claim, numbers and dates included.
 pub fn check_qualifiers(claim: &ClaimInput) -> Vec<CheckOutcome> {
     if !claim.cited {
         return vec![];
     }
-    let wanted = find(&claim.text);
+    let wanted = counts(&spans(&claim.text));
     resolved_refs(&claim.refs)
         .filter_map(|(ordinal, r)| {
-            let around = find(&checked_window(r)?);
+            let around = counts(&window_qualifiers(r)?);
             (around != wanted).then(|| CheckOutcome {
                 method: CheckMethod::Qualifier,
                 verdict: CheckVerdict::Inconclusive,
