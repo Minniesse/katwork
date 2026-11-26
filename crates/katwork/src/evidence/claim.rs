@@ -173,12 +173,15 @@ pub async fn insert_claims_on(
         "INSERT INTO claim_refs (claim_id, workspace_id, ordinal, citation_id, source_ref)
          SELECT u.claim_id, $1, u.ordinal, c.id, c.source_ref
          FROM UNNEST($2::uuid[], $3::int[], $4::uuid[]) AS u(claim_id, ordinal, citation_id)
-         JOIN citations c ON c.id = u.citation_id AND c.workspace_id = $1",
+         JOIN citations c
+           ON c.id = u.citation_id AND c.workspace_id = $1 AND c.id = ANY($5)",
     )
     .bind(workspace)
     .bind(&ref_claims)
     .bind(&ref_ordinals)
     .bind(&ref_citations)
+    // Only the citations the writer loaded for its job: the row count then refuses any other.
+    .bind(citations.iter().map(|c| c.id).collect::<Vec<_>>())
     .execute(&mut *conn)
     .await?
     .rows_affected();

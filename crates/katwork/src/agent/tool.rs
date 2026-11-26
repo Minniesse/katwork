@@ -6,7 +6,8 @@ use crate::{
 use async_trait::async_trait;
 use serde_json::Value;
 
-/// Implementations own their future. Never detach effects; every write starts with authorize_write.
+/// Implementations own their future. Never detach effects; every write starts with authorize_write,
+/// except `cite`: a `WorkspaceRead` tool whose citation insert is fenced (`fence::check`) only.
 /// Non-Read effects must atomically store an idempotency receipt and reuse its recorded result.
 #[async_trait]
 pub trait Tool: Send + Sync {

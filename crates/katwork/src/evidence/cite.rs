@@ -143,6 +143,9 @@ fn plan(span: &SpanRow, quote: Option<&str>) -> Result<Planned, ToolError> {
     if span.text.is_empty() {
         return Err(ToolError::Coded("quote_not_in_span"));
     }
+    // A hidden span is always cited whole: whether a guessed quote is absent, repeated or
+    // present in hidden text must not show in the answer.
+    let quote = quote.filter(|_| span.hidden.is_none());
     let range = match quote {
         Some(quote) => quote_range(&span.text, quote)?,
         None => 0..span.text.chars().count() as u32,
@@ -266,6 +269,7 @@ impl Tool for Cite {
             // the first read.
             let current =
                 span::get_in_space_on(&mut tx, &ctx.tenant, ctx.space_id, span_id).await?;
+            // Defence only: spans are insert-only, so this cannot fire today.
             if current.artifact_id != span.artifact_id || current.text != span.text {
                 return Err(KatError::NotFound);
             }

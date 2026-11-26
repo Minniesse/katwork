@@ -536,7 +536,8 @@ async fn cite_keeps_generated_and_hidden_flags(pool: PgPool) {
     assert!(!out.to_string().contains("9,999"));
     let (r, exact, _, _, _) = env.stored(out["citation_id"].as_str().unwrap()).await;
     assert!(r.quality.hidden);
-    assert_eq!(exact, "9,999");
+    // A hidden span is cited whole, whatever the quote.
+    assert_eq!(exact, "ซ่อน 9,999 บาท");
     // A suspect PDF span and an instruction-like span keep their reasons.
     let (_, ids) = env
         .minted_with(
@@ -557,6 +558,27 @@ async fn cite_keeps_generated_and_hidden_flags(pool: PgPool) {
     let out = cite(&env, ids[1], "1,250").await.unwrap();
     assert!(out["instruction_like"].is_string(), "{out}");
     assert_eq!(out["generated"], false);
+}
+
+#[sqlx::test]
+async fn cite_of_a_hidden_span_ignores_the_quote(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let mut hidden = text_block(1, "ลับ 9,999 และ 9,999 บาท");
+    hidden.hidden = Some(HiddenWhy::Tiny);
+    let (_, ids) = env.minted(vec![hidden], ArtifactRole::Input).await;
+    // Absent, repeated and present guesses all answer alike: the whole span, its text withheld.
+    let mut citation_ids = vec![];
+    for quote in ["ไม่มีในข้อความ", "9,999", "ลับ"] {
+        let out = cite(&env, ids[0], quote).await.unwrap();
+        assert_eq!(out["hidden"], true);
+        assert_eq!(out["exact"], Value::Null);
+        citation_ids.push(out["citation_id"].clone());
+    }
+    assert!(citation_ids.iter().all(|id| *id == citation_ids[0]));
+    let (_, exact, start, end, _) = env.stored(citation_ids[0].as_str().unwrap()).await;
+    assert_eq!(exact, "ลับ 9,999 และ 9,999 บาท");
+    assert_eq!((start, end), (0, exact.chars().count() as i32));
+    assert_eq!(env.citations().await, 1);
 }
 
 #[sqlx::test]
@@ -1006,6 +1028,37 @@ async fn insert_claims_copies_each_citations_source_ref(pool: PgPool) {
     assert_eq!(stored[0].0, "number");
     assert_eq!(stored[1].2, Some(json!({"op":"sum","args":[0,1]})));
     assert_eq!((stored[2].0.as_str(), stored[2].1), ("fact", false));
+}
+
+#[sqlx::test]
+async fn insert_claims_refuses_a_citation_of_another_job(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let (rows, _) = two_citations(&env).await;
+    let version = output_version(&env).await;
+    // A real citation of a second job of the same workspace, which the writer did not load.
+    let (_, span) = env.span("งบประมาณ 12,500 บาท").await;
+    let (job, task, run) = env.other_job().await;
+    let ctx = ToolCtx {
+        job_id: job,
+        task_id: task,
+        run_id: run,
+        ..env.ctx()
+    };
+    let foreign = call(&ctx, json!({"span_id": span, "quote": "12,500"}))
+        .await
+        .unwrap();
+    let foreign = CitationId(foreign["citation_id"].as_str().unwrap().parse().unwrap());
+    let error = insert(&env, version, &[claim(0, vec![rows[0].id, foreign])], &rows)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "citation_unknown");
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM claims) + (SELECT count(*) FROM claim_refs)",
+    )
+    .fetch_one(&env.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, 0);
 }
 
 #[sqlx::test]
