@@ -148,6 +148,21 @@ async fn expire(pool: &PgPool, task: TaskId) {
     .await
     .unwrap();
 }
+/// Returns once no transaction holds a row lock on the task. The failed heartbeat above drops
+/// its transaction holding `FOR SHARE`, and sqlx rolls that back in the background; the claim
+/// skips locked rows, so it would find nothing until the rollback lands. Waiting for the lock
+/// is waiting for that event (the outer bound only stops a hang).
+async fn unlocked(pool: &PgPool, task: TaskId) {
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        sqlx::query("SELECT id FROM tasks WHERE id=$1 FOR NO KEY UPDATE")
+            .bind(task)
+            .execute(pool),
+    )
+    .await
+    .expect("the task row stayed locked")
+    .unwrap();
+}
 async fn start_run(core: &Core, c: &ClaimedTask) -> RunId {
     let id = RunId::new();
     sqlx::query("INSERT INTO runs(id,workspace_id,job_id,task_id,kat_id,kind,lease_epoch,kat_config_hash,state) VALUES($1,$2,$3,$4,$5,$6,$7,'test','running')")
@@ -930,6 +945,7 @@ async fn infrastructure_abort_goes_through_reclaim(pool: PgPool) {
         .await,
         Err(KatError::LeaseLost)
     ));
+    unlocked(&pool, a.task_id).await;
     let b = claim(&core, "b").await.unwrap();
     assert_eq!(b.kind, RunKind::Recovery);
     assert_eq!(terminals(&pool, run).await, ["RUN_ERROR"]);
