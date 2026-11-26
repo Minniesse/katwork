@@ -1033,6 +1033,187 @@ fn functions_that_may_refresh_and_unknown_functions_count_as_volatile() {
 }
 
 #[test]
+fn ranges_whose_ends_are_not_plain_references_fail_closed() {
+    // `ref:ref` with a function result or a bracketed reference at either end is a range the
+    // walk does not follow: with a volatile cell anywhere it counts as reading one.
+    for form in [
+        "SUM(INDEX(B1,1):D9)",
+        "SUM(INDEX(B1:B1,1):INDEX(D9:D9,1))",
+        "SUM(CHOOSE(1,B1):D9)",
+        "SUM(IF(TRUE,B1):D9)",
+        "SUM(_xlfn.XLOOKUP(1,B1:B1,B1:B1):D9)",
+        "SUM((B1):(D9))",
+        "SUM((B1):D9)",
+    ] {
+        let rows = [
+            row(5, r#"<c r="C5"><f>RAND()</f><v>1</v></c>"#),
+            row(12, &format!(r#"<c r="F12"><f>{form}</f><v>999</v></c>"#)),
+        ]
+        .concat();
+        assert_eq!(
+            recalculated(&read(&Xlsx::new().sheet("S", &data(&rows)))),
+            ["S!C5", "S!F12"],
+            "{form}"
+        );
+    }
+    let plain = row(12, r#"<c r="F12"><f>SUM(INDEX(B1,1):D9)</f><v>999</v></c>"#);
+    assert!(recalculated(&read(&Xlsx::new().sheet("S", &data(&plain)))).is_empty());
+}
+
+#[test]
+fn array_and_data_table_cells_the_file_leaves_out_are_recalculated_too() {
+    // Excel fills every cell of the range when it recalculates its formula, written or not.
+    let array = [
+        row(
+            1,
+            r#"<c r="C1"><f t="array" ref="C1:C3">NOW()</f><v>1</v></c>"#,
+        ),
+        row(2, r#"<c r="D2"><f>C2+1</f><v>999</v></c>"#),
+        row(3, r#"<c r="D3"><f>SUM(C2:C3)</f><v>999</v></c>"#),
+    ]
+    .concat();
+    assert_eq!(
+        recalculated(&read(&Xlsx::new().sheet("S", &data(&array)))),
+        ["S!C1", "S!D2", "S!D3"]
+    );
+    // Read by a range alone, the missing cells still count.
+    let ranged = [
+        row(
+            1,
+            r#"<c r="C1"><f t="array" ref="C1:C3">NOW()</f><v>1</v></c>"#,
+        ),
+        row(3, r#"<c r="D3"><f>SUM(C2:C3)</f><v>999</v></c>"#),
+    ]
+    .concat();
+    assert_eq!(
+        recalculated(&read(&Xlsx::new().sheet("S", &data(&ranged)))),
+        ["S!C1", "S!D3"]
+    );
+    let table = [
+        row(1, r#"<c r="B1"><f>NOW()</f><v>1</v></c>"#),
+        row(
+            4,
+            r#"<c r="D4"><f t="dataTable" ref="D4:E5" dt2D="1" dtr="1" r1="A1" r2="B1"/><v>7</v></c>"#,
+        ),
+        row(
+            6,
+            r#"<c r="G6"><f>E5+0</f><v>999</v></c><c r="H6"><f>SUM(E4:E5)</f><v>999</v></c>"#,
+        ),
+    ]
+    .concat();
+    assert_eq!(
+        recalculated(&read(&Xlsx::new().sheet("S", &data(&table)))),
+        ["S!B1", "S!D4", "S!G6", "S!H6"]
+    );
+    // A whole-sheet array is a rectangle to the walk, not a million cells.
+    let whole = [
+        row(
+            1,
+            r#"<c r="A1"><f t="array" ref="A1:XFD1048576">NOW()</f><v>1</v></c>"#,
+        ),
+        row(2, r#"<c r="B2"><v>5</v></c>"#),
+    ]
+    .concat();
+    let started = Instant::now();
+    let other = row(1, r#"<c r="A1"><f>S!Z900000+1</f><v>999</v></c>"#);
+    let extracted = read(
+        &Xlsx::new()
+            .sheet("S", &data(&whole))
+            .sheet("T", &data(&other)),
+    );
+    assert_eq!(recalculated(&extracted), ["S!A1", "S!B2", "T!A1"]);
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn many_recalculated_ranges_against_many_reading_ranges_stay_within_the_cap() {
+    // 2,000 arrays on a volatile cell and 2,000 sums over cells none of them covers: read, and
+    // only the arrays flagged.
+    let n = 2_000u32;
+    let rows: String = (1..=n)
+        .map(|r| {
+            row(
+                r,
+                &format!(
+                    r#"<c r="A{r}"><f t="array" ref="A{r}:B{r}">NOW()</f><v>1</v></c><c r="D{r}"><f>SUM(E{r}:F{r})</f><v>2</v></c>"#
+                ),
+            )
+        })
+        .collect();
+    let extracted = read(&Xlsx::new().sheet("S", &data(&rows)));
+    assert_eq!(recalculated(&extracted).len(), n as usize);
+}
+
+#[test]
+fn a_sheet_the_reader_cannot_read_seeds_the_walk() {
+    // A macro sheet may hold the only volatile formula: what reads it is recalculated.
+    let main = data(&row(
+        1,
+        r#"<c r="A1"><f>Macro1!A1+0</f><v>999</v></c><c r="B1"><f>A1+1</f><v>999</v></c>"#,
+    ));
+    let base = Xlsx::new().sheet("S", &main);
+    let workbook = base.workbook_part().replace(
+        "</sheets>",
+        r#"<sheet name="Macro1" sheetId="9" r:id="rIdW0"/></sheets>"#,
+    );
+    let macros = format!(
+        r#"<?xml version="1.0"?><xm:macrosheet xmlns="{SML}" xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main"><sheetData><row r="1"><c r="A1"><f>NOW()</f><v>1</v></c></row></sheetData></xm:macrosheet>"#
+    );
+    let extracted = read(
+        &base
+            .related(
+                &format!("{MS_REL}xlIntlMacrosheet"),
+                "macrosheets/intl1.xml",
+                Some(macros.as_bytes()),
+            )
+            .workbook_xml(&workbook),
+    );
+    assert_eq!(recalculated(&extracted), ["S!A1", "S!B1"]);
+    // A reference to an ordinary second worksheet is followed and seeds nothing.
+    let plain = Xlsx::new()
+        .sheet(
+            "S",
+            &data(&row(1, r#"<c r="A1"><f>T!A1+0</f><v>5</v></c>"#)),
+        )
+        .sheet("T", &data(&row(1, &num("A1", 0, "5"))));
+    assert!(recalculated(&read(&plain)).is_empty());
+}
+
+#[test]
+fn parameter_names_count_only_where_a_let_or_lambda_binds_them() {
+    let one = |formula: &str, names: &str| {
+        let rows = row(
+            1,
+            &format!(
+                r#"<c r="A1"><f>{formula}</f><v>1</v></c><c r="B1"><f>A1+1</f><v>999</v></c>"#
+            ),
+        );
+        recalculated(&read(
+            &Xlsx::new().sheet("S", &data(&rows)).workbook_tail(names),
+        ))
+    };
+    // A parameter called where nothing binds it is no LET's: not one of Excel's own.
+    assert_eq!(one("_xlpm.NOW()", ""), ["S!A1", "S!B1"]);
+    // A defined name spelled like a parameter is still followed.
+    assert_eq!(
+        one(
+            "_xlpm.x+0",
+            r#"<definedNames><definedName name="_xlpm.x">NOW()</definedName></definedNames>"#
+        ),
+        ["S!A1", "S!B1"]
+    );
+    // A bound parameter and IMAGE, one of Excel's own, are not volatile.
+    assert!(
+        one(
+            "_xlfn.LET(_xlpm.f,_xlfn.LAMBDA(_xlpm.x,_xlpm.x+1),_xlpm.f(2))",
+            ""
+        )
+        .is_empty()
+    );
+    assert!(one("_xlfn.IMAGE(\"https://example.com/a.png\")", "").is_empty());
+}
+
+#[test]
 fn a_workbook_with_no_volatile_formula_keeps_its_caches() {
     let rows = row(
         1,

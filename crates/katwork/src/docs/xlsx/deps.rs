@@ -255,6 +255,7 @@ const BUILT_IN: &[&str] = &[
     "IFNA",
     "IFS",
     "IMABS",
+    "IMAGE",
     "IMAGINARY",
     "IMARGUMENT",
     "IMCONJUGATE",
@@ -615,6 +616,11 @@ enum NameState {
 struct Resolver<'a> {
     /// Sheet names, lower-cased (Excel compares them whatever their case), to their index.
     sheets: HashMap<String, usize>,
+    /// The workbook's other sheets (chart, dialog and macro sheets), lower-cased: their cells
+    /// are never read, so one may hold the only volatile formula.
+    unread: HashSet<String>,
+    /// Some formula reads a sheet in `unread`.
+    unreadable: bool,
     /// (sheet or none, upper-cased name) to the index of the name.
     names: HashMap<(Option<usize>, String), usize>,
     defined: &'a [DefinedName],
@@ -677,6 +683,13 @@ pub(super) fn volatile_cells(
             .iter()
             .map(|&(at, _)| (sheet_names[at].to_lowercase(), at))
             .collect(),
+        unread: sheet_names
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| !sheets.iter().any(|&(read, _)| read == *at))
+            .map(|(_, name)| name.to_lowercase())
+            .collect(),
+        unreadable: false,
         names: defined
             .iter()
             .enumerate()
@@ -734,6 +747,7 @@ pub(super) fn volatile_cells(
             });
         }
     }
+    seeded |= resolver.unreadable;
     let mut tainted = Tainted::default();
     if !seeded {
         return Ok(tainted.cells);
@@ -780,6 +794,11 @@ pub(super) fn volatile_cells(
         }
     }
     areas.sort_by_key(|&(sheet, area, _)| (sheet, area.top, area.left));
+    // A cell a formula reads, written in the file or not: a recalculated array or data table
+    // marks those of its cells.
+    for &(sheet, row, col) in readers.keys() {
+        cells.entry(sheet).or_default().insert((row, col));
+    }
 
     let mut done = vec![false; formulas.len()];
     let mut queue = VecDeque::new();
@@ -834,6 +853,9 @@ pub(super) fn volatile_cells(
 #[derive(Default)]
 struct Tainted {
     cells: HashSet<(usize, u32, u32)>,
+    /// The ranges of recalculated arrays and data tables, kept whole: their cells need not be
+    /// written in the file.
+    ranges: Vec<(usize, Merge)>,
     rows: HashMap<(usize, u32), BTreeSet<u32>>,
     cols: HashMap<(usize, u32), BTreeSet<u32>>,
 }
@@ -851,6 +873,7 @@ impl Tainted {
         self.mark(at, queue);
         let (sheet, ..) = at;
         for range in ranges.get(&at).into_iter().flatten() {
+            self.ranges.push((sheet, *range));
             let Some(read) = cells.get(&sheet) else {
                 continue;
             };
@@ -873,8 +896,19 @@ impl Tainted {
         }
     }
 
-    /// Whether a recalculated cell lies in `area`, scanned along its shorter side.
+    /// Whether a recalculated cell or range lies in `area`, cells scanned along its shorter
+    /// side.
     fn within(&self, sheet: usize, area: Merge, work: &mut Work) -> Result<bool, DocError> {
+        work.step(self.ranges.len() as u64)?;
+        if self.ranges.iter().any(|&(on, range)| {
+            on == sheet
+                && range.top <= area.bottom
+                && area.top <= range.bottom
+                && range.left <= area.right
+                && area.left <= range.right
+        }) {
+            return Ok(true);
+        }
         if area.bottom - area.top <= area.right - area.left {
             for row in area.top..=area.bottom {
                 work.step(1)?;
@@ -903,10 +937,20 @@ impl Tainted {
 }
 
 impl Resolver<'_> {
+    /// The worksheet a `Sheet!` prefix names; none for any other name, noting one the workbook
+    /// has but the reader does not read.
+    fn sheet(&mut self, name: &str) -> Option<usize> {
+        let name = name.to_lowercase();
+        let found = self.sheets.get(&name).copied();
+        self.unreadable |= found.is_none() && self.unread.contains(&name);
+        found
+    }
+
     /// What `text` depends on, read at `place`; `depth` counts the names it is read through.
     fn read(&mut self, text: &str, place: Place, depth: u32) -> Result<Deps, DocError> {
         let chars: Vec<char> = text.chars().collect();
         self.work.step(1 + chars.len() as u64 / 64)?;
+        let bound = bound_parameters(&chars);
         let mut deps = Deps::default();
         let mut at = 0;
         // The sheet a `Sheet!` prefix just named: none when it names no sheet of the workbook.
@@ -948,7 +992,7 @@ impl Resolver<'_> {
                         deps.unknown = true;
                     } else {
                         at += 1;
-                        qualified = Some(self.sheets.get(&name.to_lowercase()).copied());
+                        qualified = Some(self.sheet(&name));
                     }
                 }
                 '[' => {
@@ -998,7 +1042,7 @@ impl Resolver<'_> {
                             deps.unknown = true;
                         }
                         at += 1;
-                        qualified = Some(self.sheets.get(&token.to_lowercase()).copied());
+                        qualified = Some(self.sheet(&token));
                         continue;
                     }
                     let sheet = qualified.take();
@@ -1008,7 +1052,8 @@ impl Resolver<'_> {
                         next += 1;
                     }
                     if chars.get(next) == Some(&'(') {
-                        self.call(&token, sheet, external, place, depth, &mut deps)?;
+                        let bound = bound.contains(&token.to_uppercase());
+                        self.call(&token, sheet, external, bound, place, depth, &mut deps)?;
                         continue;
                     }
                     let sheet = match sheet {
@@ -1022,6 +1067,11 @@ impl Resolver<'_> {
                     at = self.reference(&chars, start, at, sheet, place, depth, &mut deps)?;
                 }
                 _ => {
+                    // A `:` no reference took: a range with a function's result or a bracketed
+                    // reference at an end, which the walk does not follow.
+                    if c == ':' {
+                        deps.unknown = true;
+                    }
                     qualified = None;
                     at += 1;
                 }
@@ -1137,11 +1187,11 @@ impl Resolver<'_> {
         let upper = token.to_uppercase();
         if token.starts_with(|c: char| c.is_ascii_digit() || c == '.')
             || matches!(upper.as_str(), "TRUE" | "FALSE")
-            || upper.starts_with(&PARAMETER_PREFIX.to_uppercase())
         {
             return Ok(end);
         }
-        // A defined name: the sheet's own first, then the workbook's.
+        // A defined name: the sheet's own first, then the workbook's; a name spelled like a
+        // `LET` or `LAMBDA` parameter is looked up too before it is read as one.
         let found = [on.map(Some), Some(None)]
             .into_iter()
             .flatten()
@@ -1152,6 +1202,7 @@ impl Resolver<'_> {
                 self.work.step(named.areas.len() as u64)?;
                 deps.absorb(&named);
             }
+            _ if upper.starts_with(&PARAMETER_PREFIX.to_uppercase()) => {}
             _ => deps.unknown = true,
         }
         Ok(end)
@@ -1160,18 +1211,20 @@ impl Resolver<'_> {
     /// A function called by `token`: volatile if Excel recalculates it at every recalculation,
     /// or if it is not one of Excel's own (another workbook's, an add-in's or a macro's, which
     /// may be); a defined name called as one (a named `LAMBDA`) is followed.
+    #[allow(clippy::too_many_arguments)]
     fn call(
         &mut self,
         token: &str,
         sheet: Option<Option<usize>>,
         external: bool,
+        bound: bool,
         place: Place,
         depth: u32,
         deps: &mut Deps,
     ) -> Result<(), DocError> {
         let upper = token.to_uppercase();
-        if upper.starts_with(&PARAMETER_PREFIX.to_uppercase()) {
-            // A `LET` parameter bound to a `LAMBDA` written in this same formula.
+        if bound {
+            // A `LET` or `LAMBDA` parameter this same text binds, to a `LAMBDA` it holds.
             return Ok(());
         }
         let mut name = upper.as_str();
@@ -1233,6 +1286,39 @@ impl Resolver<'_> {
         self.states[at] = NameState::Read(deps.clone());
         Ok(deps)
     }
+}
+
+/// The `_xlpm.` names, upper-cased, that `chars` writes anywhere but in call position outside
+/// string literals: the parameters a `LET` or `LAMBDA` of the same text binds.
+fn bound_parameters(chars: &[char]) -> HashSet<String> {
+    let mut bound = HashSet::new();
+    let mut at = 0;
+    while let Some(&c) = chars.get(at) {
+        if c == '"' {
+            at += 1;
+            while chars.get(at).is_some_and(|&c| c != '"') {
+                at += 1;
+            }
+            at += 1;
+        } else if word(c) && (at == 0 || !word(chars[at - 1])) {
+            let start = at;
+            while chars.get(at).is_some_and(|&c| word(c)) {
+                at += 1;
+            }
+            let token: String = chars[start..at].iter().collect::<String>().to_uppercase();
+            let mut next = at;
+            while chars.get(next).is_some_and(|c| " \r\n\t".contains(*c)) {
+                next += 1;
+            }
+            if token.starts_with(&PARAMETER_PREFIX.to_uppercase()) && chars.get(next) != Some(&'(')
+            {
+                bound.insert(token);
+            }
+        } else {
+            at += 1;
+        }
+    }
+    bound
 }
 
 /// A character of a name, a number, a cell reference or a sheet name.
