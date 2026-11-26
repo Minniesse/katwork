@@ -159,12 +159,20 @@ impl Stack {
         };
         // Right after a restart the container has no published port until it is up again.
         let mut address = String::new();
-        poll(|| {
-            let result = output(self.compose().args(["port", service, port]));
-            address = String::from_utf8_lossy(&result.stdout).trim().to_owned();
-            result.status.success() && !address.is_empty()
+        let mut last = String::new();
+        let found = tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                let result = output(self.compose().args(["port", service, port]));
+                address = String::from_utf8_lossy(&result.stdout).trim().to_owned();
+                if result.status.success() && !address.is_empty() {
+                    break;
+                }
+                last = String::from_utf8_lossy(&result.stderr).into_owned();
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
         })
         .await;
+        assert!(found.is_ok(), "{service} publishes {port}: {last}");
         let port = address.rsplit(':').next().unwrap();
         self.endpoint = format!(
             "{}://localhost:{port}",

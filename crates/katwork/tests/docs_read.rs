@@ -6555,11 +6555,17 @@ async fn a_panic_clears_its_threads_wedge_mark() {
     // Paused time, kept from auto-advancing by a task that never idles: the pool's call-timeout
     // timer cannot fire while the two jobs meet at the barrier, however slow the machine is.
     tokio::time::pause();
-    let spinner = tokio::spawn(async {
+    struct Spinner(tokio::task::JoinHandle<()>);
+    impl Drop for Spinner {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _spinner = Spinner(tokio::spawn(async {
         loop {
             tokio::task::yield_now().await;
         }
-    });
+    }));
     // Both jobs wait for each other, so they run on the two threads at once.
     let barrier = Arc::new(Barrier::new(2));
     let panicking = |barrier: Arc<Barrier>| {
@@ -6578,6 +6584,12 @@ async fn a_panic_clears_its_threads_wedge_mark() {
         })
     };
     let (one, two) = (panicking(barrier.clone()), panicking(barrier));
+    // Real-time bound: a pool bug that never answers fails the test instead of hanging it.
+    let limit = std::time::Instant::now() + Duration::from_secs(10);
+    while !(one.is_finished() && two.is_finished()) {
+        assert!(std::time::Instant::now() < limit, "the jobs never finished");
+        tokio::task::yield_now().await;
+    }
     assert_eq!(one.await.unwrap(), Err::<(), _>(DocError::Internal));
     assert_eq!(two.await.unwrap(), Err::<(), _>(DocError::Internal));
     // Every job started before this instant, so a mark left behind would read as wedged once
@@ -6587,7 +6599,6 @@ async fn a_panic_clears_its_threads_wedge_mark() {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(!pool.wedged());
-    spinner.abort();
 }
 
 #[tokio::test]

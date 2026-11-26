@@ -320,17 +320,25 @@ async fn short_caller_deadline_timeout_is_not_cached(pool: PgPool) {
     );
     // Paused time: the 200 ms deadline passes only when the test advances it, once the read
     // is blocked, so setup speed cannot decide the outcome.
-    let _clock = Clock::pause();
+    let clock = Clock::pause();
     h.input.deadline = tokio::time::Instant::now() + Duration::from_millis(200);
     let mut run = Box::pin(h.run());
-    tokio::select! {
-        result = &mut run => panic!("early: {result:?}"),
-        () = async {
+    // `until` panics after 10 s of real time, so a run that never ends fails instead of hanging.
+    let (result, ()) = tokio::join!(
+        async {
+            tokio::select! {
+                result = &mut run => result,
+                () = until(|| false) => unreachable!(),
+            }
+        },
+        async {
             until(|| blocked.load(Ordering::SeqCst)).await;
             tokio::time::advance(Duration::from_millis(200)).await;
-        } => {}
-    }
-    let facts = run.await.unwrap();
+        }
+    );
+    drop(run);
+    drop(clock);
+    let facts = result.unwrap();
     assert_eq!(facts.tool_calls[0].state, ToolCallState::Failed);
     let row = &h.rows().await[0];
     assert_eq!(row.get::<String, _>("result"), "doc_timeout");
