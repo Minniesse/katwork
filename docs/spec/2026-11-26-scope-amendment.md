@@ -2,21 +2,21 @@
 
 - Status: Proposed (2026-11-26). Every change below is a proposal for the founder. None is applied to `katwork-design.md` until the founder approves it.
 - Decision owner: Founder
-- Roadmap: `docs/roadmap.md` (sub-projects 9 to 14, "Additions to existing sub-projects", "Re-plan: staged alphas", and open questions Q8 to Q26)
+- Roadmap: `docs/roadmap.md` (sub-projects 9 to 14, "Additions to existing sub-projects", "Re-plan: staged alphas", "Differentiation", and open questions Q8 to Q28)
 
 ## Why
 
-On 2026-11-26 the founder made three rulings about a competing desktop agent and the alpha. The first adopts every one of its capability areas into KatWork's scope. The second, "All before the alpha", makes all of that scope alpha scope. The third accepts staged alphas. Alpha 1 ships the current spec scope (sub-projects 1 to 7). The new areas follow in Alpha 2 (connectors, routines, team admin, and the platform additions), Alpha 3 (companion and spend) and Alpha 4 (voice and meetings), each with its own plan approval. The spec still describes the narrower alpha: §1.1 lists nine goals, and §1.2 rules out voice and video calls, a hosted cloud and native binaries. This file lists every spec change the new scope needs. Each is written as a proposal, tagged with the alpha wave it belongs to, and points to the roadmap question that decides it. A tag such as [Alpha 2] means the change applies to the spec from that wave on; until then the spec as written describes the earlier waves. Where a ruling settles a point, the entry says so. Where it does not, the entry stays open.
+On 2026-11-26 the founder made three rulings about a competing desktop agent and the alpha. The first adopts every one of its capability areas into KatWork's scope. The second puts all of that scope before the alpha. The third accepts staged alphas. Alpha 1 ships the current spec scope (sub-projects 1 to 7). The new areas follow in Alpha 2 (connectors, routines, team admin, and the platform additions), Alpha 3 (companion and spend) and Alpha 4 (voice and meetings), each with its own plan approval. The spec still describes the narrower alpha: §1.1 lists nine goals, and §1.2 rules out voice and video calls, a hosted cloud and native binaries. This file lists every spec change the new scope needs. Each is written as a proposal, tagged with the alpha wave it belongs to, and points to the roadmap question that decides it. A tag such as [Alpha 2] means the change applies to the spec from that wave on; until then the spec as written describes the earlier waves. Where a ruling settles a point, the entry says so. Where it does not, the entry stays open.
 
 KatWork takes ideas and scope from that product only. Its code, prompts and text are not used.
 
 ## §1.1 Goals for the alpha
 
 1. **Heading date.** [Alpha 1, then each wave] Change "Goals for the alpha (2027-01-31)" to "Goals for Alpha 1" with the date the founder approves. Add a short table of the later waves and their goals. The re-plan proposes these dates (roadmap Q1):
-   - Alpha 1: week of 2028-01-03.
-   - Alpha 2: week of 2028-06-19.
-   - Alpha 3: week of 2028-10-16.
-   - Alpha 4: week of 2029-01-29.
+   - Alpha 1: week of 2027-12-06.
+   - Alpha 2: week of 2028-07-17.
+   - Alpha 3: week of 2028-11-13.
+   - Alpha 4: week of 2029-02-26.
 2. **New goals.** [Alphas 2 to 4] Add these after goal 9, one per new sub-project:
    - 10. People can let a Kat act on their own computer through an optional companion app, within grants they set (sub-project 9). [Alpha 3]
    - 11. Kats can pay, within spend limits and with a person's approval for every payment (sub-project 10). [Alpha 3]
@@ -33,7 +33,7 @@ KatWork takes ideas and scope from that product only. Its code, prompts and text
 1. **"Voice and video calls."** [Alpha 4] The rulings place voice, phone calls and meeting capture in Alpha 4, so this line can no longer stand as written. Proposal: remove it. Add a rule instead: phone calls to third parties and live meeting capture stay off in any install until the Thai legal read passes (roadmap Q11).
 2. **"A hosted cloud offering."** [Alpha 3] Payments and credits may need a KatWork-run service. Proposal: keep this non-goal, and use payment rails that each install brings (roadmap Q9 and Q10). If the founder chooses a KatWork-run payment service, this line changes.
 3. **"Native Linux binaries inside a Kat's computer."** [Alpha 2] A full shell, stdio MCP servers and plugin commands would break this. Proposal: keep it. Stdio MCP servers and plugin commands run as pinned containers outside agentOS, and a full shell waits for KatsAgentOS (roadmap Q17).
-4. **"A streamed desktop for the Craft apps"** [Alpha 1] waits for sub-project 7. The staged-alpha ruling, as relayed, places sub-project 7 in Alpha 1. Local computer use, screen recording and the general desktop on 2b's GUI tier, all in later waves, need the same virtual display. Proposal: once the founder confirms that sub-project 7 is in Alpha 1 (roadmap Q3), remove this line.
+4. **"A streamed desktop for the Craft apps"** [Alpha 1] waits for sub-project 7. The staged-alpha ruling, as relayed, places sub-project 7 in Alpha 1. Local computer use, screen recording and the general desktop on 2b's GUI tier, all in later waves, need the same virtual display. Proposal: once the founder confirms that sub-project 7 is in Alpha 1 (roadmap Q3), remove this line. That adds the streamed Craft desktop (an app running windowed on a virtual display) to Alpha 1, so it is the one Alpha 1 change that adds scope, and it does so only if Q3 is confirmed. Without it, sub-project 7 and its 20 tasks leave Alpha 1.
 5. **"High availability or multi-host scheduling."** [Alpha 2] Private worker pools would need multi-host scheduling. Proposal: keep the non-goal. Whether private pools belong to an alpha wave is a founder question (roadmap Q23).
 6. **New non-goals, proposed** [all waves] (each is an open question, roadmap Q18 to Q21):
    - Browser stealth that hides that a Kat's browser is automated.
@@ -94,7 +94,7 @@ KatWork takes ideas and scope from that product only. Its code, prompts and text
 
 These are smaller and are listed so that nothing is missed:
 - **§4 Domain model:** [Alpha 2, payment instruments and orders Alpha 3] routines and triggers; connectors and their credentials; skills and versions; roles beyond admin and member; version numbers on tracked tasks for conflict detection; payment instruments and orders.
-- **§5.2 Services:** [companion relay Alpha 3, speech engine Alpha 4, the rest Alpha 2] a companion relay, the speech engine, the connector runtime (pinned containers for stdio MCP and plugin commands), and the routine trigger endpoint.
+- **§5.2 Services:** [companion relay Alpha 3, speech engine Alpha 4, the rest Alpha 2] a companion relay, the speech engine, the connector runtime (pinned containers for stdio MCP and plugin commands), and the routine trigger endpoint. Also, if roadmap Q28 is approved, Playwright as a second browser runtime beside chromiumoxide [Alpha 2]; it is not counted in the roadmap's estimates.
 - **§6.4:** [Alpha 2] rooms where Kats talk to each other, with cost and loop rules. The 5-task, 3-level DAG limit still holds.
 - **§6.5 Approvals:** [Alpha 2, payment second factor Alpha 3] new action types: `pay`, `message-on-behalf` and `record`. Add a `pending_external` state, typed denial reasons, and a line on each approval card explaining why the job stopped. Bulk approval covers only identical requests, never outward or destructive ones. A second factor for payments.
 - **§7.2:** [Alpha 2] a disclosure card before sharing a Kat, listing what travels with it.
@@ -153,10 +153,33 @@ Meeting capture, voice memos, phone calls, screen recording and teach recordings
 - how §13's purge reaches recordings and everything derived from them;
 - how a person who was recorded asks for deletion.
 
-It depends on the legal read in roadmap Q11.
+It depends on two legal reads: a PDPA read on screen and teach recordings, needed before Alpha 2, and the read on calls and meeting recording in roadmap Q11, needed before Alpha 4. The roadmap's schedule asks for the ADR and the first read by the Alpha 2 plan approval (proposed week of 2027-10-11).
 
 A connector-credentials ADR is also needed, before Alpha 2. It decides whose credential a connector uses: the person's, a Kat service account, or a delegated one. The roadmap names it under sub-project 12.
 
+## Differentiation proposals
+
+The roadmap's "Differentiation" section answers the founder's request for research into what people need. Where its responses are not already in the spec, an ADR or an approved plan, they are listed here. Each is a proposal, with an owning sub-project, a task estimate and a proposed wave. Roadmap Q27 decides each one. Until the founder rules, all 29 tasks are counted in Alpha 2. The recommendation in Q27 pulls the five marked "claim" into Alpha 1, because the published claims rest on them.
+
+| Id | Proposal | Spec section | Owner | Tasks | Proposed wave |
+|---|---|---|---|---|---|
+| DP1 | Seeded-defect KatBench worlds for every alpha template, adding sign, ratio, currency and unit-scale traps (claim 1) | §15 | 3 | 3 | Alpha 1 if Q27, else Alpha 2 |
+| DP2 | Claims ordered by risk in the evidence report, and a timing test for opening a claim's source span (claim 2) | §7.1, §15 | 6 | 2 | Alpha 1 if Q27, else Alpha 2 |
+| DP3 | Reviewer minutes per deliverable, logged from use | §15 | 6 | 1 | Alpha 2 |
+| DP4 | A completion receipt generated from the job log: inputs read against the input list, checks run and not run, tried and rejected, stops, time and tokens. A skipped file or a zero-match run is a failed check (claim 3) | §7.1, §19 item 3 | 3 | 3 | Alpha 1 if Q27, else Alpha 2 |
+| DP5 | A data screen per Space (providers, what each model call sent); a personal-data flag on a folder that routes its jobs to a local model; the redaction check on every outward send, not only the HA template | §11, §13 | 3, with 6 | 3 | Alpha 2 |
+| DP6 | An offline-install test in CI: zero outbound connections (claim 4) | §13, §15 | 2b | 1 | Alpha 1 if Q27, else Alpha 2 |
+| DP7 | Each template declares its date era and digit form; a check fails mixed forms (claim 5) | §7.3 | 3 | 1 | Alpha 1 if Q27, else Alpha 2 |
+| DP8 | Thai print checked on two renderers | §15 | 3 | 1 | Alpha 2 |
+| DP9 | Approval cards: approve with a comment, unsure, opening the cited span first for high-risk claims, a card budget per job, the card content stored in the audit row, a seal-and-initial approval type, and an alarm when approvals become too fast and uniform | §7.2 | 3, with 6 | 4 | Alpha 2 |
+| DP10 | Redo one section without restarting the job; a target for how fast a stop takes effect | §6.6 | 4 | 2 | Alpha 2 |
+| DP11 | A matched-and-exceptions output for reconciliation | §8 | 3 | 2 | Alpha 2 |
+| DP12 | A cost estimate before a team job, a workspace cost cap, an "unpriced" state for models without a price, and no silent switch to a weaker model | §6.6, §11 | 4, with 6 | 3 | Alpha 2 |
+| DP13 | A decision log with reasons and rejected options | §11 | 2c | 2 | Alpha 2 |
+| DP14 | A first run with one visible next action, and a one-page glossary | §10 | 6 | 1 | Alpha 2 |
+
+Not listed: an official letter and memo template, which is roadmap Q26 and is not counted.
+
 ## Open questions
 
-The founder's questions for this amendment are in the roadmap, Q1 and Q8 to Q26, each with a recommended option. Roadmap Q3 (sub-project 7 and the alpha) also decides §1.2 item 4 above. No change tagged Alpha 1 adds scope: Alpha 1 is the spec as written, re-dated.
+The founder's questions for this amendment are in the roadmap, Q1 and Q8 to Q28, each with a recommended option. Roadmap Q3 (sub-project 7 and the alpha) also decides §1.2 item 4 above. Alpha 1 is the spec as written, re-dated. Only two things would add scope to it: confirming Q3, which brings the streamed Craft desktop, and accepting the Q27 recommendation, which brings the claim-carrying differentiation proposals.

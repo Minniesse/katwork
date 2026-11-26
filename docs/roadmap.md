@@ -27,8 +27,8 @@ Two sizes are counted from approved plans. The sub-project 1 plan has 17 task he
 | 3 | Gates and policy | #132 | Not planned | L (estimate) | Not written |
 | 4 | Routing | #133 | Not planned | M (estimate) | Not written |
 | 5 | Channels | #134 | Not planned | M (estimate) | Not written |
-| 6 | Views and shells | #135 | Not planned | L (estimate, with the additions) | Not written |
-| 7 | Craft integration beyond 2a | #136 | Not planned | L (estimate, with the additions) | Not written |
+| 6 | Views and shells | #135 | Not planned | M (estimate, 15 tasks); L with the additions (23) | Not written |
+| 7 | Craft integration beyond 2a | #136 | Not planned | M (estimate, 20 tasks); L with the addition (22) | Not written |
 | 8 | Federation, after the alpha | #137 | Not planned | L (estimate) | Not written |
 | 9 | Companion (proposed) | None yet | Not planned | L (estimate) | Not written |
 | 10 | Spend (proposed) | None yet | Not planned | M (estimate) | Not written |
@@ -232,7 +232,7 @@ All views read one event model.
 
 **Depends on:** sub-project 1's event stream; 2a's Craft previews and panel; 2b's browser screencast; sub-project 3 (the board shows the approval queue); sub-project 4 (plan items drive the live graph and the office view, §6.4).
 
-**Size:** M (estimate).
+**Size:** M (estimate, 15 tasks); L with the additions from the expanded scope (23).
 
 ### 7. Craft integration beyond 2a (#136)
 
@@ -249,7 +249,7 @@ All views read one event model.
 
 **Depends on:** 2a's Craft track; approvals for outward Craft actions need sub-project 3; the UI plane's virtual display relates to 2b's GUI tier.
 
-**Size:** M to L (estimate).
+**Size:** M (estimate, 20 tasks); L with the addition from the expanded scope (22).
 
 Whether this sub-project is needed for the alpha is not stated (Q3).
 
@@ -271,17 +271,17 @@ A peer can never approve a local side effect.
 
 The founder read a static teardown of a competing desktop agent and made three rulings:
 
-- "[...] features: all": every capability area of that product becomes KatWork scope. (The quote is shortened here because it names the product.)
-- "All before the alpha": all of it is alpha scope, and the alpha date moves.
-- "just do it from ur recommended [...]": this accepted the staged alphas this re-plan recommended. Everything adopted stays product scope. Alpha 1 ships the current spec scope, and the new areas follow as later alpha waves, each with its own plan approval (see "Re-plan: staged alphas").
+- Adopt all of that product's features: every capability area becomes KatWork scope.
+- Put all of it before the alpha: all of it is alpha scope, and the alpha date moves.
+- Accept this re-plan's recommendation for staged alphas: everything adopted stays product scope. Alpha 1 ships the current spec scope, and the new areas follow as later alpha waves, each with its own plan approval (see "Re-plan: staged alphas").
 
 This repo calls that product "a competing desktop agent" and does not name it. KatWork takes ideas and scope from the teardown only, never its code, prompts or text.
 
 The capability areas are: agent tools and planning; computer use and the browser; personal data, voice, phone calls and meetings; commerce, payments and a vault; connectors, plugins and MCP; teams, sharing and admin; automations and the chat shell.
 
-The rulings settle scope and the wave structure. They do not settle how each area is built, which spec sections change, or the questions listed at the end (Q8 to Q26). Sub-projects 9 to 14 below are this re-plan's proposal for where the new scope goes; the founder may merge or split them (Q8). Nothing in them is built before its plan is approved.
+The rulings settle scope and the wave structure. They do not settle how each area is built, which spec sections change, or the questions listed at the end (Q8 to Q28). Sub-projects 9 to 14 below are this re-plan's proposal for where the new scope goes; the founder may merge or split them (Q8). Nothing in them is built before its plan is approved.
 
-Some parts of the competing product run against KatWork's spec or ADRs, for example a browser that hides that it is automated, or link previews in chat. "All" adopts every capability area, but whether those particular designs are adopted is not settled; each is an open question with a recommended option (Q18 to Q21).
+Some parts of the competing product run against KatWork's spec or ADRs, for example a browser that hides that it is automated, or link previews in chat. The first ruling adopts every capability area, but whether those particular designs are adopted is not settled; each is an open question with a recommended option (Q18 to Q21).
 
 ### 9. Companion (proposed)
 
@@ -307,16 +307,15 @@ Some parts of the competing product run against KatWork's spec or ADRs, for exam
 - Payment instruments for Kats, for example one-time or limited cards, on rails the founder picks (Q9).
 - `pay` action parameters: amount, currency, merchant and recipient.
 - Spend limits per Kat, per Space and per day, and an optional expected price that a payment may not exceed by more than a set margin. These are deterministic gates in code; no model decides a payment.
-- A second factor for approving payments, for example a passkey.
 - Card storage in the per-Kat vault from 2b, as write-only fields.
-- A hardware security key or passkey on the person's own device for approving payments, after a threat model (with sub-project 9).
+- A second factor for approving payments, for example a passkey or a hardware security key on the person's own device, after a threat model (with sub-project 9).
 - Adding cards by scanning them, and importing entries from a password manager.
 - Order and receipt records. A payment whose result KatWork cannot confirm gets its own outcome, separate from success and failure.
 - Credits, top-ups and usage limits, if the founder places them in this edition (Q10).
 
 **Depends on:** sub-project 3 (action types and gates), 2b (the vault), sub-project 12 (merchant and travel connectors), and the payments ADR.
 
-**Size:** M (estimate, 15 tasks).
+**Size:** M (estimate, 16 tasks with the payment second factor).
 
 ### 11. Voice and meetings (proposed)
 
@@ -350,7 +349,7 @@ Some parts of the competing product run against KatWork's spec or ADRs, for exam
 
 **Scope:**
 - Scheduled routines on sub-project 1's scheduler.
-- Triggers: webhooks, channel messages, mail, forge and incident tools, with encrypted webhook keys.
+- Triggers: webhooks, channel messages, mail, forge and incident tools, with encrypted webhook keys. In Alpha 2, mail triggers come only through sub-project 12's mail connector; triggers from the inbound mail adapter (additions to 5) come with it in Alpha 3.
 - Chained prompts, retries, and validation when a routine is turned on.
 - Scheduled browser research (Phase 3's capability, pulled forward).
 
@@ -367,7 +366,7 @@ Some parts of the competing product run against KatWork's spec or ADRs, for exam
 - Sharing a Kat by copy, with a disclosure card before sharing that lists what travels (files, skills, vault entries, connectors).
 - Service accounts, and delegated logins with an acknowledged warning and an admin kill switch.
 - An admin console: the command denylist, tool and connector allowlists, the egress dashboard with each Kat's applied status, and network diagnostics.
-- Tracking which blocked connectors people ask for, after a privacy review.
+- Tracking which blocked connectors people ask for, after a privacy review. It is off by default, an admin turns it on, and its data stays on the install (§13 telemetry rule).
 
 **Depends on:** sub-project 3, sub-project 6 and sub-project 12. SSO and SCIM stay with the Enterprise edition (§16) unless the founder rules otherwise (Q10).
 
@@ -375,53 +374,70 @@ Some parts of the competing product run against KatWork's spec or ADRs, for exam
 
 ### Additions to existing sub-projects
 
-- **2b Kat computers:** Playwright as an alternative browser runtime, if the plan finds it needed beside chromiumoxide; a general Linux desktop on the GUI tier, with take-over; teach recording (a person records a task and the Kat proposes steps, reviewed before use); screen recording; the egress gateway failing closed when its policy cannot refresh, and an applied status per Kat; card and contact entries in the vault as write-only fields, and typed secret requests; credential fill that clears the fields and hands over to the person when it fails; browser dialogs shown to the person, never accepted automatically; clipboard transfer that is explicit and logged; idle pause, then parking when nobody is present.
+- **2b Kat computers:** a general Linux desktop on the GUI tier, with take-over; teach recording (a person records a task and the Kat proposes steps, reviewed before use); screen recording; the egress gateway failing closed when its policy cannot refresh, and an applied status per Kat; card and contact entries in the vault as write-only fields, and typed secret requests; credential fill that clears the fields and hands over to the person when it fails; browser dialogs shown to the person, never accepted automatically; clipboard transfer that is explicit and logged; idle pause, then parking when nobody is present.
 - **2c Memory:** a review queue for shared memory and for skills; Kat-authored skills with version history, review and revert; untrusted shared memory flagged as such.
-- **3 Gates and policy:** new action types (`pay`, `message-on-behalf`, `record`); spend limits and the payment second factor (with sub-project 10); typed denial reasons returned to the Kat; an admin command denylist; approval rules per person and per team, where a rule that requires asking a person always overrides a rule that allows an action; bulk approval only for identical requests and never for outward or destructive actions; harness hooks before and after tool calls; a `pending_external` state distinct from an error; data-use preconditions per connector; a line on every approval card that explains why the job stopped for approval.
+- **3 Gates and policy:** new action types (`pay`, `message-on-behalf`, `record`); spend limits (the payment second factor is in sub-project 10, Alpha 3); typed denial reasons returned to the Kat; an admin command denylist; approval rules per person and per team, where a rule that requires asking a person always overrides a rule that allows an action; bulk approval only for identical requests and never for outward or destructive actions; harness hooks before and after tool calls; a `pending_external` state distinct from an error; data-use preconditions per connector; a line on every approval card that explains why the job stopped for approval.
 - **4 Routing:** rooms where Kats talk to each other, with cost and loop rules; questions a Kat asks while it keeps working (this changes ADR-0002's resume model and needs an ADR note); version conflicts on tracked tasks; goal continuation.
 - **5 Channels:** SMS and inbound mail adapters (a Kat's own number and address); notifications; a clear install state for each channel app.
-- **6 Views and shells:** onboarding, Thai and English first with more locales by demand, and in-app notices for outages and updates; chat with several people and Kats in one thread, maths and chart rendering, and presentations in chat (within ADR-0010's plain-text rule); the review-queue view; admin pages; the desktop shell features listed in sub-project 9; a shared canvas; voice controls; Kat creation with avatars and template browsing; a sandboxed renderer for tool-result cards, if the founder adopts them (Q20).
-- **7 Craft beyond 2a:** making the virtual display and UI plane reusable by local computer use, screen recording and the general desktop.
+- **6 Views and shells**, by wave:
+  - Alpha 2: the review-queue view and admin pages (3 tasks).
+  - Alpha 3: onboarding, Thai and English first with more locales by demand, and in-app notices for outages and updates; chat with several people and Kats in one thread, maths and chart rendering, and presentations in chat (within ADR-0010's plain-text rule); a shared canvas; Kat creation with avatars and template browsing; a sandboxed renderer for tool-result cards, if the founder adopts them (Q20) (4 tasks).
+  - Alpha 4: voice controls (1 task).
+  - The companion's Tauri shell features are listed and counted once, in sub-project 9.
+- **7 Craft beyond 2a** (Alpha 2): making the virtual display and UI plane reusable by local computer use, screen recording and the general desktop (2 tasks).
 
 ## Re-plan: staged alphas
 
 On 2026-11-26 the founder accepted this re-plan's recommendation for staged alphas. Everything adopted stays product scope, but it ships in waves:
 - **Alpha 1** is the first public alpha. It carries the current spec scope: sub-projects 1 to 7 as specified, without the additions above. Federation (sub-project 8) stays after the alpha. Alpha 1 is re-dated from the measured pace.
-- **Alpha waves 2 and later** deliver the new areas: sub-projects 9 to 14 and the additions to existing sub-projects. They are ordered by dependency, and each wave's plans need their own founder approval.
+- **Alpha waves 2 and later** deliver the new areas: sub-projects 9 to 14, the additions to existing sub-projects, and the differentiation proposals. They are ordered by dependency, and each wave's plans need their own founder approval.
+
+Everything in this section is proposed, and every date needs the founder's approval.
 
 ### Pace
 
 Facts from the repository on 2026-11-26:
-- The sub-project 1 plan (17 tasks) merged in two days, 2026-10-22 and 2026-10-23, before the current review pipeline (two reviewers, a verifier and up to three fix rounds) existed.
+- The sub-project 1 plan (17 tasks) merged in two days, 2026-10-22 and 2026-10-23, before the current review pipeline existed. That pipeline has two reviewers, a verifier and up to three fix rounds.
 - The sub-project 2a plan merged on 2026-10-24. Since then 5 of its 44 tasks have merged: Tasks 8 (2026-10-25), 3 (2026-10-27), 1 (2026-10-28), 2 (2026-11-25) and 6 (2026-11-26). Tasks 4, 5 and 13 are in review; Tasks 4 and 5 have been open since 2026-10-30.
-- Average pace over those 4.7 weeks: about 1.1 merged tasks a week.
+- Average pace over those 4.71 weeks: 1.06 merged tasks a week, written "1.1" below.
 - Best week: 3 tasks in the first 5 days, about 4 a week. Then nothing merged for four weeks.
 
-The build pipeline runs at most 4 builders at once, one wave at a time.
+The build pipeline runs at most 4 builders at once.
 
-**Assumption for the proposed dates:** 4 merged tasks a week. This is SP2a's best measured week, and one task per builder per week. It is about 3.8 times SP2a's average, and the pipeline has not yet sustained it. The range below gives the dates at 1.1, 2 and 4 tasks a week. A pace review in the week of 2027-01-25 re-forecasts every date from eight weeks of measured pace.
+**Assumption for the proposed dates:**
+- Each of the 4 builders merges 1 task a week, and at most 2 builders work on one sub-project.
+- That is a nominal 4 tasks a week, SP2a's best measured week. It is about 3.8 times SP2a's 1.06 average, and the pipeline has not yet sustained it.
+- Because sub-projects wait for each other, the schedule below delivers less than 4 a week in practice:
+  - 3.74 a week in Alpha 1 (187 tasks in 50 weeks);
+  - 3.43 a week over all four waves (395 tasks in 115 weeks).
+- A pace review in the week of 2027-01-25 re-forecasts every date from eight weeks of measured pace.
 
 ### Estimated work
 
-| Wave | Sub-projects | Tasks left (estimate) |
+| Wave | Contents (tasks, estimate) | Tasks |
 |---|---|---|
-| Alpha 1 | 2a (39: plan, 44 tasks, 5 merged), 2b (30, L), 2c (15, M), 3 (30, L), 4 (15, M), 5 (15, M), 6 (15, M), 7 (20, M to L), release work (8) | 187 |
-| Alpha 2 | 12 Connectors and plugins (30), 13 Routines (12), 14 Team admin (15), the additions to 2b (8), 2c (4), 3 (10) and 4 (4), release work (4) | 87 |
-| Alpha 3 | 9 Companion (30), 10 Spend (15), the additions to 5 (4), 6 (8) and 7 (2), release work (4) | 63 |
-| Alpha 4 | 11 Voice and meetings (25), with the voice controls from the additions to 6, release work (4) | 29 |
-| **Total** | | **366** |
+| Alpha 1 | 2a (39 left of 44), 2b (30), 2c (15), 3 (30: 22 for gates and policy, 8 for the templates that need sub-project 4), 4 (15), 5 (15), 6 (15), 7 (20), release work (8) | 187 |
+| Alpha 2 | 12 Connectors and plugins (30), 13 Routines (12), 14 Team admin (15), the additions to 2b (8), 2c (4), 3 (9) and 4 (4), the Alpha 2 additions to 6 (3: the review-queue view and admin pages), the addition to 7 (2), the differentiation proposals DP1 to DP14 (29, pending Q27), release work (4) | 120 |
+| Alpha 3 | 9 Companion (30, including its Tauri shell features), 10 Spend (16, including the payment second factor), the additions to 5 (4), the Alpha 3 additions to 6 (4), release work (4) | 58 |
+| Alpha 4 | 11 Voice and meetings (25), voice controls in the views (1, the Alpha 4 addition to 6), release work (4) | 30 |
+| **Total** | | **395** |
 
-Every number except 2a's is an estimate, and each sub-project's plan replaces it. The total is 12 more than a single alpha would need, because each later wave has its own release work.
+How to read these counts:
+- Every number except 2a's is an estimate, and each sub-project's plan replaces it.
+- Sub-project 7's 20 tasks count in Alpha 1 only if the founder confirms Q3. Without it, Alpha 1 has 167 tasks.
+- The official letter and memo template (Q26) and the Playwright runtime (Q28) are not counted. If either is approved, it adds tasks to Alpha 2.
+- Each later wave carries its own release work, so four waves need 12 more release tasks than one alpha would.
 
 ### Why this order
 
 - **Alpha 1** is the spec as written. Its sub-projects depend only on each other:
   - 2b needs 2a's artifact store (Task 2, merged), and 2c needs `normalize_th` (Task 1, merged).
   - 4 needs 3 and 2c. 5 needs 3 and 4. 6 needs 3, 4 and 2b. 7 needs 2a's Craft track, 3 and 2b.
-  - Q3 asked whether sub-project 7 belongs to the alpha. The staged-alpha ruling places it in Alpha 1; Q3 closes when the founder confirms that reading.
+  - Sub-project 3's templates need sub-project 4's planning and delegation, and the research brief needs 2b's saved web spans (Q4). The schedule therefore splits 3: its gates and policy (22 tasks) come before 4, and its 8 template tasks come after 4. If the founder answers Q4 differently, the dates move.
 - **Alpha 2** is the platform layer the other new areas use.
-  - Connectors (12) need 3 and 2b. Routines (13) need 3, 5 and 12. Team admin (14) needs 3, 6 and 12.
-  - The additions to 2b, 2c, 3 and 4 include the new action types, the vault fields and the review queue. Sub-projects 9 and 10 depend on them.
+  - Connectors (12) need 3 and 2b. Routines (13) need 12. Team admin (14) needs 12 and the admin pages from the additions to 6.
+  - The additions to 2b, 2c, 3 and 4, the review-queue view and admin pages, and 7's reusable virtual display are here, because sub-projects 9, 10 and 14 build on them.
+  - In Alpha 2, routines take mail triggers only through sub-project 12's mail connector. Triggers from the inbound mail adapter come with it in Alpha 3.
 - **Alpha 3** acts for a person and pays.
   - Companion (9) needs 3, 6 and 2b. Spend (10) needs 3, 2b and 12.
   - Both need the legal read on acting on a person's behalf (Q12) and their ADRs.
@@ -431,66 +447,89 @@ Every number except 2a's is an estimate, and each sub-project's plan replaces it
 
 ### Schedule
 
-The schedule assumes:
-- 4 builders, at most 2 on one sub-project.
-- A sub-project starts once each dependency is three-quarters merged, as stacked PRs, and finishes only after its dependencies finish.
+The schedule follows these rules:
+- 4 builders, at most 2 on one sub-project, 1 merged task per builder per week. No week uses more than 4 builders.
+- A sub-project starts once each of its dependencies was three-quarters merged at the start of that week, as stacked PRs. It finishes only after its dependencies finish.
+- 2b, 2c and 3 cannot start before their plans are approved (target week of 2026-12-14).
 - Plans and ADRs are written one wave ahead of their builds and do not use builder time.
-- Each later wave starts building when the previous wave's builds end, while that wave's dry runs and release candidate run.
+- A later wave starts building when the previous wave's builds end, while that wave's dry runs and release candidate run.
 
-| Week of | Milestone |
+The order inside Alpha 1 is the one that finishes earliest among all orders of its nine work items, under these rules.
+
+| Week of (proposed) | Milestone |
 |---|---|
 | 2026-11-30 | Founder review of this re-plan and the scope amendment. 2a continues (Tasks 4, 5 and 13 in review). Plans for 2b, 2c and 3 in writing. |
 | 2026-12-14 | Plans for 2b, 2c and 3 approved (target). 2b starts beside 2a. |
-| 2027-01-25 | Pace review: eight weeks of measured pace against the 4-a-week assumption; every date below is re-forecast (Q1). This was the old public-alpha week. |
-| 2027-03-29 | 2b done: Kat computers, the browser supervisor, the vault. Sub-project 3 starts. |
+| 2027-01-25 | Pace review: eight weeks of measured pace against the assumption; every date below is re-forecast (Q1). This was the old public-alpha week. |
+| 2027-03-29 | 2b done: Kat computers, the browser supervisor, the vault. Sub-project 3 (gates and policy) starts. |
 | 2027-04-12 | 2c starts. |
 | 2027-04-19 | 2a done: documents and evidence, all 13 Craft apps, the meeting-minutes demo, OCR. |
-| 2027-06-07 | 2c done: memory. |
-| 2027-06-14 | Sub-project 4 starts (routing, Laya in shadow mode, delegation). |
-| 2027-07-12 | Sub-project 3 done: approvals, gates, templates. Sub-project 7 starts. |
-| 2027-07-19 | Sub-project 5 starts (channels). |
-| 2027-08-02 | Sub-project 6 starts (views and shells). |
-| 2027-08-09 | Sub-project 4 done. |
+| 2027-06-07 | 2c done: memory. Sub-project 4 starts (routing, Laya in shadow mode, delegation). |
+| 2027-06-14 | Sub-project 3's gates and policy done. Sub-project 7 starts. |
+| 2027-07-19 | Sub-project 7 pauses; its builders move to sub-project 5, which can start now that 4 is three-quarters merged. |
+| 2027-07-26 | Sub-project 3's template tasks start. |
+| 2027-08-02 | Sub-project 4 done. |
+| 2027-08-23 | Sub-project 6 starts (views and shells). |
+| 2027-08-30 | Sub-project 3 done, with the templates. |
+| 2027-09-06 | Sub-project 7 resumes. |
 | 2027-09-13 | Sub-project 5 done. |
-| 2027-09-27 | Sub-project 6 done: board, live graph, 3D office, Tauri and Capacitor shells. |
-| 2027-10-11 | Plans for Alpha 2 (12, 13, 14 and the additions to 2b, 2c, 3 and 4) approved (target). The MCP posture and connector-credentials ADRs reviewed. |
-| 2027-11-15 | Sub-project 7 done. Alpha 1 release work: hardening (kill-switch, replay and fidelity gates), demo mode, docs. |
-| 2027-12-13 | Alpha 1 builds end. Design-partner dry runs. Alpha 2 builds start. |
-| 2027-12-20 | Fixes from the partners. |
-| 2027-12-27 | Licence review. Release candidate. |
-| 2028-01-03 | **Alpha 1, public: proposed, founder approval needed.** |
-| 2028-03-27 | Sub-project 12 done. |
-| 2028-04-10 | Plans for Alpha 3 (9, 10 and the additions to 5, 6 and 7) approved (target). Companion trust-model and payment ADRs reviewed; the Q12 legal read back. |
-| 2028-06-05 | Alpha 2 builds end (13 and 14 done). Alpha 3 builds start. |
-| 2028-06-19 | **Alpha 2: proposed, founder approval needed.** |
-| 2028-08-07 | Plans for Alpha 4 (11) approved (target). Voice and recording-retention ADRs reviewed; the Q11 legal read back. |
-| 2028-10-02 | Alpha 3 builds end. Alpha 4 builds start. |
-| 2028-10-16 | **Alpha 3: proposed, founder approval needed.** |
-| 2029-01-15 | Alpha 4 builds end. |
-| 2029-01-29 | **Alpha 4: proposed, founder approval needed.** |
+| 2027-10-11 | Plans for Alpha 2 approved (target): 12, 13 and 14, the Alpha 2 additions, and the differentiation proposals the founder accepts (Q27). The MCP posture, connector-credentials and recording-retention ADRs reviewed, and the PDPA legal read for screen and teach recordings back. |
+| 2027-10-18 | Sub-projects 6 and 7 done. Alpha 1 release work: hardening (kill-switch, replay and fidelity gates), demo mode, docs. |
+| 2027-11-15 | Alpha 1 builds end. Design-partner dry runs. Alpha 2 builds start. |
+| 2027-11-22 | Fixes from the partners. |
+| 2027-11-29 | Licence review. Release candidate. |
+| 2027-12-06 | **Alpha 1, public.** |
+| 2028-02-28 | Sub-project 12 done. |
+| 2028-04-10 | Plans for Alpha 3 approved (target): 9, 10 and the Alpha 3 additions. Companion trust-model and payment ADRs reviewed; the Q12 legal read back. |
+| 2028-07-03 | Alpha 2 builds end (13 and 14 done). Alpha 3 builds start. |
+| 2028-07-17 | **Alpha 2.** |
+| 2028-08-07 | Plans for Alpha 4 approved (target): 11. Voice ADR reviewed; the Q11 legal read back. |
+| 2028-10-30 | Alpha 3 builds end. Alpha 4 builds start. |
+| 2028-11-13 | **Alpha 3.** |
+| 2029-02-12 | Alpha 4 builds end. |
+| 2029-02-26 | **Alpha 4.** |
 
-Alpha 4 runs longer than its 29 tasks suggest because sub-project 11 is one sub-project, and at most 2 builders work on one sub-project.
+Why sub-project 7 spans 18 weeks for 20 tasks:
+- Its two builders work 5 weeks (2027-06-14 to 2027-07-12) on the parts that need only 2a, 2b and 3.
+- They then move to sub-projects 5, 3's templates and 6, which sit on the critical path.
+- They come back from 2027-09-06.
+
+Giving 7 its builders without a break would delay 5 and 6, and Alpha 1 with them.
+
+Alpha 4 runs longer than its 30 tasks suggest. Sub-project 11 is one sub-project, and at most 2 builders work on one sub-project.
 
 ### Range by pace
 
-| Pace (merged tasks a week) | Alpha 1 | Last wave (Alpha 4) |
-|---|---|---|
-| 1.1 (SP2a's average) | week of 2030-04-01 | about 2033-05 |
-| 2 | week of 2028-10-09 | about 2030-06 |
-| 4 (SP2a's best week; the proposal) | week of 2028-01-03 | week of 2029-01-29 |
+One method gives every row. Take the schedule above, built at a nominal 4 tasks a week. Stretch its build spans from 2026-11-30 by 4 divided by the pace: 50 weeks to the end of Alpha 1 builds, and 115 weeks to the end of Alpha 4 builds. Then add the same release weeks: 3 for Alpha 1 and 2 for Alpha 4.
 
-The 1.1 and 2 rows use the same order. Their later-wave dates are the remaining 179 tasks at that pace, plus two release weeks.
+| Nominal pace (tasks a week) | Alpha 1 public | Alpha 4 public |
+|---|---|---|
+| 1.1 (SP2a's average) | week of 2030-06-17 | week of 2034-12-18 |
+| 2 | week of 2028-11-20 | week of 2031-05-12 |
+| 4 (SP2a's best week; the proposal) | week of 2027-12-06 | week of 2029-02-26 |
 
 **What else moves the dates:**
 - Founder gates: plan approvals, the legal reads (Q11, Q12) and the design-partner annex (Q5).
 - Alpha 3's outward parts (sends as a person, payments) and Alpha 4's calls and live capture cannot ship before their legal reads.
-- If the founder wants an early slice of a later wave (Q22), it takes builder weeks from Alpha 1.
+- If the founder pulls the claim-carrying differentiation proposals into Alpha 1 (Q27), Alpha 1 gains about 10 tasks and up to about 3 weeks.
+- An early slice of a later wave (Q22) takes builder weeks from Alpha 1.
 
 **Cut order.** Inside Alpha 1, §18's cut order (WhatsApp and Teams, then Capacitor, then 3D) still stands as written. This re-plan proposes no cut across the waves.
 
 ## Differentiation
 
-The founder asked on 2026-11-26 for KatWork to outperform other products, through research into what people want and need, across many fields. A first research wave read published studies on office work, trust and delegation with AI, and the Thai work context, and coded public complaints about AI tools in English and Thai. Its findings feed each sub-project's plan. Nothing here changes the scope or the dates above. A finding that would change scope comes to the founder as a proposal.
+On 2026-11-26 the founder asked for KatWork to outperform other products, through research into what people want and need, across many fields. A first research wave did four things:
+- read published studies on office work;
+- read studies on trust and delegation with AI;
+- read studies on the Thai work context;
+- coded public complaints about AI tools in English and Thai.
+
+Its findings feed each sub-project's plan.
+
+**Status of this section.** The responses below are proposals, not scope.
+- Where a response is already in the spec, an ADR or an approved plan, the table names that source.
+- Every other response is a differentiation proposal, DP1 to DP14 in the scope amendment. Each carries a proposed wave, a task estimate, and a founder question (Q27) that decides it.
+- The 29 tasks of DP1 to DP14 are counted in Alpha 2 until the founder rules. Alpha 1 stays the spec as written.
 
 **Limits of the evidence.**
 - Every count comes from one coder.
@@ -498,42 +537,44 @@ The founder asked on 2026-11-26 for KatWork to outperform other products, throug
 - No source measures willingness to pay.
 - Satisfied users rarely post.
 
-The ranking is therefore ordinal, and needs that sit next to each other should be read as ties.
+The ranking is ordinal, so needs that sit next to each other should be read as ties.
 
 ### Unmet needs, ranked
 
-The order follows how many independent sources support each need, how intense the complaints are, and how close the need is to KatWork's mission.
+The order follows three things: how many independent sources support each need, how intense the complaints are, and how close the need is to KatWork's mission.
 
-| # | What people need | KatWork's design response | Owner |
-|---|---|---|---|
-| 1 | **No silent wrong numbers.** Wrong output that looks right is the most damaging failure and the least noticed. People want every figure checked against a source they can open. | Every number, date and quote in a draft is marked passed, failed or unverified. A "check these first" list opens the report, and the missing-evidence list sits on the cover. A failed or unverified claim blocks acceptance of any section the template marks as required evidence. Seeded-defect test worlds cover every alpha template. | 2a (verifier), 3 (acceptance, test worlds), 6 |
-| 2 | **Data stays in the building.** People want a plain answer to "where does my file go". This is a top fear in organisations, and PDPA enforcement is real. | One screen per Space showing which model providers see it, what each outbound model call sent, and what never leaves. A personal-data flag on a folder sends its jobs to a local model. A redaction check runs before any outward send. An offline-install test runs in CI. | 1, 2b (egress gateway), 3 (redaction), 6 |
-| 3 | **Review that costs less than redoing the work.** Checking AI output often eats the time it saved. | Claims ordered by risk: failed first, then unverified, with passed claims collapsed to a count. One click opens the source at the exact span, highlighted. Reviewer minutes per deliverable are logged from use, not taken from surveys. | 2a (evidence card), 6 |
-| 4 | **Right in the person's own file and template, including Thai print.** Spreadsheets and slides come out worst, and Thai numerals, tone marks and fonts break. | The deliverable opens in the office's own template, reads back, and prints the same on two renderers. Each template declares its date era (Buddhist or Common) and digit form (Thai or Arabic), and a check fails mixed forms. | 2a (writers), 3 (template fill, render check) |
-| 5 | **Approvals that catch errors.** Approval prompts decay into rubber stamps, and blame lands on the nearest person. | Approval cards offer approve, approve with a comment, unsure, and decline. High-risk claims ask the reviewer to open the cited span first. Each job has a budget of cards. The audit row stores exactly what the card showed. Seal-and-initial is an approval type. An alarm fires when approvals become too fast and too uniform. | 3, 5 (cards per channel), 6 |
-| 6 | **An honest "done".** Agents claim completion they did not achieve. | A completion receipt generated from the job log covers inputs read against the input list, checks run and not run, what was tried and rejected, stops and their reasons, and time and tokens from the model-call records. A skipped file or a run that matched zero records is a failed check. | 1 (records), 3 (completion record), 2a (reader coverage) |
-| 7 | **Staying in control.** People want partnership, not full automation. | A clarifying card when the brief lacks audience, template or period. A stop that works within seconds. Take-over of a Kat's browser or app. Redo of one section without restarting. Every outward or destructive action waits as a Proposal. | 3, 4, 6, 2b |
-| 8 | **Thai official-document correctness.** This covers Buddhist-Era dates, numerals, register, the official letter form, and scanned input. | Official letter and memo forms with a register check. OCR lines below confidence are flagged, not trusted. Pulling an official memo template from Phase 3 forward is a founder question (Q26). | 2a (`katwork-thai`, OCR), 3, 4 |
-| 9 | **Reconcile across files and show only the exceptions; the same figure everywhere.** | Reconciliation results in two parts: matched (collapsed) and exceptions (both sources side by side). In a pack, every output draws each figure from one verified fact. | 3 (monthly pack), 2a (cell facts) |
-| 10 | **Predictable cost.** People want an estimate first, no silent burn, and no silent switch to a weaker model. | An estimate of tokens and time before a team job, and the running cost during it. A per-workspace cap. A model without a price shows "unpriced", never zero. No silent model downgrade. | 1 (gateway), 4, 6 |
-| 11 | **Memory of facts and decisions, with their reasons, across a long job.** | A fact register and a decision log (decision, reason, rejected options, who, when) that later tasks and jobs reuse. Space memory accepts an entry only through a person or a policy. | 2c, 2a, 4 |
-| 12 | **An easy start for non-technical staff.** | A chat-first first run (LINE too), with one visible next action. The 3D office optional. A one-page glossary. | 6, 5 |
+| # | What people need | Proposed response | Already in the spec or a plan | Proposals (owner) |
+|---|---|---|---|---|
+| 1 | **No silent wrong numbers.** Wrong output that looks right is the most damaging failure, and the least noticed. People want every figure checked against a source they can open. | Every number, date and quote in a draft is marked passed, failed or unverified. The missing-evidence list is shown. A failed or unverified claim blocks acceptance of a section that needs evidence. Seeded-defect test worlds cover every alpha template. | Claim statuses and the verifier (§7.1, ADR-0007); the acceptance rule (§19 item 3); KatBench seeded worlds (2a plan) | DP1 more trap kinds and a world per template (3) |
+| 2 | **Data stays in the building.** People want a plain answer to "where does my file go". This is a top fear in organisations, and PDPA enforcement is real. | Residency per Space and local-only Spaces. A screen per Space showing which providers see it and what each model call sent. A personal-data flag on a folder. A redaction check before outward sends. An offline-install test. | Residency per Space, local models (§11, §13); the HA redaction check (§8); the egress gateway (ADR-0009) | DP5 data screen, folder flag, redaction on every outward send (3, with 6); DP6 offline-install CI test (2b) |
+| 3 | **Review that costs less than redoing the work.** Checking AI output often eats the time it saved. | One click opens the source at the exact span. Claims ordered by risk, failed first. Reviewer minutes logged from use, not surveys. | Source spans (ADR-0007); the evidence card (2a plan) | DP2 risk ordering and the span-open timing test (6); DP3 reviewer minutes (6) |
+| 4 | **Right in the person's own file and template, including Thai print.** Spreadsheets and slides come out worst, and Thai numerals, tone marks and fonts break. | The deliverable opens in the office's own template and reads back. Each template declares its date era and digit form. Thai print is checked on two renderers. | Template writers with read-back (2a plan); template fill and the render check (§19 item 3); fidelity gates (§15) | DP7 date-era and digit declaration (3); DP8 two-renderer Thai print check (3) |
+| 5 | **Approvals that catch errors.** Approval prompts decay into rubber stamps, and blame lands on the nearest person. | Each approval card stores exactly what it showed, and there are more ways to answer. | Proposals, approval cards and the audit log (§6.5, §7.2) | DP9 approve with a comment, unsure, forced span opening for high-risk claims, a card budget per job, the card content in the audit row, seal-and-initial approval, a fast-approval alarm (3, with 6) |
+| 6 | **An honest "done".** Agents claim completion they did not achieve. | Completion comes from a harness-owned record, never from the model. Reports are generated by code. | The harness-owned completion record (§19 item 3); reports generated by code (§7.1); stops name a reason (§6.6) | DP4 a completion receipt from the job log, where a skipped file or a zero-match run fails (3) |
+| 7 | **Staying in control.** People want partnership, not full automation. | Clarifying questions, Proposals for outward actions, pausing, and take-over. | Clarifying questions (§6.4); Proposals (§6.5); pause all Kats (§6.6); take-over (§9) | DP10 redo one section without a restart, and a stop-latency target (4) |
+| 8 | **Thai official-document correctness.** This covers Buddhist-Era dates, numerals, register, the official letter form, and scanned input. | Thai normalisation and Buddhist-Era dates. OCR lines below confidence are flagged. | `katwork-thai` and OCR flags (2a plan, ADR-0007) | None counted. An official letter and memo template is Q26, which this section does not decide. |
+| 9 | **Reconcile across files, show only the exceptions, and keep the same figure everywhere.** | In a pack, every output draws each figure from one verified fact, and cross-file conflicts become an approval card. | The monthly pack (§8) | DP11 a matched-and-exceptions output (3) |
+| 10 | **Predictable cost.** People want an estimate first, no silent burn, and no silent switch to a weaker model. | Run budgets, and usage per Kat and job. A provider limit stops the job with a named reason. | Run budgets (§6.6); usage tracking and limits (§11) | DP12 a pre-run estimate, a workspace cap, an "unpriced" state and no silent downgrade (4, with 6) |
+| 11 | **Memory of facts and decisions, with their reasons, across a long job.** | Shared decisions per Space, and `remember` with provenance. | §11 memory (2c) | DP13 a decision log with reasons and rejected options (2c) |
+| 12 | **An easy start for non-technical staff.** | Chat as the mobile default, and the board as the accessible fallback. | §10 | DP14 a first run with one visible next action, and a glossary (6) |
 
 ### Five claims to test and publish
 
-These are targets, not measurements. KatWork will test each in its own CI or in a timed internal run, and publish both the method and the result.
+These are targets, not measurements. KatWork will test each one, and publish both the method and the result. Each claim holds only once its proposals are built. Q27 decides whether those come in Alpha 1 or Alpha 2.
 
-1. On KatBench's seeded-defect worlds, no planted wrong figure, unit mix or date-era swap is ever marked as passed.
-2. A reviewer opens the exact source span behind any claim in under 10 seconds.
-3. A job's completion receipt is generated from its log, and no statement in it is contradicted by that log. Skipped files and zero-match runs fail.
-4. An offline install makes zero outbound connections, and no outward action runs without a person approving that exact action.
-5. Every figure in a monthly pack is identical across all its outputs, and Thai dates and numerals follow the template's declared form with zero violations.
+| # | Claim | Owner | Wave | Where it is tested |
+|---|---|---|---|---|
+| 1 | On KatBench's seeded-defect worlds, no planted wrong figure, unit mix or date-era swap is ever marked as passed. | 3 (with 2a's verifier) | Alpha 2, or Alpha 1 if Q27 | KatBench runs in CI |
+| 2 | A reviewer opens the exact source span behind any claim in under 10 seconds. | 6 (with 2a's evidence card) | Alpha 2, or Alpha 1 if Q27 | A timed internal run on the alpha templates |
+| 3 | A job's completion receipt is generated from its log, and no statement in it is contradicted by that log. Skipped files and zero-match runs fail. | 3 | Alpha 2, or Alpha 1 if Q27 | CI on seeded skipped-file and zero-match runs, plus an audit of 50 jobs |
+| 4 | An offline install makes zero outbound connections. No outward action runs unless a person approved it: in Alpha 1, that exact action. If bulk approval or standing grants are adopted (Q21), it must be the exact batch or grant that covers it. | 2b (offline test), 3 (approval gate) | Alpha 1 for the approval part; the offline test with DP6 | CI: an offline-install test and the approval-gate replay suite (§15) |
+| 5 | Every figure in a monthly pack is identical across all its outputs, and Thai dates and numerals follow the template's declared form with zero violations. | 3 | Alpha 2, or Alpha 1 if Q27 | CI on generated monthly packs |
 
-Claims about how reviewers behave, for example their catch rate with and without the proof panel, need real reviewers. They are design-partner measurements in the dry runs, not launch claims.
+Claims about how reviewers behave need real reviewers, for example their catch rate with and without the proof panel. They are design-partner measurements in the dry runs, not launch claims.
 
 ### Adopted areas the evidence does not yet support
 
-The research found no supporting evidence for these areas, and some evidence of risk: privacy fears, reluctance to hand over credentials, and third-party consent. They are **kept per the founder's ruling; evidence to gather**. None is dropped. Each already sits in a late wave and behind its legal read.
+The research found no supporting evidence for these areas. It found some evidence of risk: privacy fears, reluctance to hand over credentials, and third-party consent. They are **kept per the founder's ruling; evidence to gather**. None is dropped, and each already sits in a later wave behind its legal read.
 
 | Area | Wave | Evidence to gather |
 |---|---|---|
@@ -545,7 +586,7 @@ The research found no supporting evidence for these areas, and some evidence of 
 
 ## Alpha (#138)
 
-**Date:** the spec's §1.1 heading reads "Goals for the alpha (2027-01-31)", with the public alpha in the week of 2027-01-25 (§17). That date cannot hold. Under the staged alphas, this section describes **Alpha 1**, the first public alpha, with the current spec scope. "Re-plan: staged alphas" proposes the week of 2028-01-03 for Alpha 1 at 4 merged tasks a week, and dates for Alphas 2 to 4. Every date is proposed and needs the founder's approval (Q1). Each later wave repeats the release work and entry criteria below for its own scope, plus the gates of its ADRs and legal reads.
+**Date:** the spec's §1.1 heading reads "Goals for the alpha (2027-01-31)", with the public alpha in the week of 2027-01-25 (§17). That date cannot hold. Under the staged alphas, this section describes **Alpha 1**, the first public alpha, with the current spec scope. "Re-plan: staged alphas" proposes the week of 2027-12-06 for Alpha 1 at a nominal 4 merged tasks a week, and dates for Alphas 2 to 4. Every date is proposed and needs the founder's approval (Q1). Each later wave repeats the release work and entry criteria below for its own scope, plus the gates of its ADRs and legal reads.
 
 **Work that belongs to the release itself.** No §19 item owns this work:
 - Running the hardening gates (kill-switch, replay and fidelity). Sub-project 3 builds the kill-switch and replay tests; §17 runs the gates in the week of 2027-01-04, the same week as the HA rubric pack, which is a template (Q4).
@@ -583,7 +624,7 @@ These come from §17's last four weeks.
 5. Each Craft app or operation that fails its §9.1 gate is forbidden in that app's policy. A failing optional app never blocks a template, but a template whose Rust baseline fails its Thai gate is blocked (§9.1). GridCraft's check of XLSX outputs is not optional in this sense: it runs on every XLSX save, its outage marks the version "not checked by GridCraft", and a file it reports Excel would repair is refused.
 6. Demo mode runs with no keys, and its canned decisions are labelled synthetic. A live demo never depends on an external login (§15, §18).
 7. The 2a plan's legal reads come before any customer deployment uses the parts they gate. Until the Typhoon OCR terms pass, Typhoon OCR stays off.
-8. The human-labelled Thai claim set from real documents, which the 2a plan defers, is built before the design-partner dry runs (week of 2027-01-11). No sub-project owns it yet.
+8. The human-labelled Thai claim set from real documents, which the 2a plan defers, is built before the design-partner dry runs (proposed week of 2027-11-15, "Re-plan: staged alphas"). No sub-project owns it yet.
 
 **Fallbacks in §18:** for Thai document fidelity, a narrower supported-feature list; if the Craft track slips, the forks the demo does not use merge after it, and their apps stay watchable through previews.
 
@@ -606,17 +647,17 @@ The spec names, without assigning them to sub-projects:
 
 Nobody has ruled on these. This roadmap does not decide them.
 
-1. **The alpha dates.** The spec's §1.1 heading gives 2027-01-31, with the public alpha in the week of 2027-01-25; that cannot hold. The founder accepted staged alphas on 2026-11-26. At 4 merged tasks a week (SP2a's best week), "Re-plan: staged alphas" proposes:
-   - Alpha 1: week of 2028-01-03.
-   - Alpha 2: week of 2028-06-19.
-   - Alpha 3: week of 2028-10-16.
-   - Alpha 4: week of 2029-01-29.
+1. **The alpha dates.** The spec's §1.1 heading gives 2027-01-31, with the public alpha in the week of 2027-01-25; that cannot hold. The founder accepted staged alphas on 2026-11-26. At a nominal 4 merged tasks a week (SP2a's best week; the schedule delivers 3.43 a week overall), "Re-plan: staged alphas" proposes:
+   - Alpha 1: week of 2027-12-06.
+   - Alpha 2: week of 2028-07-17.
+   - Alpha 3: week of 2028-11-13.
+   - Alpha 4: week of 2029-02-26.
 
-   At 2 a week, Alpha 1 is the week of 2028-10-09. At SP2a's 1.1 average, it is the week of 2030-04-01. Which dates and pace does the founder approve? Recommended: approve them as targets and re-forecast at the pace review in the week of 2027-01-25.
+   Scaled to 2 a week, Alpha 1 is the week of 2028-11-20. At SP2a's 1.1 average, it is the week of 2030-06-17. Which dates and pace does the founder approve? Recommended: approve them as targets and re-forecast at the pace review in the week of 2027-01-25.
 2. **Routing before memory.** Sub-project 4 carries a recall tool and a memory byte cap (§19 item 4), which need 2c's memory, but §17 runs routing in the weeks of 2026-11-23 and 2026-11-30 and memory in the week of 2026-12-28. Does sub-project 4 wait for 2c, build those two parts after 2c lands, or does 2c move earlier?
-3. **Sub-project 7 and the alpha.** §19 lists sub-project 7 before federation, and only federation is marked "after the alpha". §17 gives sub-project 7 no week, and §1.2 defers the streamed Craft desktop to it. Is sub-project 7 required for the alpha, partly required, or after it? The staged-alpha ruling, as relayed, places sub-projects 1 to 7 in Alpha 1, so this re-plan counts sub-project 7 there. Recommended: confirm that reading, which closes this question.
-4. **Templates.** All six templates are alpha goals (§1.1 goal 8), and §18's cut order names none, so cutting one would be a new founder decision. Two things are open. First, which sub-project builds each of the research brief, SAR, One Report, monthly pack and HA rubric pack: all in sub-project 3 (§19 item 3), or each with the sub-project it first needs? Second, how their dependencies on later sub-projects are handled: their teams need sub-project 4's planning and delegation, and the research brief needs 2b's saved web spans, while §19 lists sub-project 3 before both. Should any template be cut if the date in Q1 cannot hold?
-5. **Design partners.** The dry runs (week of 2027-01-11) and any partner samples need a signed data annex (§15). Who are the partners, and when is the annex signed?
+3. **Sub-project 7 and the alpha.** §19 lists sub-project 7 before federation, and only federation is marked "after the alpha". §17 gives sub-project 7 no week, and §1.2 defers the streamed Craft desktop to it. Is sub-project 7 required for the alpha, partly required, or after it? The staged-alpha ruling, as relayed, places sub-projects 1 to 7 in Alpha 1, so this re-plan counts sub-project 7 there (20 tasks; without it Alpha 1 has 167). Confirming it also removes the "streamed Craft desktop" non-goal for Alpha 1, because sub-project 7 builds that UI plane (scope amendment, §1.2 item 4). Recommended: confirm that reading, which closes this question.
+4. **Templates.** All six templates are alpha goals (§1.1 goal 8), and §18's cut order names none, so cutting one would be a new founder decision. Two things are open; the proposed schedule assumes the second is answered by building the templates after sub-project 4. First, which sub-project builds each of the research brief, SAR, One Report, monthly pack and HA rubric pack: all in sub-project 3 (§19 item 3), or each with the sub-project it first needs? Second, how their dependencies on later sub-projects are handled: their teams need sub-project 4's planning and delegation, and the research brief needs 2b's saved web spans, while §19 lists sub-project 3 before both. Should any template be cut if the date in Q1 cannot hold?
+5. **Design partners.** The Alpha 1 dry runs (proposed week of 2027-11-15) and any partner samples need a signed data annex (§15). Who are the partners, and when is the annex signed?
 6. **After the alpha.** How do the Phase 2 to 4 use cases (§8), the Enterprise features (§16) and KatsAgentOS (§14) map onto sub-projects or plans, and in what order relative to federation? The expanded scope pulls two Phase capabilities into the alpha (scheduled browser research from Phase 3, through sub-project 13; image and video generation from Phase 4, through sub-project 12). The rest of this question is still open.
 7. **Plan-item closure.** §6.4's plan-item closure (a lead-Kat structured check plus the registered checks, driving the live graph and the office view) is not assigned to a sub-project in §19. Does it belong to sub-project 4 (lead-Kat planning) or sub-project 3 (registered checks)?
 
@@ -638,8 +679,10 @@ The rulings settle that all of the new scope is product scope, delivered in alph
 19. **Telemetry.** The competing product sends telemetry by default. §13 says no telemetry unless an admin turns it on. Recommended: keep §13 as written.
 20. **Link previews and rich cards from tool results.** ADR-0010 renders model text as plain text, with no link previews and nothing fetched from a reply. Recommended: no link previews. Tool-result cards only in a sandboxed renderer with no network, with an ADR-0010 amendment, in sub-project 6.
 21. **Unattended actions.** Standing grants to send as a person, an admin switch that hides a Kat's screen while it works, and a model classifier that approves actions on its own all appear in the competing product. Recommended: standing grants only bound to one recipient and content class, with caps. Hiding the screen keeps the activity log and the take-over path. A classifier may narrow permissions but never approve; code decides (§5.1, ADR-0010).
-22. **An early look at the new scope.** In the proposed order, the new sub-projects come after Alpha 1 (builds from the week of 2027-12-13). Does the founder want an early demo slice of one of them, for example voice chat or one connector, before the core is done? Recommended: no. The core sub-projects are dependencies of all of them, and an early slice would take builder weeks from them.
+22. **An early look at the new scope.** In the proposed order, the new sub-projects come after Alpha 1 (builds from the week of 2027-11-15). Does the founder want an early demo slice of one of them, for example voice chat or one connector, before the core is done? Recommended: no. The core sub-projects are dependencies of all of them, and an early slice would take builder weeks from them.
 23. **Private worker pools.** The competing product can run its agents on a customer's own pool of machines. For KatWork that means multi-host scheduling, a §1.2 non-goal. Recommended: keep the single-host alpha and place private pools after it, because they are a hosting mode, not a capability a person uses. This needs the founder's ruling, because the rulings make it product scope.
 24. **A phone as a tool host.** The competing product can use a person's phone for photos, location and similar tools. Recommended: include it in sub-project 9 after the desktop companion, with photos and location behind PDPA grants (§13). If Q16 keeps mobile to notifications only, this moves after the last alpha wave, which needs the founder's ruling.
 25. **Choices a Kat makes for you.** Another pattern from the research lets an agent pick a default when it would otherwise wait, record why, and let the person review it later. Spec §6.4 says "a timeout never picks defaults" for clarifying questions, so this conflicts with the spec as written. Recommended: allow it only for reversible choices inside a job, for example which of two sheet names is the budget. Each such choice is listed on the completion receipt and the approval card, with its reason, and a template may forbid it. Never allow it for a clarifying question (audience, period, template, recipient), for anything outward or destructive, or for anything that changes a claim's source. This is a proposal, not a decision.
 26. **An official letter and memo template in an alpha.** Thai official-document correctness is a ranked need (see "Differentiation"), but the official memo factory is a Phase 3 use case (§8). Should a letter and memo template move into an alpha wave? Recommended: yes, into Alpha 2. It reuses the template engine and `katwork-thai`, and its date and numeral checks are claim 5.
+27. **The differentiation proposals.** DP1 to DP14 in the scope amendment (29 tasks) are responses to the research that the spec and plans do not hold yet. Which does the founder accept, and in which wave? Recommended: accept all fourteen. Pull the five that carry the published claims (DP1, DP2, DP4, DP6, DP7; about 10 tasks, up to about 3 weeks) into Alpha 1, and put the rest in Alpha 2. Until the founder rules, all 29 tasks are counted in Alpha 2.
+28. **Playwright as a second browser runtime.** The competing product uses Playwright; the spec names chromiumoxide (§5.2). Should 2b's plan consider Playwright as well? Recommended: only if the 2b plan finds a need that chromiumoxide cannot meet, in Alpha 2. Not counted in "Estimated work".
