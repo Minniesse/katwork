@@ -827,8 +827,12 @@ fn volatile_formulas_and_their_dependents_are_suspect() {
     ] {
         assert_eq!(recalculated(&with(calc)), expected, "{calc}");
     }
-    // A workbook in manual mode is not recalculated on open by this rule.
-    assert!(recalculated(&with(r#"<calcPr calcId="191029" calcMode="manual"/>"#)).is_empty());
+    // A manual calculation mode changes nothing: Excel keeps the mode of the first workbook it
+    // opened, so it may well open this one in automatic mode.
+    assert_eq!(
+        recalculated(&with(r#"<calcPr calcId="191029" calcMode="manual"/>"#)),
+        expected
+    );
 }
 
 #[test]

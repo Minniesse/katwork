@@ -1,8 +1,9 @@
-//! Which formula cells Excel recalculates when it opens a workbook in automatic mode, though the
-//! current engine saved it: every formula holding a volatile function or marked `ca`, and every
-//! formula that depends on one, through cells, ranges, other sheets and defined names. Excel
-//! recalculates volatile cells and all their dependents at every recalculation, opening a
-//! workbook in automatic mode included, so what such a cell shows is not its cache.
+//! Which formula cells Excel recalculates when it opens a workbook, though the current engine
+//! saved it: every formula holding a volatile function or marked `ca`, and every formula that
+//! depends on one, through cells, ranges, other sheets and defined names. Excel recalculates
+//! volatile cells and all their dependents at every recalculation, opening a workbook in
+//! automatic mode included, so what such a cell shows is not its cache. A workbook's own
+//! `calcMode` exempts nothing: Excel keeps the mode of the first workbook it opened.
 //!
 //! Fail closed: a reference the reader does not follow (a structured or external reference, a
 //! 3-D range, an unknown sheet or name, a name that names itself) counts as depending on a

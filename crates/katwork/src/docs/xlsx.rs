@@ -450,9 +450,9 @@ pub(super) fn read(bytes: &[u8], limits: &DocLimits) -> Result<Extracted, DocErr
         record_read(part, xml);
         read_sheets.push((at, read_sheet(xml, &strings, limits)?));
     }
-    // A workbook Excel recalculates whole already has every formula flagged; one in manual mode
-    // is not recalculated for its volatile formulas.
-    if !workbook.full_calc_on_load && !workbook.manual {
+    // A workbook Excel recalculates whole already has every formula flagged. A manual
+    // `calcMode` exempts no workbook: Excel keeps the mode of the first workbook it opened.
+    if !workbook.full_calc_on_load {
         let names: Vec<&str> = sheets.iter().map(|sheet| sheet.name.as_str()).collect();
         let read: Vec<(usize, &SheetData)> =
             read_sheets.iter().map(|(at, data)| (*at, data)).collect();
@@ -1401,9 +1401,6 @@ struct Workbook {
     /// manual `calcMode` changes nothing, since Excel keeps the mode of the first workbook it
     /// opened.
     full_calc_on_load: bool,
-    /// `calcMode="manual"`: Excel does not recalculate volatile formulas on open (though it
-    /// may still recalculate the whole workbook, see `full_calc_on_load`).
-    manual: bool,
     sheets: Vec<SheetEntry>,
     names: Vec<deps::DefinedName>,
     /// Markup compatibility left some defined name undecided.
@@ -1428,7 +1425,6 @@ impl Workbook {
         let mut workbook = Workbook {
             date1904: false,
             full_calc_on_load: true,
-            manual: false,
             sheets: Vec::new(),
             names: Vec::new(),
             names_undecided: false,
@@ -1524,11 +1520,14 @@ impl Workbook {
                         &start,
                         ["fullCalcOnLoad", "forceFullCalc", "calcId", "calcMode"],
                     )?;
-                    workbook.manual = match mode.as_deref() {
-                        None | Some("auto" | "autoNoTable") => false,
-                        Some("manual") => true,
-                        Some(_) => return Err(bad),
-                    };
+                    // Read only to refuse a mode Excel does not write: no mode makes a cache
+                    // trusted.
+                    if !matches!(
+                        mode.as_deref(),
+                        None | Some("auto" | "autoNoTable" | "manual")
+                    ) {
+                        return Err(bad);
+                    }
                     let flag = |value: Option<String>| match value {
                         Some(value) => boolean(&value).ok_or(bad),
                         None => Ok(false),
