@@ -6550,7 +6550,16 @@ async fn a_job_that_sees_its_deadline_reports_which_one_passed() {
 
 #[tokio::test]
 async fn a_panic_clears_its_threads_wedge_mark() {
-    let pool = pool(2, Duration::from_millis(10));
+    const CALL: Duration = Duration::from_millis(10);
+    let pool = pool(2, CALL);
+    // Paused time, kept from auto-advancing by a task that never idles: the pool's call-timeout
+    // timer cannot fire while the two jobs meet at the barrier, however slow the machine is.
+    tokio::time::pause();
+    let spinner = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
     // Both jobs wait for each other, so they run on the two threads at once.
     let barrier = Arc::new(Barrier::new(2));
     let panicking = |barrier: Arc<Barrier>| {
@@ -6571,9 +6580,14 @@ async fn a_panic_clears_its_threads_wedge_mark() {
     let (one, two) = (panicking(barrier.clone()), panicking(barrier));
     assert_eq!(one.await.unwrap(), Err::<(), _>(DocError::Internal));
     assert_eq!(two.await.unwrap(), Err::<(), _>(DocError::Internal));
-    // Well past three call timeouts, with every thread idle.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Every job started before this instant, so a mark left behind would read as wedged once
+    // three call timeouts have passed since it. Real time, as the pool reads it.
+    let done = std::time::Instant::now();
+    while done.elapsed() <= CALL * 3 {
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert!(!pool.wedged());
+    spinner.abort();
 }
 
 #[tokio::test]

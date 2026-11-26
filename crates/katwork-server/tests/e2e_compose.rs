@@ -157,8 +157,15 @@ impl Stack {
         } else {
             ("katwork", "3000")
         };
-        let address = self.run(&["port", service, port]);
-        let port = address.trim().rsplit(':').next().unwrap();
+        // Right after a restart the container has no published port until it is up again.
+        let mut address = String::new();
+        poll(|| {
+            let result = output(self.compose().args(["port", service, port]));
+            address = String::from_utf8_lossy(&result.stdout).trim().to_owned();
+            result.status.success() && !address.is_empty()
+        })
+        .await;
+        let port = address.rsplit(':').next().unwrap();
         self.endpoint = format!(
             "{}://localhost:{port}",
             if self.https { "https" } else { "http" }
@@ -168,7 +175,7 @@ impl Stack {
             .timeout(Duration::from_secs(180));
         if self.https {
             // Connect to the assigned port while keeping TLS, Host and HTTP/2 authority canonical.
-            builder = builder.resolve("localhost", address.trim().parse().unwrap());
+            builder = builder.resolve("localhost", address.parse().unwrap());
             let root = self.dir.join("root.crt");
             poll(|| {
                 output(

@@ -299,8 +299,11 @@ async fn short_caller_deadline_timeout_is_not_cached(pool: PgPool) {
     let released = Arc::new(Mutex::new(released));
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = calls.clone();
+    let blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = blocked.clone();
     let extract: ExtractFn = Arc::new(move |_, _, _| {
         if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+            signal.store(true, Ordering::SeqCst);
             let _ = released.lock().unwrap().recv();
         }
         Ok(one_block())
@@ -315,8 +318,19 @@ async fn short_caller_deadline_timeout_is_not_cached(pool: PgPool) {
         &mut h,
         vec![turn("", vec![read("a", file)]), turn("late", vec![])],
     );
+    // Paused time: the 200 ms deadline passes only when the test advances it, once the read
+    // is blocked, so setup speed cannot decide the outcome.
+    let _clock = Clock::pause();
     h.input.deadline = tokio::time::Instant::now() + Duration::from_millis(200);
-    let facts = h.run().await.unwrap();
+    let mut run = Box::pin(h.run());
+    tokio::select! {
+        result = &mut run => panic!("early: {result:?}"),
+        () = async {
+            until(|| blocked.load(Ordering::SeqCst)).await;
+            tokio::time::advance(Duration::from_millis(200)).await;
+        } => {}
+    }
+    let facts = run.await.unwrap();
     assert_eq!(facts.tool_calls[0].state, ToolCallState::Failed);
     let row = &h.rows().await[0];
     assert_eq!(row.get::<String, _>("result"), "doc_timeout");
