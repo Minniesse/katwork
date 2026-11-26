@@ -300,10 +300,6 @@ fn extract_refuses_kinds_whose_readers_come_later() {
         Err(DocError::Unsupported("xlsx"))
     );
     assert_eq!(
-        docs::extract(MediaKind::Pdf, b"%PDF-1.7", &limits()),
-        Err(DocError::Unsupported("pdf"))
-    );
-    assert_eq!(
         docs::extract(MediaKind::Image, b"\x89PNG", &limits()),
         Err(DocError::Unsupported("image"))
     );

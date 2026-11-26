@@ -49,6 +49,10 @@ regex-syntax.workspace = true
 zip.workspace = true
 quick-xml.workspace = true
 crc32fast.workspace = true
+flate2.workspace = true
+lopdf.workspace = true
+pdf-extract.workspace = true
+weezl.workspace = true
 
 # statvfs for the artifact store's free space (f_bavail x f_frsize); std has no call for it.
 [target.'cfg(unix)'.dependencies]
@@ -57,4 +61,3 @@ nix = { version = "0.31", default-features = false, features = ["fs"] }
 [dev-dependencies]
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util", "io-util"] }
-flate2.workspace = true
