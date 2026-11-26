@@ -8,6 +8,8 @@
 //! `cargo test --release -p katwork --test docs_heap -- --ignored --nocapture`
 #[path = "support/ooxml.rs"]
 mod ooxml;
+#[path = "support/pdf_build.rs"]
+mod pdf_build;
 
 use std::{
     sync::Arc,
@@ -602,6 +604,69 @@ fn floods() -> Vec<Flood> {
     ]
 }
 
+/// A PDF `/ActualText` span costs its text once, not once per glyph: one span of 1 MiB over
+/// 1,000 glyphs, fewer than the walk reads between two budget checks, stays far under a 256 MiB
+/// budget (a copy per glyph held 1 GiB before the first check).
+#[test]
+fn a_pdf_actual_text_span_is_held_once() {
+    let mut doc = pdf_build::Doc::new();
+    doc.size = (5_000.0, 50.0);
+    let actual = "A".repeat(1 << 20);
+    let glyphs = "x".repeat(1_000);
+    doc.page(
+        &format!(
+            "BT /F1 4 Tf 10 20 Td /Span << /ActualText ({actual}) >> BDC ({glyphs}) Tj EMC ET"
+        ),
+        "",
+    );
+    let bytes = doc.build();
+    let started = Instant::now();
+    let (result, peak) = heap::measure(|| {
+        deadline::scope(started + Duration::from_secs(60), None, 256 << 20, || {
+            docs::extract(MediaKind::Pdf, &bytes, &DocLimits::default()).map(drop)
+        })
+    });
+    assert!(peak < 64 << 20, "peak {peak} ({result:?})");
+    assert_eq!(result, Ok(()));
+}
+
+/// Many `/ActualText` spans under 64 KiB, all naming one 60 KiB property list: the read stops at
+/// its budget while it makes blocks of their text (each code point of a block holds a box, so
+/// 1,024 such spans between two checks held 1.7 GiB), and the spans' text stops at
+/// `max_output_bytes` in all.
+#[test]
+fn many_pdf_actual_text_spans_stay_within_the_budget() {
+    let pdf = |spans: usize| {
+        let mut doc = pdf_build::Doc::new();
+        doc.size = (50_000.0, 50.0);
+        let properties = doc.add(format!("<< /ActualText ({}) >>", "A".repeat(60 << 10)));
+        doc.page(
+            &format!(
+                "BT /F1 4 Tf 10 20 Td {} ET",
+                "/Span /P0 BDC (x) Tj EMC ".repeat(spans)
+            ),
+            &format!("/Properties << /P0 {properties} 0 R >>"),
+        );
+        doc.build()
+    };
+    let read = |bytes: &[u8], budget: u64| {
+        let started = Instant::now();
+        heap::measure(|| {
+            deadline::scope(started + Duration::from_secs(120), None, budget, || {
+                docs::extract(MediaKind::Pdf, bytes, &DocLimits::default()).map(drop)
+            })
+        })
+    };
+    // 12 MiB of span text, under the output cap: the budget stops it.
+    let (result, peak) = read(&pdf(200), 64 << 20);
+    assert_eq!(result, Err(DocError::TooComplex("memory")));
+    assert!(peak < 96 << 20, "peak {peak}");
+    // 53 MiB of span text, past the output cap, under the default budget.
+    let (result, peak) = read(&pdf(900), 1 << 30);
+    assert_eq!(result, Err(DocError::TooComplex("actual_text")));
+    assert!(peak < 256 << 20, "peak {peak}");
+}
+
 /// A read as the pool runs it, its peak live bytes and how long it took.
 fn counted(bytes: &[u8], limits: &DocLimits) -> (Result<Extracted, DocError>, u64, Duration) {
     let started = Instant::now();
@@ -857,4 +922,63 @@ fn a_style_the_same_under_every_reading_is_held_once() {
         twice < once + once / 4,
         "{once} once, {twice} with four readings"
     );
+}
+
+/// A file whose `startxref` names a Flate stream with a predictor, which lopdf decodes as a
+/// cross-reference stream while it loads, its row buffers sized by the predictor's parameters.
+fn predictor_at_startxref(params: &str) -> Vec<u8> {
+    let mut doc = pdf_build::Doc::new();
+    let id = doc.add(pdf_build::stream(
+        &format!("/Filter /FlateDecode /DecodeParms << /Predictor 12 {params} >>"),
+        &pdf_build::flate(b"\x02\x00\x00"),
+    ));
+    doc.page("", "");
+    let mut bytes = doc.build();
+    let object = format!("\n{id} 0 obj").into_bytes();
+    let at = 1 + bytes
+        .windows(object.len())
+        .position(|window| window == object.as_slice())
+        .unwrap();
+    let table = bytes
+        .windows(9)
+        .rposition(|window| window == b"startxref")
+        .unwrap();
+    bytes.truncate(table);
+    bytes.extend_from_slice(format!("startxref\n{at}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+/// A predictor's row is never sized by the file: lopdf decodes the stream `startxref` names with
+/// two row buffers of `/Columns` x `/Colors` x `/BitsPerComponent` bits each, so a value past the
+/// bounds KatWork's own decoder keeps is refused before lopdf reads the file (one such file held
+/// two 4 GiB buffers). Each value here would cost lopdf at least 128 MiB.
+#[test]
+fn a_pdf_predictor_row_is_never_sized_by_the_file() {
+    for params in [
+        "/Columns 67108864",
+        "/Columns 4294967295",
+        "/Colors 67108864",
+        "/BitsPerComponent 536870912",
+        "/Columns%huge\n+67108864",
+        "/Col#75mns 67108864",
+        "/Columns 67108864.0",
+        "/Columns 99999999999999999999999",
+    ] {
+        let bytes = predictor_at_startxref(params);
+        let (result, peak) = heap::measure(|| {
+            docs::extract(MediaKind::Pdf, &bytes, &DocLimits::default()).map(drop)
+        });
+        assert!(peak < 16 << 20, "{params}: peak {peak} ({result:?})");
+        assert_eq!(
+            result,
+            Err(DocError::Malformed("stream_predictor")),
+            "{params}"
+        );
+    }
+    // At the bounds the file reads as before.
+    let bytes = predictor_at_startxref("/Columns 65536 /Colors 32 /BitsPerComponent 16");
+    let (result, peak) =
+        heap::measure(|| docs::extract(MediaKind::Pdf, &bytes, &DocLimits::default()).map(drop));
+    assert!(peak < 16 << 20, "peak {peak} ({result:?})");
+    assert_eq!(result, Ok(()));
 }

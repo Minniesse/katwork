@@ -11,10 +11,16 @@ pub mod deadline;
 mod docx;
 pub mod heap;
 pub mod limits;
+pub mod numfmt;
 pub mod package;
+pub mod pdf;
+pub mod pdf_guard;
+pub mod pdf_layer;
+pub mod pdf_visibility;
 pub mod pool;
 mod text;
 pub mod watchdog;
+pub mod xlsx;
 pub mod xml_guard;
 
 pub use limits::DocLimits;
@@ -87,7 +93,20 @@ impl ExtractorId {
         name: Cow::Borrowed("docx-accepted"),
         version: 1,
     };
+    pub const XLSX: ExtractorId = ExtractorId {
+        name: Cow::Borrowed("xlsx-cached"),
+        version: 1,
+    };
+    pub const PDF: ExtractorId = ExtractorId {
+        name: Cow::Borrowed("pdf-text"),
+        version: 1,
+    };
 }
+
+/// The XLSX reader's id, under the name the SP2a plan gives it.
+pub const XLSX: ExtractorId = ExtractorId::XLSX;
+/// The PDF reader's extractor (`ExtractorId::PDF`).
+pub const PDF: ExtractorId = ExtractorId::PDF;
 
 /// A longer block is split into pieces of at most this many code points (see `split_pieces`).
 pub const MAX_BLOCK_CHARS: usize = 1_500;
@@ -133,6 +152,27 @@ pub enum HiddenWhy {
     HiddenColumn,
     HiddenSheet,
     EmptyFormat,
+}
+
+impl HiddenWhy {
+    /// The wire name, as serde writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HiddenWhy::InvisibleMode => "invisible_mode",
+            HiddenWhy::OptionalContentOff => "optional_content_off",
+            HiddenWhy::OutsideCropBox => "outside_crop_box",
+            HiddenWhy::Clipped => "clipped",
+            HiddenWhy::Transparent => "transparent",
+            HiddenWhy::Tiny => "tiny",
+            HiddenWhy::LowContrast => "low_contrast",
+            HiddenWhy::Covered => "covered",
+            HiddenWhy::UnknownPaint => "unknown_paint",
+            HiddenWhy::HiddenRow => "hidden_row",
+            HiddenWhy::HiddenColumn => "hidden_column",
+            HiddenWhy::HiddenSheet => "hidden_sheet",
+            HiddenWhy::EmptyFormat => "empty_format",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -245,8 +285,8 @@ pub fn extract(kind: MediaKind, bytes: &[u8], limits: &DocLimits) -> Result<Extr
     match kind {
         MediaKind::Text => text::read(bytes, limits),
         MediaKind::Docx => docx::read(bytes, limits),
-        MediaKind::Xlsx => Err(DocError::Unsupported("xlsx")),
-        MediaKind::Pdf => Err(DocError::Unsupported("pdf")),
+        MediaKind::Xlsx => xlsx::read(bytes, limits),
+        MediaKind::Pdf => pdf::read(bytes, limits),
         MediaKind::Image => Err(DocError::Unsupported("image")),
     }
 }
