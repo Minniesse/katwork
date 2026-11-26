@@ -2,7 +2,7 @@
 
 This document lists every KatWork sub-project from the design spec (`docs/spec/katwork-design.md` §19), plus the sub-projects proposed for the expanded scope (9 to 14), what each one covers, what it depends on, its rough size, the order of work, and the entry criteria for the public alpha. It is a map, not a plan. Each sub-project gets its own detailed plan, and the founder approves each plan before that build starts (spec §19.1). The founder decided (2026-11-25) that each plan is written and reviewed one wave ahead of its build; that is process, not scope.
 
-Where this roadmap and the spec or an approved plan disagree, the spec and the plan win. Scope listed here comes from the spec, the approved plans, the ADRs in `docs/adr/`, and the founder's rulings and decisions of 2026-11-26 on the expanded scope (see "Expanded scope" and "Decisions" below). The spec changes the expanded scope needs are in `docs/spec/2026-11-26-scope-amendment.md`. The founder approved them with this re-plan, and they are still to be written into the spec; until then, each approved change takes precedence over the spec text it changes. The few questions the approval did not settle are listed at the end.
+Where this roadmap and the spec or an approved plan disagree, the spec and the plan win. Scope listed here comes from the spec, the approved plans, the ADRs in `docs/adr/`, and the founder's rulings and decisions of 2026-11-26 on the expanded scope (see "Expanded scope" and "Decisions" below). The spec changes the expanded scope needs are in `docs/spec/2026-11-26-scope-amendment.md`. The founder approved them with this re-plan; they are still to be written into the spec. The few questions the approval did not settle are listed at the end.
 
 ## Sizes
 
@@ -291,6 +291,8 @@ Some parts of the competing product run against KatWork's spec or ADRs, for exam
 - Local computer use: the accessibility tree, screen actions, and grants per app.
 - Personal-data tools on that computer: messages, mail, notes, reminders, calendar, contacts, photos and location, each behind its own grant and each outward send a Proposal (§6.5).
 - Desktop notifications, a tray, a capture overlay and element picking, built into the Tauri shell from sub-project 6.
+- Platforms (Q16): Windows and macOS desktop through the Tauri shell. Mobile gets notifications only.
+- Order (Q13): personal data comes first through cross-platform connectors (mail and calendar, LINE). Apple-only tools come last in this sub-project's plan.
 
 **Rules proposed for its plan and the companion trust-model ADR** (not decided):
 - The companion checks every approval itself, for example against a signed proposal digest, instead of trusting a flag from the server.
@@ -336,7 +338,7 @@ Some parts of the competing product run against KatWork's spec or ADRs, for exam
 - A connector catalog with the OAuth lifecycle: a sign-in card, typed refusal and sign-out reasons, and several accounts per connector.
 - Connector credentials: per person, per Kat service account, or delegated, with write-only secrets.
 - General MCP servers beyond Craft: tools, resources, auth and elicitation, behind the same policy posture as Craft's MCP proxy.
-- Named connectors chosen by Thai-market demand (Q13), including mail and calendar, a password manager, travel, forge, social search and finance.
+- Named connectors in this order (Q14): mail and calendar first, then file stores and LINE OA, then the rest by design-partner demand, including a password manager, travel, forge, social search and finance.
 - Image and video generation as model connectors, opt-in, with cost caps (Phase 4's creative Kat capability, pulled forward).
 - External coding agents launched as connectors.
 - A plugin package format with strict ingestion checks, and a team marketplace with optional, default and required plugins.
@@ -436,6 +438,7 @@ How to read these counts:
 
 - **Alpha 1** is the spec as written, plus the claim-carrying differentiation proposals. Its sub-projects depend only on each other:
   - 2b needs 2a's artifact store (Task 2, merged), and 2c needs `normalize_th` (Task 1, merged).
+  - 3 needs 2a's evidence verifier, evidence reports and trust flags. It starts when 2a is 34 of 39 tasks merged.
   - 4 needs 3 and 2c (Q2). 5 needs 3 and 4. 6 needs 3, 4 and 2b. 7 needs 2a's Craft track, 3 and 2b.
   - Sub-project 3's templates need sub-project 4's planning and delegation, and the research brief needs 2b's saved web spans. So sub-project 3 is split (Q4): its gates and policy come before 4, and its template tasks come after 4.
 - **Alpha 2** is the platform layer the other new areas use.
@@ -456,7 +459,8 @@ The schedule follows these rules:
 - A sub-project starts once each of its dependencies was three-quarters merged at the start of that week, as stacked PRs. It finishes only after its dependencies finish.
 - Where a sub-project depends on sub-project 3, it depends on 3's gates-and-policy part (25 tasks). Only 3's 14 template tasks depend on sub-project 4 (and on 2a and 2b).
 - Each wave's release work (hardening, demo mode, docs) starts only after all the other work in that wave is done.
-- Inside Alpha 2, routines (13) and team admin (14) wait for sub-project 12 to be three-quarters merged, and 14 also waits for the admin pages. That is why Alpha 2's 113 tasks take 31 weeks, not 29.
+- Inside Alpha 2, routines (13) and team admin (14) wait for sub-project 12 to be three-quarters merged, and 14 also waits for the admin pages. Alpha 2's 17 differentiation tasks also share one 2-builder limit. That is why Alpha 2's 113 tasks take 31 weeks, not 29.
+- Alpha 1's order was searched; waves 2 to 4 use one fixed order. A better order might save Alpha 2 about a week.
 - 2b, 2c and 3 cannot start before their plans are approved (target week of 2026-12-14).
 - Plans and ADRs are written one wave ahead of their builds and do not use builder time.
 - A later wave starts building when the previous wave's builds end, while that wave's dry runs and release candidate run.
@@ -557,7 +561,7 @@ The order follows three things: how many independent sources support each need, 
 | 5 | **Approvals that catch errors.** Approval prompts decay into rubber stamps, and blame lands on the nearest person. | Each approval card stores exactly what it showed, and there are more ways to answer. | Proposals, approval cards and the audit log (§6.5, §7.2) | DP9 approve with a comment, unsure, forced span opening for high-risk claims, a card budget per job, the card content in the audit row, seal-and-initial approval, a fast-approval alarm (3, with 6) |
 | 6 | **An honest "done".** Agents claim completion they did not achieve. | Completion comes from a harness-owned record, never from the model. Reports are generated by code. | The harness-owned completion record (§19 item 3); reports generated by code (§7.1); stops name a reason (§6.6) | DP4 a completion receipt from the job log, where a skipped file or a zero-match run fails (3) |
 | 7 | **Staying in control.** People want partnership, not full automation. | Clarifying questions, Proposals for outward actions, pausing, and take-over. | Clarifying questions (§6.4); Proposals (§6.5); pause all Kats (§6.6); take-over (§9) | DP10 redo one section without a restart, and a stop-latency target (4) |
-| 8 | **Thai official-document correctness.** This covers Buddhist-Era dates, numerals, register, the official letter form, and scanned input. | Thai normalisation and Buddhist-Era dates. OCR lines below confidence are flagged. | `katwork-thai` and OCR flags (2a plan, ADR-0007) | An official letter and memo template with a register check, in Alpha 2 (Q26; 3, 4 tasks) |
+| 8 | **Thai official-document correctness.** This covers Buddhist-Era dates, numerals, register, the official letter form, and scanned input. | Thai normalisation and Buddhist-Era dates. OCR lines below confidence are flagged. | `katwork-thai` and OCR flags (2a plan, ADR-0007) | An official letter and memo template with a register check, in Alpha 2 (Q26; sub-project 3, 4 tasks) |
 | 9 | **Reconcile across files, show only the exceptions, and keep the same figure everywhere.** | In a pack, every output draws each figure from one verified fact, and cross-file conflicts become an approval card. | The monthly pack (§8) | DP11 a matched-and-exceptions output (3) |
 | 10 | **Predictable cost.** People want an estimate first, no silent burn, and no silent switch to a weaker model. | Run budgets, and usage per Kat and job. A provider limit stops the job with a named reason. | Run budgets (§6.6); usage tracking and limits (§11) | DP12 a pre-run estimate, a workspace cap, an "unpriced" state and no silent downgrade (4, with 6) |
 | 11 | **Memory of facts and decisions, with their reasons, across a long job.** | Shared decisions per Space, and `remember` with provenance. | §11 memory (2c) | DP13 a decision log with reasons and rejected options (2c) |
@@ -583,7 +587,7 @@ The research found no supporting evidence for these areas. It found some evidenc
 
 | Area | Wave | Evidence to gather |
 |---|---|---|
-| Payments (sub-project 10) | Alpha 3 | Whether offices want Kats to pay, and for what; the rails question (Q9) |
+| Payments (sub-project 10) | Alpha 3 | Whether offices want Kats to pay, and for what; how many installs use the fallback checkout (Q9) |
 | Outbound phone calls (sub-project 11) | Alpha 4 | Office demand; the Thai legal read (Q11) |
 | Local desktop control (sub-project 9) | Alpha 3 | Which tasks people would hand over on their own computer |
 | Personal data from apps on a person's own computer (sub-project 9) | Alpha 3 | Demand among LINE-first and Windows users (Q13) |
@@ -646,7 +650,11 @@ The spec names, without assigning them to sub-projects:
 - KatsAgentOS, built by the lab (§14);
 - the Enterprise edition features (§16);
 - a hosted cloud (§16);
-- the Phase 2 to 4 use cases (§8): PPTX output and Thai OCR at scale (Phase 2), a tracked-changes engine and scheduled browser research (Phase 3), and a creative Kat (Phase 4).
+- the Phase 2 to 4 use cases (§8): PPTX output and Thai OCR at scale (Phase 2), a tracked-changes engine (Phase 3), and the creative-Kat use cases (Phase 4). Two Phase capabilities come earlier, in Alpha 2: scheduled browser research (sub-project 13) and image and video generation (sub-project 12).
+
+The decisions also place two adopted capabilities after the last alpha wave:
+- private worker pools, because the alpha waves stay single-host (Q23);
+- a phone as a tool host, because mobile is notifications only in the alpha waves (Q16, Q24).
 
 ## Decisions (founder, 2026-11-26)
 

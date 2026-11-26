@@ -1,6 +1,6 @@
 # Scope amendment: the expanded scope in alpha waves
 
-- Status: Approved (2026-11-26). The founder approved the re-plan and took every recommended answer (roadmap "Decisions"). The changes below are still to be written into `katwork-design.md`. Until then, each change takes precedence over the spec text it changes, from its wave on.
+- Status: Approved (2026-11-26), with the re-plan in PR #150; the founder took every recommended answer (roadmap "Decisions"). The changes below are still to be written into `katwork-design.md`.
 - Decision owner: Founder
 - Roadmap: `docs/roadmap.md` (sub-projects 9 to 14, "Additions to existing sub-projects", "Re-plan: staged alphas", "Differentiation", and "Decisions")
 
@@ -123,7 +123,7 @@ Today every place a Kat acts is a server-side computer that KatWork isolates and
 ### MCP posture [needed before Alpha 2]
 
 ADR-0010 and ADR-0011 cover untrusted content and the Craft apps' MCP servers behind a policy proxy. General MCP servers are wider. They come from third parties and run commands or call remote services. They return text and resources that may carry injections, they ask for credentials, and they can elicit input from a person. The ADR must settle several things:
-- which transports are allowed: remote HTTPS only at first, or stdio in pinned containers;
+- how remote HTTPS servers come first, and how stdio servers run as pinned containers (roadmap Q17);
 - how tools are allowlisted per Kat and per Space: always, ask or blocked;
 - how MCP results are flagged as untrusted;
 - whose credentials a server sees;
@@ -140,7 +140,7 @@ Voice chat, dictation, phone calls and meeting capture all need speech-to-text a
 ### Payment rails [needed before Alpha 3]
 
 Kats paying for things need instruments, limits and records. A self-hosted install has no merchant relationship, card-issuing account or payment processor of its own. The ADR must settle several things:
-- which rails an install uses (roadmap Q9);
+- how an install connects its own payment provider account, and how the fallback checkout a person pays works (roadmap Q9);
 - how instruments are stored and shown to Kats without exposing card data to a model;
 - how spend limits and expected prices are checked in code;
 - what second factor approves a payment;
