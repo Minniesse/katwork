@@ -1214,6 +1214,112 @@ fn parameter_names_count_only_where_a_let_or_lambda_binds_them() {
 }
 
 #[test]
+fn fully_written_arrays_cost_no_rectangle_checks() {
+    // 20,000 single-cell arrays reading one TODAY(), and 20,000 sums beside them: read, with
+    // the arrays flagged and the sums not.
+    let n = 20_000u32;
+    let rows: String = (1..=n)
+        .map(|r| {
+            let first = if r == 1 {
+                r#"<c r="A1"><f>TODAY()</f><v>1</v></c>"#.to_owned()
+            } else {
+                String::new()
+            };
+            row(
+                r,
+                &format!(
+                    r#"{first}<c r="B{r}"><f t="array" ref="B{r}">$A$1-C{r}</f><v>1</v></c><c r="E{r}"><f>SUM(F{r}:G{r})</f><v>2</v></c>"#
+                ),
+            )
+        })
+        .collect();
+    let extracted = read(&Xlsx::new().sheet("S", &data(&rows)));
+    let flagged = recalculated(&extracted);
+    assert_eq!(flagged.len(), n as usize + 1);
+    assert!(flagged.iter().all(|at| !at.starts_with("S!E")));
+    // 8,000 two-cell dynamic arrays, every cell written.
+    let n = 8_000u32;
+    let rows: String = (1..=n)
+        .map(|r| {
+            let first = if r == 1 {
+                r#"<c r="A1"><f>TODAY()</f><v>1</v></c>"#.to_owned()
+            } else {
+                String::new()
+            };
+            row(
+                r,
+                &format!(
+                    r#"{first}<c r="B{r}"><f t="array" ref="B{r}:C{r}">$A$1+{{1,2}}</f><v>1</v></c><c r="C{r}"><v>2</v></c><c r="E{r}"><f>SUM(F{r}:G{r})</f><v>2</v></c>"#
+                ),
+            )
+        })
+        .collect();
+    let flagged = recalculated(&read(&Xlsx::new().sheet("S", &data(&rows))));
+    assert_eq!(flagged.len(), 2 * n as usize + 1);
+}
+
+#[test]
+fn three_d_references_through_an_unread_sheet_seed_the_walk() {
+    for reference in [
+        "Macro1:S!A1",
+        "S:Macro1!A1",
+        "'Macro1:S'!A1",
+        "'S:Macro1'!A1",
+        "S:T!A1",
+    ] {
+        let main = data(&row(
+            1,
+            &format!(r#"<c r="A1"><f>SUM({reference})</f><v>999</v></c>"#),
+        ));
+        // Sheets in tab order: S, Macro1, T.
+        let base = Xlsx::new()
+            .sheet("S", &main)
+            .sheet("T", &data(&row(1, &num("A1", 0, "1"))));
+        let workbook = base.workbook_part().replace(
+            r#"<sheet name="T""#,
+            r#"<sheet name="Macro1" sheetId="9" r:id="rIdW0"/><sheet name="T""#,
+        );
+        let macros = format!(
+            r#"<?xml version="1.0"?><xm:macrosheet xmlns="{SML}" xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main"><sheetData><row r="1"><c r="A1"><f>NOW()</f><v>1</v></c></row></sheetData></xm:macrosheet>"#
+        );
+        let extracted = read(
+            &base
+                .related(
+                    &format!("{MS_REL}xlIntlMacrosheet"),
+                    "macrosheets/intl1.xml",
+                    Some(macros.as_bytes()),
+                )
+                .workbook_xml(&workbook),
+        );
+        assert_eq!(recalculated(&extracted), ["S!A1"], "{reference}");
+    }
+}
+
+#[test]
+fn parameters_are_bound_only_inside_a_let_or_lambda() {
+    let one = |formula: &str| {
+        let rows = row(
+            1,
+            &format!(
+                r#"<c r="A1"><f>{formula}</f><v>1</v></c><c r="B1"><f>A1+1</f><v>999</v></c>"#
+            ),
+        );
+        recalculated(&read(&Xlsx::new().sheet("S", &data(&rows))))
+    };
+    // Written outside any LET or LAMBDA, in a quoted sheet name or brackets, it binds nothing.
+    for formula in [
+        "SUM(_xlpm.f)+_xlpm.f()",
+        "'_xlpm.f'!A1+_xlpm.f()",
+        "_xlfn.LET(_xlpm.x,'_xlpm.f'!A1,_xlpm.f())",
+        "_xlfn.LET(_xlpm.x,Table1[_xlpm.f],_xlpm.f())",
+        "SUM(1)+_xlpm.f()",
+    ] {
+        assert_eq!(one(formula), ["S!A1", "S!B1"], "{formula}");
+    }
+    assert!(one("_xlfn.LET(_xlpm.f,_xlfn.LAMBDA(_xlpm.x,_xlpm.x+1),_xlpm.f(2))").is_empty());
+}
+
+#[test]
 fn a_workbook_with_no_volatile_formula_keeps_its_caches() {
     let rows = row(
         1,

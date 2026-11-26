@@ -618,7 +618,7 @@ struct Resolver<'a> {
     sheets: HashMap<String, usize>,
     /// The workbook's other sheets (chart, dialog and macro sheets), lower-cased: their cells
     /// are never read, so one may hold the only volatile formula.
-    unread: HashSet<String>,
+    unread: HashMap<String, usize>,
     /// Some formula reads a sheet in `unread`.
     unreadable: bool,
     /// (sheet or none, upper-cased name) to the index of the name.
@@ -687,7 +687,7 @@ pub(super) fn volatile_cells(
             .iter()
             .enumerate()
             .filter(|(at, _)| !sheets.iter().any(|&(read, _)| read == *at))
-            .map(|(_, name)| name.to_lowercase())
+            .map(|(at, name)| (name.to_lowercase(), at))
             .collect(),
         unreadable: false,
         names: defined
@@ -873,15 +873,23 @@ impl Tainted {
         self.mark(at, queue);
         let (sheet, ..) = at;
         for range in ranges.get(&at).into_iter().flatten() {
-            self.ranges.push((sheet, *range));
-            let Some(read) = cells.get(&sheet) else {
-                continue;
-            };
-            for &(row, col) in read.range((range.top, range.left)..=(range.bottom, range.right)) {
-                work.step(1)?;
-                if (range.left..=range.right).contains(&col) {
-                    self.mark((sheet, row, col), queue);
+            let mut marked = 0u64;
+            if let Some(read) = cells.get(&sheet) {
+                for &(row, col) in read.range((range.top, range.left)..=(range.bottom, range.right))
+                {
+                    work.step(1)?;
+                    if (range.left..=range.right).contains(&col) {
+                        self.mark((sheet, row, col), queue);
+                        marked += 1;
+                    }
                 }
+            }
+            // Kept whole only when the file leaves some of its cells out: a range every cell
+            // of which is marked costs `within` nothing more.
+            let size =
+                u64::from(range.bottom - range.top + 1) * u64::from(range.right - range.left + 1);
+            if marked < size {
+                self.ranges.push((sheet, *range));
             }
         }
         Ok(())
@@ -942,8 +950,30 @@ impl Resolver<'_> {
     fn sheet(&mut self, name: &str) -> Option<usize> {
         let name = name.to_lowercase();
         let found = self.sheets.get(&name).copied();
-        self.unreadable |= found.is_none() && self.unread.contains(&name);
+        self.unreadable |= found.is_none() && self.unread.contains_key(&name);
+        if let Some((first, last)) = name.split_once(':') {
+            self.span(first, last);
+        }
         found
+    }
+
+    /// A 3-D reference from sheet `first` to sheet `last`, in tab order: notes an unread sheet
+    /// at either end or between them.
+    fn span(&mut self, first: &str, last: &str) {
+        let at = |name: &str| {
+            let name = name.to_lowercase();
+            self.sheets
+                .get(&name)
+                .or_else(|| self.unread.get(&name))
+                .copied()
+        };
+        let (first_at, last_at) = (at(first), at(last));
+        let (low, high) = match (first_at, last_at) {
+            (Some(a), Some(b)) => (a.min(b), a.max(b)),
+            (Some(a), None) | (None, Some(a)) => (a, a),
+            (None, None) => return,
+        };
+        self.unreadable |= self.unread.values().any(|&at| (low..=high).contains(&at));
     }
 
     /// What `text` depends on, read at `place`; `depth` counts the names it is read through.
@@ -1109,6 +1139,10 @@ impl Resolver<'_> {
                 _ => None,
             };
             let Some((a, b)) = range.filter(|_| chars.get(stop) != Some(&'!')) else {
+                // `First:Last!A1`: a 3-D reference, not followed.
+                if chars.get(stop) == Some(&'!') {
+                    self.span(&token, &other);
+                }
                 deps.unknown = true;
                 return Ok(stop);
             };
@@ -1288,34 +1322,74 @@ impl Resolver<'_> {
     }
 }
 
-/// The `_xlpm.` names, upper-cased, that `chars` writes anywhere but in call position outside
-/// string literals: the parameters a `LET` or `LAMBDA` of the same text binds.
+/// The `_xlpm.` names, upper-cased, that `chars` writes inside a `LET` or `LAMBDA` call and
+/// not in call position (string literals, quoted sheet names and bracketed text left out): the
+/// parameters such a call binds.
 fn bound_parameters(chars: &[char]) -> HashSet<String> {
     let mut bound = HashSet::new();
+    // The function each open parenthesis belongs to: whether it is a `LET` or `LAMBDA`.
+    let mut calls: Vec<bool> = Vec::new();
     let mut at = 0;
     while let Some(&c) = chars.get(at) {
-        if c == '"' {
-            at += 1;
-            while chars.get(at).is_some_and(|&c| c != '"') {
+        match c {
+            '"' | '\'' => {
+                at += 1;
+                while chars.get(at).is_some_and(|&next| next != c) {
+                    at += 1;
+                }
                 at += 1;
             }
-            at += 1;
-        } else if word(c) && (at == 0 || !word(chars[at - 1])) {
-            let start = at;
-            while chars.get(at).is_some_and(|&c| word(c)) {
+            '[' => {
+                let mut open = 0u32;
+                while let Some(&c) = chars.get(at) {
+                    at += 1;
+                    match c {
+                        '[' => open += 1,
+                        ']' => {
+                            open = open.saturating_sub(1);
+                            if open == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            '(' => {
+                calls.push(false);
                 at += 1;
             }
-            let token: String = chars[start..at].iter().collect::<String>().to_uppercase();
-            let mut next = at;
-            while chars.get(next).is_some_and(|c| " \r\n\t".contains(*c)) {
-                next += 1;
+            ')' => {
+                calls.pop();
+                at += 1;
             }
-            if token.starts_with(&PARAMETER_PREFIX.to_uppercase()) && chars.get(next) != Some(&'(')
-            {
-                bound.insert(token);
+            c if word(c) => {
+                let start = at;
+                while chars.get(at).is_some_and(|&c| word(c)) {
+                    at += 1;
+                }
+                let token: String = chars[start..at].iter().collect::<String>().to_uppercase();
+                let mut next = at;
+                while chars.get(next).is_some_and(|c| " \r\n\t".contains(*c)) {
+                    next += 1;
+                }
+                if chars.get(next) == Some(&'(') {
+                    let mut name = token.as_str();
+                    while let Some(rest) = FUNCTION_PREFIXES
+                        .iter()
+                        .find_map(|prefix| name.strip_prefix(&prefix.to_uppercase()))
+                    {
+                        name = rest;
+                    }
+                    calls.push(matches!(name, "LET" | "LAMBDA"));
+                    at = next + 1;
+                } else if token.starts_with(&PARAMETER_PREFIX.to_uppercase())
+                    && calls.iter().any(|&binds| binds)
+                {
+                    bound.insert(token);
+                }
             }
-        } else {
-            at += 1;
+            _ => at += 1,
         }
     }
     bound
