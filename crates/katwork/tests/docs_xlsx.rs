@@ -1320,6 +1320,141 @@ fn parameters_are_bound_only_inside_a_let_or_lambda() {
 }
 
 #[test]
+fn arrays_whose_results_are_empty_count_as_written() {
+    // A single-cell array per row that shows "" or its value, a SUM beside it, one TODAY():
+    // read, with only the shown arrays and TODAY() flagged.
+    // All empty, then every other one empty.
+    for (n, half) in [(4_000u32, false), (20_000, true)] {
+        let rows: String = (1..=n)
+            .map(|r| {
+                let first = if r == 1 {
+                    r#"<c r="Z1"><f>TODAY()</f><v>1</v></c>"#
+                } else {
+                    ""
+                };
+                let shown = half && r % 2 == 1;
+                let cached = if shown {
+                    r.to_string()
+                } else {
+                    String::new()
+                };
+                let array = if shown {
+                    format!(r#"<c r="B{r}"><f t="array" ref="B{r}">IF(A{r}&gt;$Z$1,"",A{r})</f><v>{cached}</v></c>"#)
+                } else {
+                    format!(r#"<c r="B{r}" t="str"><f t="array" ref="B{r}">IF(A{r}&gt;$Z$1,"",A{r})</f><v></v></c>"#)
+                };
+                row(
+                    r,
+                    &format!(
+                        r#"{array}<c r="C{r}"><f>SUM(D{r}:E{r})</f><v>2</v></c>{first}"#
+                    ),
+                )
+            })
+            .collect();
+        let flagged = recalculated(&read(&Xlsx::new().sheet("S", &data(&rows))));
+        let shown = if half { n / 2 } else { 0 };
+        assert_eq!(flagged.len(), shown as usize + 1, "{n}");
+        assert!(flagged.iter().all(|at| !at.starts_with("S!C")), "{n}");
+    }
+}
+
+#[test]
+fn a_large_array_with_an_empty_anchor_is_fully_written() {
+    // 150 arrays of 65 cells, each anchor showing "" and the other 64 cells written, then
+    // 10,000 SUMs over other cells: the arrays add no rectangle, so the walk stays under its
+    // cap (here 64 units for each of 20,000 cells) and the SUMs keep their caches.
+    let col = |c: u32| {
+        let (mut letters, mut c) = (Vec::new(), c);
+        while c > 0 {
+            c -= 1;
+            letters.push(b'A' + (c % 26) as u8);
+            c /= 26;
+        }
+        letters.reverse();
+        String::from_utf8(letters).unwrap()
+    };
+    let mut rows = String::new();
+    for r in 1..=150u32 {
+        let mut cells = format!(
+            r#"<c r="A{r}" t="str"><f t="array" ref="A{r}:{}{r}">IF($BO$1&gt;0,"",1)</f><v></v></c>"#,
+            col(65)
+        );
+        for c in 2..=65 {
+            cells.push_str(&format!(r#"<c r="{}{r}"><v>1</v></c>"#, col(c)));
+        }
+        if r == 1 {
+            cells.push_str(r#"<c r="BO1"><f>TODAY()</f><v>1</v></c>"#);
+        }
+        rows.push_str(&row(r, &cells));
+    }
+    for r in 151..=10_150u32 {
+        rows.push_str(&row(
+            r,
+            &format!(r#"<c r="A{r}"><f>SUM(B{r}:C{r})</f><v>2</v></c>"#),
+        ));
+    }
+    let small = DocLimits {
+        max_cells: 20_000,
+        ..limits()
+    };
+    let extracted = extract_with(&Xlsx::new().sheet("S", &data(&rows)), &small).unwrap();
+    let flagged = recalculated(&extracted);
+    assert_eq!(flagged.len(), 150 * 64 + 1);
+    assert!(!flagged.contains(&"S!A151".to_owned()));
+}
+
+#[test]
+fn small_partly_written_arrays_are_marked_cell_by_cell() {
+    // 8,000 two-cell arrays whose second cell the file leaves out, beside SUMs over other
+    // cells: read without keeping a rectangle each, and a range over a missing cell flagged.
+    let n = 8_000u32;
+    let rows: String = (1..=n)
+        .map(|r| {
+            let first = if r == 1 {
+                r#"<c r="G1"><f>SUM(C1:C2)</f><v>999</v></c><c r="Z1"><f>TODAY()</f><v>1</v></c>"#
+            } else {
+                ""
+            };
+            row(
+                r,
+                &format!(
+                    r#"<c r="B{r}"><f t="array" ref="B{r}:C{r}">$Z$1+{{1,2}}</f><v>1</v></c><c r="E{r}"><f>SUM(F{r}:G{r})</f><v>2</v></c>{first}"#
+                ),
+            )
+        })
+        .collect();
+    let flagged = recalculated(&read(&Xlsx::new().sheet("S", &data(&rows))));
+    assert!(flagged.contains(&"S!G1".to_owned()));
+    // The arrays, TODAY(), G1 and the one SUM whose range holds G1 (E1, over F1:G1).
+    assert_eq!(flagged.len(), n as usize + 3);
+}
+
+#[test]
+fn a_chart_sheet_inside_a_three_d_range_seeds_nothing() {
+    // Sheets in tab order: Jan, Chart1, Feb. A chart sheet holds no cells, so a 3-D range
+    // across it reads no unread cell.
+    let jan = data(&row(1, r#"<c r="A1"><f>SUM(Jan:Feb!B1)</f><v>3</v></c>"#));
+    let base = Xlsx::new()
+        .sheet("Jan", &jan)
+        .sheet("Feb", &data(&row(1, &num("B1", 0, "1"))));
+    let workbook = base.workbook_part().replace(
+        r#"<sheet name="Feb""#,
+        r#"<sheet name="Chart1" sheetId="9" r:id="rIdW0"/><sheet name="Feb""#,
+    );
+    let chart = format!(r#"<?xml version="1.0"?><chartsheet xmlns="{SML}"/>"#);
+    let extracted = read(
+        &base
+            .related(
+                "chartsheet",
+                "chartsheets/sheet1.xml",
+                Some(chart.as_bytes()),
+            )
+            .workbook_xml(&workbook),
+    );
+    assert!(recalculated(&extracted).is_empty());
+}
+
+#[test]
 fn a_workbook_with_no_volatile_formula_keeps_its_caches() {
     let rows = row(
         1,
@@ -1374,8 +1509,9 @@ fn volatile_dependency_chains_read_in_any_order_within_the_caps() {
             .iter()
             .all(|block| block.suspect == Some("xlsx_recalculated"))
     );
-    // A chain of ranges that only resolves backwards, one link per pass, is refused past the
-    // walk's work cap rather than walked without bound.
+    // A chain of ranges that only resolves backwards, one link per pass, stops at the walk's
+    // work cap rather than running without bound: then every formula counts as recalculated,
+    // one that reads nothing volatile (B1) included, and the file is still read.
     let n = 900u32;
     let rows: String = (1..=n)
         .map(|r| {
@@ -1384,17 +1520,24 @@ fn volatile_dependency_chains_read_in_any_order_within_the_caps() {
             } else {
                 format!("SUM(A{}:A{})", r + 1, (r + 2).min(n))
             };
-            row(r, &format!(r#"<c r="A{r}"><f>{formula}</f><v>1</v></c>"#))
+            let plain = if r == 1 {
+                r#"<c r="B1"><f>1+1</f><v>2</v></c>"#
+            } else {
+                ""
+            };
+            row(
+                r,
+                &format!(r#"<c r="A{r}"><f>{formula}</f><v>1</v></c>{plain}"#),
+            )
         })
         .collect();
     let small = DocLimits {
         max_cells: 1_000,
         ..limits()
     };
-    assert_eq!(
-        extract_with(&Xlsx::new().sheet("S", &data(&rows)), &small),
-        Err(DocError::TooComplex("formula_dependencies"))
-    );
+    let capped = extract_with(&Xlsx::new().sheet("S", &data(&rows)), &small).unwrap();
+    assert_eq!(recalculated(&capped).len(), n as usize + 1);
+    assert!(recalculated(&capped).contains(&"S!B1".to_owned()));
 }
 
 #[test]

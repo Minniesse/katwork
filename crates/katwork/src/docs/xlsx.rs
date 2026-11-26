@@ -456,9 +456,13 @@ pub(super) fn read(bytes: &[u8], limits: &DocLimits) -> Result<Extracted, DocErr
         let names: Vec<&str> = sheets.iter().map(|sheet| sheet.name.as_str()).collect();
         let read: Vec<(usize, &SheetData)> =
             read_sheets.iter().map(|(at, data)| (*at, data)).collect();
+        let charts: Vec<usize> = (0..sheets.len())
+            .filter(|&at| matches!(sheets[at].kind, SheetKind::Chart))
+            .collect();
         out.volatile = deps::volatile_cells(
             &names,
             &read,
+            &charts,
             &workbook.names,
             workbook.names_undecided,
             limits,
@@ -786,10 +790,9 @@ impl Parts {
                     return Err(DocError::Malformed("xlsx_sheet_identity"));
                 }
                 SheetKind::Worksheet(part)
-            } else if rel.is("chartsheet")
-                || rel.is("dialogsheet")
-                || rel.is("xlMacrosheet")
-                || rel.is("xlIntlMacrosheet")
+            } else if rel.is("chartsheet") {
+                SheetKind::Chart
+            } else if rel.is("dialogsheet") || rel.is("xlMacrosheet") || rel.is("xlIntlMacrosheet")
             {
                 SheetKind::NoCells
             } else {
@@ -1600,8 +1603,10 @@ impl Workbook {
 
 enum SheetKind {
     Worksheet(String),
-    /// A chart sheet, a dialog sheet or a macro sheet: no cells this reader reads.
+    /// A dialog sheet or a macro sheet: no cells this reader reads.
     NoCells,
+    /// A chart sheet: no cells at all.
+    Chart,
 }
 
 struct Sheet {

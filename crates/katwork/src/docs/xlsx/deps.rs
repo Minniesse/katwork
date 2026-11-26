@@ -568,6 +568,10 @@ const WORK_PER_CELL: u64 = 64;
 /// References kept per cell `max_cells` allows.
 const REFS_PER_CELL: u64 = 8;
 
+/// A partly written array or data table of at most this many cells has every cell marked
+/// rather than being kept as a rectangle.
+const SMALL_RANGE: u64 = 64;
+
 /// Steps between two deadline checks.
 const STEPS_PER_CHECK: u64 = 1_024;
 
@@ -668,9 +672,54 @@ impl Work {
 /// The cells, as (sheet index, row, column), that hold a recalculated formula or lie in the
 /// range of a recalculated array formula or data table. `sheets` pairs each worksheet read with
 /// its index in the workbook's `sheets`; `sheet_names` lists them all, in that order.
+///
+/// Past the walk's work cap every formula counts as recalculated, as past its reference cap:
+/// the file is read, never refused for the walk's sake.
 pub(super) fn volatile_cells(
     sheet_names: &[&str],
     sheets: &[(usize, &SheetData)],
+    charts: &[usize],
+    defined: &[DefinedName],
+    undecided: bool,
+    limits: &DocLimits,
+) -> Result<HashSet<(usize, u32, u32)>, DocError> {
+    match walk(sheet_names, sheets, charts, defined, undecided, limits) {
+        Err(DocError::TooComplex("formula_dependencies")) => every_formula(sheets),
+        other => other,
+    }
+}
+
+/// Every formula cell, and every written cell of an array formula's or data table's range.
+fn every_formula(sheets: &[(usize, &SheetData)]) -> Result<HashSet<(usize, u32, u32)>, DocError> {
+    let mut all = HashSet::new();
+    for &(sheet, data) in sheets {
+        let ranges: Vec<Merge> = data
+            .formula_ranges
+            .iter()
+            .map(|&(range, _)| range)
+            .collect();
+        for (at, cell) in data.cells.iter().chain(&data.silent).enumerate() {
+            if at % 1024 == 1023 {
+                check("formulas")?;
+            }
+            let in_range = || {
+                ranges.iter().any(|range| {
+                    (range.top..=range.bottom).contains(&cell.row)
+                        && (range.left..=range.right).contains(&cell.col)
+                })
+            };
+            if cell.has_formula || in_range() {
+                all.insert((sheet, cell.row, cell.col));
+            }
+        }
+    }
+    Ok(all)
+}
+
+fn walk(
+    sheet_names: &[&str],
+    sheets: &[(usize, &SheetData)],
+    charts: &[usize],
     defined: &[DefinedName],
     undecided: bool,
     limits: &DocLimits,
@@ -686,7 +735,8 @@ pub(super) fn volatile_cells(
         unread: sheet_names
             .iter()
             .enumerate()
-            .filter(|(at, _)| !sheets.iter().any(|&(read, _)| read == *at))
+            // A chart sheet holds no cells at all, so it hides no volatile formula.
+            .filter(|(at, _)| !sheets.iter().any(|&(read, _)| read == *at) && !charts.contains(at))
             .map(|(at, name)| (name.to_lowercase(), at))
             .collect(),
         unreadable: false,
@@ -761,10 +811,12 @@ pub(super) fn volatile_cells(
         for &(range, (row, col)) in &data.formula_ranges {
             ranges.entry((sheet, row, col)).or_default().push(range);
         }
-        cells
-            .entry(sheet)
-            .or_default()
-            .extend(data.cells.iter().map(|cell| (cell.row, cell.col)));
+        cells.entry(sheet).or_default().extend(
+            data.cells
+                .iter()
+                .chain(&data.silent)
+                .map(|cell| (cell.row, cell.col)),
+        );
     }
     let mut work = resolver.work;
     // Past the reference cap the walk cannot tell which formulas depend on a volatile one: all
@@ -889,7 +941,17 @@ impl Tainted {
             let size =
                 u64::from(range.bottom - range.top + 1) * u64::from(range.right - range.left + 1);
             if marked < size {
-                self.ranges.push((sheet, *range));
+                if size <= SMALL_RANGE {
+                    // A small range is marked cell by cell, so it adds no rectangle either.
+                    for row in range.top..=range.bottom {
+                        for col in range.left..=range.right {
+                            work.step(1)?;
+                            self.mark((sheet, row, col), queue);
+                        }
+                    }
+                } else {
+                    self.ranges.push((sheet, *range));
+                }
             }
         }
         Ok(())
