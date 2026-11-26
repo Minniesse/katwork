@@ -38,7 +38,7 @@ Two sizes are counted from approved plans. The sub-project 1 plan has 17 task he
 | 14 | Team admin (proposed) | None yet | Not planned | M (estimate) | Not written |
 | Alpha | Public alpha release | #138 | Not started | S (estimate) | Not written |
 
-Sub-projects 9 to 14 are proposed by this re-plan. They get tracking issues once the founder approves them. The sizes in this table include the additions from the expanded scope. Alpha 1 builds sub-projects 1 to 7 without those additions; the additions come in later waves ("Re-plan: staged alphas" below).
+Sub-projects 9 to 14 are proposed by this re-plan. They get tracking issues once the founder approves them. The sizes in this table include the additions from the expanded scope, but not the differentiation proposals DP1 to DP14 (scope amendment), which are counted separately in Alpha 2. Alpha 1 builds sub-projects 1 to 7 without those additions; the additions come in later waves ("Re-plan: staged alphas" below).
 
 ## Order of work
 
@@ -450,6 +450,8 @@ How to read these counts:
 The schedule follows these rules:
 - 4 builders, at most 2 on one sub-project, 1 merged task per builder per week. No week uses more than 4 builders.
 - A sub-project starts once each of its dependencies was three-quarters merged at the start of that week, as stacked PRs. It finishes only after its dependencies finish.
+- Where a sub-project depends on sub-project 3, it depends on 3's gates-and-policy part (22 tasks). Only 3's 8 template tasks depend on sub-project 4 (and on 2a and 2b).
+- Each wave's release work (hardening, demo mode, docs) starts only after all the other work in that wave is done. Inside a wave, routines (13) and team admin (14) also wait for sub-project 12 to be three-quarters merged, and 14 waits for the admin pages. That is why Alpha 2's 120 tasks take 33 weeks, not 30.
 - 2b, 2c and 3 cannot start before their plans are approved (target week of 2026-12-14).
 - Plans and ADRs are written one wave ahead of their builds and do not use builder time.
 - A later wave starts building when the previous wave's builds end, while that wave's dry runs and release candidate run.
@@ -511,7 +513,7 @@ One method gives every row. Take the schedule above, built at a nominal 4 tasks 
 **What else moves the dates:**
 - Founder gates: plan approvals, the legal reads (Q11, Q12) and the design-partner annex (Q5).
 - Alpha 3's outward parts (sends as a person, payments) and Alpha 4's calls and live capture cannot ship before their legal reads.
-- If the founder pulls the claim-carrying differentiation proposals into Alpha 1 (Q27), Alpha 1 gains about 10 tasks and up to about 3 weeks.
+- If the founder pulls the claim-carrying differentiation proposals into Alpha 1 (Q27), Alpha 1 gains about 12 tasks and up to about 3 weeks.
 - An early slice of a later wave (Q22) takes builder weeks from Alpha 1.
 
 **Cut order.** Inside Alpha 1, §18's cut order (WhatsApp and Teams, then Capacitor, then 3D) still stands as written. This re-plan proposes no cut across the waves.
@@ -568,7 +570,7 @@ These are targets, not measurements. KatWork will test each one, and publish bot
 | 2 | A reviewer opens the exact source span behind any claim in under 10 seconds. | 6 (with 2a's evidence card) | Alpha 2, or Alpha 1 if Q27 | A timed internal run on the alpha templates |
 | 3 | A job's completion receipt is generated from its log, and no statement in it is contradicted by that log. Skipped files and zero-match runs fail. | 3 | Alpha 2, or Alpha 1 if Q27 | CI on seeded skipped-file and zero-match runs, plus an audit of 50 jobs |
 | 4 | An offline install makes zero outbound connections. No outward action runs unless a person approved it: in Alpha 1, that exact action. If bulk approval or standing grants are adopted (Q21), it must be the exact batch or grant that covers it. | 2b (offline test), 3 (approval gate) | Alpha 1 for the approval part; the offline test with DP6 | CI: an offline-install test and the approval-gate replay suite (§15) |
-| 5 | Every figure in a monthly pack is identical across all its outputs, and Thai dates and numerals follow the template's declared form with zero violations. | 3 | Alpha 2, or Alpha 1 if Q27 | CI on generated monthly packs |
+| 5 | Every figure in a monthly pack is identical across all its outputs, and Thai dates and numerals follow the template's declared form with zero violations. | 3 (DP7, DP11) | Alpha 2, or Alpha 1 if Q27 | CI on generated monthly packs |
 
 Claims about how reviewers behave need real reviewers, for example their catch rate with and without the proof panel. They are design-partner measurements in the dry runs, not launch claims.
 
@@ -630,9 +632,9 @@ These come from §17's last four weeks.
 
 **Cut order if a week slips twice** (§18): WhatsApp and Teams first, then Capacitor, then 3D (the board stays).
 
-**Not in the alpha** (spec §1.2 as written): KatsAgentOS, a VM per Kat for code, voice and video, federation, native Linux binaries inside a Kat's computer, a streamed Craft desktop, high availability, a hosted cloud, unofficial WhatsApp Web, and GPL or AGPL code in the core.
+**Not in the alpha** (spec §1.2 as written): KatsAgentOS, a VM per Kat for code, voice and video, federation, native Linux binaries inside a Kat's computer, a streamed Craft desktop (unless Q3 is confirmed), high availability, a hosted cloud, unofficial WhatsApp Web, and GPL or AGPL code in the core.
 
-This list holds for Alpha 1. The expanded scope collides with some of these items in later waves. The scope amendment proposes moving "voice and video calls" into Alpha 4 (sub-project 11). It lists the other collisions as open questions: native binaries, the streamed Craft desktop, the hosted cloud and multi-host scheduling. Until the founder approves the amendment, this list stands.
+This list holds for Alpha 1, except that the streamed Craft desktop comes into Alpha 1 if the founder confirms Q3. The expanded scope collides with some of these items in later waves. The scope amendment proposes moving "voice and video calls" into Alpha 4 (sub-project 11). It lists the other collisions as open questions: native binaries, the streamed Craft desktop, the hosted cloud and multi-host scheduling. Until the founder approves the amendment, this list stands.
 
 ## After the alpha
 
@@ -684,5 +686,5 @@ The rulings settle that all of the new scope is product scope, delivered in alph
 24. **A phone as a tool host.** The competing product can use a person's phone for photos, location and similar tools. Recommended: include it in sub-project 9 after the desktop companion, with photos and location behind PDPA grants (§13). If Q16 keeps mobile to notifications only, this moves after the last alpha wave, which needs the founder's ruling.
 25. **Choices a Kat makes for you.** Another pattern from the research lets an agent pick a default when it would otherwise wait, record why, and let the person review it later. Spec §6.4 says "a timeout never picks defaults" for clarifying questions, so this conflicts with the spec as written. Recommended: allow it only for reversible choices inside a job, for example which of two sheet names is the budget. Each such choice is listed on the completion receipt and the approval card, with its reason, and a template may forbid it. Never allow it for a clarifying question (audience, period, template, recipient), for anything outward or destructive, or for anything that changes a claim's source. This is a proposal, not a decision.
 26. **An official letter and memo template in an alpha.** Thai official-document correctness is a ranked need (see "Differentiation"), but the official memo factory is a Phase 3 use case (§8). Should a letter and memo template move into an alpha wave? Recommended: yes, into Alpha 2. It reuses the template engine and `katwork-thai`, and its date and numeral checks are claim 5.
-27. **The differentiation proposals.** DP1 to DP14 in the scope amendment (29 tasks) are responses to the research that the spec and plans do not hold yet. Which does the founder accept, and in which wave? Recommended: accept all fourteen. Pull the five that carry the published claims (DP1, DP2, DP4, DP6, DP7; about 10 tasks, up to about 3 weeks) into Alpha 1, and put the rest in Alpha 2. Until the founder rules, all 29 tasks are counted in Alpha 2.
-28. **Playwright as a second browser runtime.** The competing product uses Playwright; the spec names chromiumoxide (§5.2). Should 2b's plan consider Playwright as well? Recommended: only if the 2b plan finds a need that chromiumoxide cannot meet, in Alpha 2. Not counted in "Estimated work".
+27. **The differentiation proposals.** DP1 to DP14 in the scope amendment (29 tasks) are responses to the research that the spec and plans do not hold yet. Which does the founder accept, and in which wave? Recommended: accept all fourteen. Pull the six that carry the published claims (DP1, DP2, DP4, DP6, DP7, DP11; about 12 tasks, up to about 3 weeks) into Alpha 1, and put the rest in Alpha 2. Until the founder rules, all 29 tasks are counted in Alpha 2.
+28. **A second browser automation runtime.** The spec names chromiumoxide (§5.2). Should 2b's plan also consider a second browser automation runtime, such as Playwright? Recommended: only if the 2b plan finds a need that chromiumoxide cannot meet, in Alpha 2. Not counted in "Estimated work".

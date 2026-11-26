@@ -55,7 +55,7 @@ KatWork takes ideas and scope from that product only. Its code, prompts and text
 1. **Board.** [Alpha 2] Add a review queue (memory, skills, teach recordings), an approval-rules page and an admin console (allowlists, the denylist, the egress dashboard with each Kat's applied status, and network diagnostics). These are pages of the tasks-and-files board, so the four views stay four.
 2. **Chat.** [Alpha 3 for payment and order cards, Alpha 4 for voice] Add voice input and output, voice memos, and payment and order cards. Group chat already exists per channel.
 3. **Shells.** [Alpha 3] The Tauri desktop shell gains the companion features: a tray, notifications, a capture overlay and element picking. A URL scheme, if any, uses a typed route table: nothing is sent automatically, and tokens travel in the fragment.
-4. **Computer panel.** [Alpha 2] It can show a general Linux desktop (2b's GUI tier) as well as a browser or a Craft app.
+4. **Computer panel.** [Alpha 2] It can show a general Linux desktop (2b's GUI tier) as well as a browser or a Craft app. This is built and counted with 2b's general-desktop addition in Alpha 2.
 5. **Tool-result cards.** [Alpha 3] If the founder adopts them (roadmap Q20), they render in a sandboxed frame with no network, and a callback runs only after a person acts. This changes ADR-0010.
 6. **Hiding a Kat's screen.** [Alpha 2] If an admin can hide a Kat's screen, the activity log and the take-over path stay on (roadmap Q21).
 7. **Kat creation.** [Alpha 3] Kat creation gains avatars and template browsing. A system-prompt override is logged in the audit log.
@@ -159,7 +159,7 @@ A connector-credentials ADR is also needed, before Alpha 2. It decides whose cre
 
 ## Differentiation proposals
 
-The roadmap's "Differentiation" section answers the founder's request for research into what people need. Where its responses are not already in the spec, an ADR or an approved plan, they are listed here. Each is a proposal, with an owning sub-project, a task estimate and a proposed wave. Roadmap Q27 decides each one. Until the founder rules, all 29 tasks are counted in Alpha 2. The recommendation in Q27 pulls the five marked "claim" into Alpha 1, because the published claims rest on them.
+The roadmap's "Differentiation" section answers the founder's request for research into what people need. Where its responses are not already in the spec, an ADR or an approved plan, they are listed here. Each is a proposal, with an owning sub-project, a task estimate and a proposed wave. Roadmap Q27 decides each one. Until the founder rules, all 29 tasks are counted in Alpha 2. The recommendation in Q27 pulls the six marked "claim" into Alpha 1, because the published claims rest on them.
 
 | Id | Proposal | Spec section | Owner | Tasks | Proposed wave |
 |---|---|---|---|---|---|
@@ -173,7 +173,7 @@ The roadmap's "Differentiation" section answers the founder's request for resear
 | DP8 | Thai print checked on two renderers | §15 | 3 | 1 | Alpha 2 |
 | DP9 | Approval cards: approve with a comment, unsure, opening the cited span first for high-risk claims, a card budget per job, the card content stored in the audit row, a seal-and-initial approval type, and an alarm when approvals become too fast and uniform | §7.2 | 3, with 6 | 4 | Alpha 2 |
 | DP10 | Redo one section without restarting the job; a target for how fast a stop takes effect | §6.6 | 4 | 2 | Alpha 2 |
-| DP11 | A matched-and-exceptions output for reconciliation | §8 | 3 | 2 | Alpha 2 |
+| DP11 | A matched-and-exceptions output for reconciliation, and the cross-output check behind the monthly pack's identical figures (claim 5) | §8 | 3 | 2 | Alpha 1 if Q27, else Alpha 2 |
 | DP12 | A cost estimate before a team job, a workspace cost cap, an "unpriced" state for models without a price, and no silent switch to a weaker model | §6.6, §11 | 4, with 6 | 3 | Alpha 2 |
 | DP13 | A decision log with reasons and rejected options | §11 | 2c | 2 | Alpha 2 |
 | DP14 | A first run with one visible next action, and a one-page glossary | §10 | 6 | 1 | Alpha 2 |
