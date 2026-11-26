@@ -41,6 +41,7 @@ which rewrites the corpus and this table from `tests/support/pdf_build.rs`.
 | `fuzz/corpus/pdf/page-tree-cycle.pdf` | `1db452698a1b18fa29ea7e70d165b90fd0f4bfa1458e48f928892fdd351a897e` | a Pages node that is its own kid |
 | `fuzz/corpus/pdf/cid-width-range.pdf` | `db610594f244732eaeb82b29a96b0ab75f5d1a1dca3b9dc2bdb7306b894cfeb6` | a /W entry 0 4294967295 500 |
 | `fuzz/corpus/pdf/predictor-columns.pdf` | `1662ebdcb783317c480aaddace1e6defef48f1fd9a8a137830383b78d15dd6da` | a PNG predictor with /Columns 4294967295 |
+| `fuzz/corpus/pdf/predictor-xref.pdf` | `b4ea88f7571de4c5da13fa7a93a58340c1dcb6163cf3d82d5898bf4fa56b04bc` | startxref naming a stream with /Columns 4294967295, read as a cross-reference stream |
 | `fuzz/corpus/pdf/content-bomb.pdf` | `4d039c6bcef4edf2dffb50346683daf2de678a99c143412118ab6cf38ea9cdbe` | a Flate stream inflating to 64 MiB |
 | `fuzz/corpus/pdf/font-bomb.pdf` | `980d136aef247f0b8bc526d67da16eb347c42436710dfdfe261f13998cfce62e` | a /FontFile2 inflating to 64 MiB |
 | `fuzz/corpus/pdf/cmap-bomb.pdf` | `d7932459c1aa55b9b622b62eceac7e7ab90aa62c2077ad6a5cb9f9f025591f7d` | a /ToUnicode CMap inflating to 64 MiB |

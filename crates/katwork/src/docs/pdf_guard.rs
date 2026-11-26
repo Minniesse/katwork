@@ -205,6 +205,89 @@ fn is_delimiter(byte: u8) -> bool {
     b"()<>[]{}/%".contains(&byte)
 }
 
+/// The last run of comments `value_at` skipped: from its first `%` to where the skip ended, and
+/// the value read there. A later skip reaching a `%` inside that run ends at the same place.
+#[derive(Clone, Copy)]
+struct Skipped {
+    from: usize,
+    end: usize,
+    value: Option<u64>,
+}
+
+/// The non-negative integer lopdf reads as a dictionary value at `at`: after white space and
+/// comments, an optional `+`, then digits, saturating. A real or a reference starting with
+/// such digits counts as that integer too, so a value is never read as smaller than lopdf reads
+/// it. `None` for a negative number (lopdf reads it as 1) or anything else. Calls come in file
+/// order and reuse `last`, so each comment is read once however many names stand inside it.
+fn value_at(
+    bytes: &[u8],
+    mut at: usize,
+    last: &mut Option<Skipped>,
+) -> Result<Option<u64>, DocError> {
+    let mut comment: Option<usize> = None;
+    let mut checked = at;
+    loop {
+        if at - checked >= CHUNK {
+            deadline::check()?;
+            checked = at;
+        }
+        match bytes.get(at) {
+            Some(byte) if is_white(*byte) => at += 1,
+            Some(b'%') => {
+                if comment.is_none() {
+                    if let Some(skipped) =
+                        last.filter(|skipped| (skipped.from..skipped.end).contains(&at))
+                    {
+                        return Ok(skipped.value);
+                    }
+                    comment = Some(at);
+                }
+                // A comment ends at an end of line; lopdf reads no value after one without it.
+                match end_of_line(bytes, at)? {
+                    Some(eol) => at = eol + 1,
+                    None => {
+                        at = bytes.len();
+                        break;
+                    }
+                }
+            }
+            Some(b'+') => {
+                at += 1;
+                break;
+            }
+            _ => break,
+        }
+    }
+    let mut value = None;
+    for digit in bytes[at..].iter().take_while(|byte| byte.is_ascii_digit()) {
+        value = Some(
+            value
+                .unwrap_or(0u64)
+                .saturating_mul(10)
+                .saturating_add(u64::from(digit - b'0')),
+        );
+    }
+    if let Some(from) = comment {
+        *last = Some(Skipped {
+            from,
+            end: at,
+            value,
+        });
+    }
+    Ok(value)
+}
+
+/// The first end-of-line byte at or after `at`, checking the deadline between chunks.
+fn end_of_line(bytes: &[u8], at: usize) -> Result<Option<usize>, DocError> {
+    for (index, chunk) in bytes[at..].chunks(CHUNK).enumerate() {
+        deadline::check()?;
+        if let Some(eol) = chunk.iter().position(|byte| b"\r\n".contains(byte)) {
+            return Ok(Some(at + index * CHUNK + eol));
+        }
+    }
+    Ok(None)
+}
+
 /// Whether an integer follows at `at` (after white space), and where it ends.
 fn integer_at(bytes: &[u8], mut at: usize) -> Option<usize> {
     while bytes.get(at).is_some_and(|byte| is_white(*byte)) {
@@ -219,8 +302,13 @@ fn integer_at(bytes: &[u8], mut at: usize) -> Option<usize> {
 
 /// The checks on raw bytes before lopdf reads anything: the header, encryption (an `/Encrypt`
 /// name anywhere, however its characters are escaped: trailers and cross-reference stream
-/// dictionaries are never inside object streams, so a real one is always plain bytes), and the
-/// number of cross-reference sections lopdf would follow.
+/// dictionaries are never inside object streams, so a real one is always plain bytes), the
+/// number of cross-reference sections lopdf would follow, and predictor parameters past the
+/// bounds `predict` enforces. lopdf undoes a predictor while it loads any stream the table
+/// points at as a cross-reference or object stream, and sizes two row buffers from
+/// `/Columns`, `/Colors` and `/BitsPerComponent` before it reads a byte of data; a stream is
+/// never inside an object stream, so its parameters are plain bytes too. Any such value past
+/// its bound refuses the file, wherever it stands.
 fn scan_bytes(bytes: &[u8], limits: &DocLimits) -> Result<(), DocError> {
     if bytes.len() as u64 > limits.max_input_bytes {
         return Err(DocError::TooLarge("input"));
@@ -232,15 +320,26 @@ fn scan_bytes(bytes: &[u8], limits: &DocLimits) -> Result<(), DocError> {
     let mut sections = 1u32;
     let mut at = 0;
     let mut names = 0u64;
+    let mut skipped = None;
     while let Some(offset) = bytes[at..].iter().position(|byte| *byte == b'/') {
         names += 1;
         if names.is_multiple_of(4096) {
             deadline::check()?;
         }
-        let (name, end) = name_at(bytes, at + offset + 1, 8);
+        let (name, end) = name_at(bytes, at + offset + 1, 16);
         at = end.max(at + offset + 1);
         match name.as_slice() {
             b"Encrypt" => return Err(DocError::Encrypted),
+            b"Columns" | b"Colors" | b"BitsPerComponent" => {
+                let bound = match name.as_slice() {
+                    b"Columns" => MAX_COLUMNS,
+                    b"Colors" => MAX_COLORS,
+                    _ => 16,
+                };
+                if value_at(bytes, at, &mut skipped)?.is_some_and(|value| value > bound) {
+                    return Err(DocError::Malformed("stream_predictor"));
+                }
+            }
             // A trailer's /Prev and /XRefStm are direct offsets; an outline's /Prev is `n g R`.
             b"Prev" | b"XRefStm" => {
                 let Some(number) = integer_at(bytes, at) else {
