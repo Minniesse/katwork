@@ -3857,3 +3857,34 @@ fn pdf_saved_state_depth_is_capped() {
         ],
     );
 }
+
+/// The scan for predictor parameters reads each comment once: a 4 MiB chain of `/Columns`
+/// names, each opening a comment that runs to the end of the file, to one end of line, or to a
+/// run of comment lines, is refused or read in linear time (it took minutes when each name
+/// followed its comment again).
+#[test]
+fn pdf_comment_chains_after_predictor_names_scan_once() {
+    let size = 4 << 20;
+    let flood = |unit: &str, end: &str| {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        bytes.extend_from_slice(unit.repeat(size / unit.len()).as_bytes());
+        bytes.extend_from_slice(end.as_bytes());
+        bytes
+    };
+    for (unit, end) in [
+        ("/Columns%", ""),
+        ("/Columns%", "\n1"),
+        ("%/Colors%\n", "1"),
+        ("/BitsPerComponent %", "\n%\n".repeat(1 << 16).as_str()),
+    ] {
+        let bytes = flood(unit, end);
+        let started = std::time::Instant::now();
+        let result = read_with(&bytes, &DocLimits::default());
+        let took = started.elapsed();
+        assert!(result.is_err(), "{unit:?}");
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "{unit:?}: {took:?}"
+        );
+    }
+}
