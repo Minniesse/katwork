@@ -1,0 +1,19 @@
+[
+  {"id": "en_ignore_instructions", "fragments": [{"text": "ignore"}, {"text": "instruction"}]},
+  {"id": "en_disregard_instructions", "fragments": [{"text": "disregard"}, {"text": "instruction"}]},
+  {"id": "en_forget_instructions", "fragments": [{"text": "forget"}, {"text": "instruction"}]},
+  {"id": "en_ignore_previous", "fragments": [{"text": "ignore"}, {"text": "previous"}]},
+  {"id": "en_ignore_above", "fragments": [{"text": "ignore"}, {"text": "above"}]},
+  {"id": "en_new_instructions", "fragments": [{"text": "newinstructions"}]},
+  {"id": "en_system_prompt", "fragments": [{"text": "systemprompt"}]},
+  {"id": "en_you_are_now", "fragments": [{"text": "youarenow"}]},
+  {"id": "en_answer_supported", "fragments": [{"text": "answer"}, {"text": "supported", "gap": 1}]},
+  {"id": "en_respond_with", "fragments": [{"text": "respondwith"}]},
+  {"id": "th_ignore_instructions", "fragments": [{"text": "ไม่ต้องสนใจ"}, {"text": "คำสั่ง"}]},
+  {"id": "th_omit_instructions", "fragments": [{"text": "ละเว้น"}, {"text": "คำสั่ง"}]},
+  {"id": "th_disregard_instructions", "fragments": [{"text": "เพิกเฉย"}, {"text": "คำสั่ง"}]},
+  {"id": "th_previous_instructions", "fragments": [{"text": "คำสั่งก่อนหน้า"}]},
+  {"id": "th_system_prompt", "fragments": [{"text": "พรอมต์ระบบ"}]},
+  {"id": "th_you_are_now", "fragments": [{"text": "ตอนนี้คุณคือ"}]},
+  {"id": "th_answer_that", "fragments": [{"text": "ตอบว่า"}], "before": ["ให้", "จง", "กรุณา", "ช่วย"], "before_gap": 0}
+]

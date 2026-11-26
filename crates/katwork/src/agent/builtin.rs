@@ -1,4 +1,4 @@
-use super::{Tool, ToolCtx, ToolError, ToolOutput};
+use super::{OutputTrust, Tool, ToolCtx, ToolError, ToolOutput};
 use crate::{
     chat::{Author, message},
     ids::MessageId,
@@ -81,6 +81,10 @@ impl Tool for AskUser {
     }
     fn side_effect(&self) -> SideEffect {
         SideEffect::Read
+    }
+    /// The person's answer.
+    fn output_trust(&self) -> OutputTrust {
+        OutputTrust::Trusted
     }
     async fn call(&self, _: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
         let a: AskArgs =

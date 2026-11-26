@@ -1,0 +1,34 @@
+{
+  "type": "SpecificResource",
+  "source": "urn:katwork:artifact:01928c3e-0000-7000-8000-000000000001:v1",
+  "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "extractor": {
+    "name": "text",
+    "version": 1
+  },
+  "quality": {
+    "generated": false,
+    "hidden": false,
+    "instructionLike": false,
+    "suspectTextLayer": false
+  },
+  "selector": {
+    "type": "FragmentSelector",
+    "conformsTo": "urn:katwork:selector:block:v1",
+    "value": "ordinal=3",
+    "refinedBy": [
+      {
+        "type": "TextQuoteSelector",
+        "exact": "ไตรมาสที่ 2",
+        "prefix": "วาระที่ 3 รายงานผลการดำเนินงาน ",
+        "suffix": " ผ่านไปด้วยดี"
+      },
+      {
+        "type": "TextPositionSelector",
+        "start": 31,
+        "end": 42
+      }
+    ]
+  },
+  "boxes": []
+}

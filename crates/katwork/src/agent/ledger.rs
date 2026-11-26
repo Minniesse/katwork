@@ -1,4 +1,4 @@
-use super::{ToolCallState, ToolCtx, guards};
+use super::{OutputTrust, ToolCallState, ToolCtx, guards};
 use crate::{
     db,
     error::KatError,
@@ -33,23 +33,25 @@ async fn insert(
     effect: Option<SideEffect>,
     args: &str,
     result: Option<&str>,
+    trust: OutputTrust,
 ) -> Result<ToolCallRecordId, KatError> {
     let mut tx = transaction(&ctx.pool, ctx.lock_timeout).await?;
     guards::scoped_task(&mut tx, &ctx.tenant, &ctx.fence()).await?;
-    let starts_effect = result.is_none() && effect != Some(SideEffect::Read);
+    // An unknown effect fails closed: it counts as one that changes state.
+    let starts_effect = result.is_none() && effect.is_none_or(|e| e.changes_state());
     if starts_effect {
         fence::lock(&mut tx, &ctx.fence()).await?;
     } else {
         fence::check(&mut tx, &ctx.fence()).await?;
     }
     let id = ToolCallRecordId::new();
-    let inserted=sqlx::query("INSERT INTO tool_calls(id,workspace_id,run_id,step,tool_call_id,tool_name,side_effect,args_canonical,args_sha256,state,result,ended_at)
-        SELECT $1,$2,r.id,$4,$5,$6,$7,$8,$9,$10,$11,CASE WHEN $11::text IS NOT NULL THEN clock_timestamp() END
+    let inserted=sqlx::query("INSERT INTO tool_calls(id,workspace_id,run_id,step,tool_call_id,tool_name,side_effect,args_canonical,args_sha256,state,result,ended_at,output_trust)
+        SELECT $1,$2,r.id,$4,$5,$6,$7,$8,$9,$10,$11,CASE WHEN $11::text IS NOT NULL THEN clock_timestamp() END,$16
         FROM runs r WHERE r.id=$3 AND r.workspace_id=$2 AND r.task_id=$12 AND r.kat_id=$13 AND r.job_id=$14 AND r.state='running' AND r.lease_epoch=$15")
         .bind(id).bind(ctx.tenant.workspace_id()).bind(ctx.run_id).bind(i32::try_from(ctx.step).map_err(|_|KatError::RequestInvalid)?)
         .bind(clean(&ctx.tool_call_id)).bind(clean(name)).bind(effect.map(|e|e.wire())).bind(clean(args)).bind(sha256(args))
         .bind(if result.is_some(){"refused"}else{"started"}).bind(result.map(clean)).bind(ctx.task_id).bind(ctx.kat_id).bind(ctx.job_id).bind(ctx.lease_epoch)
-        .execute(&mut *tx).await?;
+        .bind(trust.wire()).execute(&mut *tx).await?;
     if inserted.rows_affected() != 1 {
         return Err(KatError::LeaseLost);
     }
@@ -65,13 +67,22 @@ pub async fn start_tool_call(
     ctx: &ToolCtx,
     name: &str,
     side_effect: SideEffect,
+    output_trust: OutputTrust,
     args_canonical: &str,
 ) -> Result<ToolCallRecordId, KatError> {
     let ctx = ToolCtx {
         pool: pool.clone(),
         ..ctx.clone()
     };
-    insert(&ctx, name, Some(side_effect), args_canonical, None).await
+    insert(
+        &ctx,
+        name,
+        Some(side_effect),
+        args_canonical,
+        None,
+        output_trust,
+    )
+    .await
 }
 pub async fn record_refused(
     pool: &PgPool,
@@ -85,7 +96,16 @@ pub async fn record_refused(
         pool: pool.clone(),
         ..ctx.clone()
     };
-    insert(&ctx, name, side_effect, args_canonical, Some(code)).await
+    // A refused call returned only its code: the column keeps its default.
+    insert(
+        &ctx,
+        name,
+        side_effect,
+        args_canonical,
+        Some(code),
+        OutputTrust::Untrusted,
+    )
+    .await
 }
 pub async fn retry_read(
     pool: &PgPool,
@@ -97,7 +117,7 @@ pub async fn retry_read(
     fence::check(&mut tx, fence).await?;
     let changed=sqlx::query("UPDATE tool_calls c SET attempts=2,state='started',ended_at=NULL,result=NULL FROM runs r,tasks t
         WHERE c.id=$1 AND c.run_id=r.id AND c.workspace_id=r.workspace_id AND r.task_id=t.id AND r.workspace_id=t.workspace_id
-        AND t.id=$2 AND r.lease_epoch=$3 AND r.state='running' AND c.side_effect='read' AND c.attempts=1 AND c.state IN ('timed_out','outcome_unknown')")
+        AND t.id=$2 AND r.lease_epoch=$3 AND r.state='running' AND c.side_effect IN ('read','workspace_read') AND c.attempts=1 AND c.state IN ('timed_out','outcome_unknown')")
         .bind(id).bind(fence.task_id).bind(fence.epoch).execute(&mut *tx).await?;
     if changed.rows_affected() != 1 {
         return Err(KatError::RequestInvalid);
@@ -154,7 +174,7 @@ pub(crate) async fn refuse_started(
     }
     sqlx::query("UPDATE tasks t SET effects_started_at=NULL WHERE t.id=$1
         AND NOT EXISTS (SELECT 1 FROM tool_calls c JOIN runs r ON r.id=c.run_id AND r.workspace_id=c.workspace_id
-            WHERE r.task_id=t.id AND r.workspace_id=t.workspace_id AND c.side_effect <> 'read' AND c.state <> 'refused')")
+            WHERE r.task_id=t.id AND r.workspace_id=t.workspace_id AND c.side_effect NOT IN ('read','workspace_read') AND c.state <> 'refused')")
         .bind(fence.task_id).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())

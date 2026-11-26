@@ -109,6 +109,12 @@ impl SideEffect {
         })
     }
 
+    /// False only for `Read` and `WorkspaceRead`: every other effect may change state, so the
+    /// loop does not retry it and the policy reviews before a rerun.
+    pub fn changes_state(&self) -> bool {
+        !matches!(self, Self::Read | Self::WorkspaceRead)
+    }
+
     pub fn wire(&self) -> &'static str {
         match self {
             Self::Read => "read",

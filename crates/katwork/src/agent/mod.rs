@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod builtin;
 pub mod ctx;
 pub mod guards;
@@ -6,9 +7,10 @@ pub mod registry;
 pub mod run;
 pub mod tool;
 
+pub use budget::RunBudget;
 pub use ctx::*;
 pub use registry::{DuplicateTool, ToolRegistry};
-pub use tool::{Tool, ToolError, ToolOutput};
+pub use tool::{OutputTrust, TOOL_CODES, Tool, ToolError, ToolOutput};
 
 use crate::{
     events::EventSink,
@@ -97,6 +99,8 @@ pub struct RunFacts {
     pub executor_unavailable: bool,
     pub run_closed: bool,
     pub usage: Vec<ModelCallId>,
+    /// The run's token budget, shared with its tools (the judge reads it, Task 31).
+    pub budget: RunBudget,
 }
 impl RunFacts {
     pub fn not_run(stop: StopReason) -> Self {
@@ -113,6 +117,7 @@ impl RunFacts {
             executor_unavailable: false,
             run_closed: false,
             usage: vec![],
+            budget: RunBudget::new(0),
         }
     }
 }
@@ -124,6 +129,9 @@ pub struct ToolCallRecord {
     pub name: String,
     pub side_effect: Option<SideEffect>,
     pub state: ToolCallState,
+    /// Records from before output trust existed read as untrusted.
+    #[serde(default)]
+    pub output_trust: OutputTrust,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

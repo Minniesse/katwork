@@ -30,6 +30,7 @@ uuid.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+katwork-thai = { path = "../katwork-thai" }
 # The artifact store stages files with tokio's fs and io traits.
 tokio = { workspace = true, features = ["fs", "io-util"] }
 tokio-util = { workspace = true, features = ["rt"] }
@@ -52,8 +53,6 @@ flate2.workspace = true
 lopdf.workspace = true
 pdf-extract.workspace = true
 weezl.workspace = true
-# The PDF reader compares an /ActualText span with its glyphs as matching does.
-katwork-thai = { path = "../katwork-thai" }
 
 # statvfs for the artifact store's free space (f_bavail x f_frsize); std has no call for it.
 [target.'cfg(unix)'.dependencies]

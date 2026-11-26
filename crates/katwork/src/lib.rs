@@ -7,6 +7,7 @@ pub mod db;
 pub mod docs;
 pub mod error;
 pub mod events;
+pub mod evidence;
 pub mod fence;
 pub mod ids;
 pub mod jobs;
