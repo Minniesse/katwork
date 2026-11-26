@@ -1,37 +1,41 @@
-# Scope amendment: the expanded alpha scope (proposal)
+# Scope amendment: the expanded scope in alpha waves (proposal)
 
 - Status: Proposed (2026-11-26). Every change below is a proposal for the founder. None is applied to `katwork-design.md` until the founder approves it.
 - Decision owner: Founder
-- Roadmap: `docs/roadmap.md` (sub-projects 9 to 14, "Additions to existing sub-projects", "Re-plan", and open questions Q8 to Q22)
+- Roadmap: `docs/roadmap.md` (sub-projects 9 to 14, "Additions to existing sub-projects", "Re-plan: staged alphas", and open questions Q8 to Q24)
 
 ## Why
 
-On 2026-11-26 the founder made two rulings about a competing desktop agent. The first adopts every one of its capability areas into KatWork's scope. The second, "All before the alpha", makes all of that scope alpha scope. The spec still describes the narrower alpha: §1.1 lists nine goals, and §1.2 rules out voice and video calls, a hosted cloud and native binaries. This file lists every spec change the new scope needs. Each is written as a proposal and points to the roadmap question that decides it. Where a ruling settles a point, the entry says so. Where it does not, the entry stays open.
+On 2026-11-26 the founder made three rulings about a competing desktop agent and the alpha. The first adopts every one of its capability areas into KatWork's scope. The second, "All before the alpha", makes all of that scope alpha scope. The third accepts staged alphas. Alpha 1 ships the current spec scope (sub-projects 1 to 7). The new areas follow in Alpha 2 (connectors, routines, team admin, and the platform additions), Alpha 3 (companion and spend) and Alpha 4 (voice and meetings), each with its own plan approval. The spec still describes the narrower alpha: §1.1 lists nine goals, and §1.2 rules out voice and video calls, a hosted cloud and native binaries. This file lists every spec change the new scope needs. Each is written as a proposal, tagged with the alpha wave it belongs to, and points to the roadmap question that decides it. A tag such as [Alpha 2] means the change applies to the spec from that wave on; until then the spec as written describes the earlier waves. Where a ruling settles a point, the entry says so. Where it does not, the entry stays open.
 
 KatWork takes ideas and scope from that product only. Its code, prompts and text are not used.
 
 ## §1.1 Goals for the alpha
 
-1. **Heading date.** Change "Goals for the alpha (2027-01-31)" to the date the founder approves. The re-plan proposes the week of 2028-10-16 (roadmap Q1).
-2. **New goals.** Add these after goal 9, one per new sub-project:
-   - 10. People can let a Kat act on their own computer through an optional companion app, within grants they set (sub-project 9).
-   - 11. Kats can pay, within spend limits and with a person's approval for every payment (sub-project 10).
-   - 12. People can talk to Kats by voice in Thai and English. Kats can make approved phone calls and capture meetings with recorded consent (sub-project 11).
-   - 13. Kats can use connectors, MCP servers and plugins from a catalog, under the same approval gate (sub-project 12).
-   - 14. Routines run Kats on a schedule or a trigger (sub-project 13).
-   - 15. Admins can share Kats, set roles and service accounts, and enforce allowlists from an admin console (sub-project 14).
-3. **Goal 3 (channels).** Add SMS and inbound mail to the listed channels, if §11 adds them (see §11 below).
-4. **Goal 4 (real work on real computers).** Add "and, when a person allows it, on that person's own computer".
-5. **Goal 7 (four views).** No change to the four views. The admin console and the review queue are pages of the board, not new views (proposal; see §10).
+1. **Heading date.** [Alpha 1, then each wave] Change "Goals for the alpha (2027-01-31)" to "Goals for Alpha 1" with the date the founder approves. Add a short table of the later waves and their goals. The re-plan proposes these dates (roadmap Q1):
+   - Alpha 1: week of 2028-01-03.
+   - Alpha 2: week of 2028-06-19.
+   - Alpha 3: week of 2028-10-16.
+   - Alpha 4: week of 2029-01-29.
+2. **New goals.** [Alphas 2 to 4] Add these after goal 9, one per new sub-project:
+   - 10. People can let a Kat act on their own computer through an optional companion app, within grants they set (sub-project 9). [Alpha 3]
+   - 11. Kats can pay, within spend limits and with a person's approval for every payment (sub-project 10). [Alpha 3]
+   - 12. People can talk to Kats by voice in Thai and English. Kats can make approved phone calls and capture meetings with recorded consent (sub-project 11). [Alpha 4]
+   - 13. Kats can use connectors, MCP servers and plugins from a catalog, under the same approval gate (sub-project 12). [Alpha 2]
+   - 14. Routines run Kats on a schedule or a trigger (sub-project 13). [Alpha 2]
+   - 15. Admins can share Kats, set roles and service accounts, and enforce allowlists from an admin console (sub-project 14). [Alpha 2]
+3. **Goal 3 (channels).** [Alpha 3] Add SMS and inbound mail to the listed channels, if §11 adds them (see §11 below).
+4. **Goal 4 (real work on real computers).** [Alpha 3] Add "and, when a person allows it, on that person's own computer".
+5. **Goal 7 (four views).** [Alpha 2] No change to the four views. The admin console and the review queue are pages of the board, not new views (proposal; see §10).
 
 ## §1.2 Non-goals for the alpha
 
-1. **"Voice and video calls."** The ruling places voice, phone calls and meeting capture in the alpha, so this line can no longer stand as written. Proposal: remove it. Add a rule instead: phone calls to third parties and live meeting capture stay off in any install until the Thai legal read passes (roadmap Q11).
-2. **"A hosted cloud offering."** Payments and credits may need a KatWork-run service. Proposal: keep this non-goal, and use payment rails that each install brings (roadmap Q9 and Q10). If the founder chooses a KatWork-run payment service, this line changes.
-3. **"Native Linux binaries inside a Kat's computer."** A full shell, stdio MCP servers and plugin commands would break this. Proposal: keep it. Stdio MCP servers and plugin commands run as pinned containers outside agentOS, and a full shell waits for KatsAgentOS (roadmap Q17).
-4. **"A streamed desktop for the Craft apps"** waits for sub-project 7. Local computer use, screen recording and the general desktop on 2b's GUI tier all need the virtual display that sub-project 7 builds. Proposal: if the founder makes sub-project 7 alpha scope (roadmap Q3), remove this line.
-5. **"High availability or multi-host scheduling."** Private worker pools would need multi-host scheduling. Proposal: keep the non-goal. Whether private pools still come before the alpha is a founder question (roadmap Q23).
-6. **New non-goals, proposed** (each is an open question, roadmap Q18 to Q21):
+1. **"Voice and video calls."** [Alpha 4] The rulings place voice, phone calls and meeting capture in Alpha 4, so this line can no longer stand as written. Proposal: remove it. Add a rule instead: phone calls to third parties and live meeting capture stay off in any install until the Thai legal read passes (roadmap Q11).
+2. **"A hosted cloud offering."** [Alpha 3] Payments and credits may need a KatWork-run service. Proposal: keep this non-goal, and use payment rails that each install brings (roadmap Q9 and Q10). If the founder chooses a KatWork-run payment service, this line changes.
+3. **"Native Linux binaries inside a Kat's computer."** [Alpha 2] A full shell, stdio MCP servers and plugin commands would break this. Proposal: keep it. Stdio MCP servers and plugin commands run as pinned containers outside agentOS, and a full shell waits for KatsAgentOS (roadmap Q17).
+4. **"A streamed desktop for the Craft apps"** [Alpha 1] waits for sub-project 7. The staged-alpha ruling, as relayed, places sub-project 7 in Alpha 1. Local computer use, screen recording and the general desktop on 2b's GUI tier, all in later waves, need the same virtual display. Proposal: once the founder confirms that sub-project 7 is in Alpha 1 (roadmap Q3), remove this line.
+5. **"High availability or multi-host scheduling."** [Alpha 2] Private worker pools would need multi-host scheduling. Proposal: keep the non-goal. Whether private pools belong to an alpha wave is a founder question (roadmap Q23).
+6. **New non-goals, proposed** [all waves] (each is an open question, roadmap Q18 to Q21):
    - Browser stealth that hides that a Kat's browser is automated.
    - Egress through a person's own machine.
    - Product telemetry on by default.
@@ -40,48 +44,48 @@ KatWork takes ideas and scope from that product only. Its code, prompts and text
 
 ## §8 Alpha templates
 
-1. **Meeting minutes.** "Input: typed notes, DOCX or a supplied transcript; no audio in the alpha" becomes "Input: typed notes, DOCX, a supplied transcript, or audio. Audio comes from an upload, or from a meeting the Kat captured with recorded consent." Audio needs sub-project 11's Thai speech engine and the recording rules in §13.
-2. **Phase 3 capability pulled forward.** Scheduled browser research moves from Phase 3 into the alpha through sub-project 13. The Phase 3 use cases that need it (competitor digest, and others) stay in Phase 3. Only the capability moves.
-3. **Phase 4 capability pulled forward.** Image and video generation through the model gateway (opt-in, with cost caps) moves into the alpha through sub-project 12. The creative-Kat use cases stay in Phase 4.
-4. **The six templates.** No change. The new scope adds no template, and §18's cut order still names none (roadmap Q4).
-5. **A developer template** (forge, pull requests, CI findings) is a candidate use case the new scope suggests. Proposal: list it under Phase 2, not as a seventh alpha template. The forge tools themselves stay alpha scope in sub-project 12; only a template built on them would wait.
+1. **Meeting minutes.** [Alpha 4] "Input: typed notes, DOCX or a supplied transcript; no audio in the alpha" becomes "Input: typed notes, DOCX, a supplied transcript, or audio. Audio comes from an upload, or from a meeting the Kat captured with recorded consent." Audio needs sub-project 11's Thai speech engine and the recording rules in §13.
+2. **Phase 3 capability pulled forward.** [Alpha 2] Scheduled browser research moves from Phase 3 into Alpha 2 through sub-project 13. The Phase 3 use cases that need it (competitor digest, and others) stay in Phase 3. Only the capability moves.
+3. **Phase 4 capability pulled forward.** [Alpha 2] Image and video generation through the model gateway (opt-in, with cost caps) moves into Alpha 2 through sub-project 12. The creative-Kat use cases stay in Phase 4.
+4. **The six templates.** [Alpha 1] No change. The new scope adds no template, and §18's cut order still names none (roadmap Q4).
+5. **A developer template** [Alpha 2] (forge, pull requests, CI findings) is a candidate use case the new scope suggests. Proposal: list it under Phase 2, not as a seventh alpha template. The forge tools themselves stay alpha scope in sub-project 12; only a template built on them would wait.
 
 ## §10 Office views
 
-1. **Board.** Add a review queue (memory, skills, teach recordings), an approval-rules page and an admin console (allowlists, the denylist, the egress dashboard with each Kat's applied status, and network diagnostics). These are pages of the tasks-and-files board, so the four views stay four.
-2. **Chat.** Add voice input and output, voice memos, and payment and order cards. Group chat already exists per channel.
-3. **Shells.** The Tauri desktop shell gains the companion features: a tray, notifications, a capture overlay and element picking. A URL scheme, if any, uses a typed route table: nothing is sent automatically, and tokens travel in the fragment.
-4. **Computer panel.** It can show a general Linux desktop (2b's GUI tier) as well as a browser or a Craft app.
-5. **Tool-result cards.** If the founder adopts them (roadmap Q20), they render in a sandboxed frame with no network, and a callback runs only after a person acts. This changes ADR-0010.
-6. **Hiding a Kat's screen.** If an admin can hide a Kat's screen, the activity log and the take-over path stay on (roadmap Q21).
-7. **Kat creation.** Kat creation gains avatars and template browsing. A system-prompt override is logged in the audit log.
+1. **Board.** [Alpha 2] Add a review queue (memory, skills, teach recordings), an approval-rules page and an admin console (allowlists, the denylist, the egress dashboard with each Kat's applied status, and network diagnostics). These are pages of the tasks-and-files board, so the four views stay four.
+2. **Chat.** [Alpha 3 for payment and order cards, Alpha 4 for voice] Add voice input and output, voice memos, and payment and order cards. Group chat already exists per channel.
+3. **Shells.** [Alpha 3] The Tauri desktop shell gains the companion features: a tray, notifications, a capture overlay and element picking. A URL scheme, if any, uses a typed route table: nothing is sent automatically, and tokens travel in the fragment.
+4. **Computer panel.** [Alpha 2] It can show a general Linux desktop (2b's GUI tier) as well as a browser or a Craft app.
+5. **Tool-result cards.** [Alpha 3] If the founder adopts them (roadmap Q20), they render in a sandboxed frame with no network, and a callback runs only after a person acts. This changes ADR-0010.
+6. **Hiding a Kat's screen.** [Alpha 2] If an admin can hide a Kat's screen, the activity log and the take-over path stay on (roadmap Q21).
+7. **Kat creation.** [Alpha 3] Kat creation gains avatars and template browsing. A system-prompt override is logged in the audit log.
 
 ## §11 Channels, memory, models
 
-1. **Channels.** Add two adapters, each behind the one adapter boundary: SMS (a Kat's own number) and inbound mail (a Kat's own address). Both deliver untrusted text (ADR-0010). The seven listed adapters stay.
-2. **Messages on a person's own computer** (for example a desktop messaging app) are companion tools in sub-project 9, not channel adapters.
-3. **Connectors.** Add a connector catalog beside the channels. It covers OAuth and API-key connectors and general MCP servers (remote HTTPS first). Each connector names whose credential it uses (the person's, a Kat service account, or a delegated one), and its secrets are write-only.
-4. **Memory.** Add a review queue for shared memory and skills, and Kat-authored skills with versions, review and revert. Shared memory written after an untrusted read is flagged, and needs a person, as `remember` already does.
-5. **Models.** The registry gains modalities: speech to text, text to speech, image and video generation. Each modality carries data-residency like the text models. A local speech engine is offered for local-only Spaces once one passes the Thai gate.
-6. **Routines.** Add a trigger model (schedule, webhook, channel message, connector event) on the scheduler. Webhook keys are stored encrypted.
+1. **Channels.** [Alpha 3] Add two adapters, each behind the one adapter boundary: SMS (a Kat's own number) and inbound mail (a Kat's own address). Both deliver untrusted text (ADR-0010). The seven listed adapters stay.
+2. **Messages on a person's own computer** [Alpha 3] (for example a desktop messaging app) are companion tools in sub-project 9, not channel adapters.
+3. **Connectors.** [Alpha 2] Add a connector catalog beside the channels. It covers OAuth and API-key connectors and general MCP servers (remote HTTPS first). Each connector names whose credential it uses (the person's, a Kat service account, or a delegated one), and its secrets are write-only.
+4. **Memory.** [Alpha 2] Add a review queue for shared memory and skills, and Kat-authored skills with versions, review and revert. Shared memory written after an untrusted read is flagged, and needs a person, as `remember` already does.
+5. **Models.** [Alpha 2 for image and video, Alpha 4 for speech] The registry gains modalities: speech to text, text to speech, image and video generation. Each modality carries data-residency like the text models. A local speech engine is offered for local-only Spaces once one passes the Thai gate.
+6. **Routines.** [Alpha 2] Add a trigger model (schedule, webhook, channel message, connector event) on the scheduler. Webhook keys are stored encrypted.
 
 ## §13 Security and privacy
 
-1. **Isolation.** Add the companion as a new execution target that is not a Kat computer. Proposal: it checks each approval itself, for example against a signed proposal digest, and does not accept an "approved" flag from the server. Its privileges sit in a separate helper (companion trust-model ADR). ADR-0009's kill criteria do not cover it; it needs its own conformance test.
-2. **Inputs as untrusted.** Add trigger-delivered text, inbound SMS and mail, meeting transcripts, connector and MCP results, shared memory and skills, and teach recordings to the list of untrusted sources. Each gets a trust flag on its tool calls and a carrier in KatBench-Inject. A run that read them cannot hold an outward tool without a person.
-3. **Deletion.** Extend the purge to recordings (audio, screen and teach recordings), transcripts, voice memos, and personal data read through the companion. Add a retention limit for recordings (recording-retention ADR).
-4. **Consent.** Add a consent record for each recording of another person and each call to a third party. No call and no live meeting capture runs until the legal read passes (roadmap Q11).
-5. **Payments.** Card data is stored as write-only vault fields; the model never sees card numbers. Every payment is a Proposal with amount, merchant and recipient, and spend limits are checked in code. A payment whose result KatWork cannot confirm is recorded with its own outcome, separate from success and failure.
-6. **Sending as a person.** Every send on a person's behalf is a Proposal and is checked after sending. A standing grant, if the founder allows one (roadmap Q21), is bound to one recipient and content class and capped.
-7. **Clipboard.** Clipboard transfer into or out of a Kat's computer is explicit and logged.
-8. **Browser.** Dialogs in a Kat's browser go to the person or fail. They are never accepted automatically. Credential fill clears the fields and hands over to the person when it fails.
-9. **Egress.** The gateway fails closed when its policy cannot refresh. A tighter policy applies at once; a looser one applies only on reconnect.
-10. **Plugins.** A plugin package passes strict ingestion checks before install: size limits, no links outside the package, no executable surprises, and a manifest that matches its contents.
-11. **Telemetry.** No change. No telemetry leaves the install unless an admin turns it on (roadmap Q19).
+1. **Isolation.** [Alpha 3] Add the companion as a new execution target that is not a Kat computer. Proposal: it checks each approval itself, for example against a signed proposal digest, and does not accept an "approved" flag from the server. Its privileges sit in a separate helper (companion trust-model ADR). ADR-0009's kill criteria do not cover it; it needs its own conformance test.
+2. **Inputs as untrusted.** [Alpha 2, and each later source with its wave] Add trigger-delivered text, inbound SMS and mail, meeting transcripts, connector and MCP results, shared memory and skills, and teach recordings to the list of untrusted sources. Each gets a trust flag on its tool calls and a carrier in KatBench-Inject. A run that read them cannot hold an outward tool without a person.
+3. **Deletion.** [Alpha 2 for screen and teach recordings, Alpha 4 for audio] Extend the purge to recordings (audio, screen and teach recordings), transcripts, voice memos, and personal data read through the companion. Add a retention limit for recordings (recording-retention ADR).
+4. **Consent.** [Alpha 4] Add a consent record for each recording of another person and each call to a third party. No call and no live meeting capture runs until the legal read passes (roadmap Q11).
+5. **Payments.** [Alpha 3] Card data is stored as write-only vault fields; the model never sees card numbers. Every payment is a Proposal with amount, merchant and recipient, and spend limits are checked in code. A payment whose result KatWork cannot confirm is recorded with its own outcome, separate from success and failure.
+6. **Sending as a person.** [Alpha 3] Every send on a person's behalf is a Proposal and is checked after sending. A standing grant, if the founder allows one (roadmap Q21), is bound to one recipient and content class and capped.
+7. **Clipboard.** [Alpha 2] Clipboard transfer into or out of a Kat's computer is explicit and logged.
+8. **Browser.** [Alpha 2] Dialogs in a Kat's browser go to the person or fail. They are never accepted automatically. Credential fill clears the fields and hands over to the person when it fails.
+9. **Egress.** [Alpha 2] The gateway fails closed when its policy cannot refresh. A tighter policy applies at once; a looser one applies only on reconnect.
+10. **Plugins.** [Alpha 2] A plugin package passes strict ingestion checks before install: size limits, no links outside the package, no executable surprises, and a manifest that matches its contents.
+11. **Telemetry.** [all waves] No change. No telemetry leaves the install unless an admin turns it on (roadmap Q19).
 
 ## §16 Open-core boundary
 
-The table gains rows for the new features. Which column each goes in is a founder decision (roadmap Q10); the recommendation there is:
+[Alpha 2 and Alpha 3] The table gains rows for the new features. Which column each goes in is a founder decision (roadmap Q10); the recommendation there is:
 - **Free core:** approvals, spend limits and every safety gate.
 - **Enterprise:** approval rules, the team marketplace, service accounts and the admin console.
 - **Cloud:** credits and top-ups.
@@ -89,23 +93,23 @@ The table gains rows for the new features. Which column each goes in is a founde
 ## Other sections the new scope touches
 
 These are smaller and are listed so that nothing is missed:
-- **§4 Domain model:** routines and triggers; connectors and their credentials; skills and versions; roles beyond admin and member; version numbers on tracked tasks for conflict detection; payment instruments and orders.
-- **§5.2 Services:** a companion relay, the speech engine, the connector runtime (pinned containers for stdio MCP and plugin commands), and the routine trigger endpoint.
-- **§6.4:** rooms where Kats talk to each other, with cost and loop rules. The 5-task, 3-level DAG limit still holds.
-- **§6.5 Approvals:** new action types: `pay`, `message-on-behalf` and `record`. Add a `pending_external` state, typed denial reasons, and a line on each approval card explaining why the job stopped. Bulk approval covers only identical requests, never outward or destructive ones. A second factor for payments.
-- **§7.2:** a disclosure card before sharing a Kat, listing what travels with it.
-- **§9:** the general desktop on the GUI tier, teach recording, screen recording, and the vault's card and contact fields.
-- **§17:** replace the week table with the re-plan's table once the founder approves a date.
-- **§18:** add risks for legal exposure (calls, recording, payments), Thai speech quality, and the pace assumption.
-- **ADR-0002:** questions a Kat asks while it keeps working change the resume model; needs an ADR note.
-- **ADR-0009:** a general desktop as a GUI-tier use; stealth browsing and egress through a person's machine as rejected alternatives, if the founder agrees (roadmap Q18).
-- **ADR-0010:** new untrusted sources (above); tool-result cards, if adopted (roadmap Q20).
+- **§4 Domain model:** [Alpha 2, payment instruments and orders Alpha 3] routines and triggers; connectors and their credentials; skills and versions; roles beyond admin and member; version numbers on tracked tasks for conflict detection; payment instruments and orders.
+- **§5.2 Services:** [companion relay Alpha 3, speech engine Alpha 4, the rest Alpha 2] a companion relay, the speech engine, the connector runtime (pinned containers for stdio MCP and plugin commands), and the routine trigger endpoint.
+- **§6.4:** [Alpha 2] rooms where Kats talk to each other, with cost and loop rules. The 5-task, 3-level DAG limit still holds.
+- **§6.5 Approvals:** [Alpha 2, payment second factor Alpha 3] new action types: `pay`, `message-on-behalf` and `record`. Add a `pending_external` state, typed denial reasons, and a line on each approval card explaining why the job stopped. Bulk approval covers only identical requests, never outward or destructive ones. A second factor for payments.
+- **§7.2:** [Alpha 2] a disclosure card before sharing a Kat, listing what travels with it.
+- **§9:** [Alpha 2] the general desktop on the GUI tier, teach recording, screen recording, and the vault's card and contact fields.
+- **§17:** [Alpha 1] replace the week table with the re-plan's table once the founder approves a date.
+- **§18:** [all waves] add risks for legal exposure (calls, recording, payments), Thai speech quality, and the pace assumption.
+- **ADR-0002:** [Alpha 2] questions a Kat asks while it keeps working change the resume model; needs an ADR note.
+- **ADR-0009:** [Alpha 2] a general desktop as a GUI-tier use; stealth browsing and egress through a person's machine as rejected alternatives, if the founder agrees (roadmap Q18).
+- **ADR-0010:** [Alpha 2, tool-result cards Alpha 3] new untrusted sources (above); tool-result cards, if adopted (roadmap Q20).
 
 ## New ADRs needed
 
 Each paragraph states the problem only. The ADR makes the decision, and the founder approves it.
 
-### Companion trust model
+### Companion trust model [needed before Alpha 3]
 
 Today every place a Kat acts is a server-side computer that KatWork isolates and controls (ADR-0009). A companion on a person's own computer reverses that. The person's files, apps, messages and accounts are in reach, and the host is not KatWork's. The ADR must settle several things:
 - what the companion may do, and how a person grants and revokes each capability;
@@ -114,7 +118,7 @@ Today every place a Kat acts is a server-side computer that KatWork isolates and
 - what happens when the server is compromised or unreachable;
 - which conformance test stands in for ADR-0009's kill criteria on a host KatWork does not own.
 
-### MCP posture
+### MCP posture [needed before Alpha 2]
 
 ADR-0010 and ADR-0011 cover untrusted content and the Craft apps' MCP servers behind a policy proxy. General MCP servers are wider. They come from third parties and run commands or call remote services. They return text and resources that may carry injections, they ask for credentials, and they can elicit input from a person. The ADR must settle several things:
 - which transports are allowed: remote HTTPS only at first, or stdio in pinned containers;
@@ -123,7 +127,7 @@ ADR-0010 and ADR-0011 cover untrusted content and the Craft apps' MCP servers be
 - whose credentials a server sees;
 - whether a server added by one person may run for the whole team.
 
-### Voice, STT and TTS for Thai
+### Voice, STT and TTS for Thai [needed before Alpha 4]
 
 Voice chat, dictation, phone calls and meeting capture all need speech-to-text and text-to-speech that work for Thai office speech. That speech mixes Thai and English, names, numbers and Buddhist-Era dates. No engine is qualified yet. The ADR must set a qualification gate, as ADR-0008 did for OCR:
 - a test set and error thresholds per language;
@@ -131,7 +135,7 @@ Voice chat, dictation, phone calls and meeting capture all need speech-to-text a
 - the data residency of audio;
 - how a Space that allows only local models gets voice.
 
-### Payment rails
+### Payment rails [needed before Alpha 3]
 
 Kats paying for things need instruments, limits and records. A self-hosted install has no merchant relationship, card-issuing account or payment processor of its own. The ADR must settle several things:
 - which rails an install uses (roadmap Q9);
@@ -141,7 +145,7 @@ Kats paying for things need instruments, limits and records. A self-hosted insta
 - how a payment with an unknown result is recorded and resolved;
 - what happens to refunds and disputes.
 
-### Recording retention and PDPA
+### Recording retention and PDPA [needed before Alpha 2 for screen and teach recordings, and before Alpha 4 for audio]
 
 Meeting capture, voice memos, phone calls, screen recording and teach recordings create recordings of people, often people who are not KatWork users. Under Thailand's PDPA these are personal data. Some need consent, and all need a retention limit and deletion. The ADR must settle several things:
 - what consent is recorded, by whom, and when;
@@ -151,8 +155,8 @@ Meeting capture, voice memos, phone calls, screen recording and teach recordings
 
 It depends on the legal read in roadmap Q11.
 
-A connector-credentials ADR is also needed. It decides whose credential a connector uses: the person's, a Kat service account, or a delegated one. The roadmap names it under sub-project 12.
+A connector-credentials ADR is also needed, before Alpha 2. It decides whose credential a connector uses: the person's, a Kat service account, or a delegated one. The roadmap names it under sub-project 12.
 
 ## Open questions
 
-The founder's questions for this amendment are in the roadmap, Q1 and Q8 to Q24, each with a recommended option. Roadmap Q3 (sub-project 7 and the alpha) now also decides §1.2 item 4 above.
+The founder's questions for this amendment are in the roadmap, Q1 and Q8 to Q24, each with a recommended option. Roadmap Q3 (sub-project 7 and the alpha) also decides §1.2 item 4 above. No change tagged Alpha 1 adds scope: Alpha 1 is the spec as written, re-dated.
