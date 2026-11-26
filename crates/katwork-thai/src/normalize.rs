@@ -87,8 +87,9 @@ impl Normalized {
     }
 
     /// The input range the code points `start..end` were made from, without the deleted code
-    /// points around them, widened to grapheme clusters. For the scanners' spans; `start < end`.
-    pub(crate) fn source_range(&self, start: usize, end: usize) -> Range<u32> {
+    /// points around them (a space or ZWSP before or after), widened to grapheme clusters. For
+    /// the scanners' spans and `cite`'s quotes; `start < end` (otherwise `original_range`).
+    pub fn source_range(&self, start: usize, end: usize) -> Range<u32> {
         let map = &self.map;
         match (
             map.from.get(start),

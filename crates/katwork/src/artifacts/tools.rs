@@ -36,7 +36,7 @@ const LIST_ROWS: u32 = 72;
 const MINT_RESERVE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// A `KatError` as the model sees it.
-fn from_kat(error: KatError) -> ToolError {
+pub(crate) fn from_kat(error: KatError) -> ToolError {
     match error {
         KatError::NotFound => ToolError::Coded("not_found"),
         KatError::BlobCorrupt => ToolError::Coded("blob_corrupt"),

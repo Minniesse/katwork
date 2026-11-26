@@ -354,11 +354,33 @@ impl SourceRef {
     /// `start..end` (code points of `block.text`), clamped to the text and widened to whole
     /// grapheme clusters; keeps the boxes of the lines that overlap it.
     pub fn narrow(&self, block: &Block, start: u32, end: u32) -> SourceRef {
-        let chars: Vec<char> = block.text.chars().collect();
+        let (mut narrowed, start, end) = self.refine(&block.text, start, end);
+        narrowed.boxes = block
+            .lines
+            .iter()
+            .filter(|line| (line.start as usize) < end && (line.end as usize) > start)
+            .map(|line| RefBox {
+                page: line.page,
+                rect: line.rect,
+            })
+            .collect();
+        narrowed
+    }
+
+    /// `narrow` for a stored span, whose ref is a block's (`for_block`) and whose `text` is the
+    /// block's text, but whose line offsets were not kept: every box of the block stays, so a
+    /// highlight covers the block's lines rather than only those the quote overlaps.
+    pub fn narrow_text(&self, text: &str, start: u32, end: u32) -> SourceRef {
+        self.refine(text, start, end).0
+    }
+
+    /// The refinement `narrow` and `narrow_text` share, with the snapped range.
+    fn refine(&self, text: &str, start: u32, end: u32) -> (SourceRef, usize, usize) {
+        let chars: Vec<char> = text.chars().collect();
         // Grapheme boundaries in code points, 0 and the length included.
         let mut bounds = vec![0usize];
         let mut count = 0;
-        for grapheme in block.text.graphemes(true) {
+        for grapheme in text.graphemes(true) {
             count += grapheme.chars().count();
             bounds.push(count);
         }
@@ -383,24 +405,21 @@ impl SourceRef {
         ];
         let mut narrowed = self.clone();
         *block_link(&mut narrowed.selector) = refinement;
-        narrowed.boxes = block
-            .lines
-            .iter()
-            .filter(|line| (line.start as usize) < end && (line.end as usize) > start)
-            .map(|line| RefBox {
-                page: line.page,
-                rect: line.rect,
-            })
-            .collect();
-        narrowed
+        (narrowed, start, end)
     }
 
     /// `"<file name> · <locator>"`, in the plan's English literals, for the model and the log;
     /// the web localises from the structured ref instead (Task 29). `file_name` is the
     /// artifact's full name, folders included.
     pub fn display(&self, file_name: &str) -> String {
+        format!("{file_name} · {}", self.locator())
+    }
+
+    /// The locator part of `display` (`p. 3`, `Budget!B7`, `¶ 17`, `¶ 1 · footnotes`), `?`
+    /// for a chain it cannot parse.
+    pub fn locator(&self) -> String {
         let links = self.links().unwrap_or_default();
-        let locator = match links.as_slice() {
+        match links.as_slice() {
             [Link::Page(page), Link::Block(_), ..] => format!("p. {page}"),
             [Link::Sheet { name }, Link::Cell { row, col }, ..] => {
                 format!("{name}!{}{row}", column_letters(*col))
@@ -411,8 +430,7 @@ impl SourceRef {
             },
             [Link::Block(ordinal), ..] => format!("¶ {ordinal}"),
             _ => "?".into(),
-        };
-        format!("{file_name} · {locator}")
+        }
     }
 
     /// The chain's fragment links, parsed, outer to inner.

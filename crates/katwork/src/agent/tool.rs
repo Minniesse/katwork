@@ -78,6 +78,10 @@ pub const TOOL_CODES: &[&str] = &[
     "file_encrypted",
     "file_type_unsupported",
     "doc_timeout",
+    "span_unknown",
+    "quote_not_in_span",
+    "quote_ambiguous",
+    "text_too_long",
 ];
 impl ToolError {
     pub fn code(&self) -> &'static str {
