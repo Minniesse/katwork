@@ -1431,6 +1431,7 @@ impl Workbook {
         };
         // The defined name being read: its name, its sheet and its text so far.
         let mut name: Option<(String, Option<usize>, String)> = None;
+        let mut defined = HashSet::new();
         let (mut seen, mut ids, mut names) = (HashSet::new(), HashSet::new(), HashSet::new());
         let mut rel_ids = HashSet::new();
         let bad = DocError::Malformed("xlsx_workbook");
@@ -1459,6 +1460,11 @@ impl Workbook {
                         let text = decode_xstring(&formula).into_owned();
                         if text.chars().count() > MAX_FORMULA_CHARS {
                             return Err(DocError::TooComplex("formula"));
+                        }
+                        // Two names of one scope that differ only in case: which one Excel
+                        // reads is not known.
+                        if !defined.insert((local, key.to_uppercase())) {
+                            return Err(DocError::Malformed("xlsx_defined_name"));
                         }
                         workbook.names.push(deps::DefinedName {
                             name: key,
@@ -2323,6 +2329,9 @@ struct SheetData {
     /// only that cell holds it, but a recalculation replaces every cell's value (ECMA-376
     /// Part 1 §18.17.6.3).
     formula_ranges: Vec<(Merge, (u32, u32))>,
+    /// Formula cells whose cached value is empty: they show nothing, but the dependency walk
+    /// still reads them.
+    silent: Vec<Cell>,
 }
 
 const SHEET_NAMES: &[&str] = &[
@@ -2390,6 +2399,7 @@ fn read_sheet(xml: &[u8], strings: &[Rst], limits: &DocLimits) -> Result<SheetDa
         columns: Vec::new(),
         merges: Vec::new(),
         formula_ranges: Vec::new(),
+        silent: Vec::new(),
     };
     let reference = DocError::Malformed("xlsx_cell_reference");
     let structure = DocError::Malformed("xlsx_structure");
@@ -2670,8 +2680,10 @@ fn read_sheet(xml: &[u8], strings: &[Rst], limits: &DocLimits) -> Result<SheetDa
                     ("c", 3) => {
                         let open_cell = cell.take().ok_or(structure)?;
                         let hidden = row.is_some_and(|(_, hidden, _, _)| hidden);
-                        if let Some(cell) = finish_cell(open_cell, hidden, strings)? {
-                            data.cells.push(cell);
+                        match finish_cell(open_cell, hidden, strings)? {
+                            Some((cell, false)) => data.cells.push(cell),
+                            Some((cell, true)) => data.silent.push(cell),
+                            None => {}
                         }
                     }
                     _ if depth >= 5 => {
@@ -2708,26 +2720,28 @@ fn merge_range(text: &str) -> Option<Merge> {
     })
 }
 
-/// A finished cell's value by its type, checked as Excel stores it; `None` for an empty cell.
+/// A finished cell's value by its type, checked as Excel stores it; `None` for an empty cell,
+/// and `true` beside a formula cell that shows nothing.
 fn finish_cell(
-    cell: OpenCell,
+    mut cell: OpenCell,
     row_hidden: bool,
     strings: &[Rst],
-) -> Result<Option<Cell>, DocError> {
+) -> Result<Option<(Cell, bool)>, DocError> {
     // A formula's empty cached value is a value: the cell shows nothing, and its formula's text
     // is not read in its place.
+    let mut silent = false;
     if cell.formula.is_some()
         && let Some(cached) = &cell.value
     {
-        let empty = match cell.kind.as_str() {
+        silent = match cell.kind.as_str() {
             "str" => cached.is_empty(),
             "inlineStr" => false,
             _ => cached
                 .trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'))
                 .is_empty(),
         };
-        if empty {
-            return Ok(None);
+        if silent {
+            cell.value = None;
         }
     }
     let value = match (cell.kind.as_str(), cell.value, cell.inline) {
@@ -2788,7 +2802,7 @@ fn finish_cell(
         .formula
         .map(|(text, _, _)| text)
         .filter(|text| !text.is_empty());
-    if value.is_none() && formula.is_none() {
+    if value.is_none() && formula.is_none() && !silent {
         return Ok(None);
     }
     let kind = match cell.kind.as_str() {
@@ -2797,21 +2811,24 @@ fn finish_cell(
         "e" => CellKind::Error,
         _ => CellKind::Number,
     };
-    Ok(Some(Cell {
-        row: cell.row,
-        col: cell.col,
-        xf: cell.xf,
-        unstyled: cell.unstyled,
-        row_xf: cell.row_xf,
-        kind,
-        row_hidden,
-        value,
-        formula,
-        has_formula,
-        ca: cell.ca,
-        data_table: cell.data_table,
-        master: cell.master,
-    }))
+    Ok(Some((
+        Cell {
+            row: cell.row,
+            col: cell.col,
+            xf: cell.xf,
+            unstyled: cell.unstyled,
+            row_xf: cell.row_xf,
+            kind,
+            row_hidden,
+            value,
+            formula,
+            has_formula,
+            ca: cell.ca,
+            data_table: cell.data_table,
+            master: cell.master,
+        },
+        silent,
+    )))
 }
 
 /// A `d` value as ISO 8601 writes a date, with or without a time of day and a trailing `Z`:

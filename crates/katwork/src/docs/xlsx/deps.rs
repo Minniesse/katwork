@@ -13,17 +13,543 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use super::{DocError, DocLimits, MAX_COLUMN, MAX_ROW, Merge, SheetData, check};
 
-/// Functions Excel recalculates at every recalculation, whatever their arguments changed.
+/// Functions Excel recalculates at every recalculation, whatever their arguments changed, or
+/// may (`SUMIF` for some arguments; `RTD`, `WEBSERVICE`, `STOCKHISTORY` and the `CUBE`
+/// functions fetch from outside the workbook): failing closed, all count as volatile. Every
+/// `CUBE` function is, by its prefix.
 const VOLATILE: &[&str] = &[
-    "NOW",
-    "TODAY",
-    "RAND",
-    "RANDBETWEEN",
-    "RANDARRAY",
-    "OFFSET",
-    "INDIRECT",
     "CELL",
+    "INDIRECT",
     "INFO",
+    "NOW",
+    "OFFSET",
+    "RAND",
+    "RANDARRAY",
+    "RANDBETWEEN",
+    "RTD",
+    "STOCKHISTORY",
+    "SUMIF",
+    "TODAY",
+    "WEBSERVICE",
+];
+
+fn is_volatile(name: &str) -> bool {
+    name.starts_with("CUBE") || VOLATILE.contains(&name)
+}
+
+/// Excel's own worksheet functions that are not volatile, by their names in a file after any
+/// `_xlfn.` or `_xlws.` prefix: those of ECMA-376 Part 1 §18.17.7 and the later ones Excel
+/// writes with a prefix. Any other function called (an add-in's, a macro's, another
+/// workbook's, or one the reader does not know) counts as volatile. Sorted, for a binary
+/// search.
+const BUILT_IN: &[&str] = &[
+    "ABS",
+    "ACCRINT",
+    "ACCRINTM",
+    "ACOS",
+    "ACOSH",
+    "ACOT",
+    "ACOTH",
+    "ADDRESS",
+    "AGGREGATE",
+    "AMORDEGRC",
+    "AMORLINC",
+    "ANCHORARRAY",
+    "AND",
+    "ARABIC",
+    "AREAS",
+    "ARRAYTOTEXT",
+    "ASC",
+    "ASIN",
+    "ASINH",
+    "ATAN",
+    "ATAN2",
+    "ATANH",
+    "AVEDEV",
+    "AVERAGE",
+    "AVERAGEA",
+    "AVERAGEIF",
+    "AVERAGEIFS",
+    "BAHTTEXT",
+    "BASE",
+    "BESSELI",
+    "BESSELJ",
+    "BESSELK",
+    "BESSELY",
+    "BETA.DIST",
+    "BETA.INV",
+    "BETADIST",
+    "BETAINV",
+    "BIN2DEC",
+    "BIN2HEX",
+    "BIN2OCT",
+    "BINOM.DIST",
+    "BINOM.DIST.RANGE",
+    "BINOM.INV",
+    "BINOMDIST",
+    "BITAND",
+    "BITLSHIFT",
+    "BITOR",
+    "BITRSHIFT",
+    "BITXOR",
+    "BYCOL",
+    "BYROW",
+    "CEILING",
+    "CEILING.MATH",
+    "CEILING.PRECISE",
+    "CHAR",
+    "CHIDIST",
+    "CHIINV",
+    "CHISQ.DIST",
+    "CHISQ.DIST.RT",
+    "CHISQ.INV",
+    "CHISQ.INV.RT",
+    "CHISQ.TEST",
+    "CHITEST",
+    "CHOOSE",
+    "CHOOSECOLS",
+    "CHOOSEROWS",
+    "CLEAN",
+    "CODE",
+    "COLUMN",
+    "COLUMNS",
+    "COMBIN",
+    "COMBINA",
+    "COMPLEX",
+    "CONCAT",
+    "CONCATENATE",
+    "CONFIDENCE",
+    "CONFIDENCE.NORM",
+    "CONFIDENCE.T",
+    "CONVERT",
+    "CORREL",
+    "COS",
+    "COSH",
+    "COT",
+    "COTH",
+    "COUNT",
+    "COUNTA",
+    "COUNTBLANK",
+    "COUNTIF",
+    "COUNTIFS",
+    "COUPDAYBS",
+    "COUPDAYS",
+    "COUPDAYSNC",
+    "COUPNCD",
+    "COUPNUM",
+    "COUPPCD",
+    "COVAR",
+    "COVARIANCE.P",
+    "COVARIANCE.S",
+    "CRITBINOM",
+    "CSC",
+    "CSCH",
+    "CUMIPMT",
+    "CUMPRINC",
+    "DATE",
+    "DATEDIF",
+    "DATEVALUE",
+    "DAVERAGE",
+    "DAY",
+    "DAYS",
+    "DAYS360",
+    "DB",
+    "DBCS",
+    "DCOUNT",
+    "DCOUNTA",
+    "DDB",
+    "DEC2BIN",
+    "DEC2HEX",
+    "DEC2OCT",
+    "DECIMAL",
+    "DEGREES",
+    "DELTA",
+    "DEVSQ",
+    "DGET",
+    "DISC",
+    "DMAX",
+    "DMIN",
+    "DOLLAR",
+    "DOLLARDE",
+    "DOLLARFR",
+    "DPRODUCT",
+    "DROP",
+    "DSTDEV",
+    "DSTDEVP",
+    "DSUM",
+    "DURATION",
+    "DVAR",
+    "DVARP",
+    "EDATE",
+    "EFFECT",
+    "ENCODEURL",
+    "EOMONTH",
+    "ERF",
+    "ERF.PRECISE",
+    "ERFC",
+    "ERFC.PRECISE",
+    "ERROR.TYPE",
+    "EVEN",
+    "EXACT",
+    "EXP",
+    "EXPAND",
+    "EXPON.DIST",
+    "EXPONDIST",
+    "F.DIST",
+    "F.DIST.RT",
+    "F.INV",
+    "F.INV.RT",
+    "F.TEST",
+    "FACT",
+    "FACTDOUBLE",
+    "FALSE",
+    "FDIST",
+    "FILTER",
+    "FILTERXML",
+    "FIND",
+    "FINDB",
+    "FINV",
+    "FISHER",
+    "FISHERINV",
+    "FIXED",
+    "FLOOR",
+    "FLOOR.MATH",
+    "FLOOR.PRECISE",
+    "FORECAST",
+    "FORECAST.ETS",
+    "FORECAST.ETS.CONFINT",
+    "FORECAST.ETS.SEASONALITY",
+    "FORECAST.ETS.STAT",
+    "FORECAST.LINEAR",
+    "FORMULATEXT",
+    "FREQUENCY",
+    "FTEST",
+    "FV",
+    "FVSCHEDULE",
+    "GAMMA",
+    "GAMMA.DIST",
+    "GAMMA.INV",
+    "GAMMADIST",
+    "GAMMAINV",
+    "GAMMALN",
+    "GAMMALN.PRECISE",
+    "GAUSS",
+    "GCD",
+    "GEOMEAN",
+    "GESTEP",
+    "GETPIVOTDATA",
+    "GROUPBY",
+    "GROWTH",
+    "HARMEAN",
+    "HEX2BIN",
+    "HEX2DEC",
+    "HEX2OCT",
+    "HLOOKUP",
+    "HOUR",
+    "HSTACK",
+    "HYPERLINK",
+    "HYPGEOM.DIST",
+    "HYPGEOMDIST",
+    "IF",
+    "IFERROR",
+    "IFNA",
+    "IFS",
+    "IMABS",
+    "IMAGINARY",
+    "IMARGUMENT",
+    "IMCONJUGATE",
+    "IMCOS",
+    "IMCOSH",
+    "IMCOT",
+    "IMCSC",
+    "IMCSCH",
+    "IMDIV",
+    "IMEXP",
+    "IMLN",
+    "IMLOG10",
+    "IMLOG2",
+    "IMPOWER",
+    "IMPRODUCT",
+    "IMREAL",
+    "IMSEC",
+    "IMSECH",
+    "IMSIN",
+    "IMSINH",
+    "IMSQRT",
+    "IMSUB",
+    "IMSUM",
+    "IMTAN",
+    "INDEX",
+    "INT",
+    "INTERCEPT",
+    "INTRATE",
+    "IPMT",
+    "IRR",
+    "ISBLANK",
+    "ISERR",
+    "ISERROR",
+    "ISEVEN",
+    "ISFORMULA",
+    "ISLOGICAL",
+    "ISNA",
+    "ISNONTEXT",
+    "ISNUMBER",
+    "ISO.CEILING",
+    "ISODD",
+    "ISOMITTED",
+    "ISOWEEKNUM",
+    "ISPMT",
+    "ISREF",
+    "ISTEXT",
+    "ISTHAIDIGIT",
+    "JIS",
+    "KURT",
+    "LAMBDA",
+    "LARGE",
+    "LCM",
+    "LEFT",
+    "LEFTB",
+    "LEN",
+    "LENB",
+    "LET",
+    "LINEST",
+    "LN",
+    "LOG",
+    "LOG10",
+    "LOGEST",
+    "LOGINV",
+    "LOGNORM.DIST",
+    "LOGNORM.INV",
+    "LOGNORMDIST",
+    "LOOKUP",
+    "LOWER",
+    "MAKEARRAY",
+    "MAP",
+    "MATCH",
+    "MAX",
+    "MAXA",
+    "MAXIFS",
+    "MDETERM",
+    "MDURATION",
+    "MEDIAN",
+    "MID",
+    "MIDB",
+    "MIN",
+    "MINA",
+    "MINIFS",
+    "MINUTE",
+    "MINVERSE",
+    "MIRR",
+    "MMULT",
+    "MOD",
+    "MODE",
+    "MODE.MULT",
+    "MODE.SNGL",
+    "MONTH",
+    "MROUND",
+    "MULTINOMIAL",
+    "MUNIT",
+    "N",
+    "NA",
+    "NEGBINOM.DIST",
+    "NEGBINOMDIST",
+    "NETWORKDAYS",
+    "NETWORKDAYS.INTL",
+    "NOMINAL",
+    "NORM.DIST",
+    "NORM.INV",
+    "NORM.S.DIST",
+    "NORM.S.INV",
+    "NORMDIST",
+    "NORMINV",
+    "NORMSDIST",
+    "NORMSINV",
+    "NOT",
+    "NPER",
+    "NPV",
+    "NUMBERVALUE",
+    "OCT2BIN",
+    "OCT2DEC",
+    "OCT2HEX",
+    "ODD",
+    "ODDFPRICE",
+    "ODDFYIELD",
+    "ODDLPRICE",
+    "ODDLYIELD",
+    "OR",
+    "PDURATION",
+    "PEARSON",
+    "PERCENTILE",
+    "PERCENTILE.EXC",
+    "PERCENTILE.INC",
+    "PERCENTOF",
+    "PERCENTRANK",
+    "PERCENTRANK.EXC",
+    "PERCENTRANK.INC",
+    "PERMUT",
+    "PERMUTATIONA",
+    "PHI",
+    "PHONETIC",
+    "PI",
+    "PIVOTBY",
+    "PMT",
+    "POISSON",
+    "POISSON.DIST",
+    "POWER",
+    "PPMT",
+    "PRICE",
+    "PRICEDISC",
+    "PRICEMAT",
+    "PROB",
+    "PRODUCT",
+    "PROPER",
+    "PV",
+    "QUARTILE",
+    "QUARTILE.EXC",
+    "QUARTILE.INC",
+    "QUOTIENT",
+    "RADIANS",
+    "RANK",
+    "RANK.AVG",
+    "RANK.EQ",
+    "RATE",
+    "RECEIVED",
+    "REDUCE",
+    "REGEXEXTRACT",
+    "REGEXREPLACE",
+    "REGEXTEST",
+    "REPLACE",
+    "REPLACEB",
+    "REPT",
+    "RIGHT",
+    "RIGHTB",
+    "ROMAN",
+    "ROUND",
+    "ROUNDBAHTDOWN",
+    "ROUNDBAHTUP",
+    "ROUNDDOWN",
+    "ROUNDUP",
+    "ROW",
+    "ROWS",
+    "RRI",
+    "RSQ",
+    "SCAN",
+    "SEARCH",
+    "SEARCHB",
+    "SEC",
+    "SECH",
+    "SECOND",
+    "SEQUENCE",
+    "SERIESSUM",
+    "SHEET",
+    "SHEETS",
+    "SIGN",
+    "SIN",
+    "SINGLE",
+    "SINH",
+    "SKEW",
+    "SKEW.P",
+    "SLN",
+    "SLOPE",
+    "SMALL",
+    "SORT",
+    "SORTBY",
+    "SQRT",
+    "SQRTPI",
+    "STANDARDIZE",
+    "STDEV",
+    "STDEV.P",
+    "STDEV.S",
+    "STDEVA",
+    "STDEVP",
+    "STDEVPA",
+    "STEYX",
+    "SUBSTITUTE",
+    "SUBTOTAL",
+    "SUM",
+    "SUMIFS",
+    "SUMPRODUCT",
+    "SUMSQ",
+    "SUMX2MY2",
+    "SUMX2PY2",
+    "SUMXMY2",
+    "SWITCH",
+    "SYD",
+    "T",
+    "T.DIST",
+    "T.DIST.2T",
+    "T.DIST.RT",
+    "T.INV",
+    "T.INV.2T",
+    "T.TEST",
+    "TAKE",
+    "TAN",
+    "TANH",
+    "TBILLEQ",
+    "TBILLPRICE",
+    "TBILLYIELD",
+    "TDIST",
+    "TEXT",
+    "TEXTAFTER",
+    "TEXTBEFORE",
+    "TEXTJOIN",
+    "TEXTSPLIT",
+    "THAIDAYOFWEEK",
+    "THAIDIGIT",
+    "THAIMONTHOFYEAR",
+    "THAINUMSOUND",
+    "THAINUMSTRING",
+    "THAISTRINGLENGTH",
+    "THAIYEAR",
+    "TIME",
+    "TIMEVALUE",
+    "TINV",
+    "TOCOL",
+    "TOROW",
+    "TRANSPOSE",
+    "TREND",
+    "TRIM",
+    "TRIMMEAN",
+    "TRIMRANGE",
+    "TRUE",
+    "TRUNC",
+    "TTEST",
+    "TYPE",
+    "UNICHAR",
+    "UNICODE",
+    "UNIQUE",
+    "UPPER",
+    "VALUE",
+    "VALUETOTEXT",
+    "VAR",
+    "VAR.P",
+    "VAR.S",
+    "VARA",
+    "VARP",
+    "VARPA",
+    "VDB",
+    "VLOOKUP",
+    "VSTACK",
+    "WEEKDAY",
+    "WEEKNUM",
+    "WEIBULL",
+    "WEIBULL.DIST",
+    "WORKDAY",
+    "WORKDAY.INTL",
+    "WRAPCOLS",
+    "WRAPROWS",
+    "XIRR",
+    "XLOOKUP",
+    "XMATCH",
+    "XNPV",
+    "XOR",
+    "YEAR",
+    "YEARFRAC",
+    "YIELD",
+    "YIELDDISC",
+    "YIELDMAT",
+    "Z.TEST",
+    "ZTEST",
 ];
 
 /// Prefixes Excel writes before a newer function's name in a file.
@@ -103,6 +629,9 @@ struct Work {
     max_steps: u64,
     refs: u64,
     max_refs: u64,
+    /// More references than `max_refs`: the walk stops following them, and every formula
+    /// counts as recalculated if any is volatile.
+    overflow: bool,
 }
 
 impl Work {
@@ -118,12 +647,15 @@ impl Work {
         Ok(())
     }
 
-    fn keep(&mut self, refs: usize) -> Result<(), DocError> {
-        self.refs += refs as u64;
+    /// Counts `deps`' references, and drops them once past the cap.
+    fn keep(&mut self, deps: &mut Deps) {
+        self.refs += deps.areas.len() as u64;
         if self.refs > self.max_refs {
-            return Err(DocError::TooComplex("formula_dependencies"));
+            self.overflow = true;
         }
-        Ok(())
+        if self.overflow {
+            deps.areas = Vec::new();
+        }
     }
 }
 
@@ -139,10 +671,11 @@ pub(super) fn volatile_cells(
 ) -> Result<HashSet<(usize, u32, u32)>, DocError> {
     let cap = u64::from(limits.max_cells).max(1);
     let mut resolver = Resolver {
-        sheets: sheet_names
+        // Only worksheets: a reference into a chart, dialog or macro sheet, whose cells the
+        // reader never reads, is not followed.
+        sheets: sheets
             .iter()
-            .enumerate()
-            .map(|(at, name)| (name.to_lowercase(), at))
+            .map(|&(at, _)| (sheet_names[at].to_lowercase(), at))
             .collect(),
         names: defined
             .iter()
@@ -157,6 +690,7 @@ pub(super) fn volatile_cells(
             max_steps: WORK_PER_CELL * cap,
             refs: 0,
             max_refs: REFS_PER_CELL * cap,
+            overflow: false,
         },
     };
 
@@ -168,7 +702,8 @@ pub(super) fn volatile_cells(
     let mut formulas = Vec::new();
     let mut seeded = false;
     for &(sheet, data) in sheets {
-        for (at, cell) in data.cells.iter().enumerate() {
+        // A formula whose cached value is empty shows nothing, but is recalculated all the same.
+        for (at, cell) in data.cells.iter().chain(&data.silent).enumerate() {
             if !cell.has_formula {
                 continue;
             }
@@ -191,7 +726,7 @@ pub(super) fn volatile_cells(
             };
             deps.volatile |= cell.ca;
             deps.unknown |= cell.data_table;
-            resolver.work.keep(deps.areas.len())?;
+            resolver.work.keep(&mut deps);
             seeded |= deps.volatile;
             formulas.push(Formula {
                 at: (sheet, cell.row, cell.col),
@@ -203,6 +738,7 @@ pub(super) fn volatile_cells(
     if !seeded {
         return Ok(tainted.cells);
     }
+    let overflow = resolver.work.overflow;
 
     // Array formulas and data tables, by the cell holding their `f`, and every cell read.
     let mut ranges: HashMap<(usize, u32, u32), Vec<Merge>> = HashMap::new();
@@ -216,11 +752,20 @@ pub(super) fn volatile_cells(
             .or_default()
             .extend(data.cells.iter().map(|cell| (cell.row, cell.col)));
     }
+    let mut work = resolver.work;
+    // Past the reference cap the walk cannot tell which formulas depend on a volatile one: all
+    // do.
+    if overflow {
+        let mut queue = VecDeque::new();
+        for formula in &formulas {
+            tainted.add(formula.at, &ranges, &cells, &mut queue, &mut work)?;
+        }
+        return Ok(tainted.cells);
+    }
 
     // Formulas by the single cells they read, and the ranges they read.
     let mut readers: HashMap<(usize, u32, u32), Vec<usize>> = HashMap::new();
     let mut areas: Vec<(usize, Merge, usize)> = Vec::new();
-    let mut work = resolver.work;
     for (id, formula) in formulas.iter().enumerate() {
         for &(sheet, area) in &formula.deps.areas {
             work.step(1)?;
@@ -265,6 +810,8 @@ pub(super) fn volatile_cells(
     // order, spreading at once from each it finds; a pass that finds none ends the walk.
     loop {
         let mut found = false;
+        work.step(areas.len() as u64)?;
+        areas.retain(|&(_, _, id)| !done[id]);
         for &(sheet, area, id) in &areas {
             if done[id] {
                 continue;
@@ -364,6 +911,8 @@ impl Resolver<'_> {
         let mut at = 0;
         // The sheet a `Sheet!` prefix just named: none when it names no sheet of the workbook.
         let mut qualified: Option<Option<usize>> = None;
+        // A `[1]!` prefix just named another workbook.
+        let mut external = false;
         while let Some(&c) = chars.get(at) {
             match c {
                 '"' => {
@@ -403,7 +952,8 @@ impl Resolver<'_> {
                     }
                 }
                 '[' => {
-                    // A structured or external reference.
+                    // A structured or external reference; `[1]!F(` calls a function of
+                    // another workbook.
                     deps.unknown = true;
                     let mut open = 0u32;
                     while let Some(&c) = chars.get(at) {
@@ -420,6 +970,11 @@ impl Resolver<'_> {
                         }
                     }
                     qualified = None;
+                    if chars.get(at) == Some(&'!') {
+                        at += 1;
+                        external = true;
+                        continue;
+                    }
                 }
                 '#' => {
                     // An error value such as `#REF!` or `#N/A`.
@@ -447,19 +1002,13 @@ impl Resolver<'_> {
                         continue;
                     }
                     let sheet = qualified.take();
+                    let external = std::mem::take(&mut external);
                     let mut next = at;
-                    while chars.get(next) == Some(&' ') {
+                    while chars.get(next).is_some_and(|c| " \r\n\t".contains(*c)) {
                         next += 1;
                     }
                     if chars.get(next) == Some(&'(') {
-                        let mut name = token.to_uppercase();
-                        while let Some(rest) = FUNCTION_PREFIXES
-                            .iter()
-                            .find_map(|prefix| name.strip_prefix(&prefix.to_uppercase()))
-                        {
-                            name = rest.to_owned();
-                        }
-                        deps.volatile |= VOLATILE.contains(&name.as_str());
+                        self.call(&token, sheet, external, place, depth, &mut deps)?;
                         continue;
                     }
                     let sheet = match sheet {
@@ -518,7 +1067,9 @@ impl Resolver<'_> {
             }
             match (on, place.shift) {
                 (Some(on), Some(shift)) => {
-                    if let (Some((r0, c0)), Some((r1, c1))) = (a.shifted(shift), b.shifted(shift)) {
+                    if let (Some((r0, c0)), Some((r1, c1))) =
+                        (a.shifted(shift, false), b.shifted(shift, true))
+                    {
                         deps.areas.push((
                             on,
                             Merge {
@@ -531,8 +1082,11 @@ impl Resolver<'_> {
                     }
                 }
                 (Some(on), None) if a.absolute() && b.absolute() => {
-                    let (r0, c0) = a.at();
-                    let (r1, c1) = b.at();
+                    let (Some((r0, c0)), Some((r1, c1))) =
+                        (a.shifted((0, 0), false), b.shifted((0, 0), true))
+                    else {
+                        return Ok(stop);
+                    };
                     deps.areas.push((
                         on,
                         Merge {
@@ -550,7 +1104,7 @@ impl Resolver<'_> {
         if let Some(a) = cell(&token) {
             match (on, place.shift) {
                 (Some(on), Some(shift)) => {
-                    if let Some((row, col)) = a.shifted(shift) {
+                    if let Some((row, col)) = a.shifted(shift, false) {
                         deps.areas.push((
                             on,
                             Merge {
@@ -563,7 +1117,9 @@ impl Resolver<'_> {
                     }
                 }
                 (Some(on), None) if a.absolute() => {
-                    let (row, col) = a.at();
+                    let Some((row, col)) = a.shifted((0, 0), false) else {
+                        return Ok(end);
+                    };
                     deps.areas.push((
                         on,
                         Merge {
@@ -601,6 +1157,51 @@ impl Resolver<'_> {
         Ok(end)
     }
 
+    /// A function called by `token`: volatile if Excel recalculates it at every recalculation,
+    /// or if it is not one of Excel's own (another workbook's, an add-in's or a macro's, which
+    /// may be); a defined name called as one (a named `LAMBDA`) is followed.
+    fn call(
+        &mut self,
+        token: &str,
+        sheet: Option<Option<usize>>,
+        external: bool,
+        place: Place,
+        depth: u32,
+        deps: &mut Deps,
+    ) -> Result<(), DocError> {
+        let upper = token.to_uppercase();
+        if upper.starts_with(&PARAMETER_PREFIX.to_uppercase()) {
+            // A `LET` parameter bound to a `LAMBDA` written in this same formula.
+            return Ok(());
+        }
+        let mut name = upper.as_str();
+        while let Some(rest) = FUNCTION_PREFIXES
+            .iter()
+            .find_map(|prefix| name.strip_prefix(&prefix.to_uppercase()))
+        {
+            name = rest;
+        }
+        if external || sheet == Some(None) || is_volatile(name) {
+            deps.volatile = true;
+            return Ok(());
+        }
+        let on = sheet.flatten().or(place.sheet);
+        let found = [on.map(Some), Some(None)]
+            .into_iter()
+            .flatten()
+            .find_map(|scope| self.names.get(&(scope, name.to_owned())).copied());
+        match found {
+            Some(at) if !self.undecided => {
+                let named = self.name(at, depth)?;
+                self.work.step(named.areas.len() as u64)?;
+                deps.absorb(&named);
+            }
+            _ if sheet.is_none() && BUILT_IN.binary_search(&name).is_ok() => {}
+            _ => deps.volatile = true,
+        }
+        Ok(())
+    }
+
     /// What a defined name depends on; a name met again while it is read, or read too deep,
     /// is not followed.
     fn name(&mut self, at: usize, depth: u32) -> Result<Deps, DocError> {
@@ -627,7 +1228,8 @@ impl Resolver<'_> {
             shift: None,
         };
         let deps = self.read(&defined.text.clone(), place, depth + 1)?;
-        self.work.keep(deps.areas.len())?;
+        let mut deps = deps;
+        self.work.keep(&mut deps);
         self.states[at] = NameState::Read(deps.clone());
         Ok(deps)
     }
@@ -655,21 +1257,12 @@ impl End {
         self.row.is_none_or(|(_, abs)| abs) && self.col.is_none_or(|(_, abs)| abs)
     }
 
-    /// (row, column), a whole column's rows from 1 and a whole row's columns from 1 (the other
-    /// end gives the last).
-    fn at(self) -> (u32, u32) {
-        (
-            self.row.map_or(1, |(row, _)| row),
-            self.col.map_or(1, |(col, _)| col),
-        )
-    }
-
     /// Shifted by `(rows, cols)` where relative; none when that leaves the grid (Excel shows
-    /// `#REF!`, which depends on nothing). A whole column's missing row reads as the grid's
-    /// first or last, as is the other end's.
-    fn shifted(self, (rows, cols): (i64, i64)) -> Option<(u32, u32)> {
-        let move_by = |part: Option<(u32, bool)>, by: i64, max: u32, whole: u32| match part {
-            None => Some(whole),
+    /// `#REF!`, which depends on nothing). A whole column's missing row, and a whole row's
+    /// missing column, is the grid's first on a range's first end and its last on the `last`.
+    fn shifted(self, (rows, cols): (i64, i64), last: bool) -> Option<(u32, u32)> {
+        let move_by = |part: Option<(u32, bool)>, by: i64, max: u32| match part {
+            None => Some(if last { max } else { 1 }),
             Some((value, true)) => Some(value),
             Some((value, false)) => {
                 let moved = i64::from(value) + by;
@@ -679,19 +1272,9 @@ impl End {
                     .flatten()
             }
         };
-        let whole_row = if self.col.is_some() && self.row.is_none() {
-            MAX_ROW
-        } else {
-            1
-        };
-        let whole_col = if self.row.is_some() && self.col.is_none() {
-            MAX_COLUMN
-        } else {
-            1
-        };
         Some((
-            move_by(self.row, rows, MAX_ROW, whole_row)?,
-            move_by(self.col, cols, MAX_COLUMN, whole_col)?,
+            move_by(self.row, rows, MAX_ROW)?,
+            move_by(self.col, cols, MAX_COLUMN)?,
         ))
     }
 }
@@ -747,4 +1330,29 @@ fn row_part(token: &str) -> Option<((u32, bool), &str)> {
     }
     let row: u32 = rest[..digits].parse().ok()?;
     (row <= MAX_ROW).then_some(((row, abs), &rest[digits..]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BUILT_IN, VOLATILE, is_volatile};
+
+    #[test]
+    fn function_lists_are_sorted_unique_and_apart() {
+        for list in [BUILT_IN, VOLATILE] {
+            assert!(list.windows(2).all(|pair| pair[0] < pair[1]), "{list:?}");
+        }
+        assert!(BUILT_IN.iter().all(|name| !is_volatile(name)));
+        // Functions that may refresh from outside the workbook, named one by one.
+        for name in [
+            "SUMIF",
+            "RTD",
+            "WEBSERVICE",
+            "STOCKHISTORY",
+            "CUBEVALUE",
+            "CUBESET",
+            "CUBEKPIMEMBER",
+        ] {
+            assert!(is_volatile(name), "{name}");
+        }
+    }
 }

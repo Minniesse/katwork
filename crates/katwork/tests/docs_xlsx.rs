@@ -836,6 +836,203 @@ fn volatile_formulas_and_their_dependents_are_suspect() {
 }
 
 #[test]
+fn whole_row_and_column_references_reach_every_cell_of_the_line() {
+    // A volatile cell in the middle of each range: the formula reading it is recalculated.
+    for form in [
+        "SUM(A:A)",
+        "SUM($A:$A)",
+        "SUM(A:C)",
+        "SUM(5:5)",
+        "SUM(1:9)",
+        "SUM($5:$6)",
+        "SUM(Col)",
+        "SUM(Rw)",
+    ] {
+        let rows = [
+            row(5, r#"<c r="A5"><f>RAND()</f><v>1</v></c>"#),
+            row(20, &format!(r#"<c r="E20"><f>{form}</f><v>999</v></c>"#)),
+        ]
+        .concat();
+        let extracted = read(
+            &Xlsx::new()
+                .sheet("S", &data(&rows))
+                .workbook_head("")
+                .without_calc_pr()
+                .workbook_tail(
+                    r#"<definedNames><definedName name="Col">S!$A:$A</definedName><definedName name="Rw">S!$5:$5</definedName></definedNames><calcPr calcId="191029"/>"#,
+                ),
+        );
+        assert_eq!(recalculated(&extracted), ["S!A5", "S!E20"], "{form}");
+    }
+}
+
+#[test]
+fn defined_names_called_as_functions_are_followed() {
+    // A named LAMBDA hides its volatile call behind the name it is called by.
+    let f = |at: &str, formula: &str| format!(r#"<c r="{at}"><f>{formula}</f><v>999</v></c>"#);
+    let rows = [
+        row(
+            1,
+            &[f("A1", "Clock()"), f("B1", "A1+1"), f("C1", "Plain()")].concat(),
+        ),
+        row(2, &[f("A2", "f(1)"), f("B2", "A2+1")].concat()),
+        row(3, &[f("A3", "_xlfn.Clock()"), f("B3", "A3+1")].concat()),
+    ]
+    .concat();
+    let names = r#"<definedNames><definedName name="Clock">_xlfn.LAMBDA(NOW())</definedName><definedName name="f">_xlfn.LAMBDA(_xlpm.a,_xlpm.a+NOW())</definedName><definedName name="Plain">_xlfn.LAMBDA(1)</definedName></definedNames>"#;
+    let extracted = read(&Xlsx::new().sheet("S", &data(&rows)).workbook_tail(names));
+    assert_eq!(
+        recalculated(&extracted),
+        ["S!A1", "S!A2", "S!A3", "S!B1", "S!B2", "S!B3"]
+    );
+}
+
+#[test]
+fn volatile_formulas_with_empty_caches_still_seed_the_walk() {
+    // The cell itself shows nothing, but what depends on it, and the rest of its array, is
+    // recalculated.
+    let rows = [
+        row(
+            1,
+            &[
+                r#"<c r="A1"><f>NOW()</f><v/></c>"#,
+                r#"<c r="B1" t="str"><f>TEXT(NOW(),"x")</f><v></v></c>"#,
+                r#"<c r="C1"><f t="array" ref="C1:C3">NOW()</f><v/></c>"#,
+                r#"<c r="D1"><f>INDIRECT("E1")</f><v/></c>"#,
+            ]
+            .concat(),
+        ),
+        row(
+            2,
+            &[
+                r#"<c r="A2"><f>A1+1</f><v>999</v></c>"#,
+                r#"<c r="B2" t="str"><f>B1&amp;"y"</f><v>FORGED</v></c>"#,
+                r#"<c r="C2"><v>777</v></c>"#,
+                r#"<c r="D2"><f>D1*2</f><v>999</v></c>"#,
+            ]
+            .concat(),
+        ),
+        row(3, r#"<c r="C3"><v>888</v></c>"#),
+    ]
+    .concat();
+    let extracted = read(&Xlsx::new().sheet("S", &data(&rows)));
+    assert_eq!(
+        recalculated(&extracted),
+        ["S!A2", "S!B2", "S!C2", "S!C3", "S!D2"]
+    );
+}
+
+#[test]
+fn references_the_walk_cannot_follow_fail_closed() {
+    // A sheet whose cells the reader never reads, a duplicate name, and a line break before a
+    // call's parenthesis.
+    let sheet = data(&row(
+        1,
+        r#"<c r="A1"><f>Other!A1+0</f><v>999</v></c><c r="B1"><f>NOW()</f><v>1</v></c>"#,
+    ));
+    let base = Xlsx::new().sheet("S", &sheet);
+    let workbook = base.workbook_part().replace(
+        "</sheets>",
+        r#"<sheet name="Other" sheetId="9" r:id="rIdW0"/></sheets>"#,
+    );
+    let chart = format!(r#"<?xml version="1.0"?><chartsheet xmlns="{SML}"/>"#);
+    let extracted = read(
+        &base
+            .related(
+                "chartsheet",
+                "chartsheets/sheet1.xml",
+                Some(chart.as_bytes()),
+            )
+            .workbook_xml(&workbook),
+    );
+    assert_eq!(recalculated(&extracted), ["S!A1", "S!B1"]);
+    let broken = row(
+        1,
+        "<c r=\"A1\"><f>NOW&#10;()</f><v>1</v></c><c r=\"B1\"><f>A1+1</f><v>999</v></c>",
+    );
+    assert_eq!(
+        recalculated(&read(&Xlsx::new().sheet("S", &data(&broken)))),
+        ["S!A1", "S!B1"]
+    );
+    let dup = row(1, r#"<c r="A1"><f>Dup+0</f><v>999</v></c>"#);
+    assert_eq!(
+        extract(&Xlsx::new().sheet("S", &data(&dup)).workbook_tail(
+            r#"<definedNames><definedName name="Dup">NOW()</definedName><definedName name="DUP">1</definedName></definedNames>"#
+        )),
+        Err(DocError::Malformed("xlsx_defined_name"))
+    );
+}
+
+#[test]
+fn formulas_past_the_reference_cap_are_all_flagged_not_refused() {
+    let small = DocLimits {
+        max_cells: 100,
+        ..limits()
+    };
+    let refs: Vec<String> = (1..=20).map(|r| format!("Z{r}")).collect();
+    let cells = |first: &str| {
+        (1..=50)
+            .map(|r| {
+                let formula = if r == 1 {
+                    first.to_owned()
+                } else {
+                    format!("SUM({})", refs.join(","))
+                };
+                row(r, &format!(r#"<c r="A{r}"><f>{formula}</f><v>1</v></c>"#))
+            })
+            .collect::<String>()
+    };
+    // Past 8 references per cell the walk stops following them: with a volatile formula every
+    // formula is flagged; with none, nothing is.
+    let flagged = extract_with(&Xlsx::new().sheet("S", &data(&cells("NOW()"))), &small).unwrap();
+    assert_eq!(recalculated(&flagged).len(), 50);
+    let plain = extract_with(&Xlsx::new().sheet("S", &data(&cells("1"))), &small).unwrap();
+    assert!(recalculated(&plain).is_empty());
+}
+
+#[test]
+fn functions_that_may_refresh_and_unknown_functions_count_as_volatile() {
+    // Each call, with a dependent cached at 999: both are recalculated.
+    let one = |formula: &str| {
+        let rows = row(
+            1,
+            &format!(
+                r#"<c r="A1"><f>{formula}</f><v>1</v></c><c r="B1"><f>A1+1</f><v>999</v></c>"#
+            ),
+        );
+        recalculated(&read(&Xlsx::new().sheet("S", &data(&rows))))
+    };
+    for formula in [
+        "SUMIF(C1:C3,\"&gt;0\")",
+        "RTD(\"a.b\",,\"x\")",
+        "_xlfn.WEBSERVICE(\"https://example.com\")",
+        "_xlfn.STOCKHISTORY(\"MSFT\",1)",
+        "CUBEVALUE(\"c\",\"m\")",
+        "CUBEMEMBER(\"c\",\"m\")",
+        "[1]!F(1)",
+        "[1]!SUM(1)",
+        "_xll.AddIn(1)",
+        "MyUdf(1)",
+        "Other!Fn(1)",
+    ] {
+        assert_eq!(one(formula), ["S!A1", "S!B1"], "{formula}");
+    }
+    // Excel's own functions that are not volatile, whatever their prefix or case, stay trusted.
+    for formula in [
+        "SUM(C1:C3)",
+        "IF(C1,1,2)",
+        "VLOOKUP(1,C1:D3,2,FALSE)",
+        "_xlfn.XLOOKUP(1,C1:C3,D1:D3)",
+        "_xlfn._xlws.SORT(C1:C3)",
+        "sum(C1)",
+        "LOG10(100)",
+        "_xlfn.LET(_xlpm.f,_xlfn.LAMBDA(_xlpm.x,_xlpm.x+1),_xlpm.f(2))",
+    ] {
+        assert!(one(formula).is_empty(), "{formula}");
+    }
+}
+
+#[test]
 fn a_workbook_with_no_volatile_formula_keeps_its_caches() {
     let rows = row(
         1,
