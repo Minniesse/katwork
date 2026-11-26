@@ -375,18 +375,39 @@ async fn concurrent_cites_of_one_range_make_one_row(pool: PgPool) {
         .execute(&mut holder)
         .await
         .unwrap();
+    // "12,5" widens to "12,500": both calls name one range.
     let (ctx_a, ctx_b) = (env.ctx(), env.ctx());
     let a = tokio::spawn(
         async move { call(&ctx_a, json!({"span_id": span, "quote": "12,500"})).await },
     );
-    let b = tokio::spawn(async move {
-        call(&ctx_b, json!({"span_id": span, "quote": "12,500 บาท"})).await
-    });
-    locks::wait_until_blocked_on(&pool, holder_pid, "artifacts").await;
+    let b =
+        tokio::spawn(async move { call(&ctx_b, json!({"span_id": span, "quote": "12,5"})).await });
+    // Both backends wait on the holder before it lets them go.
+    let mut observer = PgConnection::connect_with(&pool.connect_options())
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND pg_blocking_pids(pid) @> ARRAY[$1]",
+            )
+            .bind(holder_pid)
+            .fetch_one(&mut observer)
+            .await
+            .unwrap();
+            if waiting >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both cites wait on the file's row");
     sqlx::query("COMMIT").execute(&mut holder).await.unwrap();
     let (a, b) = (a.await.unwrap().unwrap(), b.await.unwrap().unwrap());
-    // "12,500" and "12,500 บาท" are different ranges; both calls end with a row each.
-    assert_ne!(a["citation_id"], b["citation_id"]);
+    assert_eq!(a["citation_id"], b["citation_id"]);
+    assert_eq!(env.citations().await, 1);
     let ctxs: Vec<ToolCtx> = (0..4).map(|_| env.ctx()).collect();
     let results = futures::future::join_all(
         ctxs.iter()
@@ -398,7 +419,7 @@ async fn concurrent_cites_of_one_range_make_one_row(pool: PgPool) {
         .map(|r| r.unwrap()["citation_id"].as_str().unwrap().to_owned())
         .collect();
     assert_eq!(ids.len(), 1);
-    assert_eq!(env.citations().await, 3);
+    assert_eq!(env.citations().await, 2);
 }
 
 #[sqlx::test]
@@ -555,6 +576,39 @@ async fn cite_escapes_tag_and_bidi_characters_in_what_it_returns(pool: PgPool) {
     let (r, stored, _, _, _) = env.stored(out["citation_id"].as_str().unwrap()).await;
     assert_eq!(stored, text);
     assert_eq!(quote_of(&r).0, text);
+}
+
+#[sqlx::test]
+async fn cite_result_stays_under_the_page_cap(pool: PgPool) {
+    let env = Env::new(pool).await;
+    // 1,500 tag characters escape to ten scalars each in the JSON line.
+    let text = format!("ยอด 1,250 {}", "\u{E0041}".repeat(1_500));
+    let (_, span) = env.span(&text).await;
+    let text_line = match Cite
+        .call(&env.ctx(), json!({"span_id": span}))
+        .await
+        .unwrap()
+    {
+        ToolOutput::Text(text) => text,
+        ToolOutput::Ask(_) => unreachable!(),
+    };
+    assert!(
+        text_line.chars().count() < 7_000,
+        "{}",
+        text_line.chars().count()
+    );
+    let out: Value = serde_json::from_str(&text_line).unwrap();
+    assert_eq!(out["cut"], true);
+    let exact = out["exact"].as_str().unwrap();
+    assert!(
+        exact.starts_with("ยอด 1,250 \\u{E0041}") && exact.ends_with('}'),
+        "{exact}"
+    );
+    let (_, stored, _, _, _) = env.stored(out["citation_id"].as_str().unwrap()).await;
+    assert_eq!(stored, text);
+    // A short exact is never marked cut.
+    let out = cite(&env, span, "ยอด 1,250").await.unwrap();
+    assert!(out.get("cut").is_none(), "{out}");
 }
 
 #[sqlx::test]

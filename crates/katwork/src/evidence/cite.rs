@@ -21,7 +21,7 @@ use crate::{
         store,
         tools::{
             from_kat,
-            page::{line, shown},
+            page::{PAGE_SCALARS, line, scalars, shown},
         },
     },
     db,
@@ -209,6 +209,9 @@ struct CiteLine<'a> {
     hidden: bool,
     instruction_like: Option<&'a str>,
     suspect: Option<&'a str>,
+    /// `exact` was cut to keep the line under the page cap.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    cut: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     warning: Option<&'static str>,
 }
@@ -308,22 +311,51 @@ impl Tool for Cite {
         })
         .await
         .map_err(from_kat_cite)?;
-        let hidden = span.hidden.is_some();
-        let (exact, exact_escaped) = shown(&planned.exact);
-        let locator = planned.source_ref.locator();
-        let (at, at_escaped) = shown(&locator);
-        let escaped = at_escaped || (exact_escaped && !hidden);
-        Ok(ToolOutput::Text(line(&CiteLine {
+        Ok(ToolOutput::Text(result_line(id, &span, &planned)))
+    }
+}
+
+/// The result line, under the read tools' page cap: an `exact` whose escaped form would push
+/// the line over it is cut at a code point (never inside an escape) and marked `cut`; the
+/// citation holds all of it.
+fn result_line(id: CitationId, span: &SpanRow, planned: &Planned) -> String {
+    let hidden = span.hidden.is_some();
+    let locator = planned.source_ref.locator();
+    let (at, at_escaped) = shown(&locator);
+    let total = planned.exact.chars().count();
+    let render = |keep: usize| -> String {
+        let prefix: String = planned.exact.chars().take(keep).collect();
+        let (exact, exact_escaped) = shown(&prefix);
+        line(&CiteLine {
             citation_id: id,
             exact: (!hidden).then_some(exact),
-            at,
+            at: at.clone(),
             generated: span.generated,
             hidden,
             instruction_like: span.instruction_like.as_deref(),
             suspect: span.suspect_text_layer.as_deref(),
-            warning: escaped.then_some("invisible_characters_escaped"),
-        })))
+            cut: keep < total,
+            warning: (at_escaped || (exact_escaped && !hidden))
+                .then_some("invisible_characters_escaped"),
+        })
+    };
+    let fits = |text: &String| scalars(text) < PAGE_SCALARS;
+    let whole = render(total);
+    if fits(&whole) {
+        return whole;
     }
+    // The longest prefix whose line fits: `lo` always fits (an empty `exact` does, since the
+    // locator is short), `hi` never does.
+    let (mut lo, mut hi) = (0, total);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if fits(&render(mid)) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    render(lo)
 }
 
 #[cfg(test)]
