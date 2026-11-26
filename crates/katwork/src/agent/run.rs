@@ -17,7 +17,7 @@ use crate::{
 };
 use futures::StreamExt;
 use serde_json::Value;
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::time::{Instant, sleep_until, timeout_at};
 use tokio_util::sync::CancellationToken;
 
@@ -40,9 +40,11 @@ pub(crate) async fn execute_with_interruption(
     interrupted: Option<&CancellationToken>,
 ) -> Result<RunFacts, RunAbort> {
     let started = Instant::now();
+    let budget = RunBudget::new(limits.max_total_tokens);
     let mut facts = RunFacts::not_run(StopReason::Interrupted);
     facts.reply_message_id = input.reply_message_id;
     facts.stop = None;
+    facts.budget = budget.clone();
     let mut runner = Runner {
         env,
         kat,
@@ -53,7 +55,7 @@ pub(crate) async fn execute_with_interruption(
         limits,
         facts,
         step: 0,
-        charged: 0,
+        budget,
         repeat: RepeatGuard::new(limits.repeat_limit, limits.repeat_window),
     };
     runner.insert().await?;
@@ -88,7 +90,7 @@ struct Runner<'a, 'b> {
     started: Instant,
     deadline: Instant,
     step: u32,
-    charged: u64,
+    budget: RunBudget,
     messages: Vec<ChatMsg>,
     repeat: RepeatGuard,
 }
@@ -200,12 +202,10 @@ impl Runner<'_, '_> {
             ),
             messages: self.messages.clone(),
             tools,
-            max_output_tokens: selected.entry.max_output_tokens.min(
-                self.limits
-                    .max_total_tokens
-                    .saturating_sub(self.charged)
-                    .min(u64::from(u32::MAX)) as u32,
-            ),
+            max_output_tokens: selected
+                .entry
+                .max_output_tokens
+                .min(self.budget.remaining().min(u64::from(u32::MAX)) as u32),
             temperature: selected.entry.temperature,
         }
     }
@@ -265,7 +265,7 @@ impl Runner<'_, '_> {
                 self.stop(StopReason::StepLimit);
                 break;
             }
-            if self.limits.max_total_tokens.saturating_sub(self.charged) < 256 {
+            if self.budget.remaining() < 256 {
                 self.stop(StopReason::TokenBudget);
                 break;
             }
@@ -364,7 +364,7 @@ impl Runner<'_, '_> {
                 self.stop(StopReason::StepLimit);
                 break;
             }
-            if self.charged >= self.limits.max_total_tokens {
+            if self.budget.remaining() == 0 {
                 self.refuse_batch(&turn.tool_calls, "token_budget", true)
                     .await?;
                 self.stop(StopReason::TokenBudget);
@@ -494,7 +494,7 @@ impl Runner<'_, '_> {
             .input
             .unwrap_or_else(|| request.input_charge_bound())
             .saturating_add(usage.output.unwrap_or(u64::from(request.max_output_tokens)));
-        self.charged = self.charged.saturating_add(charge);
+        self.budget.charge(charge);
         let outcome = match &attempt.ending {
             Ok(_) => "succeeded",
             Err(AttemptFailure::Stop(s)) => s.wire(),
@@ -557,7 +557,7 @@ impl Runner<'_, '_> {
         }
         Ok(())
     }
-    fn ctx(&self, call: &ToolCall) -> ToolCtx {
+    fn ctx(&self, call: &ToolCall, deadline: Instant) -> ToolCtx {
         ToolCtx {
             lock_timeout: self.env.lock_timeout,
             tenant: self.input.tenant.clone(),
@@ -577,7 +577,13 @@ impl Runner<'_, '_> {
             computer: None,
             pool: self.env.pool.clone(),
             cancel: self.input.cancel.clone(),
+            deadline,
+            budget: self.budget.clone(),
         }
+    }
+    /// The loop's dispatch deadline for a tool attempt starting now.
+    fn dispatch_deadline(&self) -> Instant {
+        (Instant::now() + self.limits.tool_timeout).min(self.deadline)
     }
     fn text(&self, text: &str) -> String {
         guards::truncate_result(&clean(text), self.limits.result_max_chars)
@@ -588,6 +594,7 @@ impl Runner<'_, '_> {
         call: &ToolCall,
         effect: Option<SideEffect>,
         state: ToolCallState,
+        output_trust: OutputTrust,
     ) {
         self.facts.tool_calls.push(ToolCallRecord {
             id,
@@ -596,6 +603,7 @@ impl Runner<'_, '_> {
             name: clean(&call.name),
             side_effect: effect,
             state,
+            output_trust,
         });
     }
     async fn call_events(
@@ -658,7 +666,7 @@ impl Runner<'_, '_> {
         let text = self.text(code);
         let id = ledger::record_refused(
             self.env.pool,
-            &self.ctx(call),
+            &self.ctx(call, self.deadline),
             &call.name,
             effect,
             args,
@@ -666,7 +674,12 @@ impl Runner<'_, '_> {
         )
         .await
         .map_err(|e| self.abort(e))?;
-        self.record(id, call, effect, ToolCallState::Refused);
+        let trust = self
+            .env
+            .tools
+            .get(&call.name)
+            .map_or(OutputTrust::Untrusted, |tool| tool.output_trust());
+        self.record(id, call, effect, ToolCallState::Refused, trust);
         if announce {
             self.call_events(id, call, args).await?;
             self.result_events(id, &text, Some(code)).await?;
@@ -764,21 +777,29 @@ impl Runner<'_, '_> {
                 | SideEffect::Draft
                 | SideEffect::WorkspaceWrite => {}
             }
+            let target_revision = self.target_revision(&tool, call, &args).await;
             if !self.repeat.check(&RepeatKey {
                 tool_name: call.name.clone(),
                 canonical_args: canonical.clone(),
-                target_revision: None,
+                target_revision,
             }) {
                 self.refuse_batch(&calls[index..], "loop_detected", true)
                     .await?;
                 self.stop(StopReason::LoopDetected);
                 break;
             }
-            let ctx = self.ctx(call);
-            let id = ledger::start_tool_call(self.env.pool, &ctx, &call.name, effect, &canonical)
-                .await
-                .map_err(|e| self.abort(e))?;
-            self.record(id, call, Some(effect), ToolCallState::Started);
+            let trust = tool.output_trust();
+            let id = ledger::start_tool_call(
+                self.env.pool,
+                &self.ctx(call, self.deadline),
+                &call.name,
+                effect,
+                trust,
+                &canonical,
+            )
+            .await
+            .map_err(|e| self.abort(e))?;
+            self.record(id, call, Some(effect), ToolCallState::Started, trust);
             self.call_events(id, call, &canonical).await?;
             self.emit(KatworkEvent::KatState(KatStateEvent {
                 kat_id: self.kat.id,
@@ -797,7 +818,9 @@ impl Runner<'_, '_> {
                     self.stop(reason);
                     break;
                 }
-                let deadline = (Instant::now() + self.limits.tool_timeout).min(self.deadline);
+                // Built per attempt: a retry gets its own dispatch deadline.
+                let deadline = self.dispatch_deadline();
+                let ctx = self.ctx(call, deadline);
                 let mut dispatched = false;
                 let result = tokio::select! {biased;
                     ()=self.input.cancel.cancelled()=>None,
@@ -851,14 +874,14 @@ impl Runner<'_, '_> {
                     }
                     Err(error @ (ToolError::Timeout | ToolError::OutcomeUnknown)) => {
                         let state =
-                            if effect == SideEffect::Read && matches!(error, ToolError::Timeout) {
+                            if !effect.changes_state() && matches!(error, ToolError::Timeout) {
                                 ToolCallState::TimedOut
                             } else {
                                 ToolCallState::OutcomeUnknown
                             };
                         let text = self.text(error.code());
                         self.end(id, state, Some(&text)).await?;
-                        if effect != SideEffect::Read {
+                        if effect.changes_state() {
                             self.result_events(id, &text, Some(error.code())).await?;
                             self.stop(StopReason::OutcomeUnknown);
                             break;
@@ -904,6 +927,21 @@ impl Runner<'_, '_> {
             }
         }
         Ok(())
+    }
+    /// `Tool::target_revision`, bounded by the dispatch deadline and the run's cancel token;
+    /// `None` on any failure, which only makes the repeat check stricter.
+    async fn target_revision(
+        &self,
+        tool: &Arc<dyn Tool>,
+        call: &ToolCall,
+        args: &Value,
+    ) -> Option<String> {
+        let deadline = self.dispatch_deadline();
+        let ctx = self.ctx(call, deadline);
+        tokio::select! {biased;
+            ()=self.input.cancel.cancelled()=>None,
+            revision=timeout_at(deadline, tool.target_revision(&ctx, args))=>revision.ok().flatten(),
+        }
     }
     async fn stop_before_poll(
         &mut self,

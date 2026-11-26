@@ -533,10 +533,19 @@ impl ModelProvider for Panicking {
                 computer: None,
                 pool: pool.clone(),
                 cancel: CancellationToken::new(),
+                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+                budget: RunBudget::new(200_000),
             };
-            ledger::start_tool_call(pool, &ctx, "panic_probe", SideEffect::WorkspaceWrite, "{}")
-                .await
-                .unwrap();
+            ledger::start_tool_call(
+                pool,
+                &ctx,
+                "panic_probe",
+                SideEffect::WorkspaceWrite,
+                OutputTrust::Untrusted,
+                "{}",
+            )
+            .await
+            .unwrap();
         }
         panic!("injected provider panic")
     }

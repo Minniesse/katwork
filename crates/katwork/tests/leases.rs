@@ -203,10 +203,19 @@ async fn tool(core: &Core, c: &ClaimedTask, run: RunId, effect: SideEffect) -> T
         computer: None,
         pool: core.pool.clone(),
         cancel: CancellationToken::new(),
+        deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        budget: RunBudget::new(200_000),
     };
-    ledger::start_tool_call(&core.pool, &ctx, "probe", effect, "{}")
-        .await
-        .unwrap()
+    ledger::start_tool_call(
+        &core.pool,
+        &ctx,
+        "probe",
+        effect,
+        OutputTrust::Untrusted,
+        "{}",
+    )
+    .await
+    .unwrap()
 }
 fn answered(run: RunId) -> RunFacts {
     let mut facts = RunFacts::not_run(StopReason::Interrupted);

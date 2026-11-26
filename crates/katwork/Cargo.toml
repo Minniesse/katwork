@@ -30,6 +30,7 @@ uuid.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+katwork-thai = { path = "../katwork-thai" }
 # The artifact store stages files with tokio's fs and io traits.
 tokio = { workspace = true, features = ["fs", "io-util"] }
 tokio-util = { workspace = true, features = ["rt"] }

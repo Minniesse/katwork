@@ -1,0 +1,55 @@
+{
+  "type": "SpecificResource",
+  "source": "urn:katwork:artifact:01928c3e-0000-7000-8000-000000000001:v1",
+  "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "extractor": {
+    "name": "xlsx-umya",
+    "version": 1
+  },
+  "quality": {
+    "generated": false,
+    "hidden": false,
+    "instructionLike": false,
+    "suspectTextLayer": false
+  },
+  "selector": {
+    "type": "FragmentSelector",
+    "conformsTo": "urn:katwork:selector:xlsx-sheet:v1",
+    "value": "sheetId=2;name=Budget",
+    "refinedBy": [
+      {
+        "type": "FragmentSelector",
+        "conformsTo": "https://www.rfc-editor.org/rfc/rfc7111",
+        "value": "cell=7,2",
+        "refinedBy": [
+          {
+            "type": "TextQuoteSelector",
+            "exact": "1250",
+            "prefix": "",
+            "suffix": ""
+          },
+          {
+            "type": "TextPositionSelector",
+            "start": 0,
+            "end": 4
+          }
+        ]
+      }
+    ]
+  },
+  "boxes": [],
+  "unitContext": "หน่วย: ล้านบาท",
+  "cell": {
+    "kind": "number",
+    "cached": "1250",
+    "displayed": "1250",
+    "formula": null,
+    "numberFormat": "#,##0",
+    "date1904": false,
+    "hidden": false,
+    "rowHeader": "รายได้",
+    "colHeader": "2567",
+    "headerUnit": null,
+    "cacheUntrusted": false
+  }
+}

@@ -48,7 +48,8 @@ typed_id!(
     ToolCallRecordId,
     ModelCallId,
     ArtifactId,
-    ArtifactVersionId
+    ArtifactVersionId,
+    SpanId
 );
 
 macro_rules! counter {

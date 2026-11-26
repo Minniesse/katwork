@@ -3,6 +3,8 @@
     reason = "Test fixtures drain SQL; cancellation probes deliberately drop futures"
 )]
 #![allow(dead_code)]
+#[path = "support/files.rs"]
+mod files;
 mod support;
 
 use async_trait::async_trait;
@@ -1909,5 +1911,7 @@ async fn rejected_turns_emit_no_tool_events(pool: PgPool) {
 #[path = "agent/review.rs"]
 mod review;
 
+#[path = "agent/read_tools.rs"]
+mod read_tools;
 #[path = "agent/rereview.rs"]
 mod rereview;
