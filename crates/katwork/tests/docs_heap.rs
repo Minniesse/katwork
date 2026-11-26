@@ -923,3 +923,62 @@ fn a_style_the_same_under_every_reading_is_held_once() {
         "{once} once, {twice} with four readings"
     );
 }
+
+/// A file whose `startxref` names a Flate stream with a predictor, which lopdf decodes as a
+/// cross-reference stream while it loads, its row buffers sized by the predictor's parameters.
+fn predictor_at_startxref(params: &str) -> Vec<u8> {
+    let mut doc = pdf_build::Doc::new();
+    let id = doc.add(pdf_build::stream(
+        &format!("/Filter /FlateDecode /DecodeParms << /Predictor 12 {params} >>"),
+        &pdf_build::flate(b"\x02\x00\x00"),
+    ));
+    doc.page("", "");
+    let mut bytes = doc.build();
+    let object = format!("\n{id} 0 obj").into_bytes();
+    let at = 1 + bytes
+        .windows(object.len())
+        .position(|window| window == object.as_slice())
+        .unwrap();
+    let table = bytes
+        .windows(9)
+        .rposition(|window| window == b"startxref")
+        .unwrap();
+    bytes.truncate(table);
+    bytes.extend_from_slice(format!("startxref\n{at}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+/// A predictor's row is never sized by the file: lopdf decodes the stream `startxref` names with
+/// two row buffers of `/Columns` x `/Colors` x `/BitsPerComponent` bits each, so a value past the
+/// bounds KatWork's own decoder keeps is refused before lopdf reads the file (one such file held
+/// two 4 GiB buffers). Each value here would cost lopdf at least 128 MiB.
+#[test]
+fn a_pdf_predictor_row_is_never_sized_by_the_file() {
+    for params in [
+        "/Columns 67108864",
+        "/Columns 4294967295",
+        "/Colors 67108864",
+        "/BitsPerComponent 536870912",
+        "/Columns%huge\n+67108864",
+        "/Col#75mns 67108864",
+        "/Columns 67108864.0",
+        "/Columns 99999999999999999999999",
+    ] {
+        let bytes = predictor_at_startxref(params);
+        let (result, peak) = heap::measure(|| {
+            docs::extract(MediaKind::Pdf, &bytes, &DocLimits::default()).map(drop)
+        });
+        assert!(peak < 16 << 20, "{params}: peak {peak} ({result:?})");
+        assert_eq!(
+            result,
+            Err(DocError::Malformed("stream_predictor")),
+            "{params}"
+        );
+    }
+    // At the bounds the file reads as before.
+    let bytes = predictor_at_startxref("/Columns 65536 /Colors 32 /BitsPerComponent 16");
+    let (result, peak) =
+        heap::measure(|| docs::extract(MediaKind::Pdf, &bytes, &DocLimits::default()).map(drop));
+    assert!(peak < 16 << 20, "peak {peak} ({result:?})");
+    assert_eq!(result, Ok(()));
+}

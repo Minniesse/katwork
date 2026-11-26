@@ -1760,6 +1760,28 @@ fn seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
         raw.set(page, body);
         raw.build(catalog, "")
     };
+    // The same stream where `startxref` points, so lopdf decodes it as a cross-reference stream.
+    let columns_at_startxref = {
+        let mut doc = Doc::new();
+        let id = doc.add(stream(
+            "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 4294967295 >>",
+            &flate(b"\x02\x00\x00"),
+        ));
+        doc.page("", "");
+        let mut bytes = doc.build();
+        let object = format!("\n{id} 0 obj").into_bytes();
+        let at = 1 + bytes
+            .windows(object.len())
+            .position(|window| window == object.as_slice())
+            .unwrap();
+        let table = bytes
+            .windows(9)
+            .rposition(|window| window == b"startxref")
+            .unwrap();
+        bytes.truncate(table);
+        bytes.extend_from_slice(format!("startxref\n{at}\n%%EOF\n").as_bytes());
+        bytes
+    };
     let bomb_in = |key: &str| {
         let mut doc = Doc::new();
         let data = doc.add(stream("/Filter /FlateDecode", bomb()));
@@ -1908,6 +1930,11 @@ fn seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
             "predictor-columns.pdf",
             "a PNG predictor with /Columns 4294967295",
             columns,
+        ),
+        (
+            "predictor-xref.pdf",
+            "startxref naming a stream with /Columns 4294967295, read as a cross-reference stream",
+            columns_at_startxref,
         ),
         (
             "content-bomb.pdf",
