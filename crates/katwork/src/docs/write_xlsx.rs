@@ -79,6 +79,7 @@ fn internal<E>(_: E) -> DocError {
 pub fn render_xlsx(sheets: &[SheetSpec], sources: &[CitationRow]) -> Result<Rendered, DocError> {
     let written = WrittenContent::Sheets(sheets.to_vec());
     let specs: Vec<&ClaimSpec> = claim_specs(&written);
+    // `TooLong` cannot happen on checked content: `MAX_CHARS` is within the scan limit.
     let uncited = uncited_claims(&written).map_err(|_| DocError::TooComplex("text"))?;
     let mut ordinals = cited_ordinals(specs.len(), &uncited).into_iter();
     let sources = Sources::new(specs.iter().copied(), sources)?;

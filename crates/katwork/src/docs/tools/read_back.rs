@@ -6,15 +6,28 @@ use katwork_thai::match_key;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use super::{DOCUMENT_PART, internal};
+use super::{DOCUMENT_PART, internal, xlsx_notes::xlsx_note_markers};
 use crate::{
     agent::{ToolDeps, ToolError},
     artifacts::{MediaType, tools::from_doc},
     docs::{
         Block, DocError, Extracted, Locator, content::PlacedClaim, deadline, package, xml_guard,
     },
+    evidence::claim::MAX_CLAIM_CHARS,
     ids::WorkspaceId,
 };
+
+/// Claim bookmarks one paragraph may hold open at once.
+const MAX_OPEN_BOOKMARKS: usize = 16;
+
+/// Appends `text` to a bookmark's text, refusing more than a claim can hold.
+fn push_bounded(mark: &mut String, text: &str) -> Result<(), DocError> {
+    mark.push_str(text);
+    if mark.chars().count() > MAX_CLAIM_CHARS {
+        return Err(DocError::TooComplex("bookmark_text"));
+    }
+    Ok(())
+}
 
 /// A `kw-claim-<n>` bookmark of a DOCX main part: its name, the 1-based ordinal of the `w:p` it
 /// starts in (the reader's paragraph ordinal), and the text of the `w:t` elements between its
@@ -75,6 +88,11 @@ pub fn docx_claim_bookmarks(document_xml: &[u8]) -> Result<Vec<ClaimBookmark>, D
                             continue;
                         };
                         if name.starts_with("kw-claim-") {
+                            // KatWork's renderers close each bookmark in its paragraph; a file
+                            // that keeps many open would make each text run cost them all.
+                            if open.len() >= MAX_OPEN_BOOKMARKS {
+                                return Err(DocError::TooComplex("open_bookmarks"));
+                            }
                             open.insert(
                                 id,
                                 ClaimBookmark {
@@ -102,11 +120,15 @@ pub fn docx_claim_bookmarks(document_xml: &[u8]) -> Result<Vec<ClaimBookmark>, D
             }
             Event::Text(text) if in_text > 0 && !open.is_empty() => {
                 let text = text.xml10_content();
-                open.values_mut().for_each(|m| m.text.push_str(&text));
+                for mark in open.values_mut() {
+                    push_bounded(&mut mark.text, &text)?;
+                }
             }
             Event::GeneralRef(reference) if in_text > 0 && !open.is_empty() => {
                 let c = xml_guard::resolve_ref(&reference)?;
-                open.values_mut().for_each(|m| m.text.push(c));
+                for mark in open.values_mut() {
+                    push_bounded(&mut mark.text, c.encode_utf8(&mut [0; 4]))?;
+                }
             }
             Event::Eof => break,
             _ => {}
@@ -269,14 +291,19 @@ pub async fn read_back(
         .docs
         .run(workspace, cancel, Some(deadline), move |limits| {
             let extracted = extract(media.kind(), &bytes, limits)?;
-            let marks = if media == MediaType::Docx {
-                let package = package::open_package(&bytes, limits)?;
-                let part = package
-                    .part(DOCUMENT_PART)
-                    .ok_or(DocError::Malformed("docx_main_part"))?;
-                docx_claim_bookmarks(part)?
-            } else {
-                Vec::new()
+            let (marks, notes) = match media {
+                MediaType::Docx => {
+                    let package = package::open_package(&bytes, limits)?;
+                    let part = package
+                        .part(DOCUMENT_PART)
+                        .ok_or(DocError::Malformed("docx_main_part"))?;
+                    (docx_claim_bookmarks(part)?, HashMap::new())
+                }
+                MediaType::Xlsx => {
+                    let package = package::open_package(&bytes, limits)?;
+                    (Vec::new(), xlsx_note_markers(&package)?)
+                }
+                _ => (Vec::new(), HashMap::new()),
             };
             // A name used twice locates nothing.
             let mut by_name: HashMap<&str, Option<&ClaimBookmark>> = HashMap::new();
@@ -292,6 +319,12 @@ pub async fn read_back(
                     deadline::check()?;
                 }
                 if !placed.holds(claim, &by_name) {
+                    return Ok(false);
+                }
+                // An XLSX claim cell's note starts with its marker, which Task 25 reads.
+                if let Some(cell) = claim.location.strip_prefix("cell:")
+                    && notes.get(cell) != Some(&format!("kw-claim-{}", claim.ordinal))
+                {
                     return Ok(false);
                 }
             }
@@ -337,5 +370,31 @@ mod tests {
                 text: "x & กy".into(),
             }]
         );
+    }
+
+    #[test]
+    fn bookmarks_are_bounded() {
+        let w = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p>"#;
+        let open: String = (0..=MAX_OPEN_BOOKMARKS)
+            .map(|i| format!(r#"<w:bookmarkStart w:id="{i}" w:name="kw-claim-{i}"/>"#))
+            .collect();
+        let xml = format!("{w}{open}<w:r><w:t>x</w:t></w:r></w:p></w:body></w:document>");
+        assert_eq!(
+            docx_claim_bookmarks(xml.as_bytes()),
+            Err(DocError::TooComplex("open_bookmarks"))
+        );
+        let long = format!(
+            r#"{w}<w:bookmarkStart w:id="1" w:name="kw-claim-1"/><w:r><w:t>{}</w:t></w:r><w:bookmarkEnd w:id="1"/></w:p></w:body></w:document>"#,
+            "ก".repeat(MAX_CLAIM_CHARS + 1)
+        );
+        assert_eq!(
+            docx_claim_bookmarks(long.as_bytes()),
+            Err(DocError::TooComplex("bookmark_text"))
+        );
+        let fits = long.replace(
+            &"ก".repeat(MAX_CLAIM_CHARS + 1),
+            &"ก".repeat(MAX_CLAIM_CHARS),
+        );
+        assert_eq!(docx_claim_bookmarks(fits.as_bytes()).unwrap().len(), 1);
     }
 }

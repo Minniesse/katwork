@@ -17,8 +17,8 @@ use tokio_util::sync::CancellationToken;
 use super::{
     Rendered,
     content::{
-        ClaimSpec, MAX_CLAIMS, PlacedClaim, WrittenContent, cited_ordinals, claim_specs,
-        number_uncited, uncited_claims,
+        ClaimSpec, MAX_CLAIMS, PlacedClaim, WrittenContent, cited_ordinals, claim_cells,
+        claim_specs, number_uncited, uncited_claims,
     },
     write_docx::bookmark_name,
 };
@@ -37,9 +37,11 @@ use crate::{
 
 mod read_back;
 mod writers;
+mod xlsx_notes;
 
 pub use read_back::{ClaimBookmark, docx_claim_bookmarks, read_back};
 pub use writers::{RenderDocxFn, RenderXlsxFn, WriteDocx, WriteXlsx};
+pub use xlsx_notes::xlsx_note_markers;
 
 /// Uncited figures a receipt lists; the version records all of them.
 pub const RECEIPT_UNCITED: usize = 20;
@@ -265,14 +267,20 @@ fn check_placed(
     specs: &[&ClaimSpec],
     ordinals: &[u32],
     media: MediaType,
+    content: &WrittenContent,
 ) -> Result<(), ToolError> {
     if placed.len() != specs.len() {
         return Err(internal());
     }
-    for ((claim, spec), &ordinal) in placed.iter().zip(specs).zip(ordinals) {
+    // A workbook's claim cells follow from the content alone.
+    let cells = match content {
+        WrittenContent::Sheets(sheets) => claim_cells(sheets),
+        WrittenContent::Doc(_) => Vec::new(),
+    };
+    for (index, ((claim, spec), &ordinal)) in placed.iter().zip(specs).zip(ordinals).enumerate() {
         let located = match media {
             MediaType::Docx => claim.location == format!("bookmark:{}", bookmark_name(ordinal)),
-            MediaType::Xlsx => claim.location.starts_with("cell:"),
+            MediaType::Xlsx => cells.get(index) == Some(&claim.location),
             MediaType::Pdf => claim.location.starts_with("page:"),
             _ => false,
         };
@@ -316,7 +324,7 @@ pub async fn commit_document(
         return Err(ToolError::InvalidArgs("too_many_claims".into()));
     }
     let ordinals = cited_ordinals(specs.len(), &uncited);
-    check_placed(&req.rendered.claims, &specs, &ordinals, req.media)?;
+    check_placed(&req.rendered.claims, &specs, &ordinals, req.media, &content)?;
     let known: BTreeSet<CitationId> = req.citations.iter().map(|c| c.id).collect();
     if !specs
         .iter()

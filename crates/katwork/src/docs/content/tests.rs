@@ -431,3 +431,76 @@ fn xlsx_caps() {
         .is_err()
     );
 }
+
+/// Text next to a claim that changes the figure a reader sees: an ordinal or a lone sign
+/// before it, a scale word after it. Each alone is no quantity, so only a scan across the
+/// claim's boundary finds the figure the file shows.
+#[test]
+fn figures_crossing_a_claim_boundary_are_uncited() {
+    for (inlines, shown) in [
+        (
+            vec![Inline::Text("ราคาที่ 1".into()), claim("2,000,000 บาท")],
+            "12,000,000",
+        ),
+        (vec![Inline::Text("ลดลง -".into()), claim("450")], "-450"),
+        (
+            vec![claim("2,000,000"), Inline::Text(" ล้านบาท".into())],
+            "ล้าน",
+        ),
+        (vec![Inline::Text("No. 1".into()), claim("2,000")], "12,000"),
+        (vec![Inline::Text("fell by -".into()), claim("450")], "-450"),
+        (
+            vec![claim("2,000"), Inline::Text(" million".into())],
+            "million",
+        ),
+    ] {
+        let content = doc(vec![ContentBlock::Paragraph {
+            text: inlines.clone(),
+        }]);
+        let found = texts(&content);
+        assert!(
+            found
+                .iter()
+                .any(|(text, location, _)| text.contains(shown) && location == "block:1"),
+            "{inlines:?}: {found:?}"
+        );
+    }
+}
+
+#[test]
+fn crossing_figures_keep_document_order() {
+    // A figure before the first claim, one crossing the second claim's start, one after it.
+    let content = doc(vec![ContentBlock::Paragraph {
+        text: vec![
+            Inline::Text("งบ 1,250 บาท ".into()),
+            claim("ข้อ"),
+            Inline::Text(" ลดลง -".into()),
+            claim("450"),
+            Inline::Text(" รวม 3,400 บาท".into()),
+        ],
+    }]);
+    let uncited = uncited_claims(&content).unwrap();
+    let after: Vec<u32> = uncited.iter().map(|f| f.after_claims).collect();
+    assert!(after.windows(2).all(|w| w[0] <= w[1]), "{after:?}");
+    assert_eq!(after, vec![0, 1, 2], "{uncited:?}");
+    assert_eq!(cited_ordinals(2, &uncited), vec![2, 4]);
+}
+
+#[test]
+fn a_unit_after_a_claim_is_not_an_uncited_figure() {
+    // The figure the reader sees is the claim's own value: nothing new to record.
+    for inlines in [
+        vec![
+            Inline::Text("รายได้ ".into()),
+            claim("1,250"),
+            Inline::Text(" บาท".into()),
+        ],
+        vec![claim("2,000"), Inline::Text(" baht".into())],
+        vec![Inline::Text("ประชุมวันที่ ".into()), claim("11 ต.ค. 2568")],
+    ] {
+        let content = doc(vec![ContentBlock::Paragraph {
+            text: inlines.clone(),
+        }]);
+        assert_eq!(texts(&content), vec![], "{inlines:?}");
+    }
+}

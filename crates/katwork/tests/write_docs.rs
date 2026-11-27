@@ -945,7 +945,7 @@ async fn write_xlsx_claim_cells_and_no_formulas(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn xlsx_with_notes_reads_without_hidden_cells_or_warnings(pool: PgPool) {
+async fn xlsx_with_notes_reads_without_hidden_cells_or_other_warnings(pool: PgPool) {
     let env = Env::new(pool).await;
     let (_, a) = env.cited("แหล่ง").await;
     let receipt = call(
@@ -958,7 +958,7 @@ async fn xlsx_with_notes_reads_without_hidden_cells_or_warnings(pool: PgPool) {
     .unwrap();
     let bytes = env.bytes(&file_id(&receipt)).await;
     keep_xlsx(
-        "xlsx_with_notes_reads_without_hidden_cells_or_warnings",
+        "xlsx_with_notes_reads_without_hidden_cells_or_other_warnings",
         &bytes,
     );
     let out = read(MediaKind::Xlsx, &bytes);
@@ -987,7 +987,7 @@ async fn xlsx_with_notes_reads_without_hidden_cells_or_warnings(pool: PgPool) {
         (CellKind::Number, false)
     );
     assert_eq!(number.formula, None);
-    env.keep_outputs("xlsx_with_notes_reads_without_hidden_cells_or_warnings")
+    env.keep_outputs("xlsx_with_notes_reads_without_hidden_cells_or_other_warnings")
         .await;
 }
 
@@ -1167,6 +1167,9 @@ async fn tool_schema_and_serde_agree(pool: PgPool) {
         json!({"name": "x", "content": {"blocks": [para(vec![json!({"claim": {"text": "", "kind": "number", "cite": [a]}})])]}}),
         json!({"name": "x", "content": {"blocks": [para(vec![json!({"claim": {"text": "1", "kind": "number", "cite": []}})])]}}),
         json!({"name": "x", "content": {"blocks": [para(vec![json!(5)])]}}),
+        json!({"name": "x", "content": {"blocks": [para(vec![json!({"claim": {"text": "1", "kind": "number", "cite": vec![a; 9]}})])]}}),
+        json!({"name": "x", "content": {"blocks": [para(vec![json!({"claim": {"text": "ก".repeat(501), "kind": "fact", "cite": [a]}})])]}}),
+        json!({"name": "x", "content": {"blocks": vec![para(vec![]); 2_001]}}),
     ];
     let schema = jsonschema::validator_for(&docx.spec().parameters).unwrap();
     for args in bad_docx {
@@ -1186,6 +1189,9 @@ async fn tool_schema_and_serde_agree(pool: PgPool) {
         json!({"name": "x", "sheets": [{"name": "", "rows": []}]}),
         json!({"name": "x", "sheets": [{"name": "S", "rows": [], "hidden": true}]}),
         json!({"name": "x", "file_id": "nope", "sheets": [{"name": "S", "rows": []}]}),
+        json!({"name": "x", "sheets": (0..17).map(|i| json!({"name": format!("S{i}"), "rows": []})).collect::<Vec<_>>()}),
+        json!({"name": "x", "sheets": [{"name": "S", "rows": [[{"number": "1".repeat(65)}]]}]}),
+        json!({"name": "x", "sheets": [{"name": "ก".repeat(32), "rows": []}]}),
     ];
     let schema = jsonschema::validator_for(&xlsx.spec().parameters).unwrap();
     for args in bad_xlsx {
@@ -2070,7 +2076,69 @@ async fn a_renderer_that_hides_a_claim_commits_nothing(pool: PgPool) {
         .await;
         assert_eq!(code(result), "tool_failed");
     }
+    // An XLSX claim reported at another cell holding the same text.
+    let tool = WriteXlsx::with_renderer(
+        env.deps(),
+        Arc::new(|sheets: &[SheetSpec], sources| {
+            let mut full = render_xlsx(sheets, sources)?;
+            full.claims.swap(0, 1);
+            let (a, b) = (full.claims[0].ordinal, full.claims[1].ordinal);
+            full.claims[0].ordinal = b;
+            full.claims[1].ordinal = a;
+            Ok(full)
+        }),
+    );
+    let same = claim("ข้อ", "fact", &[a]);
+    let result = call(
+        &tool,
+        &env.ctx(),
+        json!({"name": "h", "sheets": [{"name": "S", "rows": [[same.clone(), same]]}]}),
+    )
+    .await;
+    assert_eq!(code(result), "tool_failed");
     assert_eq!(env.output_versions().await, 0);
+}
+
+#[sqlx::test]
+async fn xlsx_read_back_checks_each_note_marker(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let (_, a) = env.cited("แหล่ง").await;
+    let mut conn = env.pool.acquire().await.unwrap();
+    let rows =
+        katwork::evidence::citation::get_for_job_on(&mut conn, &env.tenant, JobId(env.f.job), &[a])
+            .await
+            .unwrap();
+    let sheets: Vec<SheetSpec> = serde_json::from_value(json!([{"name": "A!B", "rows": [
+        ["x", claim("ข้อ", "fact", &[a])], [claim("1,250", "number", &[a])]]}]))
+    .unwrap();
+    let rendered = render_xlsx(&sheets, &rows).unwrap();
+    let deps = env.deps();
+    check_back(
+        &env,
+        &deps,
+        MediaType::Xlsx,
+        &rendered.bytes,
+        &rendered.claims,
+    )
+    .await
+    .unwrap();
+    // The same cell text under another ordinal: its note names another marker.
+    let mut wrong = rendered.claims.clone();
+    wrong[0].ordinal += 5;
+    assert_eq!(
+        code(check_back(&env, &deps, MediaType::Xlsx, &rendered.bytes, &wrong).await),
+        "read_back_failed"
+    );
+    // A workbook without the notes fails.
+    let mut book = rust_xlsxwriter::Workbook::new();
+    let sheet = book.add_worksheet();
+    sheet.set_name("A!B").unwrap();
+    sheet.write_string(0, 1, "ข้อ").unwrap();
+    let bare = book.save_to_buffer().unwrap();
+    assert_eq!(
+        code(check_back(&env, &deps, MediaType::Xlsx, &bare, &rendered.claims[..1]).await),
+        "read_back_failed"
+    );
 }
 
 #[sqlx::test]
@@ -2149,28 +2217,150 @@ fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-/// The identifiers a file names through `docx_rs::`, in paths and in `use docx_rs::{..}` lists.
-fn docx_rs_names(source: &str) -> Vec<String> {
-    let ident = |s: &str| -> String {
-        s.chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '*')
-            .collect()
-    };
-    let mut names = Vec::new();
-    for (at, _) in source.match_indices("docx_rs::") {
-        let rest = &source[at + "docx_rs::".len()..];
-        if let Some(list) = rest.strip_prefix('{') {
-            let list = &list[..list.find('}').unwrap_or(list.len())];
-            names.extend(
-                list.split(',')
-                    .map(|item| ident(item.trim()))
-                    .filter(|n| !n.is_empty()),
-            );
+/// docx-rs's reader functions, which no KatWork source may name in any form (clippy's
+/// `disallowed-methods` also bans them, following renames and re-exports).
+const DOCX_RS_READERS: &[&str] = &[
+    "read_docx",
+    "read_docx_with_options",
+    "read_xml",
+    "read_zip",
+    "read_document_rels",
+    "extract_xml_package_parts",
+];
+
+/// `source` with every comment removed and every string and character literal emptied, so a
+/// name inside one is neither found nor hidden.
+fn code_only(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if c == '/' && next == Some('/') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+        } else if c == '/' && next == Some('*') {
+            let mut depth = 0;
+            while i < chars.len() {
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    i += 2;
+                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            out.push(' ');
+        } else if c == 'r'
+            && !out.chars().last().is_some_and(ident)
+            && matches!(next, Some('"' | '#'))
+        {
+            // A raw string: r"..", r#".."#, and so on.
+            let mut hashes = 0;
+            let mut j = i + 1;
+            while chars.get(j) == Some(&'#') {
+                hashes += 1;
+                j += 1;
+            }
+            if chars.get(j) != Some(&'"') {
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            j += 1;
+            loop {
+                if j >= chars.len() {
+                    break;
+                }
+                if chars[j] == '"' && (1..=hashes).all(|h| chars.get(j + h) == Some(&'#')) {
+                    j += 1 + hashes;
+                    break;
+                }
+                j += 1;
+            }
+            out.push_str("\"\"");
+            i = j;
+        } else if c == '"' {
+            i += 1;
+            while i < chars.len() && chars[i] != '"' {
+                i += if chars[i] == '\\' { 2 } else { 1 };
+            }
+            i += 1;
+            out.push_str("\"\"");
+        } else if c == '\'' && (next == Some('\\') || chars.get(i + 2) == Some(&'\'')) {
+            // A character literal; `'a` alone is a lifetime.
+            i += 1;
+            while i < chars.len() && chars[i] != '\'' {
+                i += if chars[i] == '\\' { 2 } else { 1 };
+            }
+            i += 1;
+            out.push_str("' '");
         } else {
-            names.push(ident(rest));
+            out.push(c);
+            i += 1;
         }
     }
-    names
+    out
+}
+
+/// Every whole-word occurrence of `word` in `code`, as byte offsets.
+fn word_at(code: &str, word: &str) -> Vec<usize> {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    code.match_indices(word)
+        .map(|(at, _)| at)
+        .filter(|&at| {
+            !code[..at].chars().next_back().is_some_and(ident)
+                && !code[at + word.len()..].chars().next().is_some_and(ident)
+        })
+        .collect()
+}
+
+/// Why `code` uses docx-rs beyond the builder types, if it does: every `docx_rs` must be
+/// followed directly by `::` and an allowed type, or by `::{..}` listing allowed types (each
+/// optionally renamed with `as`), with no nested braces.
+fn docx_rs_misuse(code: &str) -> Option<String> {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    for at in word_at(code, "docx_rs") {
+        let Some(rest) = code[at + "docx_rs".len()..].strip_prefix("::") else {
+            return Some("`docx_rs` not followed directly by `::`".into());
+        };
+        if let Some(list) = rest.strip_prefix('{') {
+            let Some(end) = list.find('}') else {
+                return Some("an unclosed `docx_rs::{`".into());
+            };
+            let list = &list[..end];
+            if list.contains('{') {
+                return Some("nested braces in a `docx_rs::{..}` list".into());
+            }
+            for item in list.split(',').map(str::trim).filter(|i| !i.is_empty()) {
+                let words: Vec<&str> = item.split_whitespace().collect();
+                let ok = match words.as_slice() {
+                    [name] => DOCX_RS_BUILDER.contains(name),
+                    [name, "as", alias] => {
+                        DOCX_RS_BUILDER.contains(name) && alias.chars().all(ident)
+                    }
+                    _ => false,
+                };
+                if !ok {
+                    return Some(format!("`docx_rs::{{{item}}}`"));
+                }
+            }
+        } else {
+            let name: String = rest.chars().take_while(|&c| ident(c)).collect();
+            if !DOCX_RS_BUILDER.contains(&name.as_str()) {
+                return Some(format!("`docx_rs::{name}`"));
+            }
+        }
+    }
+    None
 }
 
 #[test]
@@ -2182,17 +2372,19 @@ fn katwork_never_reads_with_docx_rs() {
     assert!(files.len() > 50, "the scan found the workspace's sources");
     let mut users = Vec::new();
     for path in files {
-        let source = std::fs::read_to_string(&path).unwrap();
-        if !source.contains("docx_rs") {
-            continue;
-        }
-        let names = docx_rs_names(&source);
-        for name in &names {
+        let code = code_only(&std::fs::read_to_string(&path).unwrap());
+        for reader in DOCX_RS_READERS {
             assert!(
-                DOCX_RS_BUILDER.contains(&name.as_str()),
-                "{} uses docx_rs::{name}: only the builder types are allowed",
+                word_at(&code, reader).is_empty(),
+                "{} names docx-rs's reader `{reader}`",
                 path.display()
             );
+        }
+        if word_at(&code, "docx_rs").is_empty() {
+            continue;
+        }
+        if let Some(why) = docx_rs_misuse(&code) {
+            panic!("{} uses docx-rs beyond its builder: {why}", path.display());
         }
         users.push(path);
     }
@@ -2201,4 +2393,63 @@ fn katwork_never_reads_with_docx_rs() {
         "only the DOCX writer may use docx-rs: {users:?}"
     );
     assert_eq!(users.len(), 1, "the DOCX writer uses docx-rs");
+}
+
+#[test]
+fn the_docx_rs_guard_sees_through_evasions() {
+    for (code, caught) in [
+        (
+            "use docx_rs as dx; fn f(b: &[u8]) { let _ = dx::read_docx(b); }",
+            true,
+        ),
+        ("use docx_rs::{Docx as D, // note\n read_docx as rd};", true),
+        ("use docx_rs::{Docx as D3, {Paragraph}};", true),
+        ("fn f(b: &[u8]) { let _ = docx_rs ::Docx::new(); }", true),
+        ("pub use docx_rs as builder_probe;", true),
+        ("extern crate docx_rs as x;", true),
+        ("use docx_rs::*;", true),
+        ("use docx_rs::reader::X;", true),
+        (
+            "use docx_rs::{Docx, Paragraph as P}; // docx_rs::read_docx\nlet s = \"docx_rs as x\";",
+            false,
+        ),
+        (
+            "let d = docx_rs::Docx::new().add_paragraph(docx_rs::Paragraph::new());",
+            false,
+        ),
+    ] {
+        let code = code_only(code);
+        let readers = DOCX_RS_READERS
+            .iter()
+            .any(|r| !word_at(&code, r).is_empty());
+        assert_eq!(docx_rs_misuse(&code).is_some() || readers, caught, "{code}");
+    }
+}
+
+#[sqlx::test]
+async fn figures_crossing_a_claim_boundary_are_recorded(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let (_, a) = env.cited("แหล่ง").await;
+    for (inlines, shown) in [
+        (
+            vec![json!("ราคาที่ 1"), claim("2,000,000 บาท", "number", &[a])],
+            "12,000,000",
+        ),
+        (vec![json!("ลดลง -"), claim("450", "number", &[a])], "-450"),
+        (
+            vec![claim("2,000,000", "number", &[a]), json!(" ล้านบาท")],
+            "ล้าน",
+        ),
+    ] {
+        let receipt = call(&env.docx(), &env.ctx(), doc_args("x", vec![para(inlines)]))
+            .await
+            .unwrap();
+        let uncited = receipt["uncited"].as_array().unwrap();
+        assert!(
+            uncited
+                .iter()
+                .any(|u| u["text"].as_str().unwrap().contains(shown)),
+            "{shown}: {receipt}"
+        );
+    }
 }

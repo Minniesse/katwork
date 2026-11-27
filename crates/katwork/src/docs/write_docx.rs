@@ -276,6 +276,7 @@ fn with_lang(styles: Vec<u8>) -> Result<Vec<u8>, DocError> {
 pub fn render_docx(content: &DocContent, sources: &[CitationRow]) -> Result<Rendered, DocError> {
     let written = WrittenContent::Doc(content.clone());
     let specs = super::content::claim_specs(&written);
+    // `TooLong` cannot happen on checked content: `MAX_CHARS` is within the scan limit.
     let uncited = uncited_claims(&written).map_err(|_| DocError::TooComplex("text"))?;
     let ordinals = cited_ordinals(specs.len(), &uncited);
     let mut writer = Writer {

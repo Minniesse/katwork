@@ -49,6 +49,10 @@ pub const MAX_NUMBER_DIGITS: usize = 15;
 /// Claims, cited and uncited, one version may record: a workbook's 50,000 number cells are each
 /// an uncited claim, and each claim is a row the verification pass checks.
 pub const MAX_CLAIMS: usize = 60_000;
+// The figure scan refuses a text over `MAX_SCAN_CODE_POINTS`; no content can reach it, so
+// `uncited_claims` never fails on checked content and the renderers' `TooLong` mapping is a
+// defence only.
+const _: () = assert!(MAX_CHARS <= katwork_thai::MAX_SCAN_CODE_POINTS);
 /// Code points of context kept on each side of an uncited figure.
 pub const UNCITED_CONTEXT: usize = 32;
 
@@ -428,6 +432,21 @@ pub fn claim_specs(content: &WrittenContent) -> Vec<&ClaimSpec> {
     out
 }
 
+/// The location of each claim cell of a workbook, in the order of `claim_specs`.
+pub fn claim_cells(sheets: &[SheetSpec]) -> Vec<String> {
+    let mut out = Vec::new();
+    for sheet in sheets {
+        for (r, row) in sheet.rows.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
+                if matches!(cell, CellSpec::Claim(_)) {
+                    out.push(cell_location(&sheet.name, r, c));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// A block's sequences of inlines, in document order: its text, each list item, or each table
 /// cell (the header row first).
 pub fn block_runs(block: &ContentBlock) -> Vec<&[Inline]> {
@@ -473,27 +492,8 @@ impl Walk {
     /// Every `Quantity` number and every date in `run`, in order of their start, each with up
     /// to `UNCITED_CONTEXT` code points of the run on each side.
     fn scan(&mut self, run: &str, location: &str) -> Result<(), TooLong> {
-        if run.is_empty() {
-            return Ok(());
-        }
-        let ctx = scan_ctx();
-        let mut found: Vec<(u32, u32, ClaimKind)> = find_numbers(run, &ctx)?
-            .into_iter()
-            .filter(|f| f.value.role == NumberRole::Quantity)
-            .map(|f| (f.start, f.end, ClaimKind::Number))
-            .chain(
-                find_dates(run, &ctx)?
-                    .into_iter()
-                    .map(|f| (f.start, f.end, ClaimKind::Date)),
-            )
-            .collect();
-        found.sort_by_key(|&(start, end, _)| (start, end));
-        if found.is_empty() {
-            return Ok(());
-        }
-        let bounds = Bounds::new(run);
-        for (start, end, kind) in found {
-            self.push(kind, window(run, &bounds, start, end), location);
+        for (_, _, kind, text) in figures(run, |role| role == NumberRole::Quantity)? {
+            self.push(kind, text, location);
         }
         Ok(())
     }
@@ -513,22 +513,99 @@ impl Walk {
         });
     }
 
-    /// A paragraph's (heading's, item's, cell's) inlines: the adjacent `Text` inlines between
+    /// A paragraph's (heading's, item's, cell's) inlines. The adjacent `Text` inlines between
     /// two claims are joined into one run, so a figure split across inlines is still found.
+    /// Then the whole sequence is scanned with the claims' texts in place: a figure whose span
+    /// crosses a claim's boundary is what a reader sees (an ordinal or a sign before a claim, a
+    /// scale word after it) and no claim says, so it is recorded as uncited too, whatever role
+    /// the scanner gives it. Figures are recorded in document order of their start.
     fn inlines(&mut self, inlines: &[Inline], location: &str) -> Result<(), TooLong> {
+        let mut joined = String::new();
+        let mut joined_len = 0usize;
+        // Each claim's code-point range in `joined`, and each text run with its start there.
+        let mut claims: Vec<(u32, u32)> = Vec::new();
+        let mut runs: Vec<(String, u32)> = Vec::new();
         let mut run = String::new();
+        let mut run_start = 0u32;
         for inline in inlines {
             match inline {
-                Inline::Text(text) => run.push_str(text),
-                Inline::Claim(_) => {
-                    self.scan(&run, location)?;
-                    run.clear();
-                    self.after += 1;
+                Inline::Text(text) => {
+                    run.push_str(text);
+                    joined.push_str(text);
+                    joined_len += text.chars().count();
+                }
+                Inline::Claim(ClaimInline { claim }) => {
+                    runs.push((std::mem::take(&mut run), run_start));
+                    let start = joined_len as u32;
+                    joined.push_str(&claim.text);
+                    joined_len += claim.text.chars().count();
+                    claims.push((start, joined_len as u32));
+                    run_start = joined_len as u32;
                 }
             }
         }
-        self.scan(&run, location)
+        runs.push((run, run_start));
+        let mut found: Vec<(u32, u32, ClaimKind, String)> = Vec::new();
+        for (run, offset) in &runs {
+            for (start, end, kind, text) in figures(run, |role| role == NumberRole::Quantity)? {
+                found.push((start + offset, end + offset, kind, text));
+            }
+        }
+        if !claims.is_empty() {
+            let crosses = |start: u32, end: u32| {
+                claims
+                    .iter()
+                    .any(|&(cs, ce)| (start < cs && end > cs) || (start < ce && end > ce))
+            };
+            found.extend(
+                figures(&joined, |_| true)?
+                    .into_iter()
+                    .filter(|&(start, end, _, _)| crosses(start, end)),
+            );
+        }
+        found.sort_by_key(|f| (f.0, f.1));
+        let first = self.after;
+        for (start, _, kind, text) in found {
+            // The claims of this sequence that end before the figure starts.
+            let before = claims.iter().filter(|&&(_, ce)| ce <= start).count() as u32;
+            self.after = first + before;
+            self.push(kind, text, location);
+        }
+        self.after = first + claims.len() as u32;
+        Ok(())
     }
+}
+
+/// The figures of `run`: every number whose role `keep` accepts and every date, in order of
+/// their start, each as its code-point range, kind and text with up to `UNCITED_CONTEXT` code
+/// points of the run on each side.
+fn figures(
+    run: &str,
+    keep: impl Fn(NumberRole) -> bool,
+) -> Result<Vec<(u32, u32, ClaimKind, String)>, TooLong> {
+    if run.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ctx = scan_ctx();
+    let mut found: Vec<(u32, u32, ClaimKind)> = find_numbers(run, &ctx)?
+        .into_iter()
+        .filter(|f| keep(f.value.role))
+        .map(|f| (f.start, f.end, ClaimKind::Number))
+        .chain(
+            find_dates(run, &ctx)?
+                .into_iter()
+                .map(|f| (f.start, f.end, ClaimKind::Date)),
+        )
+        .collect();
+    found.sort_by_key(|&(start, end, _)| (start, end));
+    if found.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bounds = Bounds::new(run);
+    Ok(found
+        .into_iter()
+        .map(|(start, end, kind)| (start, end, kind, window(run, &bounds, start, end)))
+        .collect())
 }
 
 /// The grapheme-cluster boundaries of a run: each in code points and in bytes, from 0 to the
