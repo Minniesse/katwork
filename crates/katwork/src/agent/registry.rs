@@ -1,6 +1,7 @@
 use super::{Tool, ToolDeps, builtin};
 use crate::{
     artifacts::tools::{ListFiles, ReadFile},
+    docs::tools::{WriteDocx, WriteXlsx},
     evidence::cite::Cite,
 };
 use std::{
@@ -57,6 +58,12 @@ impl ToolRegistry {
             .expect("distinct standard names");
         registry
             .register(Arc::new(Cite))
+            .expect("distinct standard names");
+        registry
+            .register(Arc::new(WriteDocx::new(deps.clone())))
+            .expect("distinct standard names");
+        registry
+            .register(Arc::new(WriteXlsx::new(deps.clone())))
             .expect("distinct standard names");
         registry
     }

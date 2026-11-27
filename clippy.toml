@@ -7,4 +7,10 @@ disallowed-methods = [
     { path = "sqlx::Pool::try_begin_with", reason = "Use db::guarded for cancellable database work" },
     { path = "sqlx::Acquire::begin", reason = "Use db::guarded for cancellable database work" },
     { path = "sqlx::Acquire::acquire", reason = "Use db::guarded for cancellable database work" },
+    { path = "docx_rs::read_docx", reason = "docx-rs reads only through zip 8.6, whose read-path advisories deny.toml ignores (#167): KatWork only writes DOCX with docx-rs" },
+    { path = "docx_rs::read_docx_with_options", reason = "docx-rs reads only through zip 8.6, whose read-path advisories deny.toml ignores (#167): KatWork only writes DOCX with docx-rs" },
+    { path = "docx_rs::read_xml", reason = "docx-rs reads only through zip 8.6, whose read-path advisories deny.toml ignores (#167): KatWork only writes DOCX with docx-rs" },
+    { path = "docx_rs::read_zip", reason = "docx-rs reads only through zip 8.6, whose read-path advisories deny.toml ignores (#167): KatWork only writes DOCX with docx-rs" },
+    { path = "docx_rs::read_document_rels", reason = "docx-rs reads only through zip 8.6, whose read-path advisories deny.toml ignores (#167): KatWork only writes DOCX with docx-rs" },
+    { path = "docx_rs::extract_xml_package_parts", reason = "docx-rs reads only through zip 8.6, whose read-path advisories deny.toml ignores (#167): KatWork only writes DOCX with docx-rs" },
 ]

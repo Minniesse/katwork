@@ -83,6 +83,10 @@ pub const TOOL_CODES: &[&str] = &[
     "quote_not_in_span",
     "quote_ambiguous",
     "text_too_long",
+    "citation_unknown",
+    "artifact_not_writable",
+    "read_back_failed",
+    "xlsx_would_be_repaired",
 ];
 impl ToolError {
     pub fn code(&self) -> &'static str {

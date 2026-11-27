@@ -2,6 +2,18 @@
 ignore = [
     # chrono is unmaintained with no safe upgrade; not a vulnerability. Replacing it is #141.
     { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, replacement tracked in #141" },
+    # zip 8.6 comes only through docx-rs, and these advisories are all in zip's read and extract
+    # code. KatWork writes DOCX with docx-rs and never reads with it: the test
+    # `katwork_never_reads_with_docx_rs` (crates/katwork/tests/write_docs.rs) fails on any use
+    # of docx-rs beyond the writer's builder types.
+    { id = "RUSTSEC-2026-0367", reason = "zip 8.6 read path via docx-rs; KatWork only writes DOCX with docx-rs, never reads; remove in #167" },
+    { id = "RUSTSEC-2026-0368", reason = "zip 8.6 read path via docx-rs; KatWork only writes DOCX with docx-rs, never reads; remove in #167" },
+    { id = "RUSTSEC-2026-0369", reason = "zip 8.6 read path via docx-rs; KatWork only writes DOCX with docx-rs, never reads; remove in #167" },
+    { id = "RUSTSEC-2026-0429", reason = "zip 8.6 read path via docx-rs; KatWork only writes DOCX with docx-rs, never reads; remove in #167" },
+    { id = "RUSTSEC-2026-0545", reason = "zip 8.6 read path via docx-rs; KatWork only writes DOCX with docx-rs, never reads; remove in #167" },
+    { id = "RUSTSEC-2026-0546", reason = "zip 8.6 read path via docx-rs; KatWork only writes DOCX with docx-rs, never reads; remove in #167" },
+    { id = "RUSTSEC-2026-0547", reason = "zip 8.6 read path via docx-rs; KatWork only writes DOCX with docx-rs, never reads; remove in #167" },
+    { id = "RUSTSEC-2026-0548", reason = "zip 8.6 read path via docx-rs; KatWork only writes DOCX with docx-rs, never reads; remove in #167" },
 ]
 
 [licenses]
