@@ -49,7 +49,9 @@ typed_id!(
     ModelCallId,
     ArtifactId,
     ArtifactVersionId,
-    SpanId
+    SpanId,
+    CitationId,
+    ClaimId
 );
 
 macro_rules! counter {

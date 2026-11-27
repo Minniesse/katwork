@@ -1,5 +1,8 @@
 use super::{Tool, ToolDeps, builtin};
-use crate::artifacts::tools::{ListFiles, ReadFile};
+use crate::{
+    artifacts::tools::{ListFiles, ReadFile},
+    evidence::cite::Cite,
+};
 use std::{
     collections::{BTreeMap, btree_map::Entry},
     sync::Arc,
@@ -51,6 +54,9 @@ impl ToolRegistry {
             .expect("distinct standard names");
         registry
             .register(Arc::new(ReadFile::new(deps.clone())))
+            .expect("distinct standard names");
+        registry
+            .register(Arc::new(Cite))
             .expect("distinct standard names");
         registry
     }
