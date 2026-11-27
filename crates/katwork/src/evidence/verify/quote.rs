@@ -24,10 +24,18 @@ pub fn check_quote(claim: &ClaimInput, ctx: &Ctx) -> Vec<CheckOutcome> {
     let key = keyed(&claim.text);
     resolved_refs(&claim.refs)
         .filter_map(|(ordinal, r)| {
-            let super::ResolvedRef::Ok { exact, .. } = r else {
+            let super::ResolvedRef::Ok {
+                exact,
+                block_text,
+                quote_start,
+                quote_end,
+                ..
+            } = r
+            else {
                 return None;
             };
-            let contained = contains_whole(&keyed(exact), &key);
+            let (cut_start, cut_end) = quote_cuts(block_text, *quote_start, *quote_end);
+            let contained = contains_whole(&keyed(exact), &key, cut_start, cut_end);
             let (verdict, basis, code) = if contained {
                 (CheckVerdict::Supported, Basis::Exact, "checked")
             } else {
@@ -67,10 +75,44 @@ fn is_thai(c: char) -> bool {
     ('\u{0E01}'..='\u{0E4E}').contains(&c) && c != '\u{0E3F}'
 }
 
-/// Two code points of one run that no space separates: an English word, a number, or Thai
-/// text, which has no word boundaries this crate can see.
-fn same_run(a: char, b: char) -> bool {
-    (is_word(a) && is_word(b)) || (is_thai(a) && is_thai(b))
+fn is_hyphen(c: char) -> bool {
+    matches!(c, '-' | '\u{2010}' | '\u{2011}')
+}
+
+/// `x`, `j`, `y` read as one run: `. , / -` between two digits ("1.5", "1,250", "1/2567",
+/// "1-3"), or a hyphen between two word code points ("non-binding").
+fn joins(x: char, j: char, y: char) -> bool {
+    let digit = |c: char| c.is_numeric();
+    (digit(x) && digit(y) && (matches!(j, '.' | ',' | '/') || is_hyphen(j)))
+        || (is_word(x) && is_word(y) && is_hyphen(j))
+}
+
+/// Whether the boundary before `text[i]` lies inside a run, for `0 < i < text.len()`. Each code
+/// point records whether a space came right before it; a space is always a boundary. With
+/// `thai` false, two Thai code points do not make a run (the lexicon covers Thai).
+fn joined(text: &[(char, bool)], i: usize, thai: bool) -> bool {
+    let (a, b) = (text[i - 1], text[i]);
+    if b.1 {
+        return false;
+    }
+    (is_word(a.0) && is_word(b.0))
+        || (thai && is_thai(a.0) && is_thai(b.0))
+        || text
+            .get(i + 1)
+            .is_some_and(|n| !n.1 && joins(a.0, b.0, n.0))
+        || (i >= 2 && !a.1 && joins(text[i - 2].0, a.0, b.0))
+}
+
+/// Whether the quote's start and end fall inside an English word or a number of `block_text`
+/// ("approved" cut from "disapproved", "Section 1" from "Section 12"); a cut between two Thai
+/// code points is left to the qualifier lexicon. Positions are clamped to the block.
+fn quote_cuts(block_text: &str, start: u32, end: u32) -> (bool, bool) {
+    let raw: Vec<(char, bool)> = block_text.chars().map(|c| (c, false)).collect();
+    let len = raw.len();
+    let end = (end as usize).min(len);
+    let start = (start as usize).min(end);
+    let cut = |i: usize| i > 0 && i < len && joined(&raw, i, false);
+    (cut(start), cut(end))
 }
 
 /// `normalize_th(text)` as `match_key` sees it, except that a space between two word code
@@ -94,20 +136,35 @@ fn keyed(text: &str) -> Vec<(char, bool)> {
 }
 
 /// `needle` occurs in `hay` at a place whose ends do not cut a run: a hit in the middle of an
-/// English word or a number ("approved" in "disapproved", "1" in "12") is not one, nor is a hit
-/// whose end falls inside a run of Thai text, which has no word boundaries to check (it is then
-/// a paraphrase). An empty needle is never contained.
-fn contains_whole(hay: &[(char, bool)], needle: &[(char, bool)]) -> bool {
-    let (Some(first), Some(last)) = (needle.first(), needle.last()) else {
+/// English word or a number ("approved" in "disapproved", "1" in "12", "1" in "1.5", "binding"
+/// in "non-binding") is not one, nor is a hit whose end falls inside a run of Thai text, which
+/// has no word boundaries to check (it is then a paraphrase). A hit that reaches an end of `hay`
+/// the quote itself cut from a run (`cut_start`, `cut_end`) is not whole either. An empty needle
+/// is never contained.
+fn contains_whole(
+    hay: &[(char, bool)],
+    needle: &[(char, bool)],
+    cut_start: bool,
+    cut_end: bool,
+) -> bool {
+    if needle.is_empty() {
         return false;
-    };
+    }
     let hay_chars: Vec<char> = hay.iter().map(|(c, _)| *c).collect();
     let needle_chars: Vec<char> = needle.iter().map(|(c, _)| *c).collect();
     let mut found = false;
     each_hit(&hay_chars, &needle_chars, |at| {
         let end = at + needle.len();
-        let left = at == 0 || hay[at].1 || !same_run(hay[at - 1].0, first.0);
-        let right = end == hay.len() || hay[end].1 || !same_run(last.0, hay[end].0);
+        let left = if at == 0 {
+            !cut_start
+        } else {
+            !joined(hay, at, true)
+        };
+        let right = if end == hay.len() {
+            !cut_end
+        } else {
+            !joined(hay, end, true)
+        };
         found = left && right;
         !found
     });

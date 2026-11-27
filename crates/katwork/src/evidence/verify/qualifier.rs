@@ -3,7 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
-use katwork_thai::{Ctx, NumberRole, TooLong, find_numbers, match_key, normalize_th};
+use katwork_thai::{
+    Ctx, MAX_SCAN_CODE_POINTS, NumberRole, TooLong, find_numbers, match_key, normalize_th,
+};
 use serde::Serialize;
 use serde_json::json;
 
@@ -61,8 +63,10 @@ struct Sub {
     not_after: &'static [&'static str],
     /// Not a qualifier right before one of these (`อย่าง` is "kind of", `งดงาม` "beautiful").
     not_before: &'static [&'static str],
-    /// Only right after a digit (`5+`).
+    /// Only right after a digit (`5+`; spaces between them are ignored).
     after_digit: bool,
+    /// Only right before a digit (`<-5`).
+    before_digit: bool,
 }
 
 const fn sub(text: &'static str, meaning: Meaning, plan: bool) -> Sub {
@@ -73,6 +77,7 @@ const fn sub(text: &'static str, meaning: Meaning, plan: bool) -> Sub {
         not_after: &[],
         not_before: &[],
         after_digit: false,
+        before_digit: false,
     }
 }
 
@@ -124,6 +129,10 @@ const SUBSTRINGS: &[Sub] = &[
         not_before: &["-"],
         ..sub("<", Meaning::Lt, false)
     },
+    Sub {
+        before_digit: true,
+        ..sub("<-", Meaning::Lt, false)
+    },
     sub(">=", Meaning::Ge, false),
     sub("<=", Meaning::Le, false),
     sub("≥", Meaning::Ge, false),
@@ -157,6 +166,30 @@ const ENGLISH: &[(&str, Meaning, bool)] = &[
     ("dont", Meaning::Neg, false),
     ("doesnt", Meaning::Neg, false),
     ("didnt", Meaning::Neg, false),
+    ("cant", Meaning::Neg, false),
+    ("couldnt", Meaning::Neg, false),
+    ("wouldnt", Meaning::Neg, false),
+    ("shouldnt", Meaning::Neg, false),
+    ("isnt", Meaning::Neg, false),
+    ("arent", Meaning::Neg, false),
+    ("wasnt", Meaning::Neg, false),
+    ("werent", Meaning::Neg, false),
+    ("hasnt", Meaning::Neg, false),
+    ("havent", Meaning::Neg, false),
+    ("hadnt", Meaning::Neg, false),
+    ("wont", Meaning::Neg, false),
+    ("deny", Meaning::Neg, false),
+    ("denied", Meaning::Neg, false),
+    ("denies", Meaning::Neg, false),
+    ("refuse", Meaning::Neg, false),
+    ("refused", Meaning::Neg, false),
+    ("refuses", Meaning::Neg, false),
+    ("decline", Meaning::Neg, false),
+    ("declined", Meaning::Neg, false),
+    ("declines", Meaning::Neg, false),
+    ("veto", Meaning::Neg, false),
+    ("vetoed", Meaning::Neg, false),
+    ("vetoes", Meaning::Neg, false),
     ("no more than", Meaning::Le, true),
     ("not more than", Meaning::Le, true),
     ("at most", Meaning::Le, true),
@@ -201,6 +234,7 @@ struct SubKey {
     not_after: Vec<Vec<char>>,
     not_before: Vec<Vec<char>>,
     after_digit: bool,
+    before_digit: bool,
 }
 
 struct Lexicon {
@@ -227,6 +261,7 @@ fn build(words: Words) -> Lexicon {
             not_after: e.not_after.iter().map(|t| key(t)).collect(),
             not_before: e.not_before.iter().map(|t| key(t)).collect(),
             after_digit: e.after_digit,
+            before_digit: e.before_digit,
         })
         .collect();
     subs.sort_by_key(|e| std::cmp::Reverse(e.key.len()));
@@ -305,6 +340,8 @@ fn substring_scan(text: &str, lexicon: &Lexicon) -> Vec<Qualifier> {
         let hit = lexicon.subs.iter().find(|e| {
             chars[i..].starts_with(&e.key)
                 && !(e.after_digit && !(i > 0 && chars[i - 1].is_ascii_digit()))
+                && !(e.before_digit
+                    && !chars.get(i + e.key.len()).is_some_and(char::is_ascii_digit))
                 && !e
                     .not_before
                     .iter()
@@ -486,6 +523,22 @@ fn is_thai(c: char) -> bool {
     ('\u{0E00}'..='\u{0E7F}').contains(&c)
 }
 
+/// A `.` before a space that does not end a sentence: the next word starts with a digit or a
+/// lowercase letter ("No. 5", "e.g. at"), or the word before it is a single letter or a dotted
+/// run ("J.", "e.g.", "4.b."). An abbreviation before a capital ("Mr. Smith") still ends one.
+fn abbreviation_dot(chars: &[char], i: usize) -> bool {
+    let next = chars[i + 1..].iter().find(|c| !c.is_whitespace());
+    if next.is_some_and(|c| c.is_numeric() || c.is_lowercase()) {
+        return true;
+    }
+    let word_start = chars[..i]
+        .iter()
+        .rposition(|c| c.is_whitespace())
+        .map_or(0, |p| p + 1);
+    let word = &chars[word_start..i];
+    (word.len() == 1 && word[0].is_alphabetic()) || (word.len() > 1 && word.contains(&'.'))
+}
+
 /// The code-point range of the quote's sentence reading in `chars`.
 fn sentence_range(
     chars: &[char],
@@ -508,7 +561,9 @@ fn sentence_range(
         let c = chars[i];
         match c {
             '!' | '?' | 'ฯ' | '\n' | '\r' | '\u{2028}' | '\u{2029}' => true,
-            '.' => chars.get(i + 1).is_none_or(|n| n.is_whitespace()),
+            '.' => {
+                chars.get(i + 1).is_none_or(|n| n.is_whitespace()) && !abbreviation_dot(chars, i)
+            }
             _ if c.is_whitespace() => run[i] >= THAI_SENTENCE_RUN && i > 0 && is_thai(chars[i - 1]),
             _ => false,
         }
@@ -611,22 +666,32 @@ pub fn check_qualifiers(claim: &ClaimInput) -> Vec<CheckOutcome> {
     if !claim.cited {
         return vec![];
     }
+    let too_long = |text: &str| text.chars().nth(MAX_SCAN_CODE_POINTS).is_some();
+    let claim_too_long = too_long(&claim.text);
     resolved_refs(&claim.refs)
         .filter_map(|(ordinal, r)| {
-            let readings = readings(&claim.text, r)?;
-            let differing = readings.iter().find(|x| x.claim != x.source)?;
-            Some(CheckOutcome {
+            let mismatch = |detail| CheckOutcome {
                 method: CheckMethod::Qualifier,
                 verdict: CheckVerdict::Inconclusive,
                 basis: Basis::None,
                 code: "qualifier_mismatch",
                 ref_ordinal: Some(ordinal),
                 advisory: false,
-                detail: json!({
-                    "claim": names(&differing.claim),
-                    "source": names(&differing.source),
-                }),
-            })
+                detail,
+            };
+            // A text too long to scan is never scanned in part: it is flagged.
+            let ResolvedRef::Ok { block_text, .. } = r else {
+                return None;
+            };
+            if claim_too_long || too_long(block_text) {
+                return Some(mismatch(json!({"reason": "text_too_long"})));
+            }
+            let readings = readings(&claim.text, r)?;
+            let differing = readings.iter().find(|x| x.claim != x.source)?;
+            Some(mismatch(json!({
+                "claim": names(&differing.claim),
+                "source": names(&differing.source),
+            })))
         })
         .collect()
 }

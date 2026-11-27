@@ -834,6 +834,33 @@ fn every_lexicon_entry_returns_its_own_meaning() {
         ("ลงมา", Le),
         ("สูงสุด", Le),
         ("ต่ำสุด", Ge),
+        // Same classes, added in fix round 2 (a note on the 2026-11-27 decision).
+        ("cant", Neg),
+        ("couldnt", Neg),
+        ("wouldnt", Neg),
+        ("shouldnt", Neg),
+        ("isnt", Neg),
+        ("arent", Neg),
+        ("wasnt", Neg),
+        ("werent", Neg),
+        ("hasnt", Neg),
+        ("havent", Neg),
+        ("hadnt", Neg),
+        ("wont", Neg),
+        ("couldn't", Neg),
+        ("hasn't", Neg),
+        ("deny", Neg),
+        ("denied", Neg),
+        ("denies", Neg),
+        ("refuse", Neg),
+        ("refused", Neg),
+        ("refuses", Neg),
+        ("decline", Neg),
+        ("declined", Neg),
+        ("declines", Neg),
+        ("veto", Neg),
+        ("vetoed", Neg),
+        ("vetoes", Neg),
     ];
     for (text, meaning) in rows {
         let padded = format!("x {text} 5");
@@ -2250,6 +2277,53 @@ fn review_false_passes_are_flagged() {
         ("5 days", "5 days", "maximum 5 days"),
         ("5 ล้านบาท", "5 ล้านบาท", "วงเงิน 5 ล้านบาทขึ้นไป"),
         ("5 วัน", "5 วัน", "สูงสุด 5 วัน"),
+        // Fix round 2.
+        (
+            "the board approved the budget",
+            "the board approved the budget",
+            "Reports that the board approved the budget were denied",
+        ),
+        (
+            "approve the budget",
+            "approve the budget",
+            "They couldnt approve the budget",
+        ),
+        (
+            "approve the budget",
+            "approve the budget",
+            "They cant approve the budget",
+        ),
+        (
+            "approve the budget",
+            "approve the budget",
+            "The board declined to approve the budget",
+        ),
+        (
+            "approve the budget",
+            "approve the budget",
+            "The board refused to approve the budget",
+        ),
+        (
+            "approve the budget",
+            "approve the budget",
+            "The minister vetoed: approve the budget",
+        ),
+        (
+            "approve the budget",
+            "approve the budget",
+            "The board did not, under Resolution No. 5, approve the budget.",
+        ),
+        (
+            "approve the budget",
+            "approve the budget",
+            "The board did not, e.g. at its May meeting, approve the budget.",
+        ),
+        (
+            "approve the budget",
+            "approve the budget",
+            "The board did not, i.e. at its May meeting, approve the budget.",
+        ),
+        ("rate 5%", "5%", "rate <-5%"),
     ];
     for (text, quote, block) in rows {
         let c = claim(ClaimKind::Quote, text, vec![full(quote, block)]);
@@ -2258,14 +2332,12 @@ fn review_false_passes_are_flagged() {
     }
 }
 
-/// Phrasings the extended lists do not cover; pinned so a later change is deliberate.
 #[test]
 fn known_gaps_after_the_extended_lists() {
+    // Phrasings the lists and the sentence splitter do not cover yet; each is pinned so a later
+    // change is deliberate. Follow-up: issue #165.
     let rows: &[(&str, &str)] = &[
-        (
-            "the board approved the budget",
-            "Reports that the board approved the budget were denied",
-        ),
+        // Conditionals.
         (
             "the board approved the budget",
             "if the board approved the budget",
@@ -2274,7 +2346,59 @@ fn known_gaps_after_the_extended_lists() {
             "the board approved the budget",
             "unless the board approved the budget",
         ),
+        ("อนุมัติงบประมาณ", "ถ้าที่ประชุมอนุมัติงบประมาณ"),
+        ("อนุมัติงบประมาณ", "หากที่ประชุมอนุมัติงบประมาณ"),
+        // Questions.
+        (
+            "the board approve the budget",
+            "Did the board approve the budget?",
+        ),
         ("the board approved", "the board approved? Certainly not"),
+        // Negating words not in the lists.
+        ("การอนุมัติงบประมาณ", "ที่ประชุมคัดค้านการอนุมัติงบประมาณ"),
+        ("การอนุมัติงบประมาณ", "ที่ประชุมค้านการอนุมัติงบประมาณ"),
+        ("การอนุมัติงบประมาณ", "ที่ประชุมล้มเหลวในการอนุมัติงบประมาณ"),
+        ("อนุมัติงบประมาณ", "ที่ประชุมมิอนุมัติงบประมาณ"),
+        ("อนุมัติงบประมาณ", "ที่ประชุมยังมิอนุมัติงบประมาณ"),
+        ("อนุมัติงบประมาณ", "ที่ประชุมบ่อนุมัติงบประมาณ"),
+        (
+            "approve the budget",
+            "The motion was withdrawn: approve the budget",
+        ),
+        (
+            "approve the budget",
+            "The order was revoked: approve the budget",
+        ),
+        (
+            "approve the budget",
+            "The vote was blocked: approve the budget",
+        ),
+        (
+            "approve the budget",
+            "There was a failure to approve the budget",
+        ),
+        (
+            "approve the budget",
+            "There was a lack of will to approve the budget",
+        ),
+        (
+            "approve the budget",
+            "In the absence of a quorum, approve the budget",
+        ),
+        // The sentence splitter: a Thai space after 30 or more code points, and abbreviations
+        // before a capital letter.
+        (
+            "อนุมัติงบประมาณเพิ่มเติม",
+            "ที่ประชุมไม่เห็นด้วยกับข้อเสนอของฝ่ายบริหารที่ขอให้ อนุมัติงบประมาณเพิ่มเติม",
+        ),
+        (
+            "approve the budget",
+            "The board did not, as Mr. Smith asked, approve the budget.",
+        ),
+        (
+            "approve the budget",
+            "The board did not, per the Co. Ltd. rules, approve the budget.",
+        ),
     ];
     for (quote, block) in rows {
         let c = claim(ClaimKind::Quote, quote, vec![full(quote, block)]);
@@ -2376,5 +2500,159 @@ fn straddled_entry_is_not_misread_as_a_shorter_one() {
     // "ไม่เกิน" in every reading, so nothing is flagged.
     let block = "ไม่เกินกขคงจอนุมัติ";
     let c = claim(ClaimKind::Quote, "ไม่เกิน อนุมัติ", vec![full("อนุมัติ", block)]);
+    assert!(check_qualifiers(&c).is_empty());
+}
+
+// ---------------------------------------------------------------- fix round 2
+
+#[test]
+fn quote_cut_from_inside_a_word_is_a_paraphrase() {
+    // (claim, quote, block): the quote itself starts or ends inside a word or a number of the
+    // block, so a claim reaching that edge is not whole.
+    for (text, quote, block) in [
+        (
+            "approved the budget",
+            "approved the budget",
+            "The board disapproved the budget",
+        ),
+        (
+            "approved the plan",
+            "approved the plan",
+            "They unapproved the plan",
+        ),
+        ("Section 1", "Section 1", "Section 12 was repealed"),
+        (
+            "binding agreement",
+            "binding agreement",
+            "a non-binding agreement",
+        ),
+        ("Section 1", "Section 1", "Section 1.5 was repealed"),
+    ] {
+        let c = claim(ClaimKind::Quote, text, vec![full(quote, block)]);
+        let out = check_quote(&c, &Ctx::default());
+        assert!(
+            out.iter().all(|k| k.verdict != CheckVerdict::Supported),
+            "{quote:?} in {block:?}: {out:?}"
+        );
+        assert_ne!(status(&c).0, ClaimStatus::Passed, "{quote:?} in {block:?}");
+    }
+    // A quote on whole words passes, and a claim inside it away from a cut edge is not affected.
+    for (text, quote, block) in [
+        (
+            "approved the budget",
+            "approved the budget",
+            "The board approved the budget",
+        ),
+        (
+            "the budget",
+            "approved the budget",
+            "The board approved the budget",
+        ),
+        ("Section 1", "Section 1", "Section 1. Repealed"),
+        ("the budget", "the budget", "the budget - approved"),
+    ] {
+        let c = claim(ClaimKind::Quote, text, vec![full(quote, block)]);
+        let out = check_quote(&c, &Ctx::default());
+        assert_eq!(out.len(), 1, "{quote:?} in {block:?}");
+        assert_eq!(
+            out[0].verdict,
+            CheckVerdict::Supported,
+            "{quote:?} in {block:?}"
+        );
+    }
+    // The cut edge counts only where the claim reaches it.
+    let c = claim(
+        ClaimKind::Quote,
+        "the budget",
+        vec![full(
+            "approved the budget",
+            "The board disapproved the budget",
+        )],
+    );
+    assert_eq!(
+        check_quote(&c, &Ctx::default())[0].verdict,
+        CheckVerdict::Supported
+    );
+}
+
+#[test]
+fn joined_runs_are_not_cut() {
+    // Inside the quote: `. , / -` between two digits, and a hyphen between two letters, join one
+    // run.
+    for (text, exact) in [
+        ("Section 1", "Section 1.5 was repealed"),
+        ("Section 1", "Section 1,250 was repealed"),
+        ("Section 1", "Section 1/2567 was repealed"),
+        ("No. 1", "No. 1-3 repealed"),
+        ("binding agreement", "a non-binding agreement"),
+        ("binding agreement", "a non\u{2011}binding agreement"),
+        ("binding agreement", "a non\u{2010}binding agreement"),
+        ("pre", "pre-approved"),
+    ] {
+        let c = claim(ClaimKind::Quote, text, vec![full(exact, exact)]);
+        let out = check_quote(&c, &Ctx::default());
+        assert!(
+            out.iter().all(|k| k.verdict != CheckVerdict::Supported),
+            "{text:?} in {exact:?}: {out:?}"
+        );
+    }
+}
+
+#[test]
+fn lt_arrow_before_a_digit_is_a_comparator() {
+    use Meaning::*;
+    assert_eq!(qualifier::find("rate <-5%"), set(&[Lt]));
+    assert_eq!(qualifier::find("a<-5"), set(&[Lt]));
+    assert_eq!(qualifier::find("a <- b"), set(&[]));
+}
+
+#[test]
+fn text_too_long_for_a_qualifier_scan_is_a_mismatch() {
+    // A block or a claim longer than MAX_SCAN_CODE_POINTS is never scanned: it is flagged.
+    let block = format!("{} approve the budget", "a".repeat(MAX_SCAN_CODE_POINTS));
+    let c = claim(
+        ClaimKind::Quote,
+        "approve the budget",
+        vec![full("approve the budget", &block)],
+    );
+    let out = check_qualifiers(&c);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].code, "qualifier_mismatch");
+    assert_eq!(out[0].detail["reason"], json!("text_too_long"));
+    let text = format!("approve the budget {}", "a".repeat(MAX_SCAN_CODE_POINTS));
+    let c = claim(
+        ClaimKind::Quote,
+        &text,
+        vec![full("approve the budget", "approve the budget")],
+    );
+    assert_eq!(check_qualifiers(&c).len(), 1);
+}
+
+#[test]
+fn abbreviation_dot_does_not_end_the_sentence() {
+    // A `.` before a digit or a lowercase letter, or after a single letter or a dotted run, is
+    // not a sentence end; a `.` before a capital after a full word still is.
+    for block in [
+        "The board did not, under Resolution No. 5, approve the budget.",
+        "The board did not, e.g. at its May meeting, approve the budget.",
+        "The board did not, i.e. at its May meeting, approve the budget.",
+        "The board did not, per section 4.b. of the rules, approve the budget.",
+        "The board did not, per J. Lee, approve the budget.",
+    ] {
+        let c = claim(
+            ClaimKind::Quote,
+            "approve the budget",
+            vec![full("approve the budget", block)],
+        );
+        assert_eq!(check_qualifiers(&c).len(), 1, "{block:?}");
+    }
+    let c = claim(
+        ClaimKind::Quote,
+        "The board approved the budget",
+        vec![full(
+            "The board approved the budget",
+            "It was not discussed at length. The board approved the budget",
+        )],
+    );
     assert!(check_qualifiers(&c).is_empty());
 }
