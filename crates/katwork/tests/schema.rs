@@ -30,6 +30,9 @@ async fn migrations_apply_cleanly(pool: PgPool) {
         [
             "artifact_versions",
             "artifacts",
+            "citations",
+            "claim_refs",
+            "claims",
             "events",
             "jobs",
             "kat_spaces",
@@ -939,6 +942,109 @@ async fn source_spans_reject_a_version_of_another_workspace(pool: PgPool) {
     let default: String = sqlx::query_scalar("SELECT column_default FROM information_schema.columns WHERE table_name = 'tool_calls' AND column_name = 'output_trust'")
         .fetch_one(&pool).await.unwrap();
     assert_eq!(default, "'untrusted'::text");
+}
+
+#[sqlx::test]
+async fn citations_and_claims_reject_rows_of_another_workspace(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let other = Fixture::new(&pool).await;
+    // A file, version and span in each workspace.
+    let mut versions = vec![];
+    let mut spans = vec![];
+    for g in [&f, &other] {
+        let (artifact, version, span) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        sqlx::query("INSERT INTO artifacts (id, workspace_id, space_id, name, role, created_by_user) VALUES ($1, $2, $3, 'a.txt', 'input', $4)")
+            .bind(artifact).bind(g.workspace).bind(g.space).bind(g.user).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO artifact_versions (id, workspace_id, artifact_id, version, sha256, bytes, media_type) VALUES ($1, $2, $3, 1, repeat('a', 64), 1, 'text')")
+            .bind(version).bind(g.workspace).bind(artifact).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO source_spans (id, workspace_id, artifact_version_id, extractor, extractor_version, ordinal, piece, source_ref, text, text_sha256, match_key, normalize_version, generated) VALUES ($1, $2, $3, 'text', 1, 1, 0, '{}', 'x', repeat('b', 64), 'x', 1, false)")
+            .bind(span).bind(g.workspace).bind(version).execute(&pool).await.unwrap();
+        versions.push(version);
+        spans.push(span);
+    }
+    let citation = |job: Uuid, run: Uuid, span: Uuid| {
+        sqlx::query("INSERT INTO citations (id, workspace_id, job_id, run_id, span_id, source_ref, exact, start_cp, end_cp, display) VALUES ($1, $2, $3, $4, $5, '{}', 'x', 0, 1, 'a.txt · ¶ 1') RETURNING id")
+            .bind(Uuid::now_v7()).bind(f.workspace).bind(job).bind(run).bind(span).fetch_one(&pool)
+    };
+    for (job, run, span, constraint) in [
+        (
+            other.job,
+            f.run,
+            spans[0],
+            "citations_job_id_workspace_id_fkey",
+        ),
+        (
+            f.job,
+            other.run,
+            spans[0],
+            "citations_run_id_workspace_id_fkey",
+        ),
+        (
+            f.job,
+            f.run,
+            spans[1],
+            "citations_span_id_workspace_id_fkey",
+        ),
+    ] {
+        workspace_fk(citation(job, run, span).await.unwrap_err(), constraint);
+    }
+    let own: Uuid = citation(f.job, f.run, spans[0]).await.unwrap().get(0);
+    let foreign: Uuid = sqlx::query("INSERT INTO citations (id, workspace_id, job_id, run_id, span_id, source_ref, exact, start_cp, end_cp, display) VALUES ($1, $2, $3, $4, $5, '{}', 'x', 0, 1, 'a.txt · ¶ 1') RETURNING id")
+        .bind(Uuid::now_v7()).bind(other.workspace).bind(other.job).bind(other.run).bind(spans[1]).fetch_one(&pool).await.unwrap().get(0);
+    let claim = |version: Uuid| {
+        sqlx::query("INSERT INTO claims (id, workspace_id, artifact_version_id, ordinal, kind, text, location, cited) VALUES ($1, $2, $3, 0, 'fact', 'x', 'p:1', true) RETURNING id")
+            .bind(Uuid::now_v7()).bind(f.workspace).bind(version).fetch_one(&pool)
+    };
+    workspace_fk(
+        claim(versions[1]).await.unwrap_err(),
+        "claims_artifact_version_id_workspace_id_fkey",
+    );
+    let claim_id: Uuid = claim(versions[0]).await.unwrap().get(0);
+    let claim_ref = |claim: Uuid, citation: Uuid| {
+        sqlx::query("INSERT INTO claim_refs (claim_id, workspace_id, ordinal, citation_id, source_ref) VALUES ($1, $2, 0, $3, '{}')")
+            .bind(claim).bind(f.workspace).bind(citation).execute(&pool)
+    };
+    workspace_fk(
+        claim_ref(claim_id, foreign).await.unwrap_err(),
+        "claim_refs_citation_id_workspace_id_fkey",
+    );
+    claim_ref(claim_id, own).await.unwrap();
+    // The range and text checks.
+    for (sql, check) in [
+        (
+            "INSERT INTO citations (id, workspace_id, job_id, run_id, span_id, source_ref, exact, start_cp, end_cp, display) VALUES ($1, $2, $3, $4, $5, '{}', 'x', 3, 3, 'd')",
+            "citations_range_check",
+        ),
+        (
+            "INSERT INTO citations (id, workspace_id, job_id, run_id, span_id, source_ref, exact, start_cp, end_cp, display) VALUES ($1, $2, $3, $4, $5, '{}', '', 4, 5, 'd')",
+            "citations_exact_check",
+        ),
+    ] {
+        let error = sqlx::query(sql)
+            .bind(Uuid::now_v7())
+            .bind(f.workspace)
+            .bind(f.job)
+            .bind(f.run)
+            .bind(spans[0])
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_database_error().and_then(|e| e.constraint()),
+            Some(check)
+        );
+    }
+    for (kind, text, check) in [
+        ("opinion", "x".to_string(), "claims_kind_check"),
+        ("fact", "x".repeat(501), "claims_text_check"),
+    ] {
+        let error = sqlx::query("INSERT INTO claims (id, workspace_id, artifact_version_id, ordinal, kind, text, location, cited) VALUES ($1, $2, $3, 1, $4, $5, 'p:1', false)")
+            .bind(Uuid::now_v7()).bind(f.workspace).bind(versions[0]).bind(kind).bind(text).execute(&pool).await.unwrap_err();
+        assert_eq!(
+            error.as_database_error().and_then(|e| e.constraint()),
+            Some(check)
+        );
+    }
 }
 
 #[sqlx::test]
