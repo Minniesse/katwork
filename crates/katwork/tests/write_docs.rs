@@ -301,6 +301,13 @@ impl Env {
     }
 }
 
+/// `fut`, or a panic after 60 s: a test that waits on a gate or a lock never hangs CI.
+async fn bounded<T>(fut: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(std::time::Duration::from_secs(60), fut)
+        .await
+        .expect("the test's writers did not finish within 60 s")
+}
+
 /// One JSON line.
 async fn call(tool: &dyn Tool, ctx: &ToolCtx, args: Value) -> Result<Value, ToolError> {
     match tool.call(ctx, args).await? {
@@ -1441,7 +1448,7 @@ async fn concurrent_same_key_writers_commit_once(pool: PgPool) {
         gate.release.notify_one();
         second.await
     };
-    let (first, second) = tokio::join!(first, second);
+    let (first, second) = bounded(async { tokio::join!(first, second) }).await;
     assert_eq!(first.unwrap(), second.unwrap());
     assert_eq!(env.output_versions().await, 1);
     assert_eq!(env.claims().await, 1);
@@ -1543,7 +1550,7 @@ async fn cross_citing_writers_both_commit(pool: PgPool) {
         b_gate.release.notify_one();
         b.await
     };
-    let (a, b) = tokio::join!(a, b);
+    let (a, b) = bounded(async { tokio::join!(a, b) }).await;
     assert_eq!(a.unwrap()["version"], 2);
     assert_eq!(b.unwrap()["version"], 2);
 }
@@ -1586,7 +1593,7 @@ async fn writer_citing_its_own_earlier_version_commits(pool: PgPool) {
         third.close().await.unwrap();
         gate.release.notify_one();
     };
-    let (written, ()) = tokio::join!(write, probe);
+    let (written, ()) = bounded(async { tokio::join!(write, probe) }).await;
     assert_eq!(written.unwrap()["version"], 2);
 }
 
@@ -1625,7 +1632,7 @@ async fn write_after_policy_change_commits_nothing(pool: PgPool) {
         .unwrap();
         go.send(()).unwrap();
     };
-    let (result, ()) = tokio::join!(write, change);
+    let (result, ()) = bounded(async { tokio::join!(write, change) }).await;
     assert_eq!(code(result), "policy_changed");
     assert_eq!(env.output_versions().await, 0);
     assert_eq!(env.output_blobs().await, 0);
@@ -1655,7 +1662,7 @@ async fn cancel_during_render_writes_no_version(pool: PgPool) {
         reached.recv().await.unwrap();
         ctx.cancel.cancel();
     };
-    let (result, ()) = tokio::join!(write, cancel);
+    let (result, ()) = bounded(async { tokio::join!(write, cancel) }).await;
     assert_eq!(code(result), "cancelled");
     assert_eq!(env.output_versions().await, 0);
     assert_eq!(env.output_blobs().await, 0);
@@ -1817,6 +1824,8 @@ async fn docx_read_back_checks_bookmark_text_and_visibility(pool: PgPool) {
         .unwrap();
     for (text, location) in [
         ("ข้ออื่น", "bookmark:kw-claim-1"),
+        // In the paragraph, but outside the bookmark.
+        ("ก่อน", "bookmark:kw-claim-1"),
         ("ข้อ ๑,๒๕๐", "bookmark:kw-claim-2"),
     ] {
         let mut bad = ok.clone();
@@ -1983,7 +1992,7 @@ async fn change_during_render<F: std::future::Future<Output = ()>>(
         between.await;
         go.send(()).unwrap();
     };
-    tokio::join!(write, change).0
+    bounded(async { tokio::join!(write, change) }).await.0
 }
 
 #[sqlx::test]
