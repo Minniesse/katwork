@@ -133,6 +133,7 @@ fn ref_has_thai(r: &ResolvedRef) -> bool {
         block_text,
         unit_context,
         cell,
+        sheet,
         ..
     } = r
     else {
@@ -152,6 +153,7 @@ fn ref_has_thai(r: &ResolvedRef) -> bool {
     has_thai(exact)
         || has_thai(block_text)
         || unit_context.as_deref().is_some_and(has_thai)
+        || sheet.as_deref().is_some_and(has_thai)
         || cell_texts.flatten().any(|t| has_thai(t))
 }
 

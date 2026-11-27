@@ -33,6 +33,7 @@ fn ok_ref(exact: &str, block: &str, quality: RefQuality) -> ResolvedRef {
         quote_end: (start + needle.len()) as u32,
         unit_context: None,
         cell: None,
+        sheet: None,
         quality,
     }
 }
@@ -573,6 +574,11 @@ fn thai_anywhere_in_a_cited_span_blocks_the_judge() {
                 });
             }
         }),
+        Box::new(|r| {
+            if let ResolvedRef::Ok { sheet, .. } = r {
+                *sheet = Some("งบ 2567".into());
+            }
+        }),
         // Thai digits are Thai script.
         Box::new(|r| {
             if let ResolvedRef::Ok { block_text, .. } = r {
@@ -1019,6 +1025,7 @@ fn window_is_ten_code_points_and_clamped() {
         quote_end: 2,
         unit_context: None,
         cell: None,
+        sheet: None,
         quality: RefQuality::Full,
     };
     assert_eq!(qualifier::window(&bad).as_deref(), Some("abc"));
