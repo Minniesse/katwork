@@ -48,6 +48,11 @@ pub const CODES: &[&str] = &[
     "arithmetic_mismatch",
     "operand_missing",
     "division_by_zero",
+    // Task 11's own: a figure with another reading, a sign that only the wording explains, a
+    // claim finer than its source.
+    "number_ambiguous",
+    "sign_differs",
+    "precision_differs",
 ];
 
 /// The visible flag "AI found a possible mismatch" (R4, R18). It never changes a status.

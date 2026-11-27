@@ -245,7 +245,7 @@ pub(crate) fn number(text: &str) -> Option<f64> {
 }
 
 /// The exact decimal value of a stored number, when a `Decimal` holds it.
-fn decimal(text: &str) -> Option<Decimal> {
+pub(crate) fn decimal(text: &str) -> Option<Decimal> {
     let text = text.trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'));
     let text = text.strip_prefix('+').unwrap_or(text);
     if text.contains(['e', 'E']) {
@@ -610,10 +610,21 @@ fn literal(token: &Token) -> Option<String> {
     })
 }
 
-/// `magnitude` (not negative) under `section`, padding left out and the result trimmed of
-/// spaces; `None` when the section holds a code KatWork does not render or no digit
-/// placeholder, or its digits are not one run of placeholders, grouping commas and a point.
-fn render(section: &Section, magnitude: Decimal) -> Option<String> {
+/// Where a section's number sits: its tokens `first..end` (placeholders, grouping commas and a
+/// point), the point's place in them, and whether it groups thousands and how many trailing
+/// commas divide it by 1,000. `None` when the section holds a code KatWork does not render or no
+/// digit placeholder, or its digits are not one run of placeholders, grouping commas and a point.
+struct Layout<'a> {
+    first: usize,
+    end: usize,
+    point: Option<usize>,
+    integer: &'a [Token],
+    fraction: &'a [Token],
+    grouping: bool,
+    thousands: u32,
+}
+
+fn layout(section: &Section) -> Option<Layout<'_>> {
     let tokens = &section.tokens;
     let unrendered = |token: &Token| {
         matches!(
@@ -679,6 +690,53 @@ fn render(section: &Section, magnitude: Decimal) -> Option<String> {
             thousands += 1;
         }
     }
+    Some(Layout {
+        first,
+        end,
+        point,
+        integer,
+        fraction,
+        grouping,
+        thousands,
+    })
+}
+
+/// How `number_format` scales the number `cached` as it shows it: the percent signs (each ×100)
+/// and the trailing commas (each ÷1,000) of the section the value takes, both zero when
+/// `display` would not render it (it then shows the cached value as it is). `None` when the
+/// code does not parse, has a conditional section or no section for the value, or `cached` is
+/// not a number.
+pub(crate) fn scaling(cached: &str, number_format: &str) -> Option<(u32, u32)> {
+    let value = number(cached)?;
+    let sections = parse(number_format)?;
+    if sections.iter().any(|section| section.condition.is_some()) {
+        return None;
+    }
+    let section = &sections[number_section(&sections, value)?];
+    let Some(layout) = layout(section) else {
+        return Some((0, 0));
+    };
+    let percent = section
+        .tokens
+        .iter()
+        .filter(|token| **token == Token::Percent)
+        .count();
+    Some((u32::try_from(percent).ok()?, layout.thousands))
+}
+
+/// `magnitude` (not negative) under `section`, padding left out and the result trimmed of
+/// spaces; `None` when [`layout`] finds no number in the section.
+fn render(section: &Section, magnitude: Decimal) -> Option<String> {
+    let tokens = &section.tokens;
+    let Layout {
+        first,
+        end,
+        point,
+        integer,
+        fraction,
+        grouping,
+        thousands,
+    } = layout(section)?;
     let placeholders = |zone: &[Token]| -> Vec<Placeholder> {
         zone.iter()
             .filter_map(|token| match token {

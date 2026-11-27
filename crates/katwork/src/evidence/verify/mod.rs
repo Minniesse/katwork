@@ -10,10 +10,16 @@ use serde::Serialize;
 use super::claim::{ClaimKind, Derive};
 use crate::docs::CellFacts;
 
+mod arithmetic;
+pub mod boundary;
+mod cell;
+mod date;
+mod number;
 pub mod qualifier;
 mod quote;
 mod resolve;
 mod rollup;
+pub mod subject;
 
 pub use qualifier::check_qualifiers;
 pub use quote::check_quote;
@@ -168,6 +174,8 @@ pub enum ResolvedRef {
         quote_end: u32,
         unit_context: Option<String>,
         cell: Option<CellFacts>,
+        /// The sheet of a cell ref, from its locator (Task 12 fills it); `None` elsewhere.
+        sheet: Option<String>,
         quality: RefQuality,
     },
     Stale {
@@ -195,4 +203,109 @@ pub(crate) fn resolved_refs(refs: &[ResolvedRef]) -> impl Iterator<Item = (u32, 
 
 pub(crate) fn ordinal(index: usize) -> u32 {
     u32::try_from(index).unwrap_or(u32::MAX)
+}
+
+/// Every check of one claim: Task 10's `check_resolve`, `check_quote` and `check_qualifiers`,
+/// then, on the refs whose `Resolve` check is `Supported`, the figure checks. A claim text
+/// holding exactly one `Quantity` (an amount in words is not counted) gets a number check per
+/// ref, its dates then being periods of its subject; one holding dates and no quantity gets a
+/// date check per ref; one with several quantities and no `derive` is `claim_number_ambiguous`;
+/// a derived claim gets one `Arithmetic` check and no per-ref number check. Each amount in
+/// words of the claim gets an `AmountWords` check. By content, never by `kind`. An uncited
+/// claim gets no check at all, and a claim none of whose refs resolved gets only Task 10's.
+pub fn check_claim(claim: &ClaimInput, ctx: &katwork_thai::Ctx) -> Vec<CheckOutcome> {
+    if !claim.cited {
+        return vec![];
+    }
+    let mut out = check_resolve(&claim.refs);
+    out.extend(check_quote(claim, ctx));
+    out.extend(check_qualifiers(claim));
+    let refs: Vec<(u32, &ResolvedRef)> = resolved_refs(&claim.refs).collect();
+    if !refs.is_empty() {
+        out.extend(figure_checks(claim, &refs, ctx));
+    }
+    out
+}
+
+fn figure_checks(
+    claim: &ClaimInput,
+    refs: &[(u32, &ResolvedRef)],
+    ctx: &katwork_thai::Ctx,
+) -> Vec<CheckOutcome> {
+    let read = katwork_thai::find_numbers(&claim.text, ctx)
+        .and_then(|found| Ok((found, subject::terms(&claim.text, ctx)?)));
+    let (found, subject) = match read {
+        Ok(read) => read,
+        Err(e) => {
+            let stop = number::too_long(CheckMethod::Number)(e);
+            return refs
+                .iter()
+                .map(|(ordinal, _)| number::stopped(stop.clone(), Some(*ordinal)))
+                .collect();
+        }
+    };
+    let mut out: Vec<CheckOutcome> = number::amount_words(&found)
+        .map(|(figure, words)| {
+            let equal = figure.value.effective() == words.value.effective();
+            CheckOutcome {
+                method: CheckMethod::AmountWords,
+                verdict: if equal {
+                    CheckVerdict::Supported
+                } else {
+                    CheckVerdict::Contradicted
+                },
+                basis: Basis::None,
+                code: if equal {
+                    "checked"
+                } else {
+                    "amount_words_mismatch"
+                },
+                ref_ordinal: None,
+                advisory: false,
+                detail: serde_json::json!({"figure": figure.raw, "words": words.raw}),
+            }
+        })
+        .collect();
+    let quantities: Vec<(usize, &katwork_thai::Found<katwork_thai::Number>)> =
+        number::counted(&found).collect();
+    let no_context = None;
+    let ambiguous = || {
+        number::stopped(
+            (
+                CheckMethod::Number,
+                "claim_number_ambiguous",
+                serde_json::json!({"quantities": quantities.len()}),
+            ),
+            None,
+        )
+    };
+    match (&claim.derive, quantities.as_slice()) {
+        (Some(derive), [(i, n)]) => {
+            let value = number::Qty::read(n, Some(*i), &no_context);
+            out.push(arithmetic::check(claim, &value, &subject, derive, ctx));
+        }
+        (Some(_), _) => out.push(ambiguous()),
+        (None, [(i, n)]) => {
+            let value = number::Qty::read(n, Some(*i), &no_context);
+            for (ordinal, r) in refs {
+                out.extend(number::check(
+                    &claim.text,
+                    &value,
+                    *i,
+                    &subject,
+                    *ordinal,
+                    r,
+                    ctx,
+                ));
+            }
+        }
+        (None, []) if !subject.periods.is_empty() => {
+            for (ordinal, r) in refs {
+                out.push(date::check(&subject, *ordinal, r, ctx));
+            }
+        }
+        (None, []) => {}
+        (None, _) => out.push(ambiguous()),
+    }
+    out
 }
