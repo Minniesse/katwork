@@ -1,6 +1,8 @@
 //! A derived figure: one aggregate comparison of the claim's value with the operation over its
 //! cited operands, in `Decimal`, never operand-by-operand equality.
-use katwork_thai::Ctx;
+use std::collections::{BTreeMap, BTreeSet};
+
+use katwork_thai::{Ctx, Unit};
 use rust_decimal::Decimal;
 use serde_json::json;
 
@@ -67,9 +69,10 @@ pub(super) fn check(
     ctx: &Ctx,
 ) -> CheckOutcome {
     let open = |code: &'static str, detail| stopped((CheckMethod::Arithmetic, code, detail), None);
-    let mut operands: Vec<Qty> = Vec::new();
+    // Each distinct ref is read once, however often `args` names it.
+    let mut read: BTreeMap<u8, Qty> = BTreeMap::new();
     let mut source: Option<Source> = None;
-    for &arg in &derive.args {
+    for &arg in derive.args.iter().collect::<BTreeSet<_>>() {
         let Some(r) = claim.refs.get(usize::from(arg)).filter(|r| is_resolved(r)) else {
             return open("operand_missing", json!({"arg": arg}));
         };
@@ -83,25 +86,37 @@ pub(super) fn check(
                 json!({"arg": arg, "quantities": found.len()}),
             );
         };
-        operands.push(qty.clone());
-        let read = match Source::read(&subject::fields(r), ctx) {
-            Ok(read) => read,
+        read.insert(arg, qty.clone());
+        let fields = match Source::read(&subject::fields(r), ctx) {
+            Ok(fields) => fields,
             Err(e) => return stopped(number::too_long(CheckMethod::Arithmetic)(e), None),
         };
         match &mut source {
-            Some(all) => all.extend(read),
-            None => source = Some(read),
+            Some(all) => all.extend(fields),
+            None => source = Some(fields),
         }
     }
     let Some(source) = source else {
         return open("operand_missing", json!({}));
     };
-    let mut units: Vec<_> = operands.iter().filter_map(|q| q.unit.as_ref()).collect();
+    let operands: Vec<&Qty> = derive.args.iter().filter_map(|arg| read.get(arg)).collect();
+    let mut units: Vec<_> = read.values().filter_map(|q| q.unit.as_ref()).collect();
     units.dedup();
-    if units.len() > 1 {
+    // The claim's unit: a sum or a difference keeps the operands' unit, a share or a percent
+    // change is a percent, a ratio has none.
+    let expected = match derive.op {
+        DeriveOp::Sum | DeriveOp::Difference => units.first().copied(),
+        DeriveOp::Share | DeriveOp::PercentChange => Some(&Unit::Percent),
+        DeriveOp::Ratio => None,
+    };
+    let claim_unit_differs = value.unit.as_ref().is_some_and(|u| Some(u) != expected);
+    if units.len() > 1 || claim_unit_differs {
         return open(
             "operand_units_differ",
-            json!({"units": units.iter().map(|u| format!("{u:?}")).collect::<Vec<_>>()}),
+            json!({
+                "units": units.iter().map(|u| format!("{u:?}")).collect::<Vec<_>>(),
+                "claim": value.unit.as_ref().map(|u| format!("{u:?}")),
+            }),
         );
     }
     let values: Vec<Decimal> = operands.iter().map(|q| q.effective).collect();

@@ -130,7 +130,11 @@ pub fn terms(claim_text: &str, ctx: &Ctx) -> Result<Subject, TooLong> {
         .iter()
         .filter(|n| n.value.role == NumberRole::Quantity)
     {
-        let (start, end) = with_unit_words(&chars, n.start as usize, n.end as usize);
+        let (start, end) = if n.value.unit.is_some() {
+            with_unit_words(&chars, n.start as usize, n.end as usize)
+        } else {
+            (n.start as usize, n.end as usize)
+        };
         mark(start, end);
     }
     let rest: String = chars

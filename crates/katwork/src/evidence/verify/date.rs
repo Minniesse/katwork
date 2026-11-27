@@ -5,13 +5,20 @@ use serde_json::json;
 
 use super::cell::{self, CellValue};
 use super::number::{Compared, settle, stopped, too_long};
+use super::qualifier;
 use super::subject::{self, Against, Source, Subject};
 use super::{Basis, CheckMethod, CheckOutcome, CheckVerdict, ResolvedRef, boundary};
 
 /// The date check of a claim whose text holds dates and no quantity, against one full-quality
 /// ref. A claim with more than one date is `date_ambiguous` (the crate reads none of them with
 /// full confidence).
-pub(super) fn check(subject: &Subject, ordinal: u32, r: &ResolvedRef, ctx: &Ctx) -> CheckOutcome {
+pub(super) fn check(
+    claim_text: &str,
+    subject: &Subject,
+    ordinal: u32,
+    r: &ResolvedRef,
+    ctx: &Ctx,
+) -> CheckOutcome {
     let at = Some(ordinal);
     let open = |code: &'static str, detail| stopped((CheckMethod::Date, code, detail), at);
     let ResolvedRef::Ok { exact, cell, .. } = r else {
@@ -36,6 +43,7 @@ pub(super) fn check(subject: &Subject, ordinal: u32, r: &ResolvedRef, ctx: &Ctx)
     };
     let detail = json!({"claim": claim.raw});
     let met = || subject::check(&subject.words, &[], &source, true);
+    let qualified = !qualifier::spans(claim_text).is_empty() || !qualifier::spans(exact).is_empty();
     match subject::against(claim, &source.dates) {
         Against::Same => settle(
             Compared::Equal(Basis::Exact),
@@ -45,7 +53,7 @@ pub(super) fn check(subject: &Subject, ordinal: u32, r: &ResolvedRef, ctx: &Ctx)
             detail,
         ),
         Against::Different => settle(
-            Compared::Differs("date_mismatch", false),
+            Compared::Differs("date_mismatch", qualified),
             met(),
             CheckMethod::Date,
             at,

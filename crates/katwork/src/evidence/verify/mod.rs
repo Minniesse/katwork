@@ -302,7 +302,7 @@ fn figure_checks(
         }
         (None, None, []) if !subject.periods.is_empty() => {
             for (ordinal, r) in refs {
-                out.push(date::check(&subject, *ordinal, r, ctx));
+                out.push(date::check(&claim.text, &subject, *ordinal, r, ctx));
             }
         }
         (None, None, []) => {}

@@ -264,7 +264,8 @@ fn relate(c: &Qty, s: &Qty) -> Rel {
         return Rel::Equal;
     }
     let one_unit = c.unit.is_some() != s.unit.is_some();
-    let scales_differ = c.scale != s.scale;
+    // Exactly one side states a scale.
+    let scales_differ = (c.scale == 0) != (s.scale == 0);
     let raw_eq = round_to(s.raw, c.raw_exp) == Some(c.raw);
     if (scales_differ || one_unit) && (raw_eq || (scales_differ && digits(c.raw) == digits(s.raw)))
     {

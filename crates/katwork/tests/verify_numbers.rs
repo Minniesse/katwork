@@ -371,6 +371,17 @@ fn number_checks_table() {
             ),
             (Inconclusive, "scale_unstated"),
         ),
+        // Both sides state a scale: a different value is a mismatch, not an unstated scale.
+        (
+            "รายได้รวม 1.25 พันล้านบาท",
+            q("รายได้รวม 125 ล้านบาท"),
+            (Contradicted, "number_mismatch"),
+        ),
+        (
+            "รายได้รวม 1,250 ล้านบาท",
+            q("รายได้รวม 1,250 พันล้านบาท"),
+            (Contradicted, "number_mismatch"),
+        ),
         // A date cell is not a number.
         (
             "ยอด 45931",
@@ -980,6 +991,13 @@ fn date_checks_table() {
 }
 
 #[test]
+fn comparator_holds_a_date_mismatch_open() {
+    let c = date("ประชุมไม่เกินวันที่ 2 ต.ค. 2568", q("ประชุมไม่เกินวันที่ 1 ต.ค. 2568"));
+    assert_figure(&c, (Inconclusive, "date_mismatch"));
+    assert_ne!(status(&c).0, ClaimStatus::Failed);
+}
+
+#[test]
 fn date_claim_finds_its_date_among_several() {
     let mut c = facts(CellKind::Text, Some("ประชุมวันที่ 1 ต.ค. 2568"));
     c.row_header = Some("5 ต.ค. 2568".into());
@@ -1131,6 +1149,39 @@ fn operands_must_agree_and_resolve() {
         vec![q("Entity A travel 10"), q("Entity A food 20")],
     );
     assert_ne!(status(&c).0, ClaimStatus::Failed);
+}
+
+#[test]
+fn derived_claim_unit_must_match_its_operands() {
+    let baht = || vec![q("travel 10 บาท"), q("food 20 บาท")];
+    let c = derived("total 30 USD", DeriveOp::Sum, baht());
+    assert_figure(&c, (Inconclusive, "operand_units_differ"));
+    assert_ne!(status(&c).0, ClaimStatus::Passed);
+    assert_figure(&derived("total 30 บาท", DeriveOp::Sum, baht()), OK);
+    let c = derived(
+        "growth 50 บาท",
+        DeriveOp::PercentChange,
+        vec![q("growth base 10"), q("growth now 15")],
+    );
+    assert_figure(&c, (Inconclusive, "operand_units_differ"));
+    let c = derived(
+        "sales 1.5%",
+        DeriveOp::Ratio,
+        vec![q("sales 15"), q("sales 10")],
+    );
+    assert_figure(&c, (Inconclusive, "operand_units_differ"));
+}
+
+#[test]
+fn repeated_operand_reads_its_ref_once() {
+    let c = ClaimInput {
+        derive: Some(Derive {
+            op: DeriveOp::Sum,
+            args: vec![0; 2000],
+        }),
+        ..claim(ClaimKind::Number, "travel 20000", vec![q("travel 10")])
+    };
+    assert_figure(&c, OK);
 }
 
 // ---------------------------------------------------------------- lists
