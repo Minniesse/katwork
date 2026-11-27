@@ -268,7 +268,6 @@ fn figure_checks(
         .collect();
     let quantities: Vec<(usize, &katwork_thai::Found<katwork_thai::Number>)> =
         number::counted(&found).collect();
-    let no_context = None;
     let ambiguous = || {
         number::stopped(
             (
@@ -279,19 +278,21 @@ fn figure_checks(
             None,
         )
     };
-    match (&claim.derive, quantities.as_slice()) {
-        (Some(derive), [(i, n)]) => {
-            let value = number::Qty::read(n, Some(*i), &no_context);
+    // Every figure `find_numbers` returns fits a `Decimal` at its own scale.
+    let one = match quantities.as_slice() {
+        [(i, n)] => number::Qty::read(n, Some(*i), &None).map(|value| (*i, value)),
+        _ => None,
+    };
+    match (&claim.derive, one, quantities.as_slice()) {
+        (Some(derive), Some((_, value)), _) => {
             out.push(arithmetic::check(claim, &value, &subject, derive, ctx));
         }
-        (Some(_), _) => out.push(ambiguous()),
-        (None, [(i, n)]) => {
-            let value = number::Qty::read(n, Some(*i), &no_context);
+        (None, Some((i, value)), _) => {
             for (ordinal, r) in refs {
                 out.extend(number::check(
                     &claim.text,
                     &value,
-                    *i,
+                    i,
                     &subject,
                     *ordinal,
                     r,
@@ -299,13 +300,13 @@ fn figure_checks(
                 ));
             }
         }
-        (None, []) if !subject.periods.is_empty() => {
+        (None, None, []) if !subject.periods.is_empty() => {
             for (ordinal, r) in refs {
                 out.push(date::check(&subject, *ordinal, r, ctx));
             }
         }
-        (None, []) => {}
-        (None, _) => out.push(ambiguous()),
+        (None, None, []) => {}
+        _ => out.push(ambiguous()),
     }
     out
 }

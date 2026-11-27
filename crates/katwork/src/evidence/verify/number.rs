@@ -30,24 +30,25 @@ pub(super) struct Qty {
 
 impl Qty {
     /// A figure `find_numbers` read; a figure stating neither scale nor unit takes the
-    /// context's (`header_unit`, else `unit_context`).
-    pub fn read(n: &Found<Number>, index: Option<usize>, context: &Context) -> Qty {
+    /// context's (`header_unit`, else `unit_context`). `None` when the scaled value does not fit
+    /// in a `Decimal`: never compared at a wrong scale.
+    pub fn read(n: &Found<Number>, index: Option<usize>, context: &Context) -> Option<Qty> {
         let v = &n.value;
         let (scale, unit) = match (v.scale.0, &v.unit, context) {
             (0, None, Some((scale, unit))) => (*scale, unit.clone()),
             _ => (v.scale.0, v.unit.clone()),
         };
         let decimals = i64::from(v.decimals);
-        Qty {
+        Some(Qty {
             raw: v.value,
-            effective: scaled(v.value, scale).unwrap_or(v.value),
+            effective: scaled(v.value, scale)?,
             scale,
             unit,
             exp: Some(i64::from(scale) - decimals),
             raw_exp: Some(-decimals),
             ambiguous: n.conf < MIN_CONF && !n.alts.is_empty(),
             index,
-        }
+        })
     }
 }
 
@@ -128,8 +129,11 @@ pub(super) fn quantities(
                 let scale = u8::try_from(thousands * 3).unwrap_or(u8::MAX);
                 let shown =
                     (0..thousands).try_fold(value, |v, _| v.checked_div(Decimal::ONE_THOUSAND));
+                let Some(shown) = shown else {
+                    return Ok(vec![]);
+                };
                 Qty {
-                    raw: shown.unwrap_or(value),
+                    raw: shown,
                     effective: value,
                     scale,
                     unit,
@@ -140,9 +144,13 @@ pub(super) fn quantities(
                 }
             } else {
                 let scale = context.as_ref().map_or(0, |(scale, _)| *scale);
+                // A value too large for its scale is not a quantity to compare.
+                let Some(effective) = scaled(value, scale) else {
+                    return Ok(vec![]);
+                };
                 Qty {
                     raw: value,
-                    effective: scaled(value, scale).unwrap_or(value),
+                    effective,
                     scale,
                     unit,
                     exp: None,
@@ -161,7 +169,7 @@ pub(super) fn quantities(
         return Err((method, "amount_words_mismatch", words));
     }
     Ok(counted(&found)
-        .map(|(i, n)| Qty::read(n, Some(i), &context))
+        .filter_map(|(i, n)| Qty::read(n, Some(i), &context))
         .collect())
 }
 
