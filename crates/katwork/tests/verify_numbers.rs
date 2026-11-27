@@ -580,8 +580,7 @@ fn comparator_belongs_to_a_different_figure() {
 fn postfix_comparator_pairs_with_the_previous_figure() {
     // The scan pairs "or more" with the next figure, so a postfix comparator is held open.
     let c = number("5 or more staff", q("5 or more staff, 3 managers"));
-    assert_ne!(status(&c).0, ClaimStatus::Passed);
-    assert_ne!(status(&c).0, ClaimStatus::Failed);
+    assert_eq!(status(&c), (ClaimStatus::Unverified, "qualifier_mismatch"));
 }
 
 #[test]
@@ -753,7 +752,10 @@ fn bool_and_error_cells_are_never_numbers() {
         facts(CellKind::Error, Some("#N/A")),
     ] {
         let r = cell(row(c, "flag"));
-        assert_ne!(figure(&number("flag 1", r)).0, Supported);
+        assert_eq!(
+            figure(&number("flag 1", r)),
+            (Unsupported, "number_not_in_source")
+        );
     }
 }
 
@@ -835,7 +837,10 @@ fn several_claim_figures_are_ambiguous() {
     for text in ["ratio 3:1", "Thailand 2024 revenue 1,250", "1 250 baht"] {
         let c = number(text, q(text));
         assert_figure(&c, (Inconclusive, "claim_number_ambiguous"));
-        assert_ne!(status(&c).0, ClaimStatus::Passed);
+        assert_eq!(
+            status(&c),
+            (ClaimStatus::Unverified, "claim_number_ambiguous")
+        );
     }
 }
 
@@ -890,15 +895,35 @@ fn only_resolved_refs_are_compared() {
 
 #[test]
 fn sign_trap_never_passes() {
-    for (text, source) in [
-        ("profit 5", "profit (5)"),
-        ("profit 5", "profit -5"),
-        ("profit 5", "profit negative 5"),
-        ("profit negative 5", "profit 5"),
-        ("กำไร 1,250", "กำไร (1,250)"),
+    for (text, source, want) in [
+        (
+            "profit 5",
+            "profit (5)",
+            (ClaimStatus::Unverified, "number_ambiguous"),
+        ),
+        (
+            "profit 5",
+            "profit -5",
+            (ClaimStatus::Failed, "number_mismatch"),
+        ),
+        (
+            "profit 5",
+            "profit negative 5",
+            (ClaimStatus::Unverified, "number_ambiguous"),
+        ),
+        (
+            "profit negative 5",
+            "profit 5",
+            (ClaimStatus::Unverified, "number_ambiguous"),
+        ),
+        (
+            "กำไร 1,250",
+            "กำไร (1,250)",
+            (ClaimStatus::Failed, "number_mismatch"),
+        ),
     ] {
         let c = number(text, q(source));
-        assert_ne!(status(&c).0, ClaimStatus::Passed, "{text} / {source}");
+        assert_eq!(status(&c), want, "{text} / {source}");
     }
     assert_figure(
         &number("profit 5", q("profit negative 5")),
@@ -911,16 +936,19 @@ fn sign_trap_never_passes() {
     // A true loss claim against an accounting negative is never failed.
     let c = number("ขาดทุน 1,250", q("ขาดทุน (1,250)"));
     assert_figure(&c, (Inconclusive, "sign_differs"));
-    assert_ne!(status(&c).0, ClaimStatus::Failed);
+    assert_eq!(status(&c), (ClaimStatus::Unverified, "sign_differs"));
 }
 
 #[test]
 fn ratio_trap_never_passes() {
     let c = number("ratio 3:1", q("ratio 1:3"));
-    assert_ne!(status(&c).0, ClaimStatus::Passed);
-    assert_ne!(status(&c).0, ClaimStatus::Failed);
+    assert_eq!(
+        status(&c),
+        (ClaimStatus::Unverified, "claim_number_ambiguous")
+    );
+    // A fraction reads as two codes: no figure to check.
     let c = number("share 1/3", q("share 3/1"));
-    assert_ne!(status(&c).0, ClaimStatus::Passed);
+    assert_eq!(status(&c), (ClaimStatus::Unverified, "needs_review"));
 }
 
 // ---------------------------------------------------------------- dates
@@ -994,7 +1022,7 @@ fn date_checks_table() {
 fn comparator_holds_a_date_mismatch_open() {
     let c = date("ประชุมไม่เกินวันที่ 2 ต.ค. 2568", q("ประชุมไม่เกินวันที่ 1 ต.ค. 2568"));
     assert_figure(&c, (Inconclusive, "date_mismatch"));
-    assert_ne!(status(&c).0, ClaimStatus::Failed);
+    assert_eq!(status(&c), (ClaimStatus::Unverified, "date_mismatch"));
 }
 
 #[test]
@@ -1129,7 +1157,7 @@ fn operands_must_agree_and_resolve() {
     }
     let c = derived("total 30", DeriveOp::Sum, vec![q("travel 10"), hidden]);
     assert_figure(&c, (Inconclusive, "operand_missing"));
-    assert_ne!(status(&c).0, ClaimStatus::Failed);
+    assert_eq!(status(&c), (ClaimStatus::Unverified, "hidden_source"));
     let c = derived(
         "total 30",
         DeriveOp::Sum,
@@ -1148,7 +1176,10 @@ fn operands_must_agree_and_resolve() {
         DeriveOp::Sum,
         vec![q("Entity A travel 10"), q("Entity A food 20")],
     );
-    assert_ne!(status(&c).0, ClaimStatus::Failed);
+    assert_eq!(
+        status(&c),
+        (ClaimStatus::Unverified, "subject_not_in_source")
+    );
 }
 
 #[test]
@@ -1156,7 +1187,10 @@ fn derived_claim_unit_must_match_its_operands() {
     let baht = || vec![q("travel 10 บาท"), q("food 20 บาท")];
     let c = derived("total 30 USD", DeriveOp::Sum, baht());
     assert_figure(&c, (Inconclusive, "operand_units_differ"));
-    assert_ne!(status(&c).0, ClaimStatus::Passed);
+    assert_eq!(
+        status(&c),
+        (ClaimStatus::Unverified, "operand_units_differ")
+    );
     assert_figure(&derived("total 30 บาท", DeriveOp::Sum, baht()), OK);
     let c = derived(
         "growth 50 บาท",
@@ -1172,16 +1206,400 @@ fn derived_claim_unit_must_match_its_operands() {
     assert_figure(&c, (Inconclusive, "operand_units_differ"));
 }
 
+/// A derive that names one ref twice counts one figure twice: refused, never computed.
 #[test]
-fn repeated_operand_reads_its_ref_once() {
-    let c = ClaimInput {
-        derive: Some(Derive {
-            op: DeriveOp::Sum,
-            args: vec![0; 2000],
-        }),
-        ..claim(ClaimKind::Number, "travel 20000", vec![q("travel 10")])
+fn repeated_operand_is_refused() {
+    let repeated = |op, args: Vec<u8>, text: &str, source: &str| ClaimInput {
+        derive: Some(Derive { op, args }),
+        ..claim(ClaimKind::Number, text, vec![q(source)])
     };
+    for c in [
+        repeated(DeriveOp::Sum, vec![0; 2000], "travel 20000", "travel 10"),
+        repeated(
+            DeriveOp::Sum,
+            vec![0, 0],
+            "budget total 2,500",
+            "budget 1,250",
+        ),
+        repeated(
+            DeriveOp::Share,
+            vec![0, 0],
+            "ส่วนแบ่งตลาด 100%",
+            "ส่วนแบ่งตลาด 1,250",
+        ),
+        repeated(
+            DeriveOp::PercentChange,
+            vec![0, 0],
+            "sales change 0%",
+            "sales 1,250",
+        ),
+    ] {
+        assert_figure(&c, (Inconclusive, "operand_missing"));
+        assert_eq!(status(&c), (ClaimStatus::Unverified, "operand_missing"));
+    }
+    assert!(
+        !Derive {
+            op: DeriveOp::Sum,
+            args: vec![0, 0]
+        }
+        .indices_in(1)
+    );
+    assert!(
+        !Derive {
+            op: DeriveOp::Share,
+            args: vec![1, 1]
+        }
+        .indices_in(2)
+    );
+    assert!(
+        Derive {
+            op: DeriveOp::Sum,
+            args: vec![0, 1]
+        }
+        .indices_in(2)
+    );
+}
+
+// ---------------------------------------------------------------- fix round 1
+
+fn with_header_unit(mut c: CellFacts, unit: &str) -> CellFacts {
+    c.header_unit = Some(unit.into());
+    c
+}
+
+#[test]
+fn header_negation_or_comparator_is_not_passed() {
+    let mismatch = (ClaimStatus::Unverified, "qualifier_mismatch");
+    let rows = [
+        (
+            "อนุมัติงบประมาณ 1,250 ล้านบาท",
+            cell(with_header_unit(
+                row(number_cell("1250"), "ไม่อนุมัติงบประมาณ"),
+                "ล้านบาท",
+            )),
+        ),
+        (
+            "approved budget 1,250",
+            cell(row(number_cell("1250"), "budget not approved")),
+        ),
+        (
+            "budget 1,250",
+            cell(row(number_cell("1250"), "budget at most")),
+        ),
+        (
+            "budget 1,250",
+            cell(col(row(number_cell("1250"), "budget"), "at least")),
+        ),
+        (
+            "งบประมาณ 1,250 ล้านบาท",
+            cell(with_header_unit(
+                row(number_cell("1250"), "งบประมาณไม่เกิน"),
+                "ล้านบาท",
+            )),
+        ),
+    ];
+    for (text, r) in rows {
+        let c = number(text, r);
+        assert_eq!(status(&c), mismatch, "{text}");
+        assert!(
+            of_method(&c, CheckMethod::Qualifier)
+                .iter()
+                .any(|o| o.code == "qualifier_mismatch")
+        );
+    }
+    // A header with no qualifier passes.
+    let c = number("budget 1,250", cell(row(number_cell("1250"), "budget")));
+    assert_eq!(status(&c), (ClaimStatus::Passed, "checked"));
+    // Dates.
+    let s = serial(2025, 10, 1, false);
+    let r = cell(row(fmt(number_cell(&s), "d/m/yyyy"), "ไม่ได้ประชุมวันที่"));
+    assert_eq!(status(&date("ประชุมวันที่ 1 ต.ค. 2568", r)), mismatch);
+    // Operands.
+    let c = derived(
+        "total 30",
+        DeriveOp::Sum,
+        vec![
+            cell(row(number_cell("10"), "travel not approved")),
+            q("food 20"),
+        ],
+    );
+    assert_eq!(status(&c), mismatch);
+}
+
+#[test]
+fn profit_or_loss_line_needs_a_negative_figure_for_a_loss() {
+    let held = (Inconclusive, "sign_differs");
+    for (text, r) in [
+        ("net loss 1,250", q("net profit (loss) 1,250")),
+        ("net loss 1,250", q("net profit/(loss) 1,250")),
+        ("ขาดทุน 1,250 ล้านบาท", q("กำไร (ขาดทุน) 1,250 ล้านบาท")),
+        ("ขาดทุน 1,250", q("กำไร(ขาดทุน)สุทธิ 1,250")),
+        (
+            "ขาดทุน 1,250 ล้านบาท",
+            cell(with_header_unit(
+                row(number_cell("1250"), "กำไร (ขาดทุน)"),
+                "ล้านบาท",
+            )),
+        ),
+    ] {
+        let c = number(text, r);
+        assert_figure(&c, held);
+        assert_eq!(
+            status(&c),
+            (ClaimStatus::Unverified, "sign_differs"),
+            "{text}"
+        );
+    }
+    // A negative figure on the line is the loss.
+    for (text, r) in [
+        (
+            "ขาดทุน 1,250 ล้านบาท",
+            cell(with_header_unit(
+                row(number_cell("-1250"), "กำไร (ขาดทุน)"),
+                "ล้านบาท",
+            )),
+        ),
+        ("net loss 1,250", q("net profit (loss) (1,250)")),
+    ] {
+        assert_figure(&number(text, r), OK);
+    }
+    // A profit claim on the line keeps its plain reading.
+    assert_figure(&number("กำไร 1,250", q("กำไร (ขาดทุน) 1,250")), OK);
+}
+
+#[test]
+fn figure_binds_to_its_own_words() {
+    let other_row = (Inconclusive, "subject_not_in_source");
+    for (text, source) in [
+        ("revenue 1,250", "revenue 1,300 cost 1,250"),
+        (
+            "รายได้ 1,250 ล้านบาท",
+            "รายได้ 1,300 ล้านบาท ค่าใช้จ่าย 1,250 ล้านบาท",
+        ),
+        ("revenue 1,250", "cost 1,250 revenue 900"),
+    ] {
+        assert_figure(&number(text, q(source)), other_row);
+    }
+    for (text, source) in [
+        ("revenue 1,250", "revenue 1,250 cost 1,300"),
+        // A quote that opens with a figure puts each figure's words after it.
+        ("staff 5", "5 staff and 3 managers"),
+        ("managers 3", "5 staff and 3 managers"),
+        ("revenue 1,250", "cost 900, revenue 1,250"),
+        ("total 3,450", "total 3,450 and 200"),
+    ] {
+        assert_figure(&number(text, q(source)), OK);
+    }
+    // A range or a factor qualifies both its figures.
+    for (text, source) in [
+        ("revenue 1,300", "revenue 1,250 to 1,300"),
+        ("revenue 1,250", "revenue 1,250 to 1,300"),
+        ("revenue 1,300", "revenue 1,250–1,300"),
+        ("revenue 1,250", "revenue 1,000-1,250"),
+        ("รายได้ 1,300 ล้านบาท", "รายได้ 1,250 ถึง 1,300 ล้านบาท"),
+        ("revenue 1,250", "revenue between 1,250 and 1,300"),
+        ("revenue 1,250", "revenue 1,250 x 2"),
+    ] {
+        let c = number(text, q(source));
+        assert_eq!(
+            status(&c),
+            (ClaimStatus::Unverified, "qualifier_mismatch"),
+            "{text} / {source}"
+        );
+    }
+    // A sum's period and entity words must hold for every operand.
+    let c = derived(
+        "รายได้ปี 2567 รวม 30",
+        DeriveOp::Sum,
+        vec![q("รายได้ปี 2566 10"), q("รายได้ปี 2567 20")],
+    );
+    assert_figure(&c, (Inconclusive, "period_mismatch"));
+    let c = derived(
+        "Entity B total 30",
+        DeriveOp::Sum,
+        vec![q("Entity A travel 10"), q("Entity B food 20")],
+    );
+    assert_figure(&c, other_row);
+    let c = derived(
+        "รายได้ปี 2567 รวม 30",
+        DeriveOp::Sum,
+        vec![q("รายได้ปี 2567 10"), q("รายได้ปี 2567 20")],
+    );
     assert_figure(&c, OK);
+    // A percent change spans two periods: the union holds.
+    let c = derived(
+        "รายได้ เพิ่มขึ้น 50%",
+        DeriveOp::PercentChange,
+        vec![q("รายได้ปี 2566 10"), q("รายได้ปี 2567 15")],
+    );
+    assert_figure(&c, OK);
+}
+
+#[test]
+fn capital_a_names_an_entity() {
+    for (text, source) in [
+        ("Entity A revenue 1,250 baht", "Entity B revenue 1,250 baht"),
+        ("Plan A budget 1,250", "Plan B budget 1,250"),
+        // An article in the source is not the entity letter.
+        ("Plan A budget 1,250", "a plan budget 1,250"),
+    ] {
+        assert_figure(
+            &number(text, q(source)),
+            (Inconclusive, "subject_not_in_source"),
+        );
+    }
+    assert_figure(
+        &number(
+            "Entity A revenue 1,250 baht",
+            q("Entity A revenue 1,250 baht"),
+        ),
+        OK,
+    );
+    // The article stays a stop word.
+    assert_figure(&number("a revenue of 1,250", q("revenue 1,250")), OK);
+}
+
+#[test]
+fn percentage_points_are_not_percent() {
+    for (text, source) in [
+        ("margin up 2.5%", "margin up 2.5% points"),
+        ("margin up 2.5%", "margin up 2.5% pp"),
+        ("อัตรากำไร เพิ่มขึ้นร้อยละ 2.5", "อัตรากำไร เพิ่มขึ้นร้อยละ 2.5 จุด"),
+    ] {
+        assert_figure(&number(text, q(source)), (Inconclusive, "scale_unstated"));
+    }
+    assert_figure(
+        &number("margin up 2.5% points", q("margin up 2.5% points")),
+        OK,
+    );
+}
+
+#[test]
+fn operand_scales_are_compared_like_a_number() {
+    for (text, refs) in [
+        ("total 30 ล้าน", vec![q("travel 10"), q("food 20")]),
+        ("total 30 ล้านบาท", vec![q("travel 10 ล้านบาท"), q("food 20")]),
+    ] {
+        let c = derived(text, DeriveOp::Sum, refs);
+        assert_figure(&c, (Inconclusive, "scale_unstated"));
+    }
+    let c = derived(
+        "total 30 ล้าน",
+        DeriveOp::Sum,
+        vec![q("travel 10 ล้าน"), q("food 20 ล้าน")],
+    );
+    assert_figure(&c, OK);
+    let c = derived(
+        "total 30,000,000",
+        DeriveOp::Sum,
+        vec![q("travel 10 ล้าน"), q("food 20 ล้าน")],
+    );
+    assert_figure(&c, OK);
+}
+
+#[test]
+fn refs_past_the_cap_are_not_compared() {
+    let refs: Vec<ResolvedRef> = (0..17).map(|_| q("รายได้ 1,250")).collect();
+    let c = claim(ClaimKind::Number, "รายได้ 1,250", refs);
+    let found = checks(&c);
+    let numbers: Vec<_> = found
+        .iter()
+        .filter(|o| o.method == CheckMethod::Number)
+        .collect();
+    assert_eq!(numbers.len(), 17);
+    assert_eq!(numbers.iter().filter(|o| o.code == "checked").count(), 16);
+    let capped: Vec<_> = numbers
+        .iter()
+        .filter(|o| o.code == "too_many_refs")
+        .collect();
+    assert_eq!(capped.len(), 1);
+    assert_eq!(
+        (capped[0].verdict, capped[0].ref_ordinal),
+        (Inconclusive, Some(16))
+    );
+    assert_eq!(status(&c), (ClaimStatus::Unverified, "too_many_refs"));
+    let refs: Vec<ResolvedRef> = (0..17).map(|_| q("travel 1")).collect();
+    let c = derived("travel 17", DeriveOp::Sum, refs);
+    assert_figure(&c, (Inconclusive, "too_many_refs"));
+}
+
+#[test]
+fn one_significant_digit_does_not_absorb_a_finer_source() {
+    for (text, source) in [
+        ("รายได้ 2 พันล้านบาท", "รายได้ 1,500 ล้านบาท"),
+        ("revenue 1 billion", "revenue 1,499 million"),
+        ("revenue 5", "revenue 5.2"),
+    ] {
+        assert_figure(
+            &number(text, q(source)),
+            (Inconclusive, "precision_differs"),
+        );
+    }
+    assert_figure(&number("revenue 2 billion", q("revenue 2,000 million")), OK);
+    assert_figure(&number("revenue 5", q("revenue 5")), OK);
+}
+
+#[test]
+fn operands_are_read_in_order() {
+    // (b - a) / a, with no absolute value: -10 then -15 is +50%.
+    let c = derived(
+        "growth 50%",
+        DeriveOp::PercentChange,
+        vec![q("growth base -10"), q("growth now -15")],
+    );
+    assert_figure(&c, OK);
+    let c = derived(
+        "growth -50%",
+        DeriveOp::PercentChange,
+        vec![q("growth base -10"), q("growth now -15")],
+    );
+    assert_figure(&c, (Inconclusive, "arithmetic_mismatch"));
+    let c = derived(
+        "growth 50%",
+        DeriveOp::PercentChange,
+        vec![q("growth now 15"), q("growth base 10")],
+    );
+    assert_figure(&c, (Inconclusive, "operand_order"));
+    let c = derived(
+        "sales difference 5",
+        DeriveOp::Difference,
+        vec![q("sales 10"), q("sales 15")],
+    );
+    assert_figure(&c, (Inconclusive, "operand_order"));
+    let c = derived(
+        "sales 1.5",
+        DeriveOp::Ratio,
+        vec![q("sales 10"), q("sales 15")],
+    );
+    assert_figure(&c, (Inconclusive, "operand_order"));
+}
+
+#[test]
+fn short_thai_sign_word_is_a_whole_word() {
+    assert_figure(
+        &number("ผลบวก 1,250", q("ผลบวก (1,250)")),
+        (Contradicted, "number_mismatch"),
+    );
+}
+
+#[test]
+fn direction_and_ratio_words_are_the_operation() {
+    let ops = || vec![q("sales 20"), q("sales 10")];
+    assert_figure(
+        &derived("sales decreased 50%", DeriveOp::PercentChange, ops()),
+        OK,
+    );
+    assert_figure(
+        &derived("sales fell 50%", DeriveOp::PercentChange, ops()),
+        OK,
+    );
+    assert_figure(&derived("sales ratio 2", DeriveOp::Ratio, ops()), OK);
+    assert_figure(&derived("sales อัตราส่วน 2", DeriveOp::Ratio, ops()), OK);
+    let up = || vec![q("sales 10"), q("sales 20")];
+    assert_figure(
+        &derived("sales rose 100%", DeriveOp::PercentChange, up()),
+        OK,
+    );
 }
 
 // ---------------------------------------------------------------- lists
@@ -1195,7 +1613,13 @@ fn word_lists_are_written_as_normalize_th_writes_them() {
 
 #[test]
 fn every_new_code_is_listed() {
-    for code in ["number_ambiguous", "sign_differs", "precision_differs"] {
+    for code in [
+        "number_ambiguous",
+        "sign_differs",
+        "precision_differs",
+        "too_many_refs",
+        "operand_order",
+    ] {
         assert!(CODES.contains(&code), "{code}");
     }
 }

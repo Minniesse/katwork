@@ -51,9 +51,15 @@ impl Derive {
         }
     }
 
-    /// The arity is right and every argument indexes a `cite` list of `cite_len` entries.
+    /// The arity is right, every argument indexes a `cite` list of `cite_len` entries, and no
+    /// argument is named twice (one figure counted twice would let any multiple of it pass).
     pub fn indices_in(&self, cite_len: usize) -> bool {
-        self.arity_ok() && self.args.iter().all(|&i| usize::from(i) < cite_len)
+        let mut seen = std::collections::BTreeSet::new();
+        self.arity_ok()
+            && self
+                .args
+                .iter()
+                .all(|&i| usize::from(i) < cite_len && seen.insert(i))
     }
 }
 

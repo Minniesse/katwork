@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use katwork_thai::{
-    Ctx, DateValue, Found, NumberRole, PeriodCmp, TooLong, compare_periods, find_dates,
+    Ctx, DateValue, Found, Number, NumberRole, PeriodCmp, TooLong, compare_periods, find_dates,
     find_numbers, match_key, normalize_th,
 };
 use serde_json::{Value, json};
@@ -74,6 +74,14 @@ pub const OP_WORDS: &[&str] = &[
     "increase",
     "decrease",
     "change",
+    "increased",
+    "rose",
+    "grew",
+    "decreased",
+    "fell",
+    "declined",
+    "ratio",
+    "อัตราส่วน",
 ];
 
 /// The unit words `find_numbers` reads as a figure's unit but leaves outside its span, longest
@@ -219,9 +227,12 @@ fn class(c: char) -> Class {
 }
 
 /// `normalize_th(text)` split into runs of Thai and runs of other letters and digits; a Thai run
-/// is `alone` when a gap or an end lies on both sides of it.
-fn runs(text: &str) -> Vec<Term> {
-    let chars: Vec<char> = normalize_th(text).text.chars().collect();
+/// is `alone` when a gap or an end lies on both sides of it. A capital `A` standing alone stays
+/// `A` (an entity letter, as in "Entity A"), so the article `a` can be a stop word.
+pub(super) fn runs(text: &str) -> Vec<Term> {
+    let normalized = normalize_th(text);
+    let original: Vec<char> = text.chars().collect();
+    let chars: Vec<char> = normalized.text.chars().collect();
     let mut out = Vec::new();
     let mut i = 0;
     while i < chars.len() {
@@ -235,10 +246,19 @@ fn runs(text: &str) -> Vec<Term> {
         }
         let gap = |at: Option<&char>| at.is_none_or(|c| class(*c) == Class::Gap);
         let alone = gap(start.checked_sub(1).and_then(|p| chars.get(p))) && gap(chars.get(i));
-        out.push(Term {
-            text: chars[start..i].iter().collect(),
-            alone,
-        });
+        let mut text: String = chars[start..i].iter().collect();
+        if text == "a" {
+            let range = normalized.original_range(start, i);
+            let written: String = original
+                .get(range.start as usize..range.end as usize)
+                .unwrap_or_default()
+                .iter()
+                .collect();
+            if written.trim() == "A" {
+                text = "A".into();
+            }
+        }
+        out.push(Term { text, alone });
     }
     out
 }
@@ -284,7 +304,11 @@ pub fn source_text(r: &ResolvedRef) -> String {
         .join(" | ")
 }
 
+/// A text's figures and dates, already found.
+pub(super) type Scanned<'a> = (&'a [Found<Number>], &'a [Found<DateValue>]);
+
 /// A source as the subject rule reads it: its words with its quantities cut out, and its dates.
+#[derive(Clone, Default)]
 pub(super) struct Source {
     latin: HashSet<String>,
     thai: HashSet<String>,
@@ -296,11 +320,28 @@ pub(super) struct Source {
 impl Source {
     /// Each field is scanned on its own, so no figure or date is read across two fields.
     pub fn read(fields: &[(&str, bool)], ctx: &Ctx) -> Result<Source, TooLong> {
+        Source::read_with(fields, None, ctx)
+    }
+
+    /// [`Source::read`], with the first field's figures and dates already scanned (`first`), so
+    /// a quote is scanned once per ref.
+    pub fn read_with(
+        fields: &[(&str, bool)],
+        first: Option<Scanned<'_>>,
+        ctx: &Ctx,
+    ) -> Result<Source, TooLong> {
         let mut cut_fields = Vec::with_capacity(fields.len());
         let mut dates = Vec::new();
-        for (text, strong) in fields {
-            dates.extend(find_dates(text, ctx)?.into_iter().map(|d| (d, *strong)));
-            let numbers = find_numbers(text, ctx)?;
+        for (at, (text, strong)) in fields.iter().enumerate() {
+            let scanned;
+            let (numbers, found_dates) = match first.filter(|_| at == 0) {
+                Some(first) => first,
+                None => {
+                    scanned = (find_numbers(text, ctx)?, find_dates(text, ctx)?);
+                    (scanned.0.as_slice(), scanned.1.as_slice())
+                }
+            };
+            dates.extend(found_dates.iter().cloned().map(|d| (d, *strong)));
             let mut chars: Vec<char> = text.chars().collect();
             for n in numbers
                 .iter()

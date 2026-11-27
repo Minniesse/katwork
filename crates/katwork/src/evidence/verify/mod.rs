@@ -19,12 +19,17 @@ pub mod qualifier;
 mod quote;
 mod resolve;
 mod rollup;
+mod scan;
 pub mod subject;
 
 pub use qualifier::check_qualifiers;
 pub use quote::check_quote;
 pub use resolve::{check_resolve, relocate};
 pub use rollup::{flags, is_disputed, roll_up};
+
+/// The refs of one claim that get number or date checks; each one past it gets one
+/// `Inconclusive` check, `too_many_refs`, and a derived claim with more operands gets one too.
+pub(crate) const MAX_FIGURE_REFS: usize = 16;
 
 /// Stored on every check row; a change to what these functions return needs a new version.
 pub const VERIFIER_VERSION: u32 = 1;
@@ -280,32 +285,33 @@ fn figure_checks(
     };
     // Every figure `find_numbers` returns fits a `Decimal` at its own scale.
     let one = match quantities.as_slice() {
-        [(i, n)] => number::Qty::read(n, Some(*i), &None).map(|value| (*i, value)),
+        [(i, n)] => number::Qty::read(n, Some(*i), &None, &claim.text).map(|value| (*i, value)),
         _ => None,
     };
-    match (&claim.derive, one, quantities.as_slice()) {
-        (Some(derive), Some((_, value)), _) => {
-            out.push(arithmetic::check(claim, &value, &subject, derive, ctx));
-        }
-        (None, Some((i, value)), _) => {
-            for (ordinal, r) in refs {
-                out.extend(number::check(
-                    &claim.text,
-                    &value,
-                    i,
-                    &subject,
-                    *ordinal,
-                    r,
-                    ctx,
-                ));
+    let single = one.is_some();
+    let side = number::ClaimSide::new(&claim.text, &subject, &found, one);
+    // Each ref is read once; refs past the cap are not compared at all.
+    let mut each = |method: CheckMethod, compare: &dyn Fn(&scan::Scan) -> Vec<CheckOutcome>| {
+        for (k, (ordinal, r)) in refs.iter().enumerate() {
+            let at = Some(*ordinal);
+            if k >= MAX_FIGURE_REFS {
+                let detail = serde_json::json!({"cap": MAX_FIGURE_REFS});
+                out.push(number::stopped((method, "too_many_refs", detail), at));
+                continue;
+            }
+            match scan::read(*ordinal, r, method, ctx) {
+                Ok(read) => out.extend(compare(&read)),
+                Err(stop) => out.push(number::stopped(stop, at)),
             }
         }
-        (None, None, []) if !subject.periods.is_empty() => {
-            for (ordinal, r) in refs {
-                out.push(date::check(&claim.text, &subject, *ordinal, r, ctx));
-            }
+    };
+    match (&claim.derive, single, quantities.as_slice()) {
+        (Some(derive), true, _) => out.extend(arithmetic::check(claim, &side, derive, ctx)),
+        (None, true, _) => each(CheckMethod::Number, &|read| number::check(&side, read, ctx)),
+        (None, false, []) if !subject.periods.is_empty() => {
+            each(CheckMethod::Date, &|read| date::check(&side, read));
         }
-        (None, None, []) => {}
+        (None, false, []) => {}
         _ => out.push(ambiguous()),
     }
     out

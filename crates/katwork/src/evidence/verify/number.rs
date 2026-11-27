@@ -1,13 +1,16 @@
 //! The number check: a claim's single quantity against a ref's quantities, its scale and unit
 //! read from the figure, the cell's format, its header unit or the block's unit context.
+use std::collections::BTreeMap;
+
 use katwork_thai::{Ctx, Flags, Found, Number, NumberRole, TooLong, Unit, find_numbers, match_key};
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde_json::{Value, json};
 
 use super::cell::{self, CellValue};
-use super::qualifier::{self, Meaning};
+use super::qualifier::{self, Meaning, Qualifier};
+use super::scan::Scan;
 use super::subject::{self, MIN_CONF, Source, Subject};
-use super::{Basis, CheckMethod, CheckOutcome, CheckVerdict, ResolvedRef, boundary};
+use super::{Basis, CheckMethod, CheckOutcome, CheckVerdict, ResolvedRef};
 use crate::evidence::instruction::instruction_like;
 
 /// A quantity as the comparisons read it.
@@ -26,13 +29,20 @@ pub(super) struct Qty {
     pub ambiguous: bool,
     /// Its index in `find_numbers` of the quote, for pairing comparators with it.
     pub index: Option<usize>,
+    /// Percentage points (`2.5% points`, `ร้อยละ 2.5 จุด`), not a percent.
+    pub points: bool,
 }
 
 impl Qty {
     /// A figure `find_numbers` read; a figure stating neither scale nor unit takes the
     /// context's (`header_unit`, else `unit_context`). `None` when the scaled value does not fit
-    /// in a `Decimal`: never compared at a wrong scale.
-    pub fn read(n: &Found<Number>, index: Option<usize>, context: &Context) -> Option<Qty> {
+    /// in a `Decimal`: never compared at a wrong scale. `text` is the text it was read from.
+    pub fn read(
+        n: &Found<Number>,
+        index: Option<usize>,
+        context: &Context,
+        text: &str,
+    ) -> Option<Qty> {
         let v = &n.value;
         let (scale, unit) = match (v.scale.0, &v.unit, context) {
             (0, None, Some((scale, unit))) => (*scale, unit.clone()),
@@ -48,8 +58,30 @@ impl Qty {
             raw_exp: Some(-decimals),
             ambiguous: n.conf < MIN_CONF && !n.alts.is_empty(),
             index,
+            points: points_after(text, n.end as usize),
         })
     }
+}
+
+/// Whether `points`, `point`, `pp`, `ppt`, `percentage point(s)` or `จุด` follows the figure
+/// ending at `end`.
+fn points_after(text: &str, end: usize) -> bool {
+    let rest: String = text
+        .chars()
+        .skip(end)
+        .skip_while(|c| c.is_whitespace())
+        .take(24)
+        .collect::<String>()
+        .to_lowercase();
+    let word = |w: &str| {
+        rest.strip_prefix(w)
+            .is_some_and(|after| after.chars().next().is_none_or(|c| !c.is_alphanumeric()))
+    };
+    rest.starts_with("จุด")
+        || rest.starts_with("point")
+        || rest.starts_with("percentage point")
+        || word("pp")
+        || word("ppt")
 }
 
 /// `value` × 10^`scale`.
@@ -97,23 +129,9 @@ pub(super) type Stop = (CheckMethod, &'static str, Value);
 /// A ref's quantities: a `Number` cell's value, else the `Quantity` figures of the quote (a
 /// `Bool`, `Error` or date cell has none). An amount in words is never one of them; one that
 /// disagrees with the figure it restates makes the quote ambiguous (`amount_words_mismatch`).
-/// Stops first at a cell fact that bars the value, a quote that cuts a figure, a text too long.
-pub(super) fn quantities(
-    r: &ResolvedRef,
-    ctx: &Ctx,
-    method: CheckMethod,
-) -> Result<Vec<Qty>, Stop> {
-    let ResolvedRef::Ok { exact, cell, .. } = r else {
-        return Ok(vec![]);
-    };
-    if let Some(code) = cell.as_ref().and_then(cell::gate) {
-        return Err((CheckMethod::Cell, code, json!({})));
-    }
-    if boundary::cuts(r, ctx) {
-        return Err((method, "quote_cuts_number", json!({"quote": exact})));
-    }
-    let context = context(r, ctx);
-    match cell.as_ref().map(cell::value) {
+pub(super) fn quantities(scan: &Scan, method: CheckMethod) -> Result<Vec<Qty>, Stop> {
+    let context = &scan.context;
+    match scan.cell.map(cell::value) {
         Some(CellValue::Number {
             value,
             percent,
@@ -124,6 +142,17 @@ pub(super) fn quantities(
             } else {
                 context.as_ref().and_then(|(_, unit)| unit.clone())
             };
+            let cell_qty = |raw, effective, scale| Qty {
+                raw,
+                effective,
+                scale,
+                unit: unit.clone(),
+                exp: None,
+                raw_exp: None,
+                ambiguous: false,
+                index: None,
+                points: false,
+            };
             let qty = if thousands > 0 {
                 // The format shows the value in thousands, millions...: that is its stated scale.
                 let scale = u8::try_from(thousands * 3).unwrap_or(u8::MAX);
@@ -132,44 +161,25 @@ pub(super) fn quantities(
                 let Some(shown) = shown else {
                     return Ok(vec![]);
                 };
-                Qty {
-                    raw: shown,
-                    effective: value,
-                    scale,
-                    unit,
-                    exp: None,
-                    raw_exp: None,
-                    ambiguous: false,
-                    index: None,
-                }
+                cell_qty(shown, value, scale)
             } else {
                 let scale = context.as_ref().map_or(0, |(scale, _)| *scale);
                 // A value too large for its scale is not a quantity to compare.
                 let Some(effective) = scaled(value, scale) else {
                     return Ok(vec![]);
                 };
-                Qty {
-                    raw: value,
-                    effective,
-                    scale,
-                    unit,
-                    exp: None,
-                    raw_exp: None,
-                    ambiguous: false,
-                    index: None,
-                }
+                cell_qty(value, effective, scale)
             };
             return Ok(vec![qty]);
         }
         Some(CellValue::Date(_) | CellValue::Nothing) => return Ok(vec![]),
         Some(CellValue::Quote) | None => {}
     }
-    let found = find_numbers(exact, ctx).map_err(too_long(method))?;
-    if let Some(words) = words_disagree(&found) {
+    if let Some(words) = words_disagree(&scan.numbers) {
         return Err((method, "amount_words_mismatch", words));
     }
-    Ok(counted(&found)
-        .filter_map(|(i, n)| Qty::read(n, Some(i), &context))
+    Ok(counted(&scan.numbers)
+        .filter_map(|(i, n)| Qty::read(n, Some(i), context, scan.exact))
         .collect())
 }
 
@@ -259,14 +269,27 @@ enum Rel {
 }
 
 fn relate(c: &Qty, s: &Qty) -> Rel {
+    let raw_eq = round_to(s.raw, c.raw_exp) == Some(c.raw);
+    if c.points != s.points {
+        // Percentage points and a percent are other units; the same figure is held open.
+        return if raw_eq {
+            Rel::ScaleUnstated
+        } else {
+            Rel::Mismatch
+        };
+    }
     let units_eq = c.unit == s.unit;
     if units_eq && round_to(s.effective, c.exp) == Some(c.effective) {
+        // A claim of one significant digit ("2 พันล้าน") rounds too much of a finer source away.
+        let finer = s.exp.is_none_or(|se| c.exp.is_some_and(|ce| se < ce));
+        if digits(c.raw) < 10 && finer && s.effective != c.effective {
+            return Rel::PrecisionDiffers;
+        }
         return Rel::Equal;
     }
     let one_unit = c.unit.is_some() != s.unit.is_some();
     // Exactly one side states a scale.
     let scales_differ = (c.scale == 0) != (s.scale == 0);
-    let raw_eq = round_to(s.raw, c.raw_exp) == Some(c.raw);
     if (scales_differ || one_unit) && (raw_eq || (scales_differ && digits(c.raw) == digits(s.raw)))
     {
         return Rel::ScaleUnstated;
@@ -287,6 +310,11 @@ fn relate(c: &Qty, s: &Qty) -> Rel {
     Rel::Mismatch
 }
 
+/// Words of a gain and of a loss: a source line holding both ("กำไร (ขาดทุน)", "profit
+/// (loss)") shows a loss as a negative figure.
+const GAIN_WORDS: &[&str] = &["กำไร", "profit", "profits", "income", "gain", "gains"];
+const LOSS_WORDS: &[&str] = &["ขาดทุน", "loss", "losses", "deficit"];
+
 /// The words that make a sign-only difference a matter of wording ("a loss of 1,250" against
 /// "(1,250)"), not a contradiction.
 const SIGN_WORDS: &[&str] = &[
@@ -302,16 +330,14 @@ const SIGN_WORDS: &[&str] = &[
     "decline",
 ];
 
+/// Whether `text` holds a word of `list`: a Latin word, or a Thai word of at most 3 code
+/// points, as a whole word; a longer Thai word inside the text's match key.
 pub(super) fn has_word(text: &str, list: &[&str]) -> bool {
+    let words = subject::runs(text);
     let key = match_key(text).text;
-    let latin: Vec<String> = katwork_thai::normalize_th(text)
-        .text
-        .split(|c: char| !c.is_alphanumeric())
-        .map(str::to_owned)
-        .collect();
     list.iter().any(|w| {
-        if w.is_ascii() {
-            latin.iter().any(|l| l == w)
+        if w.is_ascii() || w.chars().count() <= 3 {
+            words.iter().any(|t| t.text == *w)
         } else {
             key.contains(w)
         }
@@ -445,99 +471,212 @@ pub(super) fn settle(
     }
 }
 
-/// The comparator meanings that belong to the figure at `index` of a text: those paired with it
-/// and those paired with no figure (a postfix comparator such as "or more" pairs with the next
-/// figure, so an unpaired one is kept, to fail closed).
-fn comparators(text: &str, index: usize, ctx: &Ctx) -> Option<Vec<Meaning>> {
-    let mut found: Vec<Meaning> = qualifier::pair_with_numbers(text, ctx)
-        .ok()?
-        .into_iter()
-        .filter(|(_, paired)| paired.is_none_or(|p| p == index))
-        .map(|(q, _)| q.meaning)
-        .collect();
-    found.sort();
-    Some(found)
+/// Each qualifier of a text with the index (in `numbers`, the text's `find_numbers`) of the
+/// first `Quantity` that starts at or after its end, as `qualifier::pair_with_numbers` pairs
+/// them.
+pub(super) fn pair(
+    spans: &[Qualifier],
+    numbers: &[Found<Number>],
+) -> Vec<(Meaning, Option<usize>)> {
+    spans
+        .iter()
+        .map(|q| {
+            let next = numbers
+                .iter()
+                .position(|n| n.value.role == NumberRole::Quantity && n.start >= q.end);
+            (q.meaning, next)
+        })
+        .collect()
 }
 
-/// The number check of a claim's one quantity (`claim_index` in `find_numbers` of its text)
-/// against one full-quality ref, plus a `Qualifier` check when the figure the claim matched
-/// carries other comparators than the claim's.
-pub(super) fn check(
-    claim_text: &str,
-    claim: &Qty,
-    claim_index: usize,
-    subject: &Subject,
-    ordinal: u32,
-    r: &ResolvedRef,
-    ctx: &Ctx,
-) -> Vec<CheckOutcome> {
-    let at = Some(ordinal);
-    let sources = match quantities(r, ctx, CheckMethod::Number) {
+/// The comparator meanings that belong to the figure at `index`: those paired with it and those
+/// paired with no figure (a postfix comparator such as "or more" pairs with the next figure, so
+/// an unpaired one is kept, to fail closed).
+fn belonging(paired: &[(Meaning, Option<usize>)], index: usize) -> Vec<Meaning> {
+    let mut found: Vec<Meaning> = paired
+        .iter()
+        .filter(|(_, at)| at.is_none_or(|p| p == index))
+        .map(|(m, _)| *m)
+        .collect();
+    found.sort();
+    found
+}
+
+fn names(m: &[Meaning]) -> Vec<&'static str> {
+    m.iter().map(|m| m.wire()).collect()
+}
+
+fn counts_names(counts: &BTreeMap<Meaning, usize>) -> Vec<&'static str> {
+    counts
+        .iter()
+        .flat_map(|(m, n)| std::iter::repeat_n(m.wire(), *n))
+        .collect()
+}
+
+/// A `Qualifier` check, `qualifier_mismatch`, when the claim and the ref's fields (quote and
+/// cell facts) hold a negation or comparator a different number of times.
+pub(super) fn field_qualifiers(
+    claim: &BTreeMap<Meaning, usize>,
+    scan: &Scan,
+) -> Option<CheckOutcome> {
+    (*claim != scan.counts).then(|| {
+        outcome(
+            CheckMethod::Qualifier,
+            CheckVerdict::Inconclusive,
+            Basis::None,
+            "qualifier_mismatch",
+            Some(scan.ordinal),
+            json!({"claim": counts_names(claim), "source": counts_names(&scan.counts)}),
+        )
+    })
+}
+
+/// What every ref of one claim is compared with, read once per claim.
+pub(super) struct ClaimSide<'a> {
+    pub subject: &'a Subject,
+    /// The claim's one quantity and its index in `find_numbers` of the text.
+    pub figure: Option<(usize, Qty)>,
+    /// How often each negation and comparator occurs in the claim.
+    pub counts: BTreeMap<Meaning, usize>,
+    /// The comparators that belong to the claim's figure.
+    pub comparators: Vec<Meaning>,
+    pub sign_words: bool,
+    /// A loss word and no gain word.
+    pub loss: bool,
+}
+
+impl<'a> ClaimSide<'a> {
+    pub fn new(
+        text: &'a str,
+        subject: &'a Subject,
+        numbers: &[Found<Number>],
+        figure: Option<(usize, Qty)>,
+    ) -> ClaimSide<'a> {
+        let spans = qualifier::spans(text);
+        let mut counts = BTreeMap::new();
+        for q in &spans {
+            *counts.entry(q.meaning).or_insert(0) += 1;
+        }
+        let comparators = figure
+            .as_ref()
+            .map(|(i, _)| belonging(&pair(&spans, numbers), *i))
+            .unwrap_or_default();
+        ClaimSide {
+            subject,
+            figure,
+            counts,
+            comparators,
+            sign_words: has_word(text, SIGN_WORDS),
+            loss: has_word(text, LOSS_WORDS) && !has_word(text, GAIN_WORDS),
+        }
+    }
+}
+
+/// The number check of the claim's one quantity against one read ref, plus `Qualifier` checks
+/// when the ref's fields hold other negations or comparators than the claim, when the figure
+/// the claim matched carries other comparators than the claim's, or when a range or a product
+/// joins it to another figure.
+pub(super) fn check(claim: &ClaimSide, scan: &Scan, ctx: &Ctx) -> Vec<CheckOutcome> {
+    let at = Some(scan.ordinal);
+    let Some((_, mine)) = &claim.figure else {
+        return vec![];
+    };
+    let sources = match quantities(scan, CheckMethod::Number) {
         Ok(sources) => sources,
         Err(stop) => return vec![stopped(stop, at)],
     };
-    let source = match Source::read(&subject::fields(r), ctx) {
-        Ok(source) => source,
-        Err(e) => return vec![stopped(too_long(CheckMethod::Number)(e), at)],
-    };
-    let ResolvedRef::Ok { exact, .. } = r else {
-        return vec![];
-    };
+    // On a profit-or-loss line a loss is the negative figure.
+    let profit_or_loss = has_word(&scan.text, GAIN_WORDS) && has_word(&scan.text, LOSS_WORDS);
+    let mut value = mine.clone();
+    if profit_or_loss && claim.loss && value.effective.is_sign_positive() {
+        value.raw = -value.raw;
+        value.effective = -value.effective;
+    }
     let detail = json!({
-        "claim": claim.effective.to_string(),
+        "claim": value.effective.to_string(),
         "source": sources.iter().map(|s| s.effective.to_string()).collect::<Vec<_>>(),
     });
-    let sign_words = has_word(claim_text, SIGN_WORDS) || has_word(exact, SIGN_WORDS);
-    let met = || subject::check(&subject.words, &subject.periods, &source, true);
-    let qualified = !qualifier::spans(claim_text).is_empty() || !qualifier::spans(exact).is_empty();
-    let number = |equal, code| {
-        let compared = if equal {
-            Compared::Equal(Basis::Exact)
-        } else {
-            Compared::Differs(code, qualified)
-        };
-        settle(compared, met(), CheckMethod::Number, at, detail.clone())
-    };
-    match decide(claim, &sources, sign_words) {
+    let sign_words = claim.sign_words || has_word(scan.exact, SIGN_WORDS);
+    let qualified = !claim.counts.is_empty() || !scan.counts.is_empty();
+    let mut out = Vec::new();
+    match decide(&value, &sources, sign_words) {
         Decision::Equal(s) => {
-            let mut out = vec![number(true, "checked")];
-            let pairing = s.index.and_then(|i| {
-                Some((
-                    comparators(claim_text, claim_index, ctx)?,
-                    comparators(exact, i, ctx)?,
-                ))
-            });
-            if let Some((mine, theirs)) = pairing
-                && mine != theirs
-            {
-                let names = |m: &[Meaning]| m.iter().map(|m| m.wire()).collect::<Vec<_>>();
-                out.push(outcome(
+            let segment = s.index.and_then(|i| scan.segment(i));
+            let own = match &segment {
+                Some((text, _)) => {
+                    let mut fields = scan.fields.clone();
+                    fields[0] = (text.as_str(), true);
+                    match Source::read(&fields, ctx) {
+                        Ok(own) => Some(own),
+                        Err(e) => return vec![stopped(too_long(CheckMethod::Number)(e), at)],
+                    }
+                }
+                None => None,
+            };
+            let source = own.as_ref().unwrap_or(&scan.source);
+            let met = subject::check(&claim.subject.words, &claim.subject.periods, source, true);
+            out.push(settle(
+                Compared::Equal(Basis::Exact),
+                met,
+                CheckMethod::Number,
+                at,
+                detail,
+            ));
+            let mismatch = |detail| {
+                outcome(
                     CheckMethod::Qualifier,
                     CheckVerdict::Inconclusive,
                     Basis::None,
                     "qualifier_mismatch",
                     at,
-                    json!({"claim": names(&mine), "source": names(&theirs)}),
-                ));
+                    detail,
+                )
+            };
+            if segment.as_ref().is_some_and(|(_, joined)| *joined) {
+                out.push(mismatch(json!({"reason": "range"})));
             }
-            out
+            if let Some(i) = s.index {
+                let theirs = belonging(&scan.paired, i);
+                if claim.comparators != theirs {
+                    out.push(mismatch(json!({
+                        "claim": names(&claim.comparators),
+                        "source": names(&theirs),
+                    })));
+                }
+            }
         }
-        Decision::Contradicts(code) => vec![number(false, code)],
-        Decision::Open(code) => vec![outcome(
+        Decision::Contradicts(code) => {
+            let met = subject::check(
+                &claim.subject.words,
+                &claim.subject.periods,
+                &scan.source,
+                true,
+            );
+            out.push(settle(
+                Compared::Differs(code, qualified),
+                met,
+                CheckMethod::Number,
+                at,
+                detail,
+            ));
+        }
+        Decision::Open(code) => out.push(outcome(
             CheckMethod::Number,
             CheckVerdict::Inconclusive,
             Basis::None,
             code,
             at,
             detail,
-        )],
-        Decision::Absent => vec![outcome(
+        )),
+        Decision::Absent => out.push(outcome(
             CheckMethod::Number,
             CheckVerdict::Unsupported,
             Basis::None,
             "number_not_in_source",
             at,
             detail,
-        )],
+        )),
     }
+    out.extend(field_qualifiers(&claim.counts, scan));
+    out
 }

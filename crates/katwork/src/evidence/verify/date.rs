@@ -1,50 +1,37 @@
 //! The date check: a claim's date against the dates of a ref, compared by meaning, a
 //! date-formatted cell read from its serial.
-use katwork_thai::{Ctx, DateValue, Era, Flags, Found};
+use katwork_thai::{DateValue, Era, Flags, Found};
 use serde_json::json;
 
 use super::cell::{self, CellValue};
-use super::number::{Compared, settle, stopped, too_long};
-use super::qualifier;
-use super::subject::{self, Against, Source, Subject};
-use super::{Basis, CheckMethod, CheckOutcome, CheckVerdict, ResolvedRef, boundary};
+use super::number::{ClaimSide, Compared, field_qualifiers, settle, stopped};
+use super::scan::Scan;
+use super::subject::{self, Against};
+use super::{Basis, CheckMethod, CheckOutcome, CheckVerdict};
 
-/// The date check of a claim whose text holds dates and no quantity, against one full-quality
-/// ref. A claim with more than one date is `date_ambiguous` (the crate reads none of them with
+/// The date check of a claim whose text holds dates and no quantity, against one read ref,
+/// plus a `Qualifier` check when the ref's fields hold other negations or comparators than the
+/// claim. A claim with more than one date is `date_ambiguous` (the crate reads none of them with
 /// full confidence).
-pub(super) fn check(
-    claim_text: &str,
-    subject: &Subject,
-    ordinal: u32,
-    r: &ResolvedRef,
-    ctx: &Ctx,
-) -> CheckOutcome {
-    let at = Some(ordinal);
+pub(super) fn check(claim: &ClaimSide, scan: &Scan) -> Vec<CheckOutcome> {
+    let at = Some(scan.ordinal);
     let open = |code: &'static str, detail| stopped((CheckMethod::Date, code, detail), at);
-    let ResolvedRef::Ok { exact, cell, .. } = r else {
-        return open("date_not_in_source", json!({}));
-    };
-    if let Some(code) = cell.as_ref().and_then(cell::gate) {
-        return stopped((CheckMethod::Cell, code, json!({})), at);
-    }
-    if boundary::cuts(r, ctx) {
-        return open("quote_cuts_number", json!({"quote": exact}));
-    }
-    let mut source = match Source::read(&subject::fields(r), ctx) {
-        Ok(source) => source,
-        Err(e) => return stopped(too_long(CheckMethod::Date)(e), at),
-    };
+    let mut dates = scan.source.dates.clone();
     // The quote of a date cell is its serial; its day comes from the serial.
-    if let Some(CellValue::Date(Some(date))) = cell.as_ref().map(cell::value) {
-        source.dates.push((cell_date(date), true));
+    if let Some(CellValue::Date(Some(date))) = scan.cell.map(cell::value) {
+        dates.push((cell_date(date), true));
     }
-    let [claim] = subject.periods.as_slice() else {
-        return open("date_ambiguous", json!({"dates": subject.periods.len()}));
+    let subject = claim.subject;
+    let [date] = subject.periods.as_slice() else {
+        return vec![open(
+            "date_ambiguous",
+            json!({"dates": subject.periods.len()}),
+        )];
     };
-    let detail = json!({"claim": claim.raw});
-    let met = || subject::check(&subject.words, &[], &source, true);
-    let qualified = !qualifier::spans(claim_text).is_empty() || !qualifier::spans(exact).is_empty();
-    match subject::against(claim, &source.dates) {
+    let detail = json!({"claim": date.raw});
+    let met = || subject::check(&subject.words, &[], &scan.source, true);
+    let qualified = !claim.counts.is_empty() || !scan.counts.is_empty();
+    let first = match subject::against(date, &dates) {
         Against::Same => settle(
             Compared::Equal(Basis::Exact),
             met(),
@@ -66,7 +53,10 @@ pub(super) fn check(
             verdict: CheckVerdict::Unsupported,
             ..open("date_not_in_source", detail)
         },
-    }
+    };
+    let mut out = vec![first];
+    out.extend(field_qualifiers(&claim.counts, scan));
+    out
 }
 
 /// A day read from a cell's serial: exact, era-free.

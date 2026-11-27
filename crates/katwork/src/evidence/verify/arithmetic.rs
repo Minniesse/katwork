@@ -1,22 +1,26 @@
 //! A derived figure: one aggregate comparison of the claim's value with the operation over its
 //! cited operands, in `Decimal`, never operand-by-operand equality.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use katwork_thai::{Ctx, Unit};
 use rust_decimal::Decimal;
 use serde_json::json;
 
-use super::number::{self, Compared, Qty, round_to, settle, stopped};
-use super::subject::{self, OP_WORDS, Source, Subject};
-use super::{Basis, CheckMethod, CheckOutcome, ClaimInput, resolve::is_resolved};
+use super::number::{self, ClaimSide, Compared, Qty, round_to, settle, stopped};
+use super::scan::{self, Scan};
+use super::subject::{self, OP_WORDS, Source};
+use super::{
+    Basis, CheckMethod, CheckOutcome, CheckVerdict, ClaimInput, MAX_FIGURE_REFS, ordinal,
+    resolve::is_resolved,
+};
 use crate::evidence::claim::{Derive, DeriveOp};
 
 /// Words saying the change went up or down: a decrease word makes the claim's value negative.
 const INCREASE: &[&str] = &["เพิ่มขึ้น", "increase", "increased", "rose", "grew"];
 const DECREASE: &[&str] = &["ลดลง", "decrease", "decreased", "fell", "declined"];
 
-/// `sum` of all; `difference` = a − b; `ratio` = a ÷ b; `share` = a ÷ b × 100;
-/// `percent_change` = (b − a) ÷ |a| × 100. `Err` for a division by zero (or an overflow).
+/// The operands in `args` order (a, b): `sum` of all; `difference` = a − b; `ratio` = a ÷ b;
+/// `share` = a ÷ b × 100; `percent_change` = (b − a) ÷ a × 100. `Err` for a division by zero (or an overflow).
 fn compute(op: DeriveOp, values: &[Decimal]) -> Result<Decimal, &'static str> {
     let overflow = "arithmetic_mismatch";
     let pair = || match values {
@@ -50,33 +54,51 @@ fn compute(op: DeriveOp, values: &[Decimal]) -> Result<Decimal, &'static str> {
         }
         DeriveOp::PercentChange => {
             let (a, b) = pair()?;
-            hundred(divide(b.checked_sub(a).ok_or(overflow)?, a.abs())?)
+            hundred(divide(b.checked_sub(a).ok_or(overflow)?, a)?)
         }
     }
 }
 
-/// The one `Arithmetic` check of a derived claim: each operand ref must resolve with full
-/// quality and yield exactly one quantity (`operand_missing`), their explicit units must agree
-/// (`operand_units_differ`); the result, compared at the claim's precision, is `Supported`,
-/// `Derived`, or `Contradicted`, `arithmetic_mismatch`. A result that differs only in sign from
-/// a claim with no direction word is held open. The subject rule reads the union of the
-/// operands' sources, the operation's own words left out of the claim's.
+/// The `Arithmetic` check of a derived claim, plus a `Qualifier` check per operand whose fields
+/// hold other negations or comparators than the claim. Each operand ref must resolve with full
+/// quality and yield exactly one quantity, and no ref may be named twice (`operand_missing`);
+/// their explicit units must agree with each other and with the claim (`operand_units_differ`).
+/// The result, compared at the claim's precision, is `Supported`, `Derived`, or `Contradicted`,
+/// `arithmetic_mismatch`; it is held open when only one side states a scale (`scale_unstated`),
+/// when it matches only with the operands swapped (`operand_order`), or when it differs only in
+/// sign from a claim with no direction word. The subject rule, the operation's own words left out
+/// of the claim's, reads every operand on its own for a sum and their union otherwise (a change
+/// spans two periods); a missed subject holds the check open.
 pub(super) fn check(
     claim: &ClaimInput,
-    value: &Qty,
-    subject: &Subject,
+    side: &ClaimSide,
     derive: &Derive,
     ctx: &Ctx,
-) -> CheckOutcome {
-    let open = |code: &'static str, detail| stopped((CheckMethod::Arithmetic, code, detail), None);
-    // Each distinct ref is read once, however often `args` names it.
-    let mut read: BTreeMap<u8, Qty> = BTreeMap::new();
-    let mut source: Option<Source> = None;
-    for &arg in derive.args.iter().collect::<BTreeSet<_>>() {
-        let Some(r) = claim.refs.get(usize::from(arg)).filter(|r| is_resolved(r)) else {
+) -> Vec<CheckOutcome> {
+    let open =
+        |code: &'static str, detail| vec![stopped((CheckMethod::Arithmetic, code, detail), None)];
+    let Some((_, value)) = &side.figure else {
+        return vec![];
+    };
+    let distinct: BTreeSet<u8> = derive.args.iter().copied().collect();
+    if distinct.len() != derive.args.len() {
+        return open("operand_missing", json!({"reason": "repeated_operand"}));
+    }
+    if distinct.len() > MAX_FIGURE_REFS {
+        return open("too_many_refs", json!({"operands": distinct.len()}));
+    }
+    let mut scans: Vec<Scan> = Vec::new();
+    let mut operands: Vec<Qty> = Vec::new();
+    for &arg in &derive.args {
+        let index = usize::from(arg);
+        let Some(r) = claim.refs.get(index).filter(|r| is_resolved(r)) else {
             return open("operand_missing", json!({"arg": arg}));
         };
-        let found = match number::quantities(r, ctx, CheckMethod::Arithmetic) {
+        let scan = match scan::read(ordinal(index), r, CheckMethod::Arithmetic, ctx) {
+            Ok(scan) => scan,
+            Err((_, code, detail)) => return open(code, detail),
+        };
+        let found = match number::quantities(&scan, CheckMethod::Arithmetic) {
             Ok(found) => found,
             Err((_, code, detail)) => return open(code, detail),
         };
@@ -86,21 +108,11 @@ pub(super) fn check(
                 json!({"arg": arg, "quantities": found.len()}),
             );
         };
-        read.insert(arg, qty.clone());
-        let fields = match Source::read(&subject::fields(r), ctx) {
-            Ok(fields) => fields,
-            Err(e) => return stopped(number::too_long(CheckMethod::Arithmetic)(e), None),
-        };
-        match &mut source {
-            Some(all) => all.extend(fields),
-            None => source = Some(fields),
-        }
+        operands.push(qty.clone());
+        scans.push(scan);
     }
-    let Some(source) = source else {
-        return open("operand_missing", json!({}));
-    };
-    let operands: Vec<&Qty> = derive.args.iter().filter_map(|arg| read.get(arg)).collect();
-    let mut units: Vec<_> = read.values().filter_map(|q| q.unit.as_ref()).collect();
+    let mut out: Vec<CheckOutcome> = Vec::new();
+    let mut units: Vec<_> = operands.iter().filter_map(|q| q.unit.as_ref()).collect();
     units.dedup();
     // The claim's unit: a sum or a difference keeps the operands' unit, a share or a percent
     // change is a percent, a ratio has none.
@@ -137,31 +149,76 @@ pub(super) fn check(
         "result": result.to_string(),
         "operands": values.iter().map(ToString::to_string).collect::<Vec<_>>(),
     });
-    let words: Vec<_> = subject
+    let words: Vec<_> = side
+        .subject
         .words
         .iter()
         .filter(|w| !OP_WORDS.contains(&w.text.as_str()))
         .cloned()
         .collect();
-    let met = subject::check(&words, &subject.periods, &source, false);
-    if rounded == Some(claimed) {
-        return settle(
+    let periods = &side.subject.periods;
+    let met = if derive.op == DeriveOp::Sum {
+        scans
+            .iter()
+            .try_for_each(|scan| subject::check(&words, periods, &scan.source, false))
+    } else {
+        let mut union = Source::default();
+        for scan in &scans {
+            union.extend(scan.source.clone());
+        }
+        subject::check(&words, periods, &union, false)
+    }
+    // An operand's other subject leaves the result open, never contradicted.
+    .map_err(|mut miss| {
+        miss.verdict = CheckVerdict::Inconclusive;
+        miss
+    });
+    let qualified = !side.counts.is_empty() || scans.iter().any(|s| !s.counts.is_empty());
+    for scan in &scans {
+        out.extend(number::field_qualifiers(&side.counts, scan));
+    }
+    let first = if rounded == Some(claimed) {
+        settle(
             Compared::Equal(Basis::Derived),
             met,
             CheckMethod::Arithmetic,
             None,
             detail,
-        );
+        )
+    } else if mixed_scales(value, &operands) {
+        stopped((CheckMethod::Arithmetic, "scale_unstated", detail), None)
+    } else if swapped(derive.op, &values).and_then(|r| round_to(r, value.exp)) == Some(claimed) {
+        stopped((CheckMethod::Arithmetic, "operand_order", detail), None)
+    } else if !increase && !decrease && rounded.map(|r| -r) == Some(claimed) {
+        stopped(
+            (CheckMethod::Arithmetic, "arithmetic_mismatch", detail),
+            None,
+        )
+    } else {
+        settle(
+            Compared::Differs("arithmetic_mismatch", qualified),
+            met,
+            CheckMethod::Arithmetic,
+            None,
+            detail,
+        )
+    };
+    out.insert(0, first);
+    out
+}
+
+/// Only one side states a scale: some operands do and others do not, or the claim does and no
+/// operand does, or the reverse.
+fn mixed_scales(claim: &Qty, operands: &[Qty]) -> bool {
+    let stated: BTreeSet<bool> = operands.iter().map(|q| q.scale > 0).collect();
+    stated.len() > 1 || stated.first().is_some_and(|s| *s != (claim.scale > 0))
+}
+
+/// The result with the two operands swapped, for an operation whose order matters.
+fn swapped(op: DeriveOp, values: &[Decimal]) -> Option<Decimal> {
+    match (op, values) {
+        (DeriveOp::Sum, _) => None,
+        (_, [a, b]) => compute(op, &[*b, *a]).ok(),
+        _ => None,
     }
-    if !increase && !decrease && rounded.map(|r| -r) == Some(claimed) {
-        return open("arithmetic_mismatch", detail);
-    }
-    let qualified = !super::qualifier::spans(&claim.text).is_empty();
-    settle(
-        Compared::Differs("arithmetic_mismatch", qualified),
-        met,
-        CheckMethod::Arithmetic,
-        None,
-        detail,
-    )
 }
