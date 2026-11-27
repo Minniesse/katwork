@@ -1,0 +1,5 @@
+# The Craft forks KatWork builds (plan Task 13, R28), checked by scripts/check-craft-lock.sh.
+# app repo commit cli_package cli_bin features web_dir web_features thai_gate
+# features and web_features follow --no-default-features ("-" for none); thai_gate is <package>::<test> or "-".
+# Rows are added with each fork's merged commit. The KatWork build also sets FIGCRAFT_DEFAULT_SERVER to empty
+# for FigCraft (no default sharing server; the collab gate is off, so nothing reads it).
