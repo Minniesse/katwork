@@ -861,6 +861,10 @@ fn every_lexicon_entry_returns_its_own_meaning() {
         ("veto", Neg),
         ("vetoed", Neg),
         ("vetoes", Neg),
+        // Fix round 3, same family.
+        ("mustnt", Neg),
+        ("neednt", Neg),
+        ("aint", Neg),
     ];
     for (text, meaning) in rows {
         let padded = format!("x {text} 5");
@@ -2385,6 +2389,14 @@ fn known_gaps_after_the_extended_lists() {
             "approve the budget",
             "In the absence of a quorum, approve the budget",
         ),
+        (
+            "approve the budget",
+            "They voted against the motion to approve the budget",
+        ),
+        (
+            "approve the budget",
+            "They opposed the motion to approve the budget",
+        ),
         // The sentence splitter: a Thai space after 30 or more code points, and abbreviations
         // before a capital letter.
         (
@@ -2527,6 +2539,54 @@ fn quote_cut_from_inside_a_word_is_a_paraphrase() {
             "a non-binding agreement",
         ),
         ("Section 1", "Section 1", "Section 1.5 was repealed"),
+        // Fix round 3: a quote that starts at the hyphen, a cut at an invisible code point or a
+        // hyphen and a line break, and an en dash between digits.
+        (
+            "binding agreement",
+            "-binding agreement",
+            "a non-binding agreement",
+        ),
+        (
+            "approved the budget",
+            "-approved the budget",
+            "They dis-approved the budget",
+        ),
+        (
+            "approved the budget",
+            "approved the budget",
+            "They dis-approved the budget",
+        ),
+        (
+            "approved the budget",
+            "approved the budget",
+            "They non\u{2011}approved the budget",
+        ),
+        (
+            "approved the budget",
+            "approved the budget",
+            "The board dis\u{ad}approved the budget",
+        ),
+        (
+            "approved the budget",
+            "approved the budget",
+            "The board dis\u{200B}approved the budget",
+        ),
+        (
+            "approved the budget",
+            "approved the budget",
+            "The board dis\u{2060}approved the budget",
+        ),
+        (
+            "approved the budget",
+            "approved the budget",
+            "The board dis-\napproved the budget",
+        ),
+        (
+            "approved the budget",
+            "approved the budget",
+            "The board dis- approved the budget",
+        ),
+        ("No. 1", "No. 1", "No. 1\u{2013}3 repealed"),
     ] {
         let c = claim(ClaimKind::Quote, text, vec![full(quote, block)]);
         let out = check_quote(&c, &Ctx::default());
@@ -2550,6 +2610,23 @@ fn quote_cut_from_inside_a_word_is_a_paraphrase() {
         ),
         ("Section 1", "Section 1", "Section 1. Repealed"),
         ("the budget", "the budget", "the budget - approved"),
+        // A hyphen with a space before it is a dash, not a cut; a quote in single quotes is
+        // whole.
+        (
+            "approved the plan",
+            "approved the plan",
+            "budget - approved the plan",
+        ),
+        (
+            "the board approved",
+            "the board approved",
+            "He said 'the board approved' today",
+        ),
+        (
+            "the board approved",
+            "'the board approved'",
+            "He said 'the board approved' today",
+        ),
     ] {
         let c = claim(ClaimKind::Quote, text, vec![full(quote, block)]);
         let out = check_quote(&c, &Ctx::default());

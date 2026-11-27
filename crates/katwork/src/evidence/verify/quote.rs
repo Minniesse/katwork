@@ -3,7 +3,8 @@ use katwork_thai::{Ctx, NumberRole, find_dates, find_numbers, normalize_th};
 use serde_json::json;
 
 use super::{
-    Basis, CheckMethod, CheckOutcome, CheckVerdict, ClaimInput, resolve::each_hit, resolved_refs,
+    Basis, CheckMethod, CheckOutcome, CheckVerdict, ClaimInput, qualifier::is_invisible,
+    resolve::each_hit, resolved_refs,
 };
 use crate::evidence::claim::ClaimKind;
 
@@ -34,8 +35,8 @@ pub fn check_quote(claim: &ClaimInput, ctx: &Ctx) -> Vec<CheckOutcome> {
             else {
                 return None;
             };
-            let (cut_start, cut_end) = quote_cuts(block_text, *quote_start, *quote_end);
-            let contained = contains_whole(&keyed(exact), &key, cut_start, cut_end);
+            let (hay, quote) = with_context(block_text, exact, *quote_start, *quote_end);
+            let contained = contains_whole(&hay, quote, &key);
             let (verdict, basis, code) = if contained {
                 (CheckVerdict::Supported, Basis::Exact, "checked")
             } else {
@@ -76,15 +77,22 @@ fn is_thai(c: char) -> bool {
 }
 
 fn is_hyphen(c: char) -> bool {
-    matches!(c, '-' | '\u{2010}' | '\u{2011}')
+    matches!(c, '-' | '\u{2010}' | '\u{2011}' | '\u{2013}' | '\u{2212}')
+}
+
+/// A letter or digit of a spaced script: the code points a cut is tested on. An apostrophe
+/// joins two of them ("board's") but does not make a run alone ("'the board approved'").
+fn is_alnum(c: char) -> bool {
+    c.is_alphanumeric() && !is_thai(c)
 }
 
 /// `x`, `j`, `y` read as one run: `. , / -` between two digits ("1.5", "1,250", "1/2567",
-/// "1-3"), or a hyphen between two word code points ("non-binding").
+/// "1-3"), or a hyphen or an apostrophe between two letters or digits ("non-binding",
+/// "board's").
 fn joins(x: char, j: char, y: char) -> bool {
     let digit = |c: char| c.is_numeric();
     (digit(x) && digit(y) && (matches!(j, '.' | ',' | '/') || is_hyphen(j)))
-        || (is_word(x) && is_word(y) && is_hyphen(j))
+        || (is_alnum(x) && is_alnum(y) && (is_hyphen(j) || j == '\''))
 }
 
 /// Whether the boundary before `text[i]` lies inside a run, for `0 < i < text.len()`. Each code
@@ -95,7 +103,7 @@ fn joined(text: &[(char, bool)], i: usize, thai: bool) -> bool {
     if b.1 {
         return false;
     }
-    (is_word(a.0) && is_word(b.0))
+    (is_alnum(a.0) && is_alnum(b.0))
         || (thai && is_thai(a.0) && is_thai(b.0))
         || text
             .get(i + 1)
@@ -103,16 +111,64 @@ fn joined(text: &[(char, bool)], i: usize, thai: bool) -> bool {
         || (i >= 2 && !a.1 && joins(text[i - 2].0, a.0, b.0))
 }
 
-/// Whether the quote's start and end fall inside an English word or a number of `block_text`
-/// ("approved" cut from "disapproved", "Section 1" from "Section 12"); a cut between two Thai
-/// code points is left to the qualifier lexicon. Positions are clamped to the block.
-fn quote_cuts(block_text: &str, start: u32, end: u32) -> (bool, bool) {
-    let raw: Vec<(char, bool)> = block_text.chars().map(|c| (c, false)).collect();
-    let len = raw.len();
+/// Raw code points of block text read on each side of the quote for its edge test.
+/// shortcut: a run of more than 16 invisible code points at an edge hides it; upgrade if
+/// extraction ever emits such runs.
+const EDGE_RAW: usize = 16;
+
+/// Normalized code points of block text kept on each side of the quote.
+const EDGE_KEPT: usize = 2;
+
+/// The quote, keyed, with up to two normalized code points of block text on each side (so an
+/// invisible code point or a dash at the cut reads as the matcher reads it), and the range the
+/// quote takes in it. The first code point of the quote and of the text after it record
+/// whether the block had a space there.
+fn with_context(
+    block_text: &str,
+    exact: &str,
+    start: u32,
+    end: u32,
+) -> (Vec<(char, bool)>, std::ops::Range<usize>) {
+    let chars: Vec<char> = block_text.chars().collect();
+    let len = chars.len();
     let end = (end as usize).min(len);
     let start = (start as usize).min(end);
-    let cut = |i: usize| i > 0 && i < len && joined(&raw, i, false);
-    (cut(start), cut(end))
+    let visible = |c: &&char| !is_invisible(**c);
+    let before_raw = &chars[start.saturating_sub(EDGE_RAW)..start];
+    let after_raw = &chars[end..(end + EDGE_RAW).min(len)];
+    let exact_chars: Vec<char> = exact.chars().collect();
+    let space_before = before_raw
+        .iter()
+        .rev()
+        .find(visible)
+        .is_some_and(|c| c.is_whitespace())
+        || exact_chars
+            .iter()
+            .find(visible)
+            .is_some_and(|c| c.is_whitespace());
+    let space_after = after_raw
+        .iter()
+        .find(visible)
+        .is_some_and(|c| c.is_whitespace())
+        || exact_chars
+            .iter()
+            .rev()
+            .find(visible)
+            .is_some_and(|c| c.is_whitespace());
+    let before = keyed(&before_raw.iter().collect::<String>());
+    let mut quote = keyed(exact);
+    let mut after = keyed(&after_raw.iter().collect::<String>());
+    let mut hay: Vec<(char, bool)> = before[before.len().saturating_sub(EDGE_KEPT)..].to_vec();
+    if let Some(first) = quote.first_mut() {
+        first.1 |= space_before;
+    }
+    if let Some(first) = after.first_mut() {
+        first.1 |= space_after;
+    }
+    let range = hay.len()..hay.len() + quote.len();
+    hay.append(&mut quote);
+    hay.extend(after.into_iter().take(EDGE_KEPT));
+    (hay, range)
 }
 
 /// `normalize_th(text)` as `match_key` sees it, except that a space between two word code
@@ -135,37 +191,37 @@ fn keyed(text: &str) -> Vec<(char, bool)> {
     out
 }
 
-/// `needle` occurs in `hay` at a place whose ends do not cut a run: a hit in the middle of an
-/// English word or a number ("approved" in "disapproved", "1" in "12", "1" in "1.5", "binding"
-/// in "non-binding") is not one, nor is a hit whose end falls inside a run of Thai text, which
-/// has no word boundaries to check (it is then a paraphrase). A hit that reaches an end of `hay`
-/// the quote itself cut from a run (`cut_start`, `cut_end`) is not whole either. An empty needle
-/// is never contained.
+/// `needle` occurs inside the `quote` range of `hay` at a place whose ends do not cut a run: a
+/// hit in the middle of an English word or a number ("approved" in "disapproved", "1" in "12",
+/// "1" in "1.5", "binding" in "non-binding") is not one, nor is a hit whose end falls inside a
+/// run of Thai text, which has no word boundaries to check (it is then a paraphrase). The
+/// block text around the quote counts too: a hit at an edge the quote itself cut from a word or
+/// a number is not whole, and neither is a hit at the quote's start right after a hyphen that
+/// follows a word ("dis- approved"). At the quote's own two edges Thai is left to the qualifier
+/// lexicon. An empty needle is never contained.
 fn contains_whole(
     hay: &[(char, bool)],
+    quote: std::ops::Range<usize>,
     needle: &[(char, bool)],
-    cut_start: bool,
-    cut_end: bool,
 ) -> bool {
     if needle.is_empty() {
         return false;
     }
-    let hay_chars: Vec<char> = hay.iter().map(|(c, _)| *c).collect();
+    let hay_chars: Vec<char> = hay[quote.clone()].iter().map(|(c, _)| *c).collect();
     let needle_chars: Vec<char> = needle.iter().map(|(c, _)| *c).collect();
+    let cut = |i: usize| {
+        let edge = i == quote.start || i == quote.end;
+        let hyphen_before = i == quote.start
+            && i >= 2
+            && is_hyphen(hay[i - 1].0)
+            && !hay[i - 1].1
+            && is_alnum(hay[i - 2].0);
+        i > 0 && i < hay.len() && (joined(hay, i, !edge) || hyphen_before)
+    };
     let mut found = false;
     each_hit(&hay_chars, &needle_chars, |at| {
-        let end = at + needle.len();
-        let left = if at == 0 {
-            !cut_start
-        } else {
-            !joined(hay, at, true)
-        };
-        let right = if end == hay.len() {
-            !cut_end
-        } else {
-            !joined(hay, end, true)
-        };
-        found = left && right;
+        let (start, end) = (quote.start + at, quote.start + at + needle.len());
+        found = !cut(start) && !cut(end);
         !found
     });
     found

@@ -190,6 +190,9 @@ const ENGLISH: &[(&str, Meaning, bool)] = &[
     ("veto", Meaning::Neg, false),
     ("vetoed", Meaning::Neg, false),
     ("vetoes", Meaning::Neg, false),
+    ("mustnt", Meaning::Neg, false),
+    ("neednt", Meaning::Neg, false),
+    ("aint", Meaning::Neg, false),
     ("no more than", Meaning::Le, true),
     ("not more than", Meaning::Le, true),
     ("at most", Meaning::Le, true),
@@ -501,11 +504,18 @@ fn window_range(r: &ResolvedRef) -> Option<(Vec<char>, usize, usize)> {
 fn in_raw_word(c: char) -> bool {
     is_word_char(c)
         || c == '\u{2019}'
-        || matches!(
-            c,
-            '\u{00AD}' | '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}'
-        )
+        || is_invisible(c)
         || (c.is_alphanumeric() && !('\u{0E00}'..='\u{0E7F}').contains(&c))
+}
+
+/// The invisible code points that can sit inside a word of raw block text and that
+/// `normalize_th` drops: a soft hyphen, zero-width spaces and joiners, the word joiner and the
+/// byte-order mark.
+pub(super) fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}' | '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}'
+    )
 }
 
 /// Which stretch of block text a reading compares with the claim.
