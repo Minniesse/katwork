@@ -219,7 +219,11 @@ impl Budget {
     }
 
     fn piece(&mut self) -> Result<(), ContentError> {
-        self.pieces += 1;
+        self.pieces_of(1)
+    }
+
+    fn pieces_of(&mut self, count: usize) -> Result<(), ContentError> {
+        self.pieces = self.pieces.saturating_add(count);
         if self.pieces > MAX_PIECES {
             return Err(ContentError("content_too_many_pieces"));
         }
@@ -294,8 +298,17 @@ pub fn check_doc(content: &mut DocContent) -> Result<(), ContentError> {
                 {
                     return Err(ContentError("table_too_wide"));
                 }
+                // The renderer pads every row to the widest one, so the grid it draws, not the
+                // cells given, is what costs.
+                let width = rows
+                    .iter()
+                    .map(Vec::len)
+                    .chain([header.len()])
+                    .max()
+                    .unwrap_or(0);
+                let drawn_rows = rows.len() + usize::from(!header.is_empty());
+                budget.pieces_of(width.saturating_mul(drawn_rows))?;
                 for cell in header.iter_mut().chain(rows.iter_mut().flatten()) {
-                    budget.piece()?;
                     check_inlines(cell, &mut budget)?;
                 }
             }

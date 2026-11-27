@@ -320,6 +320,18 @@ fn content_caps() {
         check_doc(&mut cells),
         Err(ContentError("content_too_many_pieces"))
     );
+    // One wide header row and many empty rows: the renderer pads each row to 63 cells.
+    let mut padded = DocContent {
+        title: None,
+        blocks: vec![ContentBlock::Table {
+            header: vec![vec![]; MAX_TABLE_COLUMNS],
+            rows: vec![vec![]; 20_000],
+        }],
+    };
+    assert_eq!(
+        check_doc(&mut padded),
+        Err(ContentError("content_too_many_pieces"))
+    );
     let mut items = DocContent {
         title: None,
         blocks: vec![ContentBlock::List {

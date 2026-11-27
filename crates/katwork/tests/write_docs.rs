@@ -1060,7 +1060,7 @@ async fn dense_identical_content_passes_the_zip_ratio(pool: PgPool) {
     let rows: Vec<Value> = (0..250)
         .map(|_| json!(vec![json!({"number": "0"}); 200]))
         .collect();
-    let receipt = call(
+    call(
         &env.xlsx(),
         &env.ctx(),
         json!({"name": "zeros", "sheets": [{"name": "S", "rows": rows}]}),
