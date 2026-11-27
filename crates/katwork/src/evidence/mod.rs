@@ -5,9 +5,11 @@
 pub mod citation;
 pub mod cite;
 pub mod claim;
+pub mod codes;
 pub mod instruction;
 pub mod source_ref;
 pub mod span;
+pub mod verify;
 
 /// The context every evidence scan of figures and dates uses: two-digit years are read around a
 /// fixed day, so where `cite` widens a quote, and what the verifier finds in it later, never
