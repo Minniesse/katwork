@@ -1,7 +1,7 @@
 //! A quote never cuts a figure or a date: `cite` widens new quotes to whole tokens (Task 7), and
 //! this catches refs made any other way (an older citation, a relocated quote, a ref built by
 //! hand).
-use katwork_thai::{Ctx, find_dates, find_numbers};
+use katwork_thai::{Ctx, MAX_SCAN_CODE_POINTS, find_dates, find_numbers};
 
 use super::ResolvedRef;
 
@@ -20,6 +20,11 @@ pub fn cuts(r: &ResolvedRef, ctx: &Ctx) -> bool {
         return false;
     };
     let (start, end) = (*quote_start, *quote_end);
+    // A quote of the whole block cuts nothing, so its block is not scanned again.
+    let len = block_text.chars().take(MAX_SCAN_CODE_POINTS + 1).count();
+    if start == 0 && end as usize == len && len <= MAX_SCAN_CODE_POINTS {
+        return false;
+    }
     let cut = |s: u32, e: u32| s < end && e > start && !(s >= start && e <= end);
     let Ok(numbers) = find_numbers(block_text, ctx) else {
         return true;

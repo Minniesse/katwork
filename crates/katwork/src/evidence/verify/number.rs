@@ -66,13 +66,21 @@ impl Qty {
 /// Whether `points`, `point`, `pp`, `ppt`, `percentage point(s)` or `จุด` follows the figure
 /// ending at `end`.
 fn points_after(text: &str, end: usize) -> bool {
-    let rest: String = text
+    let mut rest: String = text
         .chars()
         .skip(end)
         .skip_while(|c| c.is_whitespace())
-        .take(24)
+        .take(40)
         .collect::<String>()
         .to_lowercase();
+    // `2.5 percent points`: a percent word between the figure and `points`.
+    for unit in ["percent", "per cent", "เปอร์เซ็นต์", "เปอร์เซนต์"]
+    {
+        if let Some(after) = rest.strip_prefix(unit) {
+            rest = after.trim_start().to_owned();
+            break;
+        }
+    }
     let word = |w: &str| {
         rest.strip_prefix(w)
             .is_some_and(|after| after.chars().next().is_none_or(|c| !c.is_alphanumeric()))
@@ -246,7 +254,7 @@ pub(super) fn round_to(value: Decimal, exp: Option<i64>) -> Option<Decimal> {
 }
 
 /// The significant digits of a value, trailing zeros dropped: 1,250 and 1.25 share them.
-fn digits(value: Decimal) -> u128 {
+pub(super) fn digits(value: Decimal) -> u128 {
     let mut m = value.normalize().mantissa().unsigned_abs();
     while m != 0 && m.is_multiple_of(10) {
         m /= 10;
@@ -345,15 +353,15 @@ pub(super) fn has_word(text: &str, list: &[&str]) -> bool {
 }
 
 /// The comparison's result before the subject rule.
-enum Decision<'a> {
-    Equal(&'a Qty),
+enum Decision {
+    Equal,
     /// A contradiction, if the subject agrees and no comparator qualifies the figures.
     Contradicts(&'static str),
     Open(&'static str),
     Absent,
 }
 
-fn decide<'a>(c: &Qty, sources: &'a [Qty], sign_words: bool) -> Decision<'a> {
+fn decide(c: &Qty, sources: &[Qty], sign_words: bool) -> Decision {
     if c.ambiguous {
         return Decision::Open("number_ambiguous");
     }
@@ -361,7 +369,7 @@ fn decide<'a>(c: &Qty, sources: &'a [Qty], sign_words: bool) -> Decision<'a> {
         return if s.ambiguous {
             Decision::Open("number_ambiguous")
         } else {
-            Decision::Equal(s)
+            Decision::Equal
         };
     }
     let [s] = sources else {
@@ -371,7 +379,7 @@ fn decide<'a>(c: &Qty, sources: &'a [Qty], sign_words: bool) -> Decision<'a> {
         return Decision::Open("number_ambiguous");
     }
     match relate(c, s) {
-        Rel::Equal => Decision::Equal(s),
+        Rel::Equal => Decision::Equal,
         Rel::ScaleUnstated => Decision::Open("scale_unstated"),
         Rel::PrecisionDiffers => Decision::Open("precision_differs"),
         Rel::UnitMismatch => Decision::Contradicts("unit_mismatch"),
@@ -586,7 +594,16 @@ pub(super) fn check(claim: &ClaimSide, scan: &Scan, ctx: &Ctx) -> Vec<CheckOutco
         Err(stop) => return vec![stopped(stop, at)],
     };
     // On a profit-or-loss line a loss is the negative figure.
-    let profit_or_loss = has_word(&scan.text, GAIN_WORDS) && has_word(&scan.text, LOSS_WORDS);
+    // The quote and the row and column headers name the line; a sheet name ("งบกำไรขาดทุน") does
+    // not.
+    let line: String = scan
+        .fields
+        .iter()
+        .filter(|(_, strong)| *strong)
+        .map(|(text, _)| *text)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let profit_or_loss = has_word(&line, GAIN_WORDS) && has_word(&line, LOSS_WORDS);
     let mut value = mine.clone();
     if profit_or_loss && claim.loss && value.effective.is_sign_positive() {
         value.raw = -value.raw;
@@ -600,21 +617,48 @@ pub(super) fn check(claim: &ClaimSide, scan: &Scan, ctx: &Ctx) -> Vec<CheckOutco
     let qualified = !claim.counts.is_empty() || !scan.counts.is_empty();
     let mut out = Vec::new();
     match decide(&value, &sources, sign_words) {
-        Decision::Equal(s) => {
-            let segment = s.index.and_then(|i| scan.segment(i));
-            let own = match &segment {
-                Some((text, _)) => {
-                    let mut fields = scan.fields.clone();
-                    fields[0] = (text.as_str(), true);
-                    match Source::read(&fields, ctx) {
-                        Ok(own) => Some(own),
-                        Err(e) => return vec![stopped(too_long(CheckMethod::Number)(e), at)],
+        Decision::Equal => {
+            // A value the quote holds more than once: the first equal figure whose own part
+            // meets the subject is the match.
+            let mut tried = Vec::new();
+            for s in sources
+                .iter()
+                .filter(|s| !s.ambiguous && relate(&value, s) == Rel::Equal)
+            {
+                let segment = s.index.and_then(|i| scan.segment(i));
+                let own = match &segment {
+                    Some((text, _)) => {
+                        let mut fields = scan.fields.clone();
+                        fields[0] = (text.as_str(), true);
+                        match Source::read(&fields, ctx) {
+                            Ok(own) => Some(own),
+                            Err(e) => {
+                                return vec![stopped(too_long(CheckMethod::Number)(e), at)];
+                            }
+                        }
                     }
+                    None => None,
+                };
+                let source = own.as_ref().unwrap_or(&scan.source);
+                let met =
+                    subject::check(&claim.subject.words, &claim.subject.periods, source, true);
+                let ok = met.is_ok();
+                tried.push((s, segment, met));
+                if ok {
+                    break;
                 }
-                None => None,
+            }
+            let pick = tried
+                .iter()
+                .position(|(_, _, met)| met.is_ok())
+                .unwrap_or(0);
+            let Some((s, segment, met)) = (!tried.is_empty()).then(|| tried.swap_remove(pick))
+            else {
+                return vec![stopped(
+                    (CheckMethod::Number, "number_ambiguous", json!({})),
+                    at,
+                )];
             };
-            let source = own.as_ref().unwrap_or(&scan.source);
-            let met = subject::check(&claim.subject.words, &claim.subject.periods, source, true);
             out.push(settle(
                 Compared::Equal(Basis::Exact),
                 met,

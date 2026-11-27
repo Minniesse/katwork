@@ -248,13 +248,13 @@ pub(super) fn runs(text: &str) -> Vec<Term> {
         let alone = gap(start.checked_sub(1).and_then(|p| chars.get(p))) && gap(chars.get(i));
         let mut text: String = chars[start..i].iter().collect();
         if text == "a" {
-            let range = normalized.original_range(start, i);
+            let range = normalized.source_range(start, i);
             let written: String = original
                 .get(range.start as usize..range.end as usize)
                 .unwrap_or_default()
                 .iter()
                 .collect();
-            if written.trim() == "A" {
+            if written == "A" {
                 text = "A".into();
             }
         }

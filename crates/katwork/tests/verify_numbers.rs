@@ -1602,6 +1602,83 @@ fn direction_and_ratio_words_are_the_operation() {
     );
 }
 
+#[test]
+fn ranges_with_unit_words_still_join() {
+    for (text, source) in [
+        ("revenue 1,250 baht", "revenue 1,250 baht to 1,300 baht"),
+        ("รายได้ 1,250 บาท", "รายได้ 1,250 บาท ถึง 1,300 บาท"),
+        ("อัตรา ร้อยละ 5", "อัตรา ร้อยละ 5 ถึงร้อยละ 7"),
+        (
+            "revenue 1,250 baht",
+            "revenue between 1,250 baht and 1,300 baht",
+        ),
+    ] {
+        assert_eq!(
+            status(&number(text, q(source))),
+            (ClaimStatus::Unverified, "qualifier_mismatch"),
+            "{text} / {source}"
+        );
+    }
+    assert_figure(
+        &number("margin up 2.5%", q("margin up 2.5 percent points")),
+        (Inconclusive, "scale_unstated"),
+    );
+}
+
+#[test]
+fn each_clause_separator_bounds_a_figure() {
+    // Without a separator the word belongs to the figure after it.
+    assert_figure(&number("note 1,250", q("revenue 900 note cost 1,250")), OK);
+    for sep in [",", ";", ".", "\n", " และ", " แต่", " while", " whereas"] {
+        let source = format!("revenue 900 note{sep} cost 1,250");
+        assert_figure(
+            &number("note 1,250", q(&source)),
+            (Inconclusive, "subject_not_in_source"),
+        );
+    }
+    // The dots of a Thai date are not separators.
+    assert_figure(
+        &number("รายได้ 1,250", q("ค่าใช้จ่าย 900 รายได้ ต.ค. 2567 1,250")),
+        OK,
+    );
+    // A run the scan cannot read still bounds its neighbour's part.
+    assert_figure(
+        &number("revenue 1,250", q("revenue 1.2 M cost 1,250")),
+        (Inconclusive, "subject_not_in_source"),
+    );
+    // A value the quote holds twice matches the figure whose part holds the words.
+    assert_figure(&number("revenue 1,250", q("cost 1,250 revenue 1,250")), OK);
+}
+
+#[test]
+fn fix_round_edges() {
+    // One significant digit in a derived claim.
+    let c = derived(
+        "รวม 2 พันล้านบาท",
+        DeriveOp::Sum,
+        vec![q("ค่าเดินทาง 700 ล้านบาท"), q("ค่าอาหาร 800 ล้านบาท")],
+    );
+    assert_figure(&c, (Inconclusive, "precision_differs"));
+    // A capital A behind an invisible character is still the entity letter.
+    assert_figure(
+        &number(
+            "Entity \u{200B}A revenue 1,250 baht",
+            q("Entity B revenue 1,250 baht"),
+        ),
+        (Inconclusive, "subject_not_in_source"),
+    );
+    // A sheet name does not make a line a profit-or-loss line.
+    let r = with_sheet(q("ขาดทุน 1,250"), "งบกำไรขาดทุน");
+    assert_figure(&number("ขาดทุน 1,250", r), OK);
+    // In a change the operands' scales cancel: a wrong change is contradicted.
+    let c = derived(
+        "growth 50%",
+        DeriveOp::PercentChange,
+        vec![q("growth base 10 ล้าน"), q("growth now 20 ล้าน")],
+    );
+    assert_figure(&c, (Contradicted, "arithmetic_mismatch"));
+}
+
 // ---------------------------------------------------------------- lists
 
 #[test]

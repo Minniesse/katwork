@@ -177,7 +177,11 @@ pub(super) fn check(
     for scan in &scans {
         out.extend(number::field_qualifiers(&side.counts, scan));
     }
-    let first = if rounded == Some(claimed) {
+    // A claim of one significant digit against a result it does not equal exactly.
+    let coarse = number::digits(value.raw) < 10 && result != claimed;
+    let first = if rounded == Some(claimed) && coarse {
+        stopped((CheckMethod::Arithmetic, "precision_differs", detail), None)
+    } else if rounded == Some(claimed) {
         settle(
             Compared::Equal(Basis::Derived),
             met,
@@ -185,7 +189,7 @@ pub(super) fn check(
             None,
             detail,
         )
-    } else if mixed_scales(value, &operands) {
+    } else if mixed_scales(derive.op, value, &operands) {
         stopped((CheckMethod::Arithmetic, "scale_unstated", detail), None)
     } else if swapped(derive.op, &values).and_then(|r| round_to(r, value.exp)) == Some(claimed) {
         stopped((CheckMethod::Arithmetic, "operand_order", detail), None)
@@ -207,11 +211,13 @@ pub(super) fn check(
     out
 }
 
-/// Only one side states a scale: some operands do and others do not, or the claim does and no
-/// operand does, or the reverse.
-fn mixed_scales(claim: &Qty, operands: &[Qty]) -> bool {
+/// Only one side states a scale: some operands do and others do not, or (for a sum or a
+/// difference, whose result keeps the operands' scale) the claim does and no operand does, or
+/// the reverse. In a ratio, a share or a change the operands' scales cancel.
+fn mixed_scales(op: DeriveOp, claim: &Qty, operands: &[Qty]) -> bool {
     let stated: BTreeSet<bool> = operands.iter().map(|q| q.scale > 0).collect();
-    stated.len() > 1 || stated.first().is_some_and(|s| *s != (claim.scale > 0))
+    let keeps_scale = matches!(op, DeriveOp::Sum | DeriveOp::Difference);
+    stated.len() > 1 || (keeps_scale && stated.first().is_some_and(|s| *s != (claim.scale > 0)))
 }
 
 /// The result with the two operands swapped, for an operation whose order matters.

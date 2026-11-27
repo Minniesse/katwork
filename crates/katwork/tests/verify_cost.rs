@@ -3,7 +3,9 @@
 //! time taken and asserts only on what the checks return, never on time.
 use katwork::evidence::claim::{ClaimKind, Derive, DeriveOp};
 use katwork::evidence::scan_ctx;
-use katwork::evidence::verify::{ClaimInput, RefQuality, ResolvedRef, check_claim};
+use katwork::evidence::verify::{
+    ClaimInput, RefQuality, ResolvedRef, check_claim, check_qualifiers, check_quote, check_resolve,
+};
 
 const REFS: usize = 255;
 
@@ -21,6 +23,38 @@ fn long_ref() -> ResolvedRef {
         sheet: None,
         quality: RefQuality::Full,
     }
+}
+
+/// The same block quoted whole.
+fn whole_ref() -> ResolvedRef {
+    let ResolvedRef::Ok { block_text, .. } = long_ref() else {
+        unreachable!()
+    };
+    let len = block_text.chars().count() as u32;
+    ResolvedRef::Ok {
+        exact: block_text.clone(),
+        block_text,
+        quote_start: 0,
+        quote_end: len,
+        unit_context: None,
+        cell: None,
+        sheet: None,
+        quality: RefQuality::Full,
+    }
+}
+
+/// Task 10's checks alone, for the share of the time they take.
+fn task_10(label: &str, claim: &ClaimInput) {
+    let ctx = scan_ctx();
+    let start = std::time::Instant::now();
+    let mut checks = check_resolve(&claim.refs);
+    checks.extend(check_quote(claim, &ctx));
+    checks.extend(check_qualifiers(claim));
+    eprintln!(
+        "{label} (Task 10's checks only): {} checks, {:.1} s",
+        checks.len(),
+        start.elapsed().as_secs_f64()
+    );
 }
 
 fn timed(label: &str, claim: &ClaimInput) {
@@ -47,6 +81,7 @@ fn many_long_refs() {
         refs: refs.clone(),
     };
     timed("plain", &plain);
+    task_10("plain", &plain);
     let derived = ClaimInput {
         text: "รายได้รวม 318,750 ล้านบาท".into(),
         derive: Some(Derive {
@@ -56,4 +91,12 @@ fn many_long_refs() {
         ..plain
     };
     timed("derived", &derived);
+    let whole = ClaimInput {
+        text: "รายได้ 1,250 ล้านบาท".into(),
+        derive: None,
+        refs: (0..REFS).map(|_| whole_ref()).collect(),
+        ..derived
+    };
+    timed("whole-block quotes", &whole);
+    task_10("whole-block quotes", &whole);
 }

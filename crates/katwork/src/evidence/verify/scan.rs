@@ -2,12 +2,12 @@
 //! the figures, dates, words and qualifiers found are shared by every check of that ref.
 use std::collections::BTreeMap;
 
-use katwork_thai::{Ctx, Found, Number, find_dates, find_numbers};
+use katwork_thai::{Ctx, DateValue, Found, Number, NumberRole, find_dates, find_numbers};
 use serde_json::json;
 
 use super::number::{self, Context, Stop};
 use super::qualifier::{self, Meaning};
-use super::subject::{self, Source};
+use super::subject::{self, Source, UNIT_WORDS};
 use super::{CheckMethod, ResolvedRef, boundary, cell};
 use crate::docs::CellFacts;
 
@@ -18,6 +18,8 @@ pub(super) struct Scan<'a> {
     pub fields: Vec<(&'a str, bool)>,
     /// `find_numbers` of the quote, every role.
     pub numbers: Vec<Found<Number>>,
+    /// `find_dates` of the quote.
+    pub dates: Vec<Found<DateValue>>,
     pub source: Source,
     pub context: Context,
     /// How often each negation and comparator occurs over every field (quote and cell facts).
@@ -25,8 +27,6 @@ pub(super) struct Scan<'a> {
     /// The quote's qualifiers paired with its figures, as `qualifier::pair_with_numbers` pairs
     /// them.
     pub paired: Vec<(Meaning, Option<usize>)>,
-    /// The fields joined, for looking up sign and profit-or-loss words.
-    pub text: String,
 }
 
 /// A ref read for comparison, or why its figures cannot be compared, first match: a cell fact
@@ -62,11 +62,6 @@ pub(super) fn read<'a>(
             paired = number::pair(&spans, &numbers);
         }
     }
-    let text = fields
-        .iter()
-        .map(|(text, _)| *text)
-        .collect::<Vec<_>>()
-        .join(" | ");
     Ok(Scan {
         ordinal,
         exact,
@@ -74,10 +69,10 @@ pub(super) fn read<'a>(
         context: number::context(r, ctx),
         fields,
         numbers,
+        dates,
         source,
         counts,
         paired,
-        text,
     })
 }
 
@@ -97,9 +92,21 @@ impl Scan<'_> {
     /// with a figure, they are those after it up to the next figure or separator. `None` when
     /// the quote holds one quantity (the whole quote is its part).
     pub fn segment(&self, index: usize) -> Option<(String, bool)> {
-        let figures: Vec<(usize, usize, usize)> = number::counted(&self.numbers)
+        // The quantities, and the runs the scan could not read that start with a digit (`1.2 M`):
+        // each bounds its neighbours' parts.
+        let mut figures: Vec<(usize, usize, usize)> = number::counted(&self.numbers)
             .map(|(i, n)| (i, n.start as usize, n.end as usize))
             .collect();
+        figures.extend(
+            self.numbers
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| {
+                    n.value.role == NumberRole::Code && n.raw.starts_with(|c: char| c.is_numeric())
+                })
+                .map(|(i, n)| (i, n.start as usize, n.end as usize)),
+        );
+        figures.sort_by_key(|f| f.1);
         if figures.len() < 2 {
             return None;
         }
@@ -114,7 +121,7 @@ impl Scan<'_> {
         let joined = |k: usize| {
             let (_, _, end) = figures[k];
             let (_, next, _) = figures[k + 1];
-            let between = text(end, next);
+            let between = without_unit_words(&text(end, next));
             let opens_range = || {
                 let before = text(0, figures[k].1);
                 before.ends_with("between") || before.ends_with("ระหว่าง")
@@ -165,19 +172,29 @@ impl Scan<'_> {
 
     /// Where clause separators sit in the quote, outside every figure the scan read.
     fn separators(&self, chars: &[char]) -> Vec<(usize, usize)> {
+        // A sign inside a figure or a date (`1,250`, `ต.ค.`, `พ.ศ.`) separates nothing; a full stop
+        // ends a clause only before a space or the quote's end.
         let inside = |i: usize| {
             self.numbers
                 .iter()
-                .any(|n| (n.start as usize..n.end as usize).contains(&i))
+                .map(|n| (n.start, n.end))
+                .chain(self.dates.iter().map(|d| (d.start, d.end)))
+                .any(|(s, e)| (s as usize..e as usize).contains(&i))
         };
+        let stop = |i: usize| chars.get(i + 1).is_none_or(|c| c.is_whitespace());
         let mut out: Vec<(usize, usize)> = chars
             .iter()
             .enumerate()
-            .filter(|(i, c)| matches!(c, ',' | ';' | '.' | '\n') && !inside(*i))
+            .filter(|(i, c)| {
+                (matches!(c, ',' | ';' | '\n') || (**c == '.' && stop(*i))) && !inside(*i)
+            })
             .map(|(i, _)| (i, i + 1))
             .collect();
-        let lower: Vec<char> = chars.iter().flat_map(|c| c.to_lowercase()).collect();
-        if lower.len() == chars.len() {
+        let lower: Vec<char> = chars
+            .iter()
+            .map(|c| c.to_lowercase().next().unwrap_or(*c))
+            .collect();
+        {
             for word in SEPARATOR_WORDS {
                 let w: Vec<char> = word.chars().collect();
                 let latin = w[0].is_ascii_alphabetic();
@@ -195,4 +212,20 @@ impl Scan<'_> {
         }
         out
     }
+}
+
+/// `text` (trimmed and lowercased) without a unit word at either end: `baht to` and
+/// `ถึงร้อยละ` are `to` and `ถึง`.
+fn without_unit_words(text: &str) -> String {
+    let mut out = text.to_owned();
+    for (word, _, _) in UNIT_WORDS {
+        let word = word.to_lowercase();
+        if let Some(rest) = out.strip_prefix(&word) {
+            out = rest.trim().to_owned();
+        }
+        if let Some(rest) = out.strip_suffix(&word) {
+            out = rest.trim().to_owned();
+        }
+    }
+    out
 }
