@@ -1,5 +1,5 @@
 //! Quote containment for `quote` and `fact` claims that hold no figure.
-use katwork_thai::{Ctx, NumberRole, find_dates, find_numbers, normalize_th};
+use katwork_thai::{Ctx, MAX_SCAN_CODE_POINTS, NumberRole, find_dates, find_numbers, normalize_th};
 use serde_json::json;
 
 use super::{
@@ -111,13 +111,55 @@ fn joined(text: &[(char, bool)], i: usize, thai: bool) -> bool {
         || (i >= 2 && !a.1 && joins(text[i - 2].0, a.0, b.0))
 }
 
-/// Raw code points of block text read on each side of the quote for its edge test.
-/// shortcut: a run of more than 16 invisible code points at an edge hides it; upgrade if
-/// extraction ever emits such runs.
-const EDGE_RAW: usize = 16;
+/// Raw code points of block text first read on each side of the quote for its edge test; the
+/// read doubles until it yields [`EDGE_KEPT`] normalized code points or reaches the block's edge.
+const EDGE_READ: usize = 16;
 
 /// Normalized code points of block text kept on each side of the quote.
 const EDGE_KEPT: usize = 2;
+
+/// Up to [`EDGE_KEPT`] keyed code points of `chars[..start]`, nearest last, and whether a space
+/// came right before `start`. Reads back as far as it takes to collect them, so no run of code
+/// points that normalization drops hides a cut; bounded by `MAX_SCAN_CODE_POINTS`.
+fn context_before(chars: &[char], start: usize) -> (Vec<(char, bool)>, bool) {
+    let mut read = EDGE_READ;
+    loop {
+        let from = start.saturating_sub(read);
+        // A sentinel letter after the text records whether a space precedes it.
+        let text: String = chars[from..start].iter().chain(['x'].iter()).collect();
+        let mut ctx = keyed(&text);
+        let space = ctx.pop().is_some_and(|(_, space)| space);
+        if ctx.last().is_some_and(|(c, _)| *c == ' ') {
+            ctx.pop();
+        }
+        if ctx.len() >= EDGE_KEPT || from == 0 || read >= MAX_SCAN_CODE_POINTS {
+            let keep = ctx.len().saturating_sub(EDGE_KEPT);
+            return (ctx.split_off(keep), space);
+        }
+        read *= 2;
+    }
+}
+
+/// Up to [`EDGE_KEPT`] keyed code points of `chars[end..]`, nearest first; the first records
+/// whether a space came right after `end`. Reads forward as [`context_before`] reads back.
+fn context_after(chars: &[char], end: usize) -> Vec<(char, bool)> {
+    let mut read = EDGE_READ;
+    loop {
+        let to = end.saturating_add(read).min(chars.len());
+        // A sentinel letter before the text, so a space at its start is recorded.
+        let text: String = ['x'].iter().chain(&chars[end..to]).collect();
+        let mut ctx = keyed(&text);
+        ctx.remove(0);
+        if ctx.first().is_some_and(|(c, _)| *c == ' ') {
+            ctx.remove(0);
+        }
+        if ctx.len() >= EDGE_KEPT || to == chars.len() || read >= MAX_SCAN_CODE_POINTS {
+            ctx.truncate(EDGE_KEPT);
+            return ctx;
+        }
+        read *= 2;
+    }
+}
 
 /// The quote, keyed, with up to two normalized code points of block text on each side (so an
 /// invisible code point or a dash at the cut reads as the matcher reads it), and the range the
@@ -134,31 +176,20 @@ fn with_context(
     let end = (end as usize).min(len);
     let start = (start as usize).min(end);
     let visible = |c: &&char| !is_invisible(**c);
-    let before_raw = &chars[start.saturating_sub(EDGE_RAW)..start];
-    let after_raw = &chars[end..(end + EDGE_RAW).min(len)];
     let exact_chars: Vec<char> = exact.chars().collect();
-    let space_before = before_raw
+    let (mut hay, space_before) = context_before(&chars, start);
+    let space_before = space_before
+        || exact_chars
+            .iter()
+            .find(visible)
+            .is_some_and(|c| c.is_whitespace());
+    let mut after = context_after(&chars, end);
+    let space_after = exact_chars
         .iter()
         .rev()
         .find(visible)
-        .is_some_and(|c| c.is_whitespace())
-        || exact_chars
-            .iter()
-            .find(visible)
-            .is_some_and(|c| c.is_whitespace());
-    let space_after = after_raw
-        .iter()
-        .find(visible)
-        .is_some_and(|c| c.is_whitespace())
-        || exact_chars
-            .iter()
-            .rev()
-            .find(visible)
-            .is_some_and(|c| c.is_whitespace());
-    let before = keyed(&before_raw.iter().collect::<String>());
+        .is_some_and(|c| c.is_whitespace());
     let mut quote = keyed(exact);
-    let mut after = keyed(&after_raw.iter().collect::<String>());
-    let mut hay: Vec<(char, bool)> = before[before.len().saturating_sub(EDGE_KEPT)..].to_vec();
     if let Some(first) = quote.first_mut() {
         first.1 |= space_before;
     }
@@ -167,7 +198,7 @@ fn with_context(
     }
     let range = hay.len()..hay.len() + quote.len();
     hay.append(&mut quote);
-    hay.extend(after.into_iter().take(EDGE_KEPT));
+    hay.append(&mut after);
     (hay, range)
 }
 
@@ -196,9 +227,11 @@ fn keyed(text: &str) -> Vec<(char, bool)> {
 /// "1" in "1.5", "binding" in "non-binding") is not one, nor is a hit whose end falls inside a
 /// run of Thai text, which has no word boundaries to check (it is then a paraphrase). The
 /// block text around the quote counts too: a hit at an edge the quote itself cut from a word or
-/// a number is not whole, and neither is a hit at the quote's start right after a hyphen that
-/// follows a word ("dis- approved"). At the quote's own two edges Thai is left to the qualifier
-/// lexicon. An empty needle is never contained.
+/// a number is not whole, and neither is a hit anywhere in the quote right after a hyphen that
+/// follows a word, with a space or a line break between ("dis- approved", "non-\nbinding"; a
+/// suspended hyphen such as "pre- and post-war" becomes a paraphrase too, which only lowers). At
+/// the quote's own two edges Thai is left to the qualifier lexicon. An empty needle is never
+/// contained.
 fn contains_whole(
     hay: &[(char, bool)],
     quote: std::ops::Range<usize>,
@@ -211,11 +244,8 @@ fn contains_whole(
     let needle_chars: Vec<char> = needle.iter().map(|(c, _)| *c).collect();
     let cut = |i: usize| {
         let edge = i == quote.start || i == quote.end;
-        let hyphen_before = i == quote.start
-            && i >= 2
-            && is_hyphen(hay[i - 1].0)
-            && !hay[i - 1].1
-            && is_alnum(hay[i - 2].0);
+        let hyphen_before =
+            i >= 2 && is_hyphen(hay[i - 1].0) && !hay[i - 1].1 && is_alnum(hay[i - 2].0);
         i > 0 && i < hay.len() && (joined(hay, i, !edge) || hyphen_before)
     };
     let mut found = false;

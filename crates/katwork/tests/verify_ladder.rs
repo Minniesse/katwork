@@ -2587,6 +2587,43 @@ fn quote_cut_from_inside_a_word_is_a_paraphrase() {
             "The board dis- approved the budget",
         ),
         ("No. 1", "No. 1", "No. 1\u{2013}3 repealed"),
+        // Change 4 (founder decision of 2026-11-27): a word, a hyphen and a space or line break
+        // before the hit is a cut anywhere in the quote.
+        (
+            "approved the budget",
+            "- approved the budget",
+            "The board dis- approved the budget",
+        ),
+        (
+            "approved the budget",
+            "-\napproved the budget",
+            "The board dis-\napproved the budget",
+        ),
+        (
+            "binding agreement",
+            "-\nbinding agreement",
+            "a non-\nbinding agreement",
+        ),
+        (
+            "approved the budget",
+            "The board dis-\napproved the budget",
+            "The board dis-\napproved the budget",
+        ),
+        (
+            "approved the budget",
+            "The board dis- approved the budget",
+            "The board dis- approved the budget",
+        ),
+        (
+            "binding agreement",
+            "a non-\nbinding agreement",
+            "a non-\nbinding agreement",
+        ),
+        (
+            "binding agreement",
+            "a non- binding agreement",
+            "a non- binding agreement",
+        ),
     ] {
         let c = claim(ClaimKind::Quote, text, vec![full(quote, block)]);
         let out = check_quote(&c, &Ctx::default());
@@ -2650,6 +2687,36 @@ fn quote_cut_from_inside_a_word_is_a_paraphrase() {
         check_quote(&c, &Ctx::default())[0].verdict,
         CheckVerdict::Supported
     );
+}
+
+#[test]
+fn a_long_run_of_dropped_code_points_does_not_hide_a_cut() {
+    // The edge test reads back until it has two normalized code points, however many code points
+    // normalization drops on the way.
+    for pad in ["\u{200B}", "\u{200E}"] {
+        let block = format!("The board dis{}approved the budget", pad.repeat(17));
+        let c = claim(
+            ClaimKind::Quote,
+            "approved the budget",
+            vec![full("approved the budget", &block)],
+        );
+        let out = check_quote(&c, &Ctx::default());
+        assert!(
+            out.iter().all(|k| k.verdict != CheckVerdict::Supported),
+            "{pad:?}: {out:?}"
+        );
+        let block = format!("The board approved the budget{}d", pad.repeat(17));
+        let c = claim(
+            ClaimKind::Quote,
+            "the budget",
+            vec![full("approved the budget", &block)],
+        );
+        let out = check_quote(&c, &Ctx::default());
+        assert!(
+            out.iter().all(|k| k.verdict != CheckVerdict::Supported),
+            "{pad:?} after: {out:?}"
+        );
+    }
 }
 
 #[test]
