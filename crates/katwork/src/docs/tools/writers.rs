@@ -225,7 +225,7 @@ const CLAIM_HELP: &str = "A claim is {\"claim\": {\"text\", \"kind\": number|dat
     recorded as uncited and listed in the result, so cite it or leave it out. Put a figure's \
     sign, currency, %, ปี and scale words (ล้าน, million) inside the claim text: text next to a \
     claim that changes the figure a reader sees is recorded as uncited too. Bidi control \
-    characters are refused. Pass `file_id` (an output of this job) to write a new version of it.";
+    characters and right-to-left letters (Hebrew, Arabic) are refused. Pass `file_id` (an output of this job) to write a new version of it.";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -197,20 +197,31 @@ pub struct ContentError(pub &'static str);
 /// since every inline is one run of one line. Zero-width characters stay: Thai text uses them.
 pub fn clean_text(text: &str) -> String {
     text.chars()
-        .filter(|&c| c != '\r')
+        .filter(|&c| c != '\r' && c != '\u{7F}')
         .map(|c| match c {
-            '\n' | '\t' => ' ',
+            // Gaps a reader sees inside a figure ("1 000") that the scanner would not read as
+            // one: figure, thin and narrow no-break spaces, the Hangul fillers, blank Braille.
+            '\n' | '\t' | '\u{2007}' | '\u{2009}' | '\u{202F}' | '\u{3164}' | '\u{FFA0}'
+            | '\u{2800}' => ' ',
             '\u{0}'..='\u{1F}' | '\u{FFFE}' | '\u{FFFF}' => '\u{FFFD}',
             c => c,
         })
         .collect()
 }
 
-/// A character that reorders text without being drawn: the bidi embeddings, overrides and
-/// isolates, and the left-to-right, right-to-left and Arabic letter marks. `match_key` drops
-/// them, so a claim `\u{202E}12\u{202C}` would match "12" while a reader sees "21"; Thai
-/// text needs none of them, so writer content holding one is refused.
+/// A character that reorders the text around it, refused in a writer's content (code
+/// `bidi_control`): the bidi embeddings, overrides, isolates and marks, which `match_key`
+/// drops (a claim `\u{202E}12\u{202C}` would match "12" while a reader sees "21"), and every
+/// letter of bidi class R or AL (Hebrew, Arabic and the other right-to-left scripts), beside
+/// which a sign or digit moves onto a claim (a Hebrew maqaf `־` reads as a hyphen). Thai and
+/// English need none of them.
 pub fn is_bidi_control(c: char) -> bool {
+    use unicode_bidi::BidiClass;
+    is_control(c) || matches!(unicode_bidi::bidi_class(c), BidiClass::R | BidiClass::AL)
+}
+
+/// The bidi embeddings, overrides, isolates and marks.
+fn is_control(c: char) -> bool {
     matches!(
         c,
         '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' | '\u{061C}'
@@ -341,7 +352,6 @@ fn sheet_name_ok(name: &str) -> bool {
     let chars = name.chars().count();
     (1..=MAX_SHEET_NAME_CHARS).contains(&chars)
         && clean_text(name) == name
-        && !name.chars().any(is_bidi_control)
         && !name.contains(['[', ']', ':', '*', '?', '/', '\\'])
         && !name.starts_with('\'')
         && !name.ends_with('\'')
@@ -383,6 +393,9 @@ pub fn check_sheets(sheets: &mut [SheetSpec]) -> Result<(), ContentError> {
     let mut names = HashSet::with_capacity(sheets.len());
     let mut cells = 0usize;
     for sheet in sheets {
+        if sheet.name.chars().any(is_bidi_control) {
+            return Err(ContentError("bidi_control"));
+        }
         if !sheet_name_ok(&sheet.name) || !names.insert(sheet.name.to_lowercase()) {
             return Err(ContentError("sheet_name"));
         }
@@ -621,8 +634,48 @@ fn spans(
                 .map(|f| (f.start, f.end, ClaimKind::Date)),
         )
         .collect();
+    let numerals = unfolded_numerals(run, &found);
+    found.extend(
+        numerals
+            .into_iter()
+            .map(|(start, end)| (start, end, ClaimKind::Number)),
+    );
     found.sort_by_key(|&(start, end, _)| (start, end));
     Ok(found)
+}
+
+/// Runs of numerals the scanners do not read, outside every figure they found: digits that
+/// `fold_digit` does not map (math, superscript and other scripts' digits), fractions such as
+/// `½`, circled and Roman numerals, and digits carrying a combining mark (`5\u{301}000`). A
+/// reader sees a figure in each, so each is recorded whole.
+fn unfolded_numerals(run: &str, found: &[(u32, u32, ClaimKind)]) -> Vec<(u32, u32)> {
+    use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
+    let mut out = Vec::new();
+    let mut start: Option<(u32, bool)> = None;
+    let mut at = 0u32;
+    for c in run.chars() {
+        let mark = matches!(
+            c.general_category(),
+            GeneralCategory::NonspacingMark | GeneralCategory::EnclosingMark
+        );
+        if c.is_numeric() || (mark && start.is_some()) {
+            let odd = mark || katwork_thai::fold_digit(c).is_none();
+            start = Some(match start {
+                Some((s, seen)) => (s, seen || odd),
+                None => (at, odd),
+            });
+        } else if let Some((s, odd)) = start.take()
+            && odd
+        {
+            out.push((s, at));
+        }
+        at += 1;
+    }
+    if let Some((s, true)) = start {
+        out.push((s, at));
+    }
+    out.retain(|&(s, e)| !found.iter().any(|&(fs, fe, _)| fs <= s && e <= fe));
+    out
 }
 
 /// `spans`, each with its text: up to `UNCITED_CONTEXT` code points of the run on each side.

@@ -61,6 +61,8 @@ rust_decimal.workspace = true
 # support: a Kat's document holds no pictures.
 docx-rs = { version = "=0.4.22", default-features = false }
 rust_xlsxwriter = { version = "=0.101.0", default-features = false }
+# Bidi classes, to refuse right-to-left letters in a writer's content (they reorder figures).
+unicode-bidi = { version = "0.3.18", default-features = false, features = ["hardcoded-data"] }
 
 # statvfs for the artifact store's free space (f_bavail x f_frsize); std has no call for it.
 [target.'cfg(unix)'.dependencies]

@@ -2204,7 +2204,11 @@ fn skipped(relative: &std::path::Path) -> bool {
     ["target", "fuzz/target", "fuzz/artifacts", "fuzz/corpus"]
         .iter()
         .any(|skip| relative == std::path::Path::new(skip))
-        || relative.file_name().is_some_and(|n| n == "node_modules")
+}
+
+/// Whether `relative` is this file, which names docx-rs's readers in its checks.
+fn is_self(relative: &std::path::Path) -> bool {
+    relative == std::path::Path::new("crates/katwork/tests/write_docs.rs")
 }
 
 /// Every Rust file under `dir` (inside the repository `root`), but this one.
@@ -2220,9 +2224,7 @@ fn rust_files(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<std::
             if !skipped(relative) {
                 rust_files(root, &path, out);
             }
-        } else if path.extension().is_some_and(|e| e == "rs")
-            && !path.ends_with("tests/write_docs.rs")
-        {
+        } else if path.extension().is_some_and(|e| e == "rs") && !is_self(relative) {
             out.push(path);
         }
     }
@@ -2237,6 +2239,12 @@ fn the_docx_rs_guard_scans_source_folders_named_like_output() {
     assert!(skipped(Path::new("fuzz/artifacts")));
     assert!(skipped(Path::new("fuzz/corpus")));
     assert!(skipped(Path::new("target")));
+    assert!(!skipped(Path::new("crates/katwork/src/docs/node_modules")));
+    assert!(!skipped(Path::new("node_modules")));
+    assert!(is_self(Path::new("crates/katwork/tests/write_docs.rs")));
+    assert!(!is_self(Path::new(
+        "crates/katwork/src/zz/tests/write_docs.rs"
+    )));
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut files = Vec::new();
     rust_files(&root, &root.join("crates"), &mut files);
@@ -2563,4 +2571,50 @@ async fn bidi_controls_are_refused_in_writer_content(pool: PgPool) {
     )
     .await
     .unwrap();
+}
+
+#[sqlx::test]
+async fn unfolded_numerals_and_rtl_letters_through_the_tools(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let (_, a) = env.cited("แหล่ง").await;
+    let receipt = call(
+        &env.docx(),
+        &env.ctx(),
+        doc_args(
+            "n",
+            vec![para(vec![
+                json!("รายได้ 𝟧𝟢𝟢 ล้านบาท กำไร ⁵⁰ ล้าน ส่วนแบ่ง ½ "),
+                claim("ข้อ", "fact", &[a]),
+            ])],
+        ),
+    )
+    .await
+    .unwrap();
+    let uncited = receipt["uncited"].to_string();
+    for shown in ["𝟧𝟢𝟢", "⁵⁰", "½"] {
+        assert!(uncited.contains(shown), "{shown}: {receipt}");
+    }
+    let receipt = call(
+        &env.xlsx(),
+        &env.ctx(),
+        json!({"name": "n", "sheets": [{"name": "S", "rows": [["𝟧𝟢𝟢", "५००"]]}]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipt["uncited"].as_array().unwrap().len(), 2, "{receipt}");
+    // A Hebrew maqaf beside a claim would move the sign onto it.
+    let maqaf = doc_args(
+        "m",
+        vec![para(vec![
+            json!("ยอด ־ "),
+            claim("450", "number", &[a]),
+            json!("- ־ บาท"),
+        ])],
+    );
+    assert_eq!(
+        code(call(&env.docx(), &env.ctx(), maqaf).await),
+        "invalid_args"
+    );
+    env.keep_outputs("unfolded_numerals_and_rtl_letters_through_the_tools")
+        .await;
 }

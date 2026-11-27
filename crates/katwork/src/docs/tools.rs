@@ -527,10 +527,10 @@ mod tests {
             cell_location("S", 1, 1),
             "cell:T!B1".into(),
         ] {
-            assert_eq!(
-                check(wrong.clone()).unwrap_err().code(),
-                "tool_failed",
-                "{wrong}"
+            let error = check(wrong.clone()).unwrap_err();
+            assert!(
+                matches!(&error, ToolError::Failed(detail) if detail == "internal_error"),
+                "{wrong}: {error:?}"
             );
         }
     }

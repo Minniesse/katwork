@@ -577,3 +577,129 @@ fn many_claims_in_one_paragraph_cross_check_by_search() {
     let after: Vec<u32> = uncited.iter().map(|f| f.after_claims).collect();
     assert_eq!(after, (0..2_000).collect::<Vec<u32>>());
 }
+
+/// Digits the figure scanner does not fold (math, superscript, fractions, other scripts)
+/// still show a reader a figure, so each run of them is recorded as uncited.
+#[test]
+fn unfolded_numerals_are_uncited() {
+    let content = doc(vec![ContentBlock::Paragraph {
+        text: vec![
+            Inline::Text("รายได้ 𝟧𝟢𝟢 ล้านบาท กำไร ⁵⁰ ล้าน ส่วนแบ่ง ½ ".into()),
+            claim("ข้อ"),
+        ],
+    }]);
+    let found: Vec<String> = texts(&content).into_iter().map(|f| f.0).collect();
+    for shown in ["𝟧𝟢𝟢", "⁵⁰", "½"] {
+        assert!(
+            found.iter().any(|t| t.contains(shown)),
+            "{shown}: {found:?}"
+        );
+    }
+    for cell in ["𝟧𝟢𝟢", "५००", "໕໐", "៥០", "၅၀", "①②", "Ⅻ"] {
+        let sheets = WrittenContent::Sheets(vec![SheetSpec {
+            name: "S".into(),
+            rows: vec![vec![CellSpec::Text(cell.into())]],
+        }]);
+        assert_eq!(texts(&sheets).len(), 1, "{cell}");
+    }
+    // A combining mark on a digit does not hide the figure.
+    let marked = doc(vec![ContentBlock::Paragraph {
+        text: vec![Inline::Text("ยอด 5\u{0301}000 บาท".into())],
+    }]);
+    assert!(!texts(&marked).is_empty());
+}
+
+/// Spaces and fillers a reader sees as a gap inside a figure: each folds to a space (DEL is
+/// dropped), so the figure is scanned as an ASCII-spaced one is, and recorded.
+#[test]
+fn invisible_separators_inside_a_figure_are_folded() {
+    for c in [
+        '\u{2007}', '\u{2009}', '\u{202F}', '\u{3164}', '\u{FFA0}', '\u{2800}', '\u{7F}',
+    ] {
+        let mut content = DocContent {
+            title: None,
+            blocks: vec![ContentBlock::Paragraph {
+                text: vec![Inline::Text(format!("ยอด 1{c}000 บาท"))],
+            }],
+        };
+        check_doc(&mut content).unwrap();
+        let found = texts(&WrittenContent::Doc(content));
+        assert!(
+            !found.is_empty() && found.iter().all(|f| f.0.contains("000")),
+            "{c:?}: {found:?}"
+        );
+    }
+    assert_eq!(clean_text("1\u{7F}000"), "1000");
+}
+
+/// Right-to-left letters reorder the text around them as the controls do: a Hebrew maqaf
+/// beside a claim moves a sign onto it.
+#[test]
+fn right_to_left_letters_are_refused() {
+    let mut maqaf = DocContent {
+        title: None,
+        blocks: vec![ContentBlock::Paragraph {
+            text: vec![
+                Inline::Text("ยอด ־ ".into()),
+                claim("450"),
+                Inline::Text("- ־ บาท".into()),
+            ],
+        }],
+    };
+    assert_eq!(check_doc(&mut maqaf), Err(ContentError("bidi_control")));
+    for c in ['א', 'ع', 'ܐ', 'ހ'] {
+        let mut text = DocContent {
+            title: None,
+            blocks: vec![ContentBlock::Paragraph {
+                text: vec![claim(&format!("12{c}"))],
+            }],
+        };
+        assert_eq!(
+            check_doc(&mut text),
+            Err(ContentError("bidi_control")),
+            "{c}"
+        );
+        let mut sheets = vec![SheetSpec {
+            name: format!("S{c}"),
+            rows: vec![],
+        }];
+        assert_eq!(
+            check_sheets(&mut sheets),
+            Err(ContentError("bidi_control")),
+            "{c}"
+        );
+    }
+    let mut control = vec![SheetSpec {
+        name: "S\u{202E}".into(),
+        rows: vec![],
+    }];
+    assert_eq!(
+        check_sheets(&mut control),
+        Err(ContentError("bidi_control"))
+    );
+    // Arabic-Indic digits are numbers, not letters: they stay.
+    let mut digits = DocContent {
+        title: None,
+        blocks: vec![ContentBlock::Paragraph {
+            text: vec![Inline::Text("ยอด ١٢".into())],
+        }],
+    };
+    assert!(check_doc(&mut digits).is_ok());
+}
+
+/// Figures that touch a claim exactly: recorded once each, in order.
+#[test]
+fn figures_touching_a_claim_are_recorded_once_in_order() {
+    for (inlines, after) in [
+        (vec![claim("ข้อ"), Inline::Text("450 บาท".into())], 1),
+        (vec![claim("ราคา"), Inline::Text("500".into())], 1),
+        (vec![Inline::Text("ยอด 500".into()), claim("บาท")], 0),
+    ] {
+        let content = doc(vec![ContentBlock::Paragraph {
+            text: inlines.clone(),
+        }]);
+        let uncited = uncited_claims(&content).unwrap();
+        let afters: Vec<u32> = uncited.iter().map(|f| f.after_claims).collect();
+        assert_eq!(afters, vec![after], "{inlines:?}: {uncited:?}");
+    }
+}

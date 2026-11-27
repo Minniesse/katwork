@@ -1554,6 +1554,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "unicode-bidi",
  "unicode-normalization",
  "unicode-properties",
  "unicode-segmentation",
