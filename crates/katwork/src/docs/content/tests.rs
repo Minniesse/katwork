@@ -573,9 +573,18 @@ fn many_claims_in_one_paragraph_cross_check_by_search() {
     }
     let content = doc(vec![ContentBlock::Paragraph { text: inlines }]);
     let uncited = uncited_claims(&content).unwrap();
-    assert_eq!(uncited.len(), 2_000);
+    // Each crossing figure is recorded right before its claim (and the scale word alone, a
+    // `Code` reading, after it).
+    let crossing: Vec<u32> = uncited
+        .iter()
+        .filter(|f| f.claim.text.contains("5 ล้าน"))
+        .map(|f| f.after_claims)
+        .collect();
+    assert!(crossing.len() >= 2_000, "{}", crossing.len());
     let after: Vec<u32> = uncited.iter().map(|f| f.after_claims).collect();
-    assert_eq!(after, (0..2_000).collect::<Vec<u32>>());
+    assert!(after.windows(2).all(|w| w[0] <= w[1]));
+    assert_eq!(after.first(), Some(&0));
+    assert!(after.last().is_some_and(|&last| last <= 2_000));
 }
 
 /// Digits the figure scanner does not fold (math, superscript, fractions, other scripts)
@@ -702,4 +711,49 @@ fn figures_touching_a_claim_are_recorded_once_in_order() {
         let afters: Vec<u32> = uncited.iter().map(|f| f.after_claims).collect();
         assert_eq!(afters, vec![after], "{inlines:?}: {uncited:?}");
     }
+}
+
+/// Readings the scanner tags `Code` or `Time` still show a reader a figure: each is recorded
+/// as uncited (founder decision, 2026-11-27), accepting noise such as `COVID-19` or a phone
+/// number.
+#[test]
+fn code_and_time_readings_are_uncited() {
+    for text in [
+        "รายได้ 1/2 ล้านบาท",
+        "1\u{200A}000 บาท",
+        "1٬000 บาท",
+        "5OO บาท",
+        "1'000",
+        "1·000",
+        "1٫5 ล้าน",
+        "3/4 ของรายได้",
+        "เวลา 12:30",
+    ] {
+        let content = doc(vec![ContentBlock::Paragraph {
+            text: vec![Inline::Text(text.into())],
+        }]);
+        assert!(!texts(&content).is_empty(), "{text}");
+    }
+    for cell in ["1/2 ล้าน", "1\u{2008}000", "3/4"] {
+        let sheets = WrittenContent::Sheets(vec![SheetSpec {
+            name: "S".into(),
+            rows: vec![vec![CellSpec::Text(cell.into())]],
+        }]);
+        assert!(!texts(&sheets).is_empty(), "{cell}");
+    }
+}
+
+#[test]
+fn numeral_runs_inside_a_found_figure_are_dropped() {
+    // "ยอด ½ และ ⅓": `½` at code point 4, `⅓` at 10. A figure the scanners found over 3..6
+    // already holds `½`; only `⅓` is left.
+    let text = "ยอด ½ และ ⅓";
+    assert_eq!(unfolded_numerals(text, &[]), vec![(4, 5), (10, 11)]);
+    assert_eq!(
+        unfolded_numerals(
+            text,
+            &[(0, 1, ClaimKind::Number), (3, 6, ClaimKind::Number)]
+        ),
+        vec![(10, 11)]
+    );
 }

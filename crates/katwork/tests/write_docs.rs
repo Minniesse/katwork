@@ -798,12 +798,16 @@ async fn xlsx_number_cells_outside_claims_are_uncited(pool: PgPool) {
         .iter()
         .map(|u| u["location"].as_str().unwrap())
         .collect();
-    assert_eq!(locations, vec!["cell:Sheet1!B2", "cell:Sheet1!B3"]);
+    // The `1` of the sheet's name reads as a code, recorded too (accepted noise).
+    assert_eq!(
+        locations,
+        vec!["sheet:Sheet1", "cell:Sheet1!B2", "cell:Sheet1!B3"]
+    );
     let stored = env.stored_claims(&file_id(&receipt)).await;
-    assert_eq!(stored.len(), 2);
+    assert_eq!(stored.len(), 3);
     assert!(stored.iter().all(|c| c.1 == "number" && !c.4));
-    assert_eq!(stored[0].2, "9999");
-    assert!(stored[1].2.contains("3,450"));
+    assert_eq!(stored[1].2, "9999");
+    assert!(stored[2].2.contains("3,450"));
     env.keep_outputs("xlsx_number_cells_outside_claims_are_uncited")
         .await;
 }
@@ -907,9 +911,17 @@ async fn write_xlsx_claim_cells_and_no_formulas(pool: PgPool) {
     assert_eq!(cell("ข้อมูล", 1, 1).text, "12345678901234567");
     assert_eq!(kind(cell("ข้อมูล", 1, 2)), CellKind::Number);
     let stored = env.stored_claims(&id).await;
-    // `+5` outside a claim is an uncited figure at B1, before the first claim.
-    assert_eq!((stored[0].3.as_str(), stored[0].4), ("cell:A!B!B1", false));
-    assert_eq!((stored[1].3.as_str(), stored[1].4), ("cell:A!B!B2", true));
+    // `+5` outside a claim is an uncited figure at B1, before the first claim (A1's
+    // `=SUM(A1:A2)` reads as codes, recorded too).
+    assert!(stored.iter().any(|c| c.3 == "cell:A!B!B1" && !c.4));
+    let first = stored.iter().find(|c| c.4).unwrap();
+    assert_eq!(first.3, "cell:A!B!B2");
+    assert!(
+        stored
+            .iter()
+            .take_while(|c| !c.4)
+            .all(|c| c.3.ends_with('1'))
+    );
     // No formula, external link, macro, hyperlink or drawing besides the notes' VML.
     let parts = parts(&bytes);
     for (name, text) in &parts {
@@ -930,7 +942,9 @@ async fn write_xlsx_claim_cells_and_no_formulas(pool: PgPool) {
         .collect();
     // The note's first line is the marker: no author prefix before it.
     assert!(!comments.contains("KatWork:"), "{comments}");
-    for n in 2..=7 {
+    let cited: Vec<i32> = stored.iter().filter(|c| c.4).map(|c| c.0).collect();
+    assert_eq!(cited.len(), 6);
+    for n in cited {
         assert!(
             comments.contains(&format!(">kw-claim-{n}\n")),
             "kw-claim-{n}: {comments}"
@@ -2268,6 +2282,15 @@ const DOCX_RS_READERS: &[&str] = &[
 /// `source` with every comment removed and every string and character literal emptied, so a
 /// name inside one is neither found nor hidden.
 fn code_only(source: &str) -> String {
+    lex(source, false)
+}
+
+/// `source` with every comment removed, its literals kept.
+fn without_comments(source: &str) -> String {
+    lex(source, true)
+}
+
+fn lex(source: &str, keep_strings: bool) -> String {
     let chars: Vec<char> = source.chars().collect();
     let ident = |c: char| c.is_alphanumeric() || c == '_';
     let mut out = String::with_capacity(source.len());
@@ -2327,15 +2350,24 @@ fn code_only(source: &str) -> String {
                 }
                 j += 1;
             }
-            out.push_str("\"\"");
+            if keep_strings {
+                out.extend(&chars[i..j.min(chars.len())]);
+            } else {
+                out.push_str("\"\"");
+            }
             i = j;
         } else if c == '"' {
+            let start = i;
             i += 1;
             while i < chars.len() && chars[i] != '"' {
                 i += if chars[i] == '\\' { 2 } else { 1 };
             }
             i += 1;
-            out.push_str("\"\"");
+            if keep_strings {
+                out.extend(&chars[start..i.min(chars.len())]);
+            } else {
+                out.push_str("\"\"");
+            }
         } else if c == '\'' && (next == Some('\\') || chars.get(i + 2) == Some(&'\'')) {
             // A character literal; `'a` alone is a lifetime.
             i += 1;
@@ -2413,7 +2445,23 @@ fn katwork_never_reads_with_docx_rs() {
     assert!(files.len() > 50, "the scan found the workspace's sources");
     let mut users = Vec::new();
     for path in files {
-        let code = code_only(&std::fs::read_to_string(&path).unwrap());
+        let source = std::fs::read_to_string(&path).unwrap();
+        let relative = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if let Some(why) = waiver_or_foreign_include(&without_comments(&source)) {
+            assert!(
+                why.starts_with("a `allow(") || why.starts_with("a `expect("),
+                "{relative}: {why}"
+            );
+            assert!(
+                DISALLOWED_METHODS_WAIVERS.contains(&relative.as_str()),
+                "{relative}: {why}, outside the reviewed exceptions"
+            );
+        }
+        let code = code_only(&source);
         for reader in DOCX_RS_READERS {
             assert!(
                 word_at(&code, reader).is_empty(),
@@ -2617,4 +2665,162 @@ async fn unfolded_numerals_and_rtl_letters_through_the_tools(pool: PgPool) {
     );
     env.keep_outputs("unfolded_numerals_and_rtl_letters_through_the_tools")
         .await;
+}
+
+#[sqlx::test]
+async fn code_and_time_readings_through_the_tools(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let (_, a) = env.cited("แหล่ง").await;
+    for text in [
+        "รายได้ 1/2 ล้านบาท",
+        "1\u{200A}000 บาท",
+        "1٬000 บาท",
+        "5OO บาท",
+    ] {
+        let receipt = call(
+            &env.docx(),
+            &env.ctx(),
+            doc_args(
+                "c",
+                vec![para(vec![json!(text), claim("ข้อ", "fact", &[a])])],
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !receipt["uncited"].as_array().unwrap().is_empty(),
+            "{text}: {receipt}"
+        );
+    }
+    let receipt = call(
+        &env.xlsx(),
+        &env.ctx(),
+        json!({"name": "c", "sheets": [{"name": "S", "rows": [["1/2 ล้าน", "1\u{2008}000", "3/4"]]}]}),
+    )
+    .await
+    .unwrap();
+    let uncited = receipt["uncited"].to_string();
+    for cell in ["cell:S!A1", "cell:S!B1", "cell:S!C1"] {
+        assert!(uncited.contains(cell), "{cell}: {receipt}");
+    }
+    env.keep_outputs("code_and_time_readings_through_the_tools")
+        .await;
+}
+
+#[test]
+fn the_docx_rs_guard_refuses_lint_waivers_and_non_rust_includes() {
+    for (code, caught) in [
+        ("#![allow(clippy::disallowed_methods)]", true),
+        ("#[allow(clippy::disallowed_methods, reason = \"x\")]", true),
+        ("#[expect(clippy::disallowed_methods)]", true),
+        ("#[allow(dead_code, clippy :: disallowed_methods)]", true),
+        ("#[path = \"zzg/x.txt\"] pub mod probe;", true),
+        ("include!(\"x.txt\");", true),
+        ("include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));", true),
+        (
+            "#[path = \"../tests/support/cancel.rs\"] mod cancel;",
+            false,
+        ),
+        ("include!(\"gen.rs\");", false),
+        ("#[allow(clippy::disallowed_types)]", false),
+    ] {
+        assert_eq!(
+            waiver_or_foreign_include(&without_comments(code)).is_some(),
+            caught,
+            "{code}"
+        );
+    }
+}
+
+/// The files that waive `clippy::disallowed_methods` today, each for a reviewed `sqlx` pool
+/// exception (`CODING_STANDARDS.md`). A waiver anywhere else fails the guard, since it would
+/// also switch off the ban on docx-rs's readers; a new reviewed exception is added here.
+const DISALLOWED_METHODS_WAIVERS: &[&str] = &[
+    "crates/katwork-server/src/routes/auth.rs",
+    "crates/katwork-server/tests/auth.rs",
+    "crates/katwork-server/tests/cancellation.rs",
+    "crates/katwork-server/tests/chat/persistence.rs",
+    "crates/katwork-server/tests/events.rs",
+    "crates/katwork-server/tests/files.rs",
+    "crates/katwork-server/tests/members_hash.rs",
+    "crates/katwork-server/tests/members.rs",
+    "crates/katwork-server/tests/operator_hash.rs",
+    "crates/katwork-server/tests/pipeline/cancel.rs",
+    "crates/katwork-server/tests/pipeline/history.rs",
+    "crates/katwork-server/tests/pipeline.rs",
+    "crates/katwork-server/tests/pipeline/safety.rs",
+    "crates/katwork-server/tests/pipeline/transactions.rs",
+    "crates/katwork-server/tests/security.rs",
+    "crates/katwork-server/tests/support/cancel_sql.rs",
+    "crates/katwork-server/tests/support/locks.rs",
+    "crates/katwork-server/tests/team/concurrency.rs",
+    "crates/katwork-server/tests/team/readers.rs",
+    "crates/katwork-server/tests/tenancy.rs",
+    "crates/katwork-server/tests/transport/events.rs",
+    "crates/katwork/src/agent/ledger.rs",
+    "crates/katwork/src/db.rs",
+    "crates/katwork/src/events/sink.rs",
+    "crates/katwork/src/jobs/job.rs",
+    "crates/katwork/src/jobs/lease.rs",
+    "crates/katwork/tests/agent/read_tools.rs",
+    "crates/katwork/tests/agent/rereview.rs",
+    "crates/katwork/tests/agent/review.rs",
+    "crates/katwork/tests/agent.rs",
+    "crates/katwork/tests/artifacts.rs",
+    "crates/katwork/tests/cite.rs",
+    "crates/katwork/tests/events.rs",
+    "crates/katwork/tests/evidence_spans.rs",
+    "crates/katwork/tests/jobs.rs",
+    "crates/katwork/tests/leases/races.rs",
+    "crates/katwork/tests/leases.rs",
+    "crates/katwork/tests/leases/worker.rs",
+    "crates/katwork/tests/schema/chat_indexes.rs",
+    "crates/katwork/tests/schema/legacy.rs",
+    "crates/katwork/tests/schema.rs",
+    "crates/katwork/tests/support/cancel.rs",
+    "crates/katwork/tests/support/cancel_sql.rs",
+    "crates/katwork/tests/support/legacy.rs",
+    "crates/katwork/tests/support/locks.rs",
+    "crates/katwork/tests/support/mod.rs",
+];
+
+/// Why `code` (comments removed, literals kept) switches off the clippy layer or pulls in a
+/// file the guard does not read, if it does: an `allow` or `expect` naming
+/// `clippy::disallowed_methods`, a `#[path]` naming a file that does not end in `.rs`, or an
+/// `include!` of anything but a literal `.rs` path.
+fn waiver_or_foreign_include(code: &str) -> Option<String> {
+    let compact: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    let literal = |rest: &str| -> Option<String> {
+        let rest = rest.strip_prefix('"')?;
+        Some(rest[..rest.find('"')?].to_owned())
+    };
+    for (at, _) in compact.match_indices("#[path=") {
+        match literal(&compact[at + "#[path=".len()..]) {
+            Some(file) if file.ends_with(".rs") => {}
+            _ => return Some("a `#[path]` to a file that is not `.rs`".into()),
+        }
+    }
+    for (at, _) in compact.match_indices("include!(") {
+        if compact[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        match literal(&compact[at + "include!(".len()..]) {
+            Some(file) if file.ends_with(".rs") => {}
+            _ => return Some("an `include!` of anything but a literal `.rs` file".into()),
+        }
+    }
+    for lint in ["allow(", "expect("] {
+        for (at, _) in compact.match_indices(lint) {
+            let args = &compact[at + lint.len()..];
+            let args = &args[..args.find(')').unwrap_or(args.len())];
+            if args.split(',').any(|a| a == "clippy::disallowed_methods") {
+                return Some(format!("a `{lint}..)` waiving clippy::disallowed_methods"));
+            }
+        }
+    }
+    None
 }

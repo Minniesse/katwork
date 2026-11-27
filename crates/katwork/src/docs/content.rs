@@ -520,7 +520,7 @@ impl Walk {
     /// Every `Quantity` number and every date in `run`, in order of their start, each with up
     /// to `UNCITED_CONTEXT` code points of the run on each side.
     fn scan(&mut self, run: &str, location: &str) -> Result<(), TooLong> {
-        for (_, _, kind, text) in figures(run, |role| role == NumberRole::Quantity)? {
+        for (_, _, kind, text) in figures(run, recorded_role)? {
             self.push(kind, text, location);
         }
         Ok(())
@@ -575,7 +575,7 @@ impl Walk {
         runs.push((run, run_start));
         let mut found: Vec<(u32, u32, ClaimKind, String)> = Vec::new();
         for (run, offset) in &runs {
-            for (start, end, kind, text) in figures(run, |role| role == NumberRole::Quantity)? {
+            for (start, end, kind, text) in figures(run, recorded_role)? {
                 found.push((start + offset, end + offset, kind, text));
             }
         }
@@ -614,6 +614,18 @@ impl Walk {
     }
 }
 
+/// Whether a number the scanner read in plain text is recorded as a figure: a quantity, and
+/// also a reading it tags `Code` or `Time` (`1/2 ล้าน`, `1٬000`, `5OO`, `12:30`), since a
+/// reader sees a figure in each (founder decision, 2026-11-27). Accepted noise: `COVID-19`, `5G`
+/// and phone numbers are recorded too. Ordinals and the parts of dates are not figures (a date
+/// is recorded whole).
+fn recorded_role(role: NumberRole) -> bool {
+    matches!(
+        role,
+        NumberRole::Quantity | NumberRole::Code | NumberRole::Time
+    )
+}
+
 /// The figures of `run`: every number whose role `keep` accepts and every date, in order of
 /// their start, each as its code-point range and kind.
 fn spans(
@@ -634,6 +646,7 @@ fn spans(
                 .map(|f| (f.start, f.end, ClaimKind::Date)),
         )
         .collect();
+    found.sort_by_key(|&(start, end, _)| (start, end));
     let numerals = unfolded_numerals(run, &found);
     found.extend(
         numerals
@@ -674,7 +687,17 @@ fn unfolded_numerals(run: &str, found: &[(u32, u32, ClaimKind)]) -> Vec<(u32, u3
     if let Some((s, true)) = start {
         out.push((s, at));
     }
-    out.retain(|&(s, e)| !found.iter().any(|&(fs, fe, _)| fs <= s && e <= fe));
+    // Drop a run inside a figure already found. Both lists ascend by start: walk them together,
+    // keeping the furthest end of the figures that start at or before the run.
+    let mut next = 0;
+    let mut furthest = 0u32;
+    out.retain(|&(s, e)| {
+        while next < found.len() && found[next].0 <= s {
+            furthest = furthest.max(found[next].1);
+            next += 1;
+        }
+        e > furthest
+    });
     out
 }
 
