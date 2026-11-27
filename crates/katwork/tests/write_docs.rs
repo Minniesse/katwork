@@ -2100,3 +2100,105 @@ async fn a_new_version_keeps_its_file_type(pool: PgPool) {
     );
     assert_eq!(env.output_versions().await, 2);
 }
+
+// ---- The docx-rs read guard ----
+
+/// The docx-rs items KatWork may use: the document builder only. docx-rs's reader
+/// (`read_docx`, `read_xml` and the rest, re-exported at its root) goes through zip 8.6's read
+/// code, whose advisories `deny.toml` ignores on the strength of this test.
+const DOCX_RS_BUILDER: &[&str] = &[
+    "AbstractNumbering",
+    "Docx",
+    "IndentLevel",
+    "Level",
+    "LevelJc",
+    "LevelOverride",
+    "LevelText",
+    "NumberFormat",
+    "Numbering",
+    "NumberingId",
+    "Paragraph",
+    "Run",
+    "RunFonts",
+    "SpecialIndentType",
+    "Start",
+    "Style",
+    "StyleType",
+    "Table",
+    "TableCell",
+    "TableRow",
+    "VertAlignType",
+];
+
+/// Every Rust file of the workspace's crates and of `fuzz/`, but this one.
+fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if !matches!(
+                path.file_name().and_then(|n| n.to_str()),
+                Some("target" | "corpus" | "artifacts" | "node_modules")
+            ) {
+                rust_files(&path, out);
+            }
+        } else if path.extension().is_some_and(|e| e == "rs")
+            && !path.ends_with("tests/write_docs.rs")
+        {
+            out.push(path);
+        }
+    }
+}
+
+/// The identifiers a file names through `docx_rs::`, in paths and in `use docx_rs::{..}` lists.
+fn docx_rs_names(source: &str) -> Vec<String> {
+    let ident = |s: &str| -> String {
+        s.chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '*')
+            .collect()
+    };
+    let mut names = Vec::new();
+    for (at, _) in source.match_indices("docx_rs::") {
+        let rest = &source[at + "docx_rs::".len()..];
+        if let Some(list) = rest.strip_prefix('{') {
+            let list = &list[..list.find('}').unwrap_or(list.len())];
+            names.extend(
+                list.split(',')
+                    .map(|item| ident(item.trim()))
+                    .filter(|n| !n.is_empty()),
+            );
+        } else {
+            names.push(ident(rest));
+        }
+    }
+    names
+}
+
+#[test]
+fn katwork_never_reads_with_docx_rs() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut files = Vec::new();
+    rust_files(&root.join("crates"), &mut files);
+    rust_files(&root.join("fuzz"), &mut files);
+    assert!(files.len() > 50, "the scan found the workspace's sources");
+    let mut users = Vec::new();
+    for path in files {
+        let source = std::fs::read_to_string(&path).unwrap();
+        if !source.contains("docx_rs") {
+            continue;
+        }
+        let names = docx_rs_names(&source);
+        for name in &names {
+            assert!(
+                DOCX_RS_BUILDER.contains(&name.as_str()),
+                "{} uses docx_rs::{name}: only the builder types are allowed",
+                path.display()
+            );
+        }
+        users.push(path);
+    }
+    assert!(
+        users.iter().all(|p| p.ends_with("src/docs/write_docx.rs")),
+        "only the DOCX writer may use docx-rs: {users:?}"
+    );
+    assert_eq!(users.len(), 1, "the DOCX writer uses docx-rs");
+}
