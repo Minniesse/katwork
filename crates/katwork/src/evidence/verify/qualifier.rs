@@ -14,6 +14,13 @@ use super::{
 /// Code points of block text read on each side of a quote.
 const WINDOW: usize = 10;
 
+/// Code points of block text the sentence reading always covers on each side of a quote in Thai
+/// text, where sentences have no reliable end mark.
+const THAI_MIN: usize = 30;
+
+/// A run of at least this many code points before a space makes that space a Thai sentence end.
+const THAI_SENTENCE_RUN: usize = 30;
+
 /// Code points read past each window edge, so a lexicon entry that straddles an edge is read
 /// whole: twice the longest entry, which leaves room for invisible characters inside it.
 const REACH: usize = 32;
@@ -44,83 +51,191 @@ impl Meaning {
     }
 }
 
-/// The Thai lexicon, exactly as the plan gives it.
-const THAI: &[(&str, Meaning)] = &[
-    ("ไม่", Meaning::Neg),
-    ("มิได้", Meaning::Neg),
-    ("มิใช่", Meaning::Neg),
-    ("ไม่เกิน", Meaning::Le),
-    ("ไม่มากกว่า", Meaning::Le),
-    ("อย่างมาก", Meaning::Le),
-    ("ไม่ต่ำกว่า", Meaning::Ge),
-    ("ไม่น้อยกว่า", Meaning::Ge),
-    ("อย่างน้อย", Meaning::Ge),
-    ("ต่ำกว่า", Meaning::Lt),
-    ("น้อยกว่า", Meaning::Lt),
-    ("ไม่ถึง", Meaning::Lt),
-    ("มากกว่า", Meaning::Gt),
-    ("สูงกว่า", Meaning::Gt),
-    ("กว่า", Meaning::Gt),
-    ("เกิน", Meaning::Gt),
-    ("ประมาณ", Meaning::Approx),
-    ("เกือบ", Meaning::Nearly),
+/// An entry matched as a substring of `match_key(text)`: Thai words and comparison symbols.
+struct Sub {
+    text: &'static str,
+    meaning: Meaning,
+    /// In the plan's original list; the rest came with the founder decision of 2026-11-27.
+    plan: bool,
+    /// Not a qualifier right after one of these (`งบประมาณ` is "budget").
+    not_after: &'static [&'static str],
+    /// Not a qualifier right before one of these (`อย่าง` is "kind of", `งดงาม` "beautiful").
+    not_before: &'static [&'static str],
+    /// Only right after a digit (`5+`).
+    after_digit: bool,
+}
+
+const fn sub(text: &'static str, meaning: Meaning, plan: bool) -> Sub {
+    Sub {
+        text,
+        meaning,
+        plan,
+        not_after: &[],
+        not_before: &[],
+        after_digit: false,
+    }
+}
+
+const SUBSTRINGS: &[Sub] = &[
+    sub("ไม่", Meaning::Neg, true),
+    sub("มิได้", Meaning::Neg, true),
+    sub("มิใช่", Meaning::Neg, true),
+    sub("ห้าม", Meaning::Neg, false),
+    sub("ปฏิเสธ", Meaning::Neg, false),
+    Sub {
+        not_before: &["งาม"],
+        ..sub("งด", Meaning::Neg, false)
+    },
+    sub("ยกเลิก", Meaning::Neg, false),
+    sub("ระงับ", Meaning::Neg, false),
+    sub("ไร้", Meaning::Neg, false),
+    sub("ปราศจาก", Meaning::Neg, false),
+    Sub {
+        not_before: &["ง"],
+        ..sub("อย่า", Meaning::Neg, false)
+    },
+    sub("ไม่เกิน", Meaning::Le, true),
+    sub("ไม่มากกว่า", Meaning::Le, true),
+    sub("อย่างมาก", Meaning::Le, true),
+    sub("ลงมา", Meaning::Le, false),
+    sub("สูงสุด", Meaning::Le, false),
+    sub("ไม่ต่ำกว่า", Meaning::Ge, true),
+    sub("ไม่น้อยกว่า", Meaning::Ge, true),
+    sub("อย่างน้อย", Meaning::Ge, true),
+    sub("ขึ้นไป", Meaning::Ge, false),
+    sub("ต่ำสุด", Meaning::Ge, false),
+    sub("ต่ำกว่า", Meaning::Lt, true),
+    sub("น้อยกว่า", Meaning::Lt, true),
+    sub("ไม่ถึง", Meaning::Lt, true),
+    sub("มากกว่า", Meaning::Gt, true),
+    sub("สูงกว่า", Meaning::Gt, true),
+    sub("กว่า", Meaning::Gt, true),
+    sub("เกิน", Meaning::Gt, true),
+    Sub {
+        not_after: &["งบ"],
+        ..sub("ประมาณ", Meaning::Approx, true)
+    },
+    sub("เกือบ", Meaning::Nearly, true),
+    Sub {
+        not_after: &["-", "="],
+        ..sub(">", Meaning::Gt, false)
+    },
+    Sub {
+        not_before: &["-"],
+        ..sub("<", Meaning::Lt, false)
+    },
+    sub(">=", Meaning::Ge, false),
+    sub("<=", Meaning::Le, false),
+    sub("≥", Meaning::Ge, false),
+    sub("≤", Meaning::Le, false),
+    Sub {
+        after_digit: true,
+        ..sub("+", Meaning::Ge, false)
+    },
 ];
 
-/// `ประมาณ` right after this is `งบประมาณ`, "budget", not a qualifier.
-const BUDGET: &str = "งบ";
-
-/// The English lexicon, exactly as the plan gives it; `no` before `.` and words ending in `n't`
-/// are handled in [`english_scan`].
-const ENGLISH: &[(&str, Meaning)] = &[
-    ("not", Meaning::Neg),
-    ("no", Meaning::Neg),
-    ("never", Meaning::Neg),
-    ("none", Meaning::Neg),
-    ("without", Meaning::Neg),
-    ("no more than", Meaning::Le),
-    ("not more than", Meaning::Le),
-    ("at most", Meaning::Le),
-    ("up to", Meaning::Le),
-    ("at least", Meaning::Ge),
-    ("no less than", Meaning::Ge),
-    ("not less than", Meaning::Ge),
-    ("less than", Meaning::Lt),
-    ("fewer than", Meaning::Lt),
-    ("under", Meaning::Lt),
-    ("below", Meaning::Lt),
-    ("more than", Meaning::Gt),
-    ("greater than", Meaning::Gt),
-    ("over", Meaning::Gt),
-    ("above", Meaning::Gt),
-    ("exceeding", Meaning::Gt),
-    ("upwards of", Meaning::Gt),
-    ("about", Meaning::Approx),
-    ("approximately", Meaning::Approx),
-    ("around", Meaning::Approx),
-    ("roughly", Meaning::Approx),
-    ("nearly", Meaning::Nearly),
-    ("almost", Meaning::Nearly),
+/// Entries matched as whole lowercased words or word sequences of `normalize_th(text)`, with
+/// whether the plan's original list held them. `no` before a numbered `.` and words ending in
+/// `n't` are handled in [`english_scan`].
+const ENGLISH: &[(&str, Meaning, bool)] = &[
+    ("not", Meaning::Neg, true),
+    ("no", Meaning::Neg, true),
+    ("never", Meaning::Neg, true),
+    ("none", Meaning::Neg, true),
+    ("without", Meaning::Neg, true),
+    ("cannot", Meaning::Neg, false),
+    ("nothing", Meaning::Neg, false),
+    ("nobody", Meaning::Neg, false),
+    ("neither", Meaning::Neg, false),
+    ("nor", Meaning::Neg, false),
+    ("hardly", Meaning::Neg, false),
+    ("unable to", Meaning::Neg, false),
+    ("failed to", Meaning::Neg, false),
+    ("reject", Meaning::Neg, false),
+    ("rejected", Meaning::Neg, false),
+    ("rejects", Meaning::Neg, false),
+    ("dont", Meaning::Neg, false),
+    ("doesnt", Meaning::Neg, false),
+    ("didnt", Meaning::Neg, false),
+    ("no more than", Meaning::Le, true),
+    ("not more than", Meaning::Le, true),
+    ("at most", Meaning::Le, true),
+    ("up to", Meaning::Le, true),
+    ("or less", Meaning::Le, false),
+    ("maximum", Meaning::Le, false),
+    ("at least", Meaning::Ge, true),
+    ("no less than", Meaning::Ge, true),
+    ("not less than", Meaning::Ge, true),
+    ("or more", Meaning::Ge, false),
+    ("minimum", Meaning::Ge, false),
+    ("less than", Meaning::Lt, true),
+    ("fewer than", Meaning::Lt, true),
+    ("under", Meaning::Lt, true),
+    ("below", Meaning::Lt, true),
+    ("more than", Meaning::Gt, true),
+    ("greater than", Meaning::Gt, true),
+    ("over", Meaning::Gt, true),
+    ("above", Meaning::Gt, true),
+    ("exceeding", Meaning::Gt, true),
+    ("upwards of", Meaning::Gt, true),
+    ("in excess of", Meaning::Gt, false),
+    ("about", Meaning::Approx, true),
+    ("approximately", Meaning::Approx, true),
+    ("around", Meaning::Approx, true),
+    ("roughly", Meaning::Approx, true),
+    ("nearly", Meaning::Nearly, true),
+    ("almost", Meaning::Nearly, true),
 ];
+
+/// Which word list a reading uses: the plan's original list, or the current, extended one.
+/// `check_qualifiers` reads with both, so adding a word can only lower a verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Words {
+    Plan,
+    Extended,
+}
+
+struct SubKey {
+    key: Vec<char>,
+    meaning: Meaning,
+    not_after: Vec<Vec<char>>,
+    not_before: Vec<Vec<char>>,
+    after_digit: bool,
+}
 
 struct Lexicon {
-    /// Thai entries as match keys, longest first.
-    thai: Vec<(Vec<char>, Meaning)>,
-    budget: Vec<char>,
+    /// Substring entries as match keys, longest first.
+    subs: Vec<SubKey>,
     /// English entries as word sequences, longest first.
     english: Vec<(Vec<String>, Meaning)>,
 }
 
+fn key(text: &str) -> Vec<char> {
+    match_key(text).text.chars().collect()
+}
+
 /// Built once, through the same normalizers as the text, so an entry typed in another mark order
 /// still matches.
-static LEXICON: LazyLock<Lexicon> = LazyLock::new(|| {
-    let key = |text: &str| -> Vec<char> { match_key(text).text.chars().collect() };
-    let mut thai: Vec<_> = THAI.iter().map(|(t, m)| (key(t), *m)).collect();
-    thai.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
-    let mut english: Vec<_> = ENGLISH
+fn build(words: Words) -> Lexicon {
+    let keep = |plan: bool| plan || words == Words::Extended;
+    let mut subs: Vec<SubKey> = SUBSTRINGS
         .iter()
-        .map(|(t, m)| {
+        .filter(|e| keep(e.plan))
+        .map(|e| SubKey {
+            key: key(e.text),
+            meaning: e.meaning,
+            not_after: e.not_after.iter().map(|t| key(t)).collect(),
+            not_before: e.not_before.iter().map(|t| key(t)).collect(),
+            after_digit: e.after_digit,
+        })
+        .collect();
+    subs.sort_by_key(|e| std::cmp::Reverse(e.key.len()));
+    let mut english: Vec<(Vec<String>, Meaning)> = ENGLISH
+        .iter()
+        .filter(|(_, _, plan)| keep(*plan))
+        .map(|(t, m, _)| {
             (
-                words(&normalize_th(t).text)
+                words_of(&normalize_th(t).text)
                     .into_iter()
                     .map(|w| w.text)
                     .collect(),
@@ -128,13 +243,19 @@ static LEXICON: LazyLock<Lexicon> = LazyLock::new(|| {
             )
         })
         .collect();
-    english.sort_by_key(|(w, _): &(Vec<String>, Meaning)| std::cmp::Reverse(w.len()));
-    Lexicon {
-        thai,
-        budget: key(BUDGET),
-        english,
+    english.sort_by_key(|(w, _)| std::cmp::Reverse(w.len()));
+    Lexicon { subs, english }
+}
+
+static PLAN: LazyLock<Lexicon> = LazyLock::new(|| build(Words::Plan));
+static EXTENDED: LazyLock<Lexicon> = LazyLock::new(|| build(Words::Extended));
+
+fn lexicon(words: Words) -> &'static Lexicon {
+    match words {
+        Words::Plan => &PLAN,
+        Words::Extended => &EXTENDED,
     }
-});
+}
 
 /// One qualifier found in a text, at code points `start..end` of that text (widened to whole
 /// grapheme clusters).
@@ -154,8 +275,14 @@ pub fn find(text: &str) -> BTreeSet<Meaning> {
 
 /// Every qualifier of [`find`] with its place in `text`, in text order.
 pub fn spans(text: &str) -> Vec<Qualifier> {
-    let mut found = thai_scan(text);
-    found.extend(english_scan(text));
+    spans_with(text, Words::Extended)
+}
+
+/// [`spans`] with the given word list.
+pub fn spans_with(text: &str, words: Words) -> Vec<Qualifier> {
+    let lexicon = lexicon(words);
+    let mut found = substring_scan(text, lexicon);
+    found.extend(english_scan(text, lexicon));
     found.sort_by_key(|q| (q.start, q.end));
     found
 }
@@ -169,29 +296,31 @@ fn counts(found: &[Qualifier]) -> BTreeMap<Meaning, usize> {
     counts
 }
 
-fn thai_scan(text: &str) -> Vec<Qualifier> {
-    let lexicon = &*LEXICON;
+fn substring_scan(text: &str, lexicon: &Lexicon) -> Vec<Qualifier> {
     let key = match_key(text);
     let chars: Vec<char> = key.text.chars().collect();
     let mut found = Vec::new();
     let mut i = 0;
     while i < chars.len() {
-        let hit = lexicon
-            .thai
-            .iter()
-            .find(|(entry, _)| chars[i..].starts_with(entry));
+        let hit = lexicon.subs.iter().find(|e| {
+            chars[i..].starts_with(&e.key)
+                && !(e.after_digit && !(i > 0 && chars[i - 1].is_ascii_digit()))
+                && !e
+                    .not_before
+                    .iter()
+                    .any(|b| chars[i + e.key.len()..].starts_with(b))
+        });
         match hit {
-            Some((entry, meaning)) => {
-                let budget = *meaning == Meaning::Approx && chars[..i].ends_with(&lexicon.budget);
-                if !budget {
-                    let range = key.original_range(i, i + entry.len());
+            Some(e) => {
+                if !e.not_after.iter().any(|a| chars[..i].ends_with(a)) {
+                    let range = key.original_range(i, i + e.key.len());
                     found.push(Qualifier {
-                        meaning: *meaning,
+                        meaning: e.meaning,
                         start: range.start,
                         end: range.end,
                     });
                 }
-                i += entry.len();
+                i += e.key.len();
             }
             None => i += 1,
         }
@@ -217,7 +346,7 @@ fn is_word_char(c: char) -> bool {
 }
 
 /// The words of a normalized text, with apostrophes trimmed from their ends.
-fn words(text: &str) -> Vec<Word> {
+fn words_of(text: &str) -> Vec<Word> {
     let chars: Vec<char> = text.chars().collect();
     let digit_at = |at: usize| chars.get(at).is_some_and(char::is_ascii_digit);
     let mut out = Vec::new();
@@ -251,10 +380,9 @@ fn words(text: &str) -> Vec<Word> {
     out
 }
 
-fn english_scan(text: &str) -> Vec<Qualifier> {
-    let lexicon = &*LEXICON;
+fn english_scan(text: &str, lexicon: &Lexicon) -> Vec<Qualifier> {
     let normalized = normalize_th(text);
-    let words = words(&normalized.text);
+    let words = words_of(&normalized.text);
     let mut found = Vec::new();
     let mut push = |meaning, first: &Word, last: &Word| {
         let range = normalized.original_range(first.start, last.end);
@@ -343,13 +471,79 @@ fn in_raw_word(c: char) -> bool {
         || (c.is_alphanumeric() && !('\u{0E00}'..='\u{0E7F}').contains(&c))
 }
 
-/// The qualifiers [`check_qualifiers`] reads around a ref: those of [`window`], plus any entry
-/// that straddles a window edge, read whole. An edge inside an English word moves outward to the
-/// word's end ("cannot" cut to "not" invents no negation, "didn't" cut to "n't" hides none), and
-/// the text up to [`REACH`] code points past each edge is scanned too, so "ไม่" cut to "่" or
-/// "ไม่เกิน" cut to "เกิน" is still read as written.
-fn window_qualifiers(r: &ResolvedRef) -> Option<Vec<Qualifier>> {
+/// Which stretch of block text a reading compares with the claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// [`window`]: 10 code points each side of the quote.
+    Window,
+    /// The quote's whole sentence (ends: `.` before a space or the end, `!`, `?`, `ฯ`, a line
+    /// break, and a space after a Thai run of 30 or more code points), never less than
+    /// [`window`], and never less than 30 code points each side when Thai text is near.
+    Sentence,
+}
+
+fn is_thai(c: char) -> bool {
+    ('\u{0E00}'..='\u{0E7F}').contains(&c)
+}
+
+/// The code-point range of the quote's sentence reading in `chars`.
+fn sentence_range(
+    chars: &[char],
+    start: usize,
+    end: usize,
+    lo: usize,
+    hi: usize,
+) -> (usize, usize) {
+    let len = chars.len();
+    // Non-space code points right before each position.
+    let mut run = vec![0usize; len + 1];
+    for i in 0..len {
+        run[i + 1] = if chars[i].is_whitespace() {
+            0
+        } else {
+            run[i] + 1
+        };
+    }
+    let is_end = |i: usize| -> bool {
+        let c = chars[i];
+        match c {
+            '!' | '?' | 'ฯ' | '\n' | '\r' | '\u{2028}' | '\u{2029}' => true,
+            '.' => chars.get(i + 1).is_none_or(|n| n.is_whitespace()),
+            _ if c.is_whitespace() => run[i] >= THAI_SENTENCE_RUN && i > 0 && is_thai(chars[i - 1]),
+            _ => false,
+        }
+    };
+    let mut s_lo = (0..start).rev().find(|&i| is_end(i)).map_or(0, |i| i + 1);
+    let mut s_hi = (end..len).find(|&i| is_end(i)).map_or(len, |i| i + 1);
+    let near_from = start.saturating_sub(THAI_MIN);
+    let near_to = end.saturating_add(THAI_MIN).min(len);
+    if chars[near_from..near_to].iter().copied().any(is_thai) {
+        s_lo = s_lo.min(near_from);
+        s_hi = s_hi.max(near_to);
+    }
+    (s_lo.min(lo), s_hi.max(hi))
+}
+
+/// The qualifiers one reading finds around a ref. An edge inside an English word moves outward
+/// to the word's end ("cannot" cut to "not" invents no negation, "didn't" cut to "n't" hides
+/// none), and the text up to [`REACH`] code points past each edge is scanned too, keeping every
+/// entry that overlaps the stretch, so "ไม่" cut to "่" or "ไม่เกิน" cut to "เกิน" is read as
+/// written.
+fn read_around(r: &ResolvedRef, reach: Reach, words: Words) -> Option<Vec<Qualifier>> {
     let (chars, mut lo, mut hi) = window_range(r)?;
+    if reach == Reach::Sentence {
+        let ResolvedRef::Ok {
+            quote_start,
+            quote_end,
+            ..
+        } = r
+        else {
+            return None;
+        };
+        let end = (*quote_end as usize).min(chars.len());
+        let start = (*quote_start as usize).min(end);
+        (lo, hi) = sentence_range(&chars, start, end, lo, hi);
+    }
     if lo > 0 && in_raw_word(chars[lo]) {
         while lo > 0 && in_raw_word(chars[lo - 1]) {
             lo -= 1;
@@ -365,11 +559,39 @@ fn window_qualifiers(r: &ResolvedRef) -> Option<Vec<Qualifier>> {
     let text: String = chars[from..to].iter().collect();
     let (lo, hi) = (lo - from, hi - from);
     Some(
-        spans(&text)
+        spans_with(&text, words)
             .into_iter()
             .filter(|q| q.end as usize > lo && (q.start as usize) < hi)
             .collect(),
     )
+}
+
+/// One reading of a claim against a ref: its word list and stretch, and the qualifier counts on
+/// each side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reading {
+    pub words: Words,
+    pub reach: Reach,
+    pub claim: BTreeMap<Meaning, usize>,
+    pub source: BTreeMap<Meaning, usize>,
+}
+
+/// Every reading `check_qualifiers` compares, widest first: the extended word list before the
+/// plan's, the sentence before the 10-code-point window. `None` for a stale ref.
+pub fn readings(claim_text: &str, r: &ResolvedRef) -> Option<Vec<Reading>> {
+    let mut out = Vec::new();
+    for words in [Words::Extended, Words::Plan] {
+        let claim = counts(&spans_with(claim_text, words));
+        for reach in [Reach::Sentence, Reach::Window] {
+            out.push(Reading {
+                words,
+                reach,
+                claim: claim.clone(),
+                source: counts(&read_around(r, reach, words)?),
+            });
+        }
+    }
+    Some(out)
 }
 
 fn names(counts: &BTreeMap<Meaning, usize>) -> Vec<&'static str> {
@@ -380,25 +602,30 @@ fn names(counts: &BTreeMap<Meaning, usize>) -> Vec<&'static str> {
 }
 
 /// For a cited claim, one `Qualifier` check, `Inconclusive`, `qualifier_mismatch`, per
-/// full-quality ref whose window holds a different count of any qualifier than the claim (so
-/// "not not approved" does not match "not approved"); nothing when the counts are equal. Runs for
-/// every cited claim, numbers and dates included.
+/// full-quality ref for which any of its [`readings`] holds a different count of any qualifier on
+/// the two sides (so "not not approved" does not match "not approved"); nothing when every
+/// reading agrees. A ref is flagged when any reading differs, so widening the stretch or adding
+/// words, which only adds readings, can only lower a verdict. Runs for every cited claim, numbers
+/// and dates included. `detail` holds the first differing reading's counts.
 pub fn check_qualifiers(claim: &ClaimInput) -> Vec<CheckOutcome> {
     if !claim.cited {
         return vec![];
     }
-    let wanted = counts(&spans(&claim.text));
     resolved_refs(&claim.refs)
         .filter_map(|(ordinal, r)| {
-            let around = counts(&window_qualifiers(r)?);
-            (around != wanted).then(|| CheckOutcome {
+            let readings = readings(&claim.text, r)?;
+            let differing = readings.iter().find(|x| x.claim != x.source)?;
+            Some(CheckOutcome {
                 method: CheckMethod::Qualifier,
                 verdict: CheckVerdict::Inconclusive,
                 basis: Basis::None,
                 code: "qualifier_mismatch",
                 ref_ordinal: Some(ordinal),
                 advisory: false,
-                detail: json!({"claim": names(&wanted), "source": names(&around)}),
+                detail: json!({
+                    "claim": names(&differing.claim),
+                    "source": names(&differing.source),
+                }),
             })
         })
         .collect()

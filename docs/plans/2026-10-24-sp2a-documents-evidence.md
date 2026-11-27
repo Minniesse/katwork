@@ -1157,7 +1157,7 @@ docs/adr/0010-untrusted-content-posture.md, docs/adr/0011-craft-apps-in-katwork.
   - `check_resolve(refs: &[ResolvedRef]) -> Vec<CheckOutcome>`: one `Resolve` check per ref: `Supported` for `Ok` with `Full` quality, or OCR quality with a box and `conf` or `align_score` of at least 0.8; otherwise `Inconclusive` with `stale`, `source_generated`, `hidden_source`, `instruction_like_source`, `suspect_text_layer`, `source_deleted`, `ocr_unaligned` or `ocr_low_confidence`.
   - **Only full-quality refs are compared.** `check_quote`, `check_qualifiers` and Task 11's number, date, cell and arithmetic checks look only at refs whose `Resolve` check is `Supported`. A ref that is generated, hidden, instruction-like, suspect, deleted or weak OCR therefore leaves its claim unverified with its resolve code and can never fail it: a hostile hidden span that disagrees with a true claim cannot make it read "Doesn't match source" (ADR-0007).
   - `check_quote(claim, refs) -> Vec<CheckOutcome>`: for `quote` and `fact` claims **whose text holds no quantity and no date** (those go to Task 11's checks whatever their kind): `match_key(claim)` inside `match_key(exact)` is `Supported`, `Exact`; else `Inconclusive`, `paraphrase` (quote) or `needs_judge` (fact).
-  - **Qualifiers** (negations and comparators). `verify::qualifier::Meaning::{Neg, Le, Ge, Lt, Gt, Approx, Nearly}` and `verify::qualifier::find(text: &str) -> BTreeSet<Meaning>`: a left-to-right, longest-match-first, non-overlapping scan. Thai entries match as substrings of `match_key(text)`; English entries match as whole lowercased words or word sequences of `normalize_th(text)`. The lexicon, exactly:
+  - **Qualifiers** (negations and comparators). `verify::qualifier::Meaning::{Neg, Le, Ge, Lt, Gt, Approx, Nearly}` and `verify::qualifier::find(text: &str) -> BTreeSet<Meaning>`: a left-to-right, longest-match-first, non-overlapping scan. Thai entries and symbols match as substrings of `match_key(text)`; English entries match as whole lowercased words or word sequences of `normalize_th(text)`. The lexicon, exactly (the plan's original list, then the entries the founder decision of 2026-11-27 added, in the last table):
 
     | Meaning | Thai | English |
     |---|---|---|
@@ -1169,7 +1169,19 @@ docs/adr/0010-untrusted-content-posture.md, docs/adr/0011-craft-apps-in-katwork.
     | `Approx` | ประมาณ (except right after งบ, so งบประมาณ, "budget", is not a qualifier) | about, approximately, around, roughly |
     | `Nearly` | เกือบ | nearly, almost |
 
-    `verify::qualifier::window(r: &ResolvedRef) -> Option<String>`: for an `Ok` ref, the 10 code points of `block_text` before `quote_start`, the quote, and the 10 after `quote_end`. `check_qualifiers(claim: &ClaimInput) -> Vec<CheckOutcome>`: for each `Ok` ref, when `find(claim.text) != find(window)`, one `Qualifier` check, `Inconclusive`, code `qualifier_mismatch`, with both sets in `detail`; nothing when they are equal. It runs for every cited claim, numbers and dates included (Task 11 calls it too).
+    Added 2026-11-27 (founder decision):
+
+    | Meaning | Thai and symbols | English |
+    |---|---|---|
+    | `Neg` | ห้าม, ปฏิเสธ, งด (not before งาม), ยกเลิก, ระงับ, ไร้, ปราศจาก, อย่า (not before ง, so อย่าง is not one) | cannot, nothing, nobody, neither, nor, hardly, unable to, failed to, reject, rejected, rejects, dont, doesnt, didnt (and every word ending in n't, as before) |
+    | `Le` | ลงมา, สูงสุด, `<=`, `≤` | or less, maximum |
+    | `Ge` | ขึ้นไป, ต่ำสุด, `>=`, `≥`, `+` right after a digit | or more, minimum |
+    | `Lt` | `<` (not before `-`) | |
+    | `Gt` | `>` (not after `-` or `=`) | in excess of |
+
+    `no` is a negation except before `.`, an optional space and a digit ("No. 5").
+
+    `verify::qualifier::window(r: &ResolvedRef) -> Option<String>`: for an `Ok` ref, the 10 code points of `block_text` before `quote_start`, the quote, and the 10 after `quote_end`. `check_qualifiers(claim: &ClaimInput) -> Vec<CheckOutcome>`: for each full-quality ref, the claim's qualifier **counts** per meaning are compared with four readings of the source (amended 2026-11-27, founder decision): the quote's whole sentence (ends: `.` before a space or the block's end, `!`, `?`, `ฯ`, a line break, a space after a Thai run of 30 or more code points; never less than `window`, and never less than 30 code points each side when Thai text is near) and `window`, each under the original and the extended list (`qualifier::readings`). An entry crossing a reading's edge is read whole. When any reading differs, one `Qualifier` check, `Inconclusive`, code `qualifier_mismatch`, with that reading's counts in `detail`; nothing when all agree. A wider reading or a new word can therefore only lower a verdict. It runs for every cited claim, numbers and dates included (Task 11 calls it too, and `qualifier::pair_with_numbers` gives it each qualifier with the next quantity).
   - `roll_up(cited: bool, checks: &[CheckOutcome]) -> (ClaimStatus, &'static str)`, skipping advisory checks, in this order:
     1. any `Contradicted` from a check other than `Judge` → `Failed`, with that check's code (R18: only deterministic checks fail a claim);
     2. not cited → `Unverified`, `uncited`;

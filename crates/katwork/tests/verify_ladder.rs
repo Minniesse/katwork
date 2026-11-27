@@ -424,6 +424,10 @@ fn relocate_never_splits_a_grapheme() {
     // "ก" alone would match inside "กิ"; such a hit is not a relocation.
     let r = narrowed("x ก y", 2, 3);
     assert_eq!(relocate("กิน", &r), Err("stale"));
+    // A quote stored without context, searched alone: the only hit splits "กิ".
+    let r = narrowed("ก", 0, 1);
+    assert_eq!(relocate("กิน", &r), Err("stale"));
+    assert_eq!(relocate("น ก", &r), Ok((2, 3)));
 }
 
 #[test]
@@ -785,6 +789,51 @@ fn every_lexicon_entry_returns_its_own_meaning() {
         ("roughly", Approx),
         ("nearly", Nearly),
         ("almost", Nearly),
+        // Added by the founder decision of 2026-11-27.
+        ("ห้าม", Neg),
+        ("ปฏิเสธ", Neg),
+        ("งด", Neg),
+        ("ยกเลิก", Neg),
+        ("ระงับ", Neg),
+        ("ไร้", Neg),
+        ("ปราศจาก", Neg),
+        ("อย่า", Neg),
+        ("cannot", Neg),
+        ("can't", Neg),
+        ("nothing", Neg),
+        ("nobody", Neg),
+        ("neither", Neg),
+        ("nor", Neg),
+        ("hardly", Neg),
+        ("unable to", Neg),
+        ("failed to", Neg),
+        ("reject", Neg),
+        ("rejected", Neg),
+        ("rejects", Neg),
+        ("dont", Neg),
+        ("don't", Neg),
+        ("doesnt", Neg),
+        ("doesn't", Neg),
+        ("didnt", Neg),
+        ("didn't", Neg),
+        ("won't", Neg),
+        ("wasn't", Neg),
+        ("aren't", Neg),
+        (">", Gt),
+        ("<", Lt),
+        ("≥", Ge),
+        ("≤", Le),
+        (">=", Ge),
+        ("<=", Le),
+        ("or more", Ge),
+        ("or less", Le),
+        ("maximum", Le),
+        ("minimum", Ge),
+        ("in excess of", Gt),
+        ("ขึ้นไป", Ge),
+        ("ลงมา", Le),
+        ("สูงสุด", Le),
+        ("ต่ำสุด", Ge),
     ];
     for (text, meaning) in rows {
         let padded = format!("x {text} 5");
@@ -805,8 +854,20 @@ fn longest_match_wins_and_matches_do_not_overlap() {
 #[test]
 fn english_words_are_whole_words() {
     use Meaning::*;
-    for text in ["nothing", "another", "overview", "notable", "cannot"] {
+    // Whole words only: a lexicon word inside a longer word is not that word ("nothing" and
+    // "cannot" are entries of their own since the founder decision of 2026-11-27).
+    for text in [
+        "another",
+        "overview",
+        "notable",
+        "knot",
+        "nobodys",
+        "rejection",
+    ] {
         assert_eq!(qualifier::find(text), set(&[]), "{text:?}");
+    }
+    for text in ["nothing", "cannot"] {
+        assert_eq!(qualifier::find(text), set(&[Neg]), "{text:?}");
     }
     assert_eq!(qualifier::find("under-budget"), set(&[Lt]));
     assert_eq!(qualifier::find("No, the board approved"), set(&[Neg]));
@@ -942,46 +1003,89 @@ fn window_is_ten_code_points_and_clamped() {
 }
 
 #[test]
-fn negation_reaching_into_the_window_is_seen_one_wholly_outside_is_not() {
-    // "ไม่" is three code points; seven filler code points put its start ten before the quote.
-    let seen = "ไม่กขคงจฉชอนุมัติ";
-    let c = claim(ClaimKind::Quote, "อนุมัติ", vec![full("อนุมัติ", seen)]);
+fn qualifier_reading_covers_the_sentence_and_30_thai_code_points() {
+    // A Thai negation 13 code points before the quote, out of the old 10-code-point window.
+    let block = "ไม่กขคงจฉชซฌญอนุมัติ";
+    let c = claim(ClaimKind::Quote, "อนุมัติ", vec![full("อนุมัติ", block)]);
     assert_eq!(check_qualifiers(&c).len(), 1);
-    // Eight fillers: the window edge cuts "ไม่" after its first code point; it is read whole.
-    let cut = "ไม่กขคงจฉชซอนุมัติ";
-    let c = claim(ClaimKind::Quote, "อนุมัติ", vec![full("อนุมัติ", cut)]);
-    assert_eq!(check_qualifiers(&c).len(), 1);
-    // Ten fillers: "ไม่" ends where the window starts, wholly outside it.
-    let unseen = "ไม่กขคงจฉชซฌญอนุมัติ";
-    let c = claim(ClaimKind::Quote, "อนุมัติ", vec![full("อนุมัติ", unseen)]);
+    // One past a line break and more than 30 code points away: another sentence, not read.
+    let block = format!("ไม่ใช่\n{}อนุมัติ", "ก".repeat(31));
+    let c = claim(ClaimKind::Quote, "อนุมัติ", vec![full("อนุมัติ", &block)]);
     assert!(check_qualifiers(&c).is_empty());
+    // A Thai space after a run of 30 or more code points ends a sentence.
+    let block = format!("ไม่ใช่{} {}อนุมัติ", "ก".repeat(30), "ข".repeat(31));
+    let c = claim(ClaimKind::Quote, "อนุมัติ", vec![full("อนุมัติ", &block)]);
+    assert!(check_qualifiers(&c).is_empty());
+    // An English negation far back in the same sentence is read; one in the sentence before is
+    // not.
+    let block =
+        "It is not true, as the press reported at length, that the board approved the budget.";
+    let c = claim(
+        ClaimKind::Quote,
+        "the board approved the budget",
+        vec![full("the board approved the budget", block)],
+    );
+    assert_eq!(check_qualifiers(&c).len(), 1);
+    let block = "Not so. The board approved the budget";
+    let c = claim(
+        ClaimKind::Quote,
+        "approved the budget",
+        vec![full("approved the budget", block)],
+    );
+    assert!(check_qualifiers(&c).is_empty());
+    // Across a line break but within 30 code points of Thai text: read.
+    let block = format!("ไม่ใช่\n{}อนุมัติ", "ก".repeat(15));
+    let c = claim(ClaimKind::Quote, "อนุมัติ", vec![full("อนุมัติ", &block)]);
+    assert_eq!(check_qualifiers(&c).len(), 1);
+    // A decimal point is not a sentence end.
+    let block = "Growth was not 2.5 percent as approved";
+    let c = claim(
+        ClaimKind::Quote,
+        "as approved",
+        vec![full("as approved", block)],
+    );
+    assert_eq!(check_qualifiers(&c).len(), 1);
 }
 
 #[test]
-fn qualifier_outside_the_window_is_a_known_gap() {
-    // Accepted residual risk (ADR-0007's fixed 10-code-point window): a negation further than
-    // ten code points before the quote is not seen, and the claim passes. A change that closes
-    // the gap breaks this test on purpose.
+fn qualifier_anywhere_in_the_sentence_is_seen() {
+    // Formerly an accepted gap of the 10-code-point window; closed by the founder decision of
+    // 2026-11-27 (the reading covers the quote's sentence).
     let block = "ที่ประชุมมีมติไม่เห็นชอบให้อนุมัติงบประมาณ";
     let c = claim(
         ClaimKind::Quote,
         "อนุมัติงบประมาณ",
         vec![full("อนุมัติงบประมาณ", block)],
     );
-    assert_eq!(status(&c), (ClaimStatus::Passed, "checked"));
+    assert_eq!(status(&c), (ClaimStatus::Unverified, "qualifier_mismatch"));
+    let block = "The board did not, after long debate, approve the budget";
+    let c = claim(
+        ClaimKind::Quote,
+        "approve the budget",
+        vec![full("approve the budget", block)],
+    );
+    assert_eq!(status(&c), (ClaimStatus::Unverified, "qualifier_mismatch"));
 }
 
 #[test]
 fn window_cut_mid_word_does_not_invent_or_hide_a_qualifier() {
-    // The window edge falls inside "cannot": the whole word is read, and "cannot" is not in the
-    // lexicon, so nothing is invented.
-    let block = "The board cannot fully approve it";
+    // The window edge falls inside "knot" ("not fully approve it" if cut): the whole word is
+    // read, so nothing is invented.
+    let block = "the knot fully approve it";
     let c = claim(
         ClaimKind::Quote,
         "approve it",
         vec![full("approve it", block)],
     );
     assert!(check_qualifiers(&c).is_empty());
+    // "cannot" is itself a negation (founder decision of 2026-11-27).
+    let block = "The board cannot fully approve it";
+    let c = claim(
+        ClaimKind::Quote,
+        "approve it",
+        vec![full("approve it", block)],
+    );
+    assert_eq!(check_qualifiers(&c).len(), 1);
     // The edge falls inside "didn't": the whole word is read, so the negation is not hidden.
     let block = "The board didn't fully approve the budget";
     let c = claim(
@@ -2042,4 +2146,235 @@ fn qualifiers_pair_with_the_next_quantity_for_task_11() {
     assert_eq!((pairs[0].0.meaning, pairs[0].1), (Neg, None));
     let long = "a".repeat(MAX_SCAN_CODE_POINTS + 1);
     assert!(qualifier::pair_with_numbers(&long, &Ctx::default()).is_err());
+}
+
+// ---------------------------------------------------------------- founder decision, 2026-11-27
+
+#[test]
+fn lexicon_exceptions_keep_ordinary_words_out() {
+    use Meaning::*;
+    for text in [
+        "อย่างไร",
+        "ตัวอย่าง",
+        "งดงาม",
+        "a => b",
+        "a -> b",
+        "a <- b",
+        "โทร +66",
+    ] {
+        assert_eq!(qualifier::find(text), set(&[]), "{text:?}");
+    }
+    assert_eq!(qualifier::find("staff 5+"), set(&[Ge]));
+    assert_eq!(qualifier::find("staff 5 or more"), set(&[Ge]));
+    assert_eq!(qualifier::find("ห้ามอนุมัติ"), set(&[Neg]));
+}
+
+/// The false passes the two reviews of the first head found, each now flagged.
+#[test]
+fn review_false_passes_are_flagged() {
+    let rows: &[(&str, &str, &str)] = &[
+        // (claim, quote, block)
+        (
+            "the board approved",
+            "the board approved",
+            "the board approved? No.",
+        ),
+        (
+            "approve the budget",
+            "approve the budget",
+            "Motion to approve the budget: no.",
+        ),
+        (
+            "approve the budget",
+            "approve the budget",
+            "They cannot approve the budget",
+        ),
+        (
+            "will approve the budget",
+            "will approve the budget",
+            "Nothing will approve the budget",
+        ),
+        (
+            "will approve the budget",
+            "will approve the budget",
+            "Nobody will approve the budget",
+        ),
+        (
+            "approve the budget",
+            "approve the budget",
+            "Neither approve the budget nor the plan",
+        ),
+        (
+            "approve the budget",
+            "approve the budget",
+            "They hardly approve the budget",
+        ),
+        (
+            "approve the budget",
+            "approve the budget",
+            "The board failed to approve the budget",
+        ),
+        (
+            "approve the budget",
+            "approve the budget",
+            "The board was unable to approve the budget",
+        ),
+        (
+            "approve the budget",
+            "approve the budget",
+            "They rejected: approve the budget",
+        ),
+        (
+            "approve the budget",
+            "approve the budget",
+            "We dont approve the budget",
+        ),
+        (
+            "the board did not approve",
+            "the board did not approve",
+            "It is not the case that the board did not approve",
+        ),
+        (
+            "the board approved the budget",
+            "the board approved the budget",
+            "It is not true, as the press reported, that the board approved the budget.",
+        ),
+        ("อนุมัติงบประมาณ", "อนุมัติงบประมาณ", "ที่ประชุมไม่ได้มีการอนุมัติงบประมาณ"),
+        ("ได้รับการอนุมัติ", "ได้รับการอนุมัติ", "ยังไม่ได้รับการอนุมัติ"),
+        ("นำเข้าสินค้า", "นำเข้าสินค้า", "ห้ามนำเข้าสินค้า"),
+        ("อนุมัติงบประมาณ", "อนุมัติงบประมาณ", "ปฏิเสธอนุมัติงบประมาณ"),
+        ("อนุมัติงบประมาณ", "อนุมัติงบประมาณ", "งดอนุมัติงบประมาณ"),
+        ("staff 5", "5", "staff >5"),
+        ("rate 5%", "5%", "rate <5%"),
+        ("staff 5", "5", "staff 5 or more"),
+        ("5 days", "5 days", "maximum 5 days"),
+        ("5 ล้านบาท", "5 ล้านบาท", "วงเงิน 5 ล้านบาทขึ้นไป"),
+        ("5 วัน", "5 วัน", "สูงสุด 5 วัน"),
+    ];
+    for (text, quote, block) in rows {
+        let c = claim(ClaimKind::Quote, text, vec![full(quote, block)]);
+        assert_eq!(check_qualifiers(&c).len(), 1, "{text:?} in {block:?}");
+        assert_ne!(status(&c).0, ClaimStatus::Passed, "{text:?} in {block:?}");
+    }
+}
+
+/// Phrasings the extended lists do not cover; pinned so a later change is deliberate.
+#[test]
+fn known_gaps_after_the_extended_lists() {
+    let rows: &[(&str, &str)] = &[
+        (
+            "the board approved the budget",
+            "Reports that the board approved the budget were denied",
+        ),
+        (
+            "the board approved the budget",
+            "if the board approved the budget",
+        ),
+        (
+            "the board approved the budget",
+            "unless the board approved the budget",
+        ),
+        ("the board approved", "the board approved? Certainly not"),
+    ];
+    for (quote, block) in rows {
+        let c = claim(ClaimKind::Quote, quote, vec![full(quote, block)]);
+        assert_eq!(status(&c), (ClaimStatus::Passed, "checked"), "{block:?}");
+    }
+}
+
+#[test]
+fn widening_or_adding_words_only_lowers() {
+    use qualifier::{Reach, Words};
+    // Only the 10-code-point window differs: the sentence holds two negations, as the claim does.
+    let block = "We did not object and not approved it";
+    let c = claim(
+        ClaimKind::Quote,
+        "not not approved it",
+        vec![full("approved it", block)],
+    );
+    let readings = qualifier::readings(&c.text, &c.refs[0]).unwrap();
+    let differs = |w, r| {
+        readings
+            .iter()
+            .any(|x| x.words == w && x.reach == r && x.claim != x.source)
+    };
+    assert!(!differs(Words::Extended, Reach::Sentence));
+    assert!(differs(Words::Extended, Reach::Window));
+    assert_eq!(check_qualifiers(&c).len(), 1);
+    // Only the plan's word list differs: "cannot" against "not".
+    let c = claim(
+        ClaimKind::Quote,
+        "cannot approve",
+        vec![full("approve", "The board did not approve")],
+    );
+    let readings = qualifier::readings(&c.text, &c.refs[0]).unwrap();
+    assert!(
+        readings
+            .iter()
+            .filter(|x| x.words == Words::Extended)
+            .all(|x| x.claim == x.source)
+    );
+    assert_eq!(check_qualifiers(&c).len(), 1);
+
+    // Property: over a grid of claims and blocks, a ref is flagged exactly when some reading
+    // differs, so it is flagged whenever the narrowest reading (the plan's words, the
+    // 10-code-point window) or any wider one is.
+    let fronts = [
+        "",
+        "not ",
+        "It is not true that ",
+        "ไม่",
+        "ที่ประชุมไม่ได้มีการ",
+        "cannot ",
+        "ห้าม",
+        "no more than ",
+        "maximum ",
+        "Not so. ",
+    ];
+    let claims = [
+        "approve the budget",
+        "not approve the budget",
+        "cannot approve the budget",
+        "อนุมัติ",
+        "ไม่อนุมัติ",
+    ];
+    let mut flagged_any = 0;
+    for front in fronts {
+        for quote in ["approve the budget", "อนุมัติ"] {
+            let block = format!("{front}{quote} ok");
+            for text in claims {
+                let c = claim(ClaimKind::Quote, text, vec![full(quote, &block)]);
+                let readings = qualifier::readings(&c.text, &c.refs[0]).unwrap();
+                assert_eq!(readings.len(), 4);
+                let any = readings.iter().any(|x| x.claim != x.source);
+                let flagged = !check_qualifiers(&c).is_empty();
+                assert_eq!(flagged, any, "{text:?} in {block:?}");
+                flagged_any += usize::from(flagged);
+            }
+        }
+    }
+    assert!(flagged_any > 0);
+
+    // And a qualifier check added to any set of checks never raises the roll-up.
+    let mismatch = o(M::Qualifier, V::Inconclusive, B::None, "qualifier_mismatch");
+    for checks in combos(&pool()) {
+        for cited in [true, false] {
+            let before = roll_up(cited, &checks);
+            let mut with = checks.clone();
+            with.push(mismatch.clone());
+            let after = roll_up(cited, &with);
+            let ok = after.0 == before.0
+                || (before.0 == ClaimStatus::Passed && after.0 == ClaimStatus::Unverified);
+            assert!(ok, "{checks:?}: {before:?} -> {after:?}");
+        }
+    }
+}
+
+#[test]
+fn straddled_entry_is_not_misread_as_a_shorter_one() {
+    // The 10-code-point window cuts "ไม่เกิน" to "เกิน"; read whole, it matches the claim's
+    // "ไม่เกิน" in every reading, so nothing is flagged.
+    let block = "ไม่เกินกขคงจอนุมัติ";
+    let c = claim(ClaimKind::Quote, "ไม่เกิน อนุมัติ", vec![full("อนุมัติ", block)]);
+    assert!(check_qualifiers(&c).is_empty());
 }
