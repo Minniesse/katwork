@@ -10,10 +10,10 @@
 # `#` starts a comment line. The check refuses a row with another column count, an unknown app, a repo other
 # than https://github.com/Minniesse/<app>, a commit that is not 40 lower-case hex characters, a duplicate app,
 # a `-` thai_gate for an app on REQUIRE_THAI_GATE, and in `features` or `web_features` (each comma-separated
-# item compared whole) a KatWork gate, `default`, or `<dependency>/<gate>` (`?/` too), which would turn the
-# gate back on through a dependency. It also refuses a lock without a row for each of the 13 apps
+# item compared whole) a KatWork gate, `default`, `<dependency>/<gate>` or `<dependency>/default` (`?/` too),
+# which would turn a gate back on through a dependency. It also refuses a lock without a row for each of the 13 apps
 # (katwork-bridge's row is optional until Task 17 adds it); --allow-missing only lists those apps, for the
-# lock's PR while the fork PRs merge.
+# lock's PR while the fork PRs merge, and fails once every app has a row, so CI must then drop it.
 set -u
 
 APPS="wordcraft gridcraft pdfcraft deckcraft designcraft vectorcraft figcraft photocraft lightcraft cadcraft filmcraft effectcraft soundcraft katwork-bridge"
@@ -39,6 +39,7 @@ check() {
         last = it[k]; sub(/^.*\//, "", last)
         if (it[k] == "") fail(col " has an empty item")
         else if (it[k] == "default") fail(col " names default, which turns every gate back on")
+        else if (last == "default") fail(col " turns every gate of a dependency back on through " it[k])
         else if (it[k] in gate) fail(col " names the KatWork gate " it[k])
         else if (last in gate) fail(col " turns the KatWork gate " last " on through " it[k])
       }
@@ -62,6 +63,8 @@ check() {
       if (missing != "") {
         if (allow_missing == "--allow-missing") printf "check-craft-lock: no row yet for:%s\n", missing
         else { printf "%s: no row for:%s\n", lock, missing; bad = 1 }
+      } else if (allow_missing == "--allow-missing") {
+        printf "%s: every app has a row: drop --allow-missing\n", lock; bad = 1
       }
       if (!bad) printf "check-craft-lock: ok (%d rows)\n", rows; exit bad
     }
@@ -118,11 +121,19 @@ self_test() {
   for g in $GATES; do
     case_ 1 "features naming $g" "$(feat "$g")"
   done
+  case_ 1 "features naming font-download" "$(feat font-download)"
+  case_ 1 "features naming self-update" "$(feat self-update)"
+  case_ 1 "features naming scripting" "$(feat scripting)"
+  case_ 1 "features naming heic" "$(feat heic)"
   case_ 1 "features naming heif" "$(feat heif)"
   case_ 1 "features naming rawnind-model" "$(feat rawnind-model)"
   case_ 1 "features naming ssip" "$(feat ssip)"
   case_ 1 "features naming default" "$(feat default)"
   case_ 1 "web_features naming default" "$(echo "$ok" | sed 's|apps/soundcraft-web - -|apps/soundcraft-web default -|')"
+  case_ 1 "a dependency's default" "$(feat soundcraft-engine/default)"
+  case_ 1 "an optional dependency's default" "$(feat soundcraft-engine?/default)"
+  case_ 1 "web_features naming a dependency's default" "$(echo "$ok" | sed 's|apps/soundcraft-web - -|apps/soundcraft-web soundcraft-engine/default -|')"
+  case_ 1 "web_features naming an optional dependency's default" "$(echo "$ok" | sed 's|apps/soundcraft-web - -|apps/soundcraft-web soundcraft-engine?/default -|')"
   case_ 1 "a gate through a dependency" "$(feat soundcraft-engine/plugin-hosts)"
   case_ 1 "a gate through an optional dependency" "$(feat soundcraft-engine?/plugin-hosts)"
   case_ 1 "web_features naming a gate through a dependency" "$(echo "$ok" | sed 's|apps/soundcraft-web - -|apps/soundcraft-web soundcraft-engine/plugins -|')"
@@ -137,6 +148,7 @@ self_test() {
   FILL=0 MODE=--allow-missing case_ 0 "the empty lock, missing rows allowed" ""
   FILL=0 MODE=--allow-missing case_ 1 "a gate, missing rows allowed" "$(feat plugins)"
   FILL=0 MODE=--allow-missing case_ 1 "eight columns, missing rows allowed" "$(echo "$ok" | sed 's/ -$//')"
+  MODE=--allow-missing case_ 1 "every app has a row, missing rows allowed" "$ok"
   if [ "$failed" = 0 ]; then echo "check-craft-lock self-test: ok"; fi
   return "$failed"
 }

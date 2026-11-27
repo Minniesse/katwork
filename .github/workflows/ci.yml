@@ -106,7 +106,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: sh scripts/check-craft-lock.sh --self-test
       # The 13 rows land as the fork PRs merge; until then the check lists the apps without a row.
-      # Drop --allow-missing in the commit that writes the 13th row.
+      # --allow-missing fails once every app has a row, so the commit that writes the 13th row drops it.
       - run: sh scripts/check-craft-lock.sh --allow-missing
 
   fuzz-smoke:
