@@ -2198,16 +2198,27 @@ const DOCX_RS_BUILDER: &[&str] = &[
     "VertAlignType",
 ];
 
-/// Every Rust file of the workspace's crates and of `fuzz/`, but this one.
-fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+/// Build and fuzzing output, by path relative to the repository root. Only these are
+/// skipped: a source folder that shares one of their names (`src/artifacts/`) is scanned.
+fn skipped(relative: &std::path::Path) -> bool {
+    ["target", "fuzz/target", "fuzz/artifacts", "fuzz/corpus"]
+        .iter()
+        .any(|skip| relative == std::path::Path::new(skip))
+        || relative.file_name().is_some_and(|n| n == "node_modules")
+}
+
+/// Every Rust file under `dir` (inside the repository `root`), but this one.
+///
+/// The guard reads `.rs` files only. Code pulled in from another kind of file (`include!` of a
+/// `.txt`, `#[path = "x.txt"]`) or from outside the scanned folders is left to clippy's
+/// `disallowed-methods`, which CI runs on every target with `-D warnings`.
+fn rust_files(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap().flatten() {
         let path = entry.path();
+        let relative = path.strip_prefix(root).unwrap_or(&path);
         if path.is_dir() {
-            if !matches!(
-                path.file_name().and_then(|n| n.to_str()),
-                Some("target" | "corpus" | "artifacts" | "node_modules")
-            ) {
-                rust_files(&path, out);
+            if !skipped(relative) {
+                rust_files(root, &path, out);
             }
         } else if path.extension().is_some_and(|e| e == "rs")
             && !path.ends_with("tests/write_docs.rs")
@@ -2215,6 +2226,24 @@ fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             out.push(path);
         }
     }
+}
+
+#[test]
+fn the_docx_rs_guard_scans_source_folders_named_like_output() {
+    use std::path::Path;
+    assert!(!skipped(Path::new("crates/katwork/src/artifacts")));
+    assert!(!skipped(Path::new("crates/katwork/src/target")));
+    assert!(!skipped(Path::new("fuzz/fuzz_targets")));
+    assert!(skipped(Path::new("fuzz/artifacts")));
+    assert!(skipped(Path::new("fuzz/corpus")));
+    assert!(skipped(Path::new("target")));
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut files = Vec::new();
+    rust_files(&root, &root.join("crates"), &mut files);
+    assert!(
+        files.iter().any(|p| p.ends_with("src/artifacts/store.rs")),
+        "src/artifacts/ is scanned"
+    );
 }
 
 /// docx-rs's reader functions, which no KatWork source may name in any form (clippy's
@@ -2259,10 +2288,14 @@ fn code_only(source: &str) -> String {
                 }
             }
             out.push(' ');
-        } else if c == 'r'
-            && !out.chars().last().is_some_and(ident)
-            && matches!(next, Some('"' | '#'))
-        {
+        } else if c == 'r' && matches!(next, Some('"' | '#')) && {
+            // `r` starts a raw string alone or after a `b` or `c` prefix (br"..", cr#".."#).
+            let mut before = out.chars().rev();
+            match before.next() {
+                Some('b' | 'c') => !before.next().is_some_and(ident),
+                last => !last.is_some_and(ident),
+            }
+        } {
             // A raw string: r"..", r#".."#, and so on.
             let mut hashes = 0;
             let mut j = i + 1;
@@ -2367,8 +2400,8 @@ fn docx_rs_misuse(code: &str) -> Option<String> {
 fn katwork_never_reads_with_docx_rs() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut files = Vec::new();
-    rust_files(&root.join("crates"), &mut files);
-    rust_files(&root.join("fuzz"), &mut files);
+    rust_files(&root, &root.join("crates"), &mut files);
+    rust_files(&root, &root.join("fuzz"), &mut files);
     assert!(files.len() > 50, "the scan found the workspace's sources");
     let mut users = Vec::new();
     for path in files {
@@ -2417,6 +2450,15 @@ fn the_docx_rs_guard_sees_through_evasions() {
             "let d = docx_rs::Docx::new().add_paragraph(docx_rs::Paragraph::new());",
             false,
         ),
+        (
+            r##"let _ = br#"a"b"#; let _ = docx_rs::read_docx(b); let _ = "x";"##,
+            true,
+        ),
+        (
+            r##"let _ = cr#"a"b"#; let _ = docx_rs::read_docx(b);"##,
+            true,
+        ),
+        (r##"let _ = br"x"; use docx_rs as d;"##, true),
     ] {
         let code = code_only(code);
         let readers = DOCX_RS_READERS
@@ -2452,4 +2494,73 @@ async fn figures_crossing_a_claim_boundary_are_recorded(pool: PgPool) {
             "{shown}: {receipt}"
         );
     }
+}
+
+/// Bidi controls reorder what a reader sees ("12" shown as "21") while the match key drops
+/// them, so writer content may hold none.
+#[sqlx::test]
+async fn bidi_controls_are_refused_in_writer_content(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let (_, a) = env.cited("แหล่ง").await;
+    let bad_docx = [
+        doc_args(
+            "b",
+            vec![para(vec![
+                json!("ยอดขาย \u{202E}"),
+                claim("12", "number", &[a]),
+                json!("\u{202C} บาท"),
+            ])],
+        ),
+        doc_args(
+            "b",
+            vec![para(vec![claim("\u{202E}12\u{202C}", "number", &[a])])],
+        ),
+        doc_args(
+            "b",
+            vec![json!({"type": "heading", "level": 1, "text": ["หัว\u{2067}ข้อ"]})],
+        ),
+        json!({"name": "b", "content": {"title": "\u{200F}ชื่อ", "blocks": []}}),
+        doc_args(
+            "b",
+            vec![json!({"type": "list", "ordered": false, "items": [["ก\u{061C}"]]})],
+        ),
+        doc_args(
+            "b",
+            vec![json!({"type": "table", "header": [["\u{202A}h"]], "rows": []})],
+        ),
+    ];
+    for args in bad_docx {
+        assert_eq!(
+            code(call(&env.docx(), &env.ctx(), args.clone()).await),
+            "invalid_args",
+            "{args}"
+        );
+    }
+    let bad_xlsx = [
+        json!({"name": "b", "sheets": [{"name": "S", "rows": [["\u{202E}12"]]}]}),
+        json!({"name": "b", "sheets": [{"name": "S", "rows": [[claim("\u{2066}12\u{2069}", "number", &[a])]]}]}),
+        json!({"name": "b", "sheets": [{"name": "S\u{200E}", "rows": []}]}),
+    ];
+    for args in bad_xlsx {
+        assert_eq!(
+            code(call(&env.xlsx(), &env.ctx(), args.clone()).await),
+            "invalid_args",
+            "{args}"
+        );
+    }
+    assert_eq!(env.output_versions().await, 0);
+    // Thai text needs none of them; ZWSP and ZWNJ stay allowed.
+    call(
+        &env.docx(),
+        &env.ctx(),
+        doc_args(
+            "ok",
+            vec![para(vec![
+                json!("ข้อ\u{200B}ความ\u{200C}"),
+                claim("12", "number", &[a]),
+            ])],
+        ),
+    )
+    .await
+    .unwrap();
 }

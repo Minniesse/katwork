@@ -504,3 +504,76 @@ fn a_unit_after_a_claim_is_not_an_uncited_figure() {
         assert_eq!(texts(&content), vec![], "{inlines:?}");
     }
 }
+
+#[test]
+fn bidi_controls_are_refused_everywhere() {
+    for c in [
+        '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}',
+        '\u{2068}', '\u{2069}', '\u{200E}', '\u{200F}', '\u{061C}',
+    ] {
+        assert!(is_bidi_control(c), "{c:?}");
+        let mut text = DocContent {
+            title: None,
+            blocks: vec![ContentBlock::Paragraph {
+                text: vec![Inline::Text(format!("ยอด{c}"))],
+            }],
+        };
+        assert_eq!(check_doc(&mut text), Err(ContentError("bidi_control")));
+        let mut claimed = DocContent {
+            title: None,
+            blocks: vec![ContentBlock::Paragraph {
+                text: vec![claim(&format!("{c}12"))],
+            }],
+        };
+        assert_eq!(check_doc(&mut claimed), Err(ContentError("bidi_control")));
+        let mut sheets = vec![SheetSpec {
+            name: format!("S{c}"),
+            rows: vec![],
+        }];
+        assert!(check_sheets(&mut sheets).is_err());
+    }
+    for c in ['\u{200B}', '\u{200C}', '\u{200D}'] {
+        assert!(!is_bidi_control(c));
+    }
+}
+
+/// A currency sign, `%`, `ปี` or a letter scale glued to a claim joins its figure, so the
+/// figure a reader sees is recorded as uncited, on purpose: it only lowers a claim, and the
+/// tool's help tells the Kat to keep them inside the claim text.
+#[test]
+fn glued_signs_and_units_cross_on_purpose() {
+    for (inlines, shown) in [
+        (vec![Inline::Text("ราคา ฿".into()), claim("450")], "฿450"),
+        (vec![claim("45"), Inline::Text("%".into())], "45%"),
+        (vec![claim("2"), Inline::Text("K".into())], "2K"),
+    ] {
+        let content = doc(vec![ContentBlock::Paragraph {
+            text: inlines.clone(),
+        }]);
+        let found = texts(&content);
+        assert!(
+            found.iter().any(|(text, _, _)| text.contains(shown)),
+            "{inlines:?}: {found:?}"
+        );
+    }
+    // Inside the claim text, nothing crosses.
+    let inside = doc(vec![ContentBlock::Paragraph {
+        text: vec![Inline::Text("ราคา ".into()), claim("฿450")],
+    }]);
+    assert_eq!(texts(&inside), vec![]);
+}
+
+#[test]
+fn many_claims_in_one_paragraph_cross_check_by_search() {
+    // 2,000 claims, each followed by a glued scale word: every one crosses.
+    let mut inlines = Vec::new();
+    for _ in 0..2_000 {
+        inlines.push(claim("5"));
+        inlines.push(Inline::Text(" ล้าน และอื่นๆ ".into()));
+    }
+    let content = doc(vec![ContentBlock::Paragraph { text: inlines }]);
+    let uncited = uncited_claims(&content).unwrap();
+    assert_eq!(uncited.len(), 2_000);
+    let after: Vec<u32> = uncited.iter().map(|f| f.after_claims).collect();
+    assert_eq!(after, (0..2_000).collect::<Vec<u32>>());
+}

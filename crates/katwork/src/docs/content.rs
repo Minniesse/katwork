@@ -206,6 +206,17 @@ pub fn clean_text(text: &str) -> String {
         .collect()
 }
 
+/// A character that reorders text without being drawn: the bidi embeddings, overrides and
+/// isolates, and the left-to-right, right-to-left and Arabic letter marks. `match_key` drops
+/// them, so a claim `\u{202E}12\u{202C}` would match "12" while a reader sees "21"; Thai
+/// text needs none of them, so writer content holding one is refused.
+pub fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' | '\u{061C}'
+    )
+}
+
 /// Counts what content costs against its caps.
 struct Budget {
     chars: usize,
@@ -214,6 +225,9 @@ struct Budget {
 
 impl Budget {
     fn text(&mut self, text: &mut String) -> Result<(), ContentError> {
+        if text.chars().any(is_bidi_control) {
+            return Err(ContentError("bidi_control"));
+        }
         *text = clean_text(text);
         self.chars = self.chars.saturating_add(text.chars().count());
         if self.chars > MAX_CHARS {
@@ -327,6 +341,7 @@ fn sheet_name_ok(name: &str) -> bool {
     let chars = name.chars().count();
     (1..=MAX_SHEET_NAME_CHARS).contains(&chars)
         && clean_text(name) == name
+        && !name.chars().any(is_bidi_control)
         && !name.contains(['[', ']', ':', '*', '?', '/', '\\'])
         && !name.starts_with('\'')
         && !name.ends_with('\'')
@@ -552,22 +567,32 @@ impl Walk {
             }
         }
         if !claims.is_empty() {
+            // `claims` is in order and its ranges do not overlap, so both their starts and
+            // their ends ascend: a figure crosses a boundary when the first start, or the first
+            // end, past its own start lies before its end.
             let crosses = |start: u32, end: u32| {
-                claims
-                    .iter()
-                    .any(|&(cs, ce)| (start < cs && end > cs) || (start < ce && end > ce))
+                let next_start = claims.partition_point(|&(cs, _)| cs <= start);
+                let next_end = claims.partition_point(|&(_, ce)| ce <= start);
+                claims.get(next_start).is_some_and(|&(cs, _)| cs < end)
+                    || claims.get(next_end).is_some_and(|&(_, ce)| ce < end)
             };
-            found.extend(
-                figures(&joined, |_| true)?
-                    .into_iter()
-                    .filter(|&(start, end, _, _)| crosses(start, end)),
-            );
+            let crossing: Vec<(u32, u32, ClaimKind)> = spans(&joined, |_| true)?
+                .into_iter()
+                .filter(|&(start, end, _)| crosses(start, end))
+                .collect();
+            // Windows only for the figures kept.
+            if !crossing.is_empty() {
+                let bounds = Bounds::new(&joined);
+                found.extend(crossing.into_iter().map(|(start, end, kind)| {
+                    (start, end, kind, window(&joined, &bounds, start, end))
+                }));
+            }
         }
         found.sort_by_key(|f| (f.0, f.1));
         let first = self.after;
         for (start, _, kind, text) in found {
             // The claims of this sequence that end before the figure starts.
-            let before = claims.iter().filter(|&&(_, ce)| ce <= start).count() as u32;
+            let before = claims.partition_point(|&(_, ce)| ce <= start) as u32;
             self.after = first + before;
             self.push(kind, text, location);
         }
@@ -577,12 +602,11 @@ impl Walk {
 }
 
 /// The figures of `run`: every number whose role `keep` accepts and every date, in order of
-/// their start, each as its code-point range, kind and text with up to `UNCITED_CONTEXT` code
-/// points of the run on each side.
-fn figures(
+/// their start, each as its code-point range and kind.
+fn spans(
     run: &str,
     keep: impl Fn(NumberRole) -> bool,
-) -> Result<Vec<(u32, u32, ClaimKind, String)>, TooLong> {
+) -> Result<Vec<(u32, u32, ClaimKind)>, TooLong> {
     if run.is_empty() {
         return Ok(Vec::new());
     }
@@ -598,6 +622,15 @@ fn figures(
         )
         .collect();
     found.sort_by_key(|&(start, end, _)| (start, end));
+    Ok(found)
+}
+
+/// `spans`, each with its text: up to `UNCITED_CONTEXT` code points of the run on each side.
+fn figures(
+    run: &str,
+    keep: impl Fn(NumberRole) -> bool,
+) -> Result<Vec<(u32, u32, ClaimKind, String)>, TooLong> {
+    let found = spans(run, keep)?;
     if found.is_empty() {
         return Ok(Vec::new());
     }

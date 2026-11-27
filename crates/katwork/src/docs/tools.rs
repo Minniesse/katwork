@@ -479,3 +479,59 @@ pub async fn commit_document(
         Outcome::Done(receipt) => Ok(receipt),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::docs::content::{CellSpec, ClaimInline, SheetSpec, cell_location};
+    use crate::evidence::claim::ClaimKind;
+
+    #[test]
+    fn check_placed_compares_each_xlsx_claim_cell_with_the_contents() {
+        let spec = ClaimSpec {
+            text: "ข้อ".into(),
+            kind: ClaimKind::Fact,
+            cite: vec![CitationId::new()],
+            derive: None,
+        };
+        let content = WrittenContent::Sheets(vec![SheetSpec {
+            name: "S".into(),
+            rows: vec![vec![
+                CellSpec::Empty,
+                CellSpec::Claim(ClaimInline {
+                    claim: spec.clone(),
+                }),
+            ]],
+        }]);
+        let placed = |location: String| PlacedClaim {
+            ordinal: 1,
+            kind: spec.kind,
+            text: spec.text.clone(),
+            location,
+            cite: spec.cite.clone(),
+            derive: None,
+            cited: true,
+        };
+        let check = |location: String| {
+            check_placed(
+                &[placed(location)],
+                &[&spec],
+                &[1],
+                MediaType::Xlsx,
+                &content,
+            )
+        };
+        assert!(check(cell_location("S", 0, 1)).is_ok());
+        for wrong in [
+            cell_location("S", 0, 0),
+            cell_location("S", 1, 1),
+            "cell:T!B1".into(),
+        ] {
+            assert_eq!(
+                check(wrong.clone()).unwrap_err().code(),
+                "tool_failed",
+                "{wrong}"
+            );
+        }
+    }
+}
