@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub mod colour;
+pub mod content;
 pub mod deadline;
 mod docx;
 pub mod heap;
@@ -19,12 +20,23 @@ pub mod pdf_layer;
 pub mod pdf_visibility;
 pub mod pool;
 mod text;
+pub mod tools;
 pub mod watchdog;
+pub mod write_docx;
+pub mod write_xlsx;
 pub mod xlsx;
 pub mod xml_guard;
 
 pub use limits::DocLimits;
 pub use pool::DocPool;
+
+/// A writer's output: the file's bytes and its cited claims, in document order, each at the
+/// location the renderer put it (SP2a Task 9). Read-back checks every one before a commit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rendered {
+    pub bytes: Vec<u8>,
+    pub claims: Vec<content::PlacedClaim>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MediaKind {

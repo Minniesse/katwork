@@ -1,7 +1,10 @@
 use super::{Initiator, RunBudget};
 use crate::{
     artifacts::{BlobStore, tools::ExtractCache},
-    docs::{DocError, DocLimits, DocPool, Extracted, MediaKind},
+    docs::{
+        DocError, DocLimits, DocPool, Extracted, MediaKind,
+        tools::{NoXlsxCheck, XlsxCheck},
+    },
     fence::Fence,
     ids::*,
     runtime::Core,
@@ -57,6 +60,8 @@ pub struct ToolDeps {
     pub blobs: Arc<dyn BlobStore>,
     pub extract: ExtractFn,
     pub cache: Arc<ExtractCache>,
+    /// The check every XLSX a writer produces goes through before commit (R19).
+    pub xlsx_check: Arc<dyn XlsxCheck>,
 }
 impl ToolDeps {
     pub fn from_core(core: &Core) -> ToolDeps {
@@ -65,6 +70,7 @@ impl ToolDeps {
             blobs: core.blobs.clone(),
             extract: Arc::new(crate::docs::extract),
             cache: core.extract_cache.clone(),
+            xlsx_check: Arc::new(NoXlsxCheck),
         }
     }
 }

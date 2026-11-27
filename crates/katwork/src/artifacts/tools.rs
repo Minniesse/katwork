@@ -48,7 +48,7 @@ pub(crate) fn from_kat(error: KatError) -> ToolError {
 }
 
 /// A `DocError` as the model sees it: final, never `ToolError::Timeout`, which the loop retries.
-fn from_doc(error: DocError) -> ToolError {
+pub(crate) fn from_doc(error: DocError) -> ToolError {
     match error {
         DocError::Cancelled => ToolError::Halted(StopReason::Cancelled),
         DocError::Internal => ToolError::Failed("internal_error".into()),
