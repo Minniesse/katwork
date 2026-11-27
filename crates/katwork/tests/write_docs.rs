@@ -232,6 +232,35 @@ impl Env {
             .unwrap()
     }
 
+    /// Leaves every XLSX version this test wrote under `target/katwork-outputs/` for the
+    /// `xlsx-check` CI job (plan Step 4).
+    async fn keep_outputs(&self, test: &str) {
+        let versions: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT sha256, bytes FROM artifact_versions
+             WHERE run_id IS NOT NULL AND media_type = 'xlsx' ORDER BY created_at, id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap();
+        assert!(!versions.is_empty(), "{test} wrote no workbook");
+        for (index, (sha256, bytes)) in versions.into_iter().enumerate() {
+            let bytes = self
+                .core
+                .blobs
+                .read(
+                    &BlobRef {
+                        workspace_id: self.tenant.workspace_id(),
+                        sha256,
+                        bytes: bytes as u64,
+                    },
+                    u64::MAX,
+                )
+                .await
+                .unwrap();
+            keep_xlsx(&format!("{test}-{}", index + 1), &bytes);
+        }
+    }
+
     /// Stored claims of the output's latest version: (ordinal, kind, text, location, cited).
     async fn stored_claims(&self, file: &str) -> Vec<(i32, String, String, String, bool)> {
         sqlx::query_as(
@@ -551,6 +580,8 @@ async fn control_characters_never_reach_the_file(pool: PgPool) {
     let out = read(MediaKind::Xlsx, &bytes);
     assert_eq!(out.blocks[0].text, clean);
     assert_eq!(out.blocks[1].text, clean);
+    env.keep_outputs("control_characters_never_reach_the_file")
+        .await;
 }
 
 #[sqlx::test]
@@ -603,6 +634,8 @@ async fn hidden_citation_text_never_reaches_the_file_or_receipt(pool: PgPool) {
     }
     // The claim is recorded with its ref; capping it is the verifier's job.
     assert_eq!(env.count("SELECT count(*) FROM claim_refs").await, 2);
+    env.keep_outputs("hidden_citation_text_never_reaches_the_file_or_receipt")
+        .await;
 }
 
 #[sqlx::test]
@@ -621,6 +654,8 @@ async fn renderers_take_only_the_display_and_id_of_a_citation(pool: PgPool) {
             .unwrap();
     let mut changed = rows.clone();
     changed[0].exact = "SENTINEL-EXACT".into();
+    changed[0].source_ref.source = "SENTINEL-SOURCE".into();
+    changed[0].source_ref.unit_context = Some("SENTINEL-UNIT".into());
     let package = |bytes: &[u8]| {
         let mut texts: Vec<(String, String)> = parts(bytes)
             .into_iter()
@@ -762,10 +797,8 @@ async fn xlsx_number_cells_outside_claims_are_uncited(pool: PgPool) {
     assert!(stored.iter().all(|c| c.1 == "number" && !c.4));
     assert_eq!(stored[0].2, "9999");
     assert!(stored[1].2.contains("3,450"));
-    keep_xlsx(
-        "xlsx_number_cells_outside_claims_are_uncited",
-        &env.bytes(&file_id(&receipt)).await,
-    );
+    env.keep_outputs("xlsx_number_cells_outside_claims_are_uncited")
+        .await;
 }
 
 #[sqlx::test]
@@ -790,6 +823,7 @@ async fn too_many_figures_are_refused(pool: PgPool) {
     )
     .await;
     assert_eq!(code(result), "invalid_args");
+    env.keep_outputs("too_many_figures_are_refused").await;
 }
 
 // ---- XLSX ----
@@ -820,7 +854,6 @@ async fn write_xlsx_claim_cells_and_no_formulas(pool: PgPool) {
     assert_eq!(receipt["gridcraft_check"], "off");
     let id = file_id(&receipt);
     let bytes = env.bytes(&id).await;
-    keep_xlsx("write_xlsx_claim_cells_and_no_formulas", &bytes);
     let out = read(MediaKind::Xlsx, &bytes);
     let cell = |sheet: &str, row: u32, col: u32| {
         out.blocks
@@ -900,6 +933,8 @@ async fn write_xlsx_claim_cells_and_no_formulas(pool: PgPool) {
         comments.contains("รายงาน &amp; &lt;markup&gt;.txt"),
         "{comments}"
     );
+    env.keep_outputs("write_xlsx_claim_cells_and_no_formulas")
+        .await;
 }
 
 #[sqlx::test]
@@ -929,7 +964,24 @@ async fn xlsx_with_notes_reads_without_hidden_cells_or_warnings(pool: PgPool) {
         "{:?}",
         out.warnings
     );
-    assert!(out.blocks.iter().all(|b| b.hidden.is_none()));
+    assert!(
+        out.blocks
+            .iter()
+            .all(|b| b.hidden.is_none() && b.suspect.is_none())
+    );
+    let number = out
+        .blocks
+        .iter()
+        .find(|b| b.text == "1,250")
+        .and_then(|b| b.cell.as_ref())
+        .unwrap();
+    assert_eq!(
+        (number.kind, number.cache_untrusted),
+        (CellKind::Number, false)
+    );
+    assert_eq!(number.formula, None);
+    env.keep_outputs("xlsx_with_notes_reads_without_hidden_cells_or_warnings")
+        .await;
 }
 
 #[sqlx::test]
@@ -958,6 +1010,8 @@ async fn xlsx_versions_record_the_check_result(pool: PgPool) {
         checks,
         vec![("docx".into(), None), ("xlsx".into(), Some("off".into()))]
     );
+    env.keep_outputs("xlsx_versions_record_the_check_result")
+        .await;
 }
 
 struct Refuse;
@@ -1006,14 +1060,12 @@ async fn dense_identical_content_passes_the_zip_ratio(pool: PgPool) {
     )
     .await
     .unwrap();
-    keep_xlsx(
-        "dense_identical_content_passes_the_zip_ratio",
-        &env.bytes(&file_id(&receipt)).await,
-    );
     let blocks: Vec<Value> = (0..2_000).map(|_| para(vec![json!("ซ้ำ")])).collect();
     call(&env.docx(), &env.ctx(), doc_args("same", blocks))
         .await
         .unwrap();
+    env.keep_outputs("dense_identical_content_passes_the_zip_ratio")
+        .await;
 }
 
 // ---- Arguments ----
@@ -1616,16 +1668,19 @@ async fn writer_cancelled_during_its_commit_statement_leaves_pool_clean(pool: Pg
     let (_, a) = env.cited("แหล่ง").await;
     let tool = env.docx();
     let args = doc_args("k", vec![para(vec![claim("ข้อ", "fact", &[a])])]);
-    for table in ["claims", "claim_refs"] {
+    // The plain checks before rendering, then the commit's last two inserts (after the blob
+    // and the version row).
+    for table in ["artifact_versions", "citations", "claims", "claim_refs"] {
         let ctx = env.ctx();
+        let blobs = env.output_blobs().await;
         cancel_sql::drop_during_statement(&pool, table, || call(&tool, &ctx, args.clone())).await;
         assert_pool_clean(&pool).await;
         cancel_sql::probe_write(&pool).await;
         assert_eq!(env.output_versions().await, 0, "{table}");
         assert_eq!(env.claims().await, 0, "{table}");
+        // At most the one blob this commit renamed, never referenced.
+        assert!(env.output_blobs().await <= blobs + 1, "{table}");
     }
-    // Each dropped commit may leave its one blob, never referenced; both wrote the same bytes.
-    assert!(env.output_blobs().await <= 1);
     call(&tool, &env.ctx(), args).await.unwrap();
     assert_eq!(env.output_versions().await, 1);
 }
@@ -1902,4 +1957,137 @@ async fn thai_claims_read_back(pool: PgPool) {
         .await
         .unwrap_or_else(|e| panic!("{text}: {e:?}"));
     }
+    env.keep_outputs("thai_claims_read_back").await;
+}
+
+// ---- The commit's own checks, behind the plain ones ----
+
+/// Runs a `write_docx` citing `a` whose render holds until `between` ran, so `between` changes
+/// the source after the plain checks passed and before the commit locks it.
+async fn change_during_render<F: std::future::Future<Output = ()>>(
+    env: &Env,
+    a: CitationId,
+    between: F,
+) -> Result<Value, ToolError> {
+    let (reached_tx, mut reached) = tokio::sync::mpsc::channel(1);
+    let (go, go_rx) = std::sync::mpsc::channel();
+    let tool = WriteDocx::with_renderer(env.deps(), held_renderer(reached_tx, go_rx));
+    let ctx = env.ctx();
+    let write = call(
+        &tool,
+        &ctx,
+        doc_args("l", vec![para(vec![claim("1,250", "number", &[a])])]),
+    );
+    let change = async {
+        reached.recv().await.unwrap();
+        between.await;
+        go.send(()).unwrap();
+    };
+    tokio::join!(write, change).0
+}
+
+#[sqlx::test]
+async fn source_deleted_during_render_is_refused_under_the_lock(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let (file, a) = env.cited("แหล่ง 1,250").await;
+    let blobs = env.output_blobs().await;
+    let result = change_during_render(&env, a, env.delete(file.id)).await;
+    assert_eq!(code(result), "citation_unknown");
+    assert_eq!(env.output_versions().await, 0);
+    assert_eq!(env.claims().await, 0);
+    assert_eq!(env.output_blobs().await, blobs);
+}
+
+#[sqlx::test]
+async fn source_moved_during_render_is_refused_under_the_lock(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let (file, a) = env.cited("แหล่ง 1,250").await;
+    let space = Uuid::now_v7();
+    sqlx::query("INSERT INTO spaces (id, workspace_id, name, allow_external) VALUES ($1, $2, 'Other', false)")
+        .bind(space)
+        .bind(env.f.workspace)
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    let pool = env.pool.clone();
+    let result = change_during_render(&env, a, async move {
+        sqlx::query("UPDATE artifacts SET space_id = $2 WHERE id = $1")
+            .bind(file.id)
+            .bind(space)
+            .execute(&pool)
+            .await
+            .unwrap();
+    })
+    .await;
+    assert_eq!(code(result), "citation_unknown");
+    assert_eq!(env.output_versions().await, 0);
+}
+
+#[sqlx::test]
+async fn a_renderer_that_hides_a_claim_commits_nothing(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let (_, a) = env.cited("แหล่ง").await;
+    // A renderer that reports one claim fewer, or one at another bookmark, than the content has.
+    let renderers: Vec<docs::tools::RenderDocxFn> = vec![
+        Arc::new(|content: &DocContent, sources| {
+            let mut full = render_docx(content, sources)?;
+            full.claims.pop();
+            Ok(full)
+        }),
+        Arc::new(|content: &DocContent, sources| {
+            let mut full = render_docx(content, sources)?;
+            full.claims[0].location = "bookmark:kw-claim-9".into();
+            Ok(full)
+        }),
+        Arc::new(|content: &DocContent, sources| {
+            let mut full = render_docx(content, sources)?;
+            full.claims[0].cite.clear();
+            Ok(full)
+        }),
+    ];
+    for render in renderers {
+        let tool = WriteDocx::with_renderer(env.deps(), render);
+        let result = call(
+            &tool,
+            &env.ctx(),
+            doc_args(
+                "h",
+                vec![para(vec![
+                    claim("ข้อแรก", "fact", &[a]),
+                    claim("ข้อสอง", "fact", &[a]),
+                ])],
+            ),
+        )
+        .await;
+        assert_eq!(code(result), "tool_failed");
+    }
+    assert_eq!(env.output_versions().await, 0);
+}
+
+#[sqlx::test]
+async fn a_new_version_keeps_its_file_type(pool: PgPool) {
+    let env = Env::new(pool).await;
+    let book = call(
+        &env.xlsx(),
+        &env.ctx(),
+        json!({"name": "b", "sheets": [{"name": "S", "rows": [["x"]]}]}),
+    )
+    .await
+    .unwrap();
+    let mut args = doc_args("d", vec![]);
+    args["file_id"] = json!(file_id(&book));
+    assert_eq!(
+        code(call(&env.docx(), &env.ctx(), args).await),
+        "invalid_args"
+    );
+    let doc = call(&env.docx(), &env.ctx(), doc_args("d", vec![]))
+        .await
+        .unwrap();
+    let args =
+        json!({"name": "b", "file_id": file_id(&doc), "sheets": [{"name": "S", "rows": []}]});
+    assert_eq!(
+        code(call(&env.xlsx(), &env.ctx(), args).await),
+        "invalid_args"
+    );
+    assert_eq!(env.output_versions().await, 2);
 }

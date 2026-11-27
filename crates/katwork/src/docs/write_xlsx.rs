@@ -16,6 +16,9 @@ use super::{
 };
 use crate::evidence::{citation::CitationRow, claim::ClaimKind};
 
+/// The longest claim text written as a number cell: 15 significant digits with their group
+/// separators, a sign and a decimal point.
+const MAX_FIGURE_CHARS: usize = 24;
 /// Cells written between two deadline checks.
 const CHECK_EVERY: usize = 256;
 
@@ -23,6 +26,11 @@ const CHECK_EVERY: usize = 256;
 /// `12.50` (`0.00`), `1,250` (`#,##0`) or `1,250.50` (`#,##0.00`), each with an optional `-`.
 /// `None` for any other text, or a figure an `f64` cannot hold exactly.
 fn plain_figure(text: &str) -> Option<(f64, String)> {
+    // Short enough that the value is finite and the format is a few characters; a negative
+    // zero would show as `0`.
+    if text.len() > MAX_FIGURE_CHARS {
+        return None;
+    }
     let digits = text.strip_prefix('-').unwrap_or(text);
     let (int, frac) = match digits.split_once('.') {
         Some((int, frac)) => (int, Some(frac)),
@@ -51,6 +59,9 @@ fn plain_figure(text: &str) -> Option<(f64, String)> {
         return None;
     }
     let value: f64 = plain.parse().ok()?;
+    if !value.is_finite() || (value == 0.0 && text.starts_with('-')) {
+        return None;
+    }
     let mut format = if grouped { "#,##0" } else { "0" }.to_owned();
     if let Some(frac) = frac {
         format.push('.');
@@ -187,5 +198,16 @@ mod tests {
         ] {
             assert_eq!(plain_figure(text), None, "{text}");
         }
+        assert_eq!(plain_figure(&format!("1{}", "0".repeat(400))), None);
+        assert_eq!(plain_figure(&format!("0.{}1", "0".repeat(400))), None);
+        assert_eq!(
+            plain_figure("123,456,789,012,345.5"),
+            None,
+            "16 significant digits"
+        );
+        assert_eq!(
+            plain_figure("12,345,678,901,234.5"),
+            Some((12_345_678_901_234.5, "#,##0.0".into()))
+        );
     }
 }
